@@ -11,6 +11,17 @@
 //! rejected as [`CodecError::TrailingBytes`](ferrumc_codec::CodecError) wrapped
 //! in [`NbtError::Codec`]. Callers framing NBT alongside other data must slice
 //! the input down to the tag first.
+//!
+//! When the NBT is embedded inside a larger buffer (for example a packet with
+//! trailing fields), use the consumed-bytes variants instead:
+//!
+//! * [`read_named_root_with_consumed`]
+//! * [`read_network_root_with_consumed`]
+//!
+//! They parse exactly one root, return the number of bytes it consumed, and
+//! leave the trailing bytes for the caller. For these variants `max_bytes`
+//! bounds the bytes the NBT is *allowed to consume* rather than the length of
+//! the whole input slice (which includes the trailing data).
 
 use ferrumc_codec::BoundedReader;
 
@@ -26,11 +37,9 @@ use crate::Result;
 /// is exceeded, or if bytes remain after the root.
 pub fn read_named_root(data: &[u8], limits: &NbtLimits) -> Result<(String, NbtTag)> {
     let mut reader = enter(data, limits)?;
-    ensure_compound_root(&mut reader)?;
-    let name = read_string(&mut reader, limits)?;
-    let compound = parse_compound(&mut reader, 1, limits)?;
+    let (name, tag) = parse_named(&mut reader, limits)?;
     reader.finish()?;
-    Ok((name, NbtTag::Compound(compound)))
+    Ok((name, tag))
 }
 
 /// Decodes a network-form root: `[type=10][compound payload]` with no name.
@@ -39,9 +48,67 @@ pub fn read_named_root(data: &[u8], limits: &NbtLimits) -> Result<(String, NbtTa
 /// bytes remain after the root.
 pub fn read_network_root(data: &[u8], limits: &NbtLimits) -> Result<NbtTag> {
     let mut reader = enter(data, limits)?;
-    ensure_compound_root(&mut reader)?;
-    let compound = parse_compound(&mut reader, 1, limits)?;
+    let tag = parse_network(&mut reader, limits)?;
     reader.finish()?;
+    Ok(tag)
+}
+
+/// Decodes a file-form root embedded in a larger buffer, reporting its length.
+///
+/// Mirrors [`read_named_root`] but does **not** reject trailing bytes: it parses
+/// exactly one root and returns the decoded name and tag alongside the number of
+/// bytes the root consumed, so `data[consumed..]` remains for the caller.
+///
+/// Unlike [`read_named_root`], `max_bytes` bounds the bytes the NBT may
+/// *consume*, not the length of `data` (which includes the trailing payload).
+/// The reader sees at most `max_bytes` bytes, so a root that tries to read
+/// further hits [`CodecError::UnexpectedEof`](ferrumc_codec::CodecError) and is
+/// rejected, while a small root inside a large buffer parses normally. Depth,
+/// list-length, and string-byte limits are identical to [`read_named_root`].
+pub fn read_named_root_with_consumed(
+    data: &[u8],
+    limits: &NbtLimits,
+) -> Result<(String, NbtTag, usize)> {
+    let mut reader = enter_view(data, limits);
+    let (name, tag) = parse_named(&mut reader, limits)?;
+    Ok((name, tag, reader.position()))
+}
+
+/// Decodes a network-form root embedded in a larger buffer, reporting its length.
+///
+/// Mirrors [`read_network_root`] but does **not** reject trailing bytes: it
+/// parses exactly one root and returns the decoded tag alongside the number of
+/// bytes it consumed, so `data[consumed..]` remains for the caller.
+///
+/// As with [`read_named_root_with_consumed`], `max_bytes` bounds the bytes the
+/// NBT may *consume* rather than the length of `data`; a root that reads past
+/// that cap hits [`CodecError::UnexpectedEof`](ferrumc_codec::CodecError) and is
+/// rejected.
+pub fn read_network_root_with_consumed(data: &[u8], limits: &NbtLimits) -> Result<(NbtTag, usize)> {
+    let mut reader = enter_view(data, limits);
+    let tag = parse_network(&mut reader, limits)?;
+    Ok((tag, reader.position()))
+}
+
+/// Parses a file-form root from an already-prepared reader.
+///
+/// Shared by [`read_named_root`] and [`read_named_root_with_consumed`]; neither
+/// the byte-length check nor the trailing-byte check live here, so each caller
+/// applies the policy appropriate to its framing.
+fn parse_named(reader: &mut BoundedReader<'_>, limits: &NbtLimits) -> Result<(String, NbtTag)> {
+    ensure_compound_root(reader)?;
+    let name = read_string(reader, limits)?;
+    let compound = parse_compound(reader, 1, limits)?;
+    Ok((name, NbtTag::Compound(compound)))
+}
+
+/// Parses a network-form root from an already-prepared reader.
+///
+/// Shared by [`read_network_root`] and [`read_network_root_with_consumed`]; see
+/// [`parse_named`] for why the framing checks live in the callers.
+fn parse_network(reader: &mut BoundedReader<'_>, limits: &NbtLimits) -> Result<NbtTag> {
+    ensure_compound_root(reader)?;
+    let compound = parse_compound(reader, 1, limits)?;
     Ok(NbtTag::Compound(compound))
 }
 
@@ -49,7 +116,8 @@ pub fn read_network_root(data: &[u8], limits: &NbtLimits) -> Result<NbtTag> {
 ///
 /// Bounding the slice up front means every later read is implicitly capped by
 /// `max_bytes`, so no length read from the stream can drive an oversized
-/// allocation.
+/// allocation. Used by the whole-slice readers, which also reject trailing
+/// bytes; embedded readers use [`enter_view`] instead.
 fn enter<'a>(data: &'a [u8], limits: &NbtLimits) -> Result<BoundedReader<'a>> {
     if data.len() > limits.max_bytes() {
         return Err(NbtError::MaxBytesExceeded {
@@ -58,6 +126,19 @@ fn enter<'a>(data: &'a [u8], limits: &NbtLimits) -> Result<BoundedReader<'a>> {
         });
     }
     Ok(BoundedReader::new(data))
+}
+
+/// Wraps at most `max_bytes` of `data` in a reader for embedded decoding.
+///
+/// The trailing payload of an embedded NBT lives beyond the root, so capping the
+/// whole slice (as [`enter`] does) would be wrong. Instead the reader is handed
+/// a view of at most `max_bytes` bytes: a root within that budget parses and
+/// reports its true length, while one that tries to read further runs off the
+/// end of the view and fails with
+/// [`CodecError::UnexpectedEof`](ferrumc_codec::CodecError).
+fn enter_view<'a>(data: &'a [u8], limits: &NbtLimits) -> BoundedReader<'a> {
+    let view = &data[..data.len().min(limits.max_bytes())];
+    BoundedReader::new(view)
 }
 
 /// Reads and validates the leading root type byte, which must be `TAG_Compound`.
@@ -238,7 +319,7 @@ fn read_string(reader: &mut BoundedReader<'_>, limits: &NbtLimits) -> Result<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::write::write_named_root;
+    use crate::write::{write_named_root, write_network_root};
     use ferrumc_codec::CodecError;
 
     /// `[0x0A][u16=0 name][body...]` — wraps a compound body in a named root.
@@ -661,5 +742,146 @@ mod tests {
             read_network_root(&bytes, &default_limits()),
             Err(NbtError::Codec(CodecError::TrailingBytes { remaining: 1 }))
         ));
+    }
+
+    /// A small but non-trivial compound used by the consumed-bytes tests.
+    fn sample_root() -> NbtTag {
+        let mut root = NbtCompound::new();
+        root.push("i", NbtTag::Int(42));
+        root.push("s", NbtTag::String("hi".to_owned()));
+        NbtTag::Compound(root)
+    }
+
+    #[test]
+    fn named_consumed_count_is_exact_and_leaves_trailing() {
+        let tag = sample_root();
+        let nbt = write_named_root("root", &tag, &default_limits()).expect("write");
+        let nbt_len = nbt.len();
+
+        let sentinel = [0xDE, 0xAD, 0xBE, 0xEF];
+        let mut buffer = nbt;
+        buffer.extend_from_slice(&sentinel);
+
+        let (name, decoded, consumed) =
+            read_named_root_with_consumed(&buffer, &default_limits()).expect("valid");
+        assert_eq!(name, "root");
+        assert_eq!(decoded, tag);
+        assert_eq!(consumed, nbt_len);
+        // The exact NBT length is reported, so the sentinel is left untouched.
+        assert_eq!(&buffer[consumed..], &sentinel);
+    }
+
+    #[test]
+    fn network_consumed_count_is_exact_and_leaves_trailing() {
+        let tag = sample_root();
+        let nbt = write_network_root(&tag, &default_limits()).expect("write");
+        let nbt_len = nbt.len();
+
+        let sentinel = [0x01, 0x02, 0x03];
+        let mut buffer = nbt;
+        buffer.extend_from_slice(&sentinel);
+
+        let (decoded, consumed) =
+            read_network_root_with_consumed(&buffer, &default_limits()).expect("valid");
+        assert_eq!(decoded, tag);
+        assert_eq!(consumed, nbt_len);
+        assert_eq!(&buffer[consumed..], &sentinel);
+    }
+
+    #[test]
+    fn small_root_in_buffer_larger_than_max_bytes_still_parses() {
+        let tag = sample_root();
+        let nbt = write_network_root(&tag, &default_limits()).expect("write");
+        let nbt_len = nbt.len();
+
+        // The buffer is far larger than max_bytes, but the root itself fits
+        // within it: max_bytes bounds the bytes consumed, not the slice length.
+        let mut buffer = nbt;
+        buffer.extend_from_slice(&vec![0xAA; 4096]);
+        let limits = default_limits().with_max_bytes(nbt_len + 1);
+
+        let (decoded, consumed) = read_network_root_with_consumed(&buffer, &limits).expect("valid");
+        assert_eq!(decoded, tag);
+        assert_eq!(consumed, nbt_len);
+    }
+
+    #[test]
+    fn root_consuming_more_than_max_bytes_is_rejected() {
+        let tag = sample_root();
+        let nbt = write_network_root(&tag, &default_limits()).expect("write");
+        let nbt_len = nbt.len();
+
+        // Plenty of trailing data, so the slice is long; the root needs more
+        // than max_bytes to decode, so it must hit EOF inside the capped view.
+        let mut buffer = nbt;
+        buffer.extend_from_slice(&[0x00; 64]);
+        let limits = default_limits().with_max_bytes(nbt_len - 1);
+
+        assert!(matches!(
+            read_network_root_with_consumed(&buffer, &limits),
+            Err(NbtError::Codec(CodecError::UnexpectedEof { .. }))
+        ));
+    }
+
+    #[test]
+    fn consumed_at_exact_max_bytes_boundary_parses() {
+        let tag = sample_root();
+        let nbt = write_network_root(&tag, &default_limits()).expect("write");
+        let nbt_len = nbt.len();
+
+        let mut buffer = nbt;
+        buffer.extend_from_slice(&[0x00; 16]);
+        // max_bytes exactly equal to the root length is enough to consume it.
+        let limits = default_limits().with_max_bytes(nbt_len);
+
+        let (decoded, consumed) = read_network_root_with_consumed(&buffer, &limits).expect("valid");
+        assert_eq!(decoded, tag);
+        assert_eq!(consumed, nbt_len);
+    }
+
+    #[test]
+    fn consumed_truncated_input_is_codec_eof() {
+        // Named: root type then a 1-byte-short name length, not enough to finish.
+        assert!(matches!(
+            read_named_root_with_consumed(&[0x0A, 0x00], &default_limits()),
+            Err(NbtError::Codec(CodecError::UnexpectedEof { .. }))
+        ));
+        // Network: just the root type, then EOF before the compound body's first
+        // entry id ([0x0A, 0x00] would be a *valid* empty network root).
+        assert!(matches!(
+            read_network_root_with_consumed(&[0x0A], &default_limits()),
+            Err(NbtError::Codec(CodecError::UnexpectedEof { .. }))
+        ));
+    }
+
+    #[test]
+    fn consumed_empty_input_is_codec_eof() {
+        assert!(matches!(
+            read_named_root_with_consumed(&[], &default_limits()),
+            Err(NbtError::Codec(CodecError::UnexpectedEof { .. }))
+        ));
+    }
+
+    #[test]
+    fn consumed_root_must_be_a_compound() {
+        // A bare Byte tag as the root, with trailing junk that must be ignored.
+        assert_eq!(
+            read_network_root_with_consumed(&[0x01, 0xAA, 0xBB], &default_limits()),
+            Err(NbtError::UnexpectedRootTag { id: 1 })
+        );
+    }
+
+    #[test]
+    fn consumed_variant_does_not_reject_trailing_bytes() {
+        // The whole-slice reader rejects this trailing byte; the consumed
+        // variant must instead report a consumed length that excludes it.
+        let mut bytes = named_root(&[0x00]); // valid empty compound
+        let root_len = bytes.len();
+        bytes.push(0xAA); // one byte the consumed variant should leave unread
+
+        let (_, _, consumed) =
+            read_named_root_with_consumed(&bytes, &default_limits()).expect("valid");
+        assert_eq!(consumed, root_len);
+        assert_eq!(&bytes[consumed..], &[0xAA]);
     }
 }
