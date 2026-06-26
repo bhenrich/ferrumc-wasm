@@ -11,4 +11,12 @@
 
 ## Crate-Specific
 
-<!-- Add crate-specific invariants here as the code develops -->
+- **No panics on any input.** Every byte read goes through `ferrumc_codec::BoundedReader`; there is no slice indexing and no `unwrap`/`expect` outside `#[cfg(test)]`. Malformed input always returns an `NbtError`, never a panic.
+- **No allocation from an untrusted length before it is bounded.**
+  - `max_bytes` caps the input slice up front, so every later read is transitively bounded.
+  - List and byte/int/long array lengths are checked against `max_list_len` before any element is read, and the result vectors grow incrementally rather than being pre-reserved from the declared length.
+  - String byte lengths are checked against `max_string_bytes` before the bytes are read.
+- **Depth accounting is explicit.** The root compound is depth 1; descending into a nested `TAG_Compound` or `TAG_List` adds one level; arrays do not nest. `depth > max_depth` is `DepthExceeded`.
+- **Negative lengths are always rejected** (`NegativeLength`); a non-empty list declaring element type `TAG_End` is `MalformedList`.
+- **Big-endian, strict UTF-8.** All multi-byte integers are big-endian (via the reader). Strings are validated as strict `UTF-8`; Java Modified `UTF-8` is rejected as `InvalidUtf8`.
+- **Roots are compounds and self-delimiting.** Both root readers require a `TAG_Compound` and reject trailing bytes. The writers emit bytes the matching readers accept and enforce the format's structural caps (`u16` string length, `i32` sequence length).
