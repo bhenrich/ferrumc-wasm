@@ -6,7 +6,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Error taxonomy for the harness (hex parse, transcript parse, round-trip,
+# script mismatch). Library convention is thiserror, not anyhow.
+thiserror.workspace = true
+# `BytesMut` is the encode sink the generated proto codecs write into.
+bytes.workspace = true
+# `BoundedReader`/`CodecError` are the decode source and id-read error used by
+# `assert_packet_roundtrip`.
+ferrumc-codec.workspace = true
+# `Direction`/`ProtoError` model transcript entries and round-trip failures; the
+# generated packets are exercised by this crate's tests.
+ferrumc-proto.workspace = true
 
 [dev-dependencies]
 

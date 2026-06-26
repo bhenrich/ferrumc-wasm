@@ -171,6 +171,12 @@ dependencies = [
 [[package]]
 name = "ferrumc-net"
 version = "0.2.0-dev"
+dependencies = [
+ "bytes",
+ "ferrumc-codec",
+ "ferrumc-proto",
+ "thiserror",
+]
 
 [[package]]
 name = "ferrumc-observability"
@@ -240,6 +246,12 @@ version = "0.2.0-dev"
 [[package]]
 name = "ferrumc-testkit"
 version = "0.2.0-dev"
+dependencies = [
+ "bytes",
+ "ferrumc-codec",
+ "ferrumc-proto",
+ "thiserror",
+]
 
 [[package]]
 name = "ferrumc-world"
