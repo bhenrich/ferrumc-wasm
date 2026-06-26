@@ -6,9 +6,24 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Player identity is a UUID (Minecraft identifies players by UUID). `v4` (from
+# the workspace default) gives fresh random ids; `v3` adds deterministic,
+# name-based ids used for offline-mode players.
+uuid = { workspace = true, features = ["v3"] }
+# Root server error type (`ServerError`) is a thiserror enum.
+thiserror = { workspace = true }
+# Optional (de)serialization for the shared value types (ids, ticks, text
+# components, game mode). Behind the `serde` feature so downstream crates that
+# do not need it can opt out. Nothing network-related is pulled in.
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
+# Round-trip serde tests need a concrete format.
+serde_json = { workspace = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "uuid/serde"]
 
 [lints]
 workspace = true
