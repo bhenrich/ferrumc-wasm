@@ -45,4 +45,14 @@ pub enum WorldError {
         /// The rejected bits-per-entry value.
         bits: u8,
     },
+
+    /// A [`ferrumc_math::BlockPos`] was applied to a [`crate::Chunk`] that does
+    /// not contain it: either the position's column is a different
+    /// [`ferrumc_math::ChunkPos`], or its `y` is outside the buildable height
+    /// range (`MIN_Y ..= MIN_Y + HEIGHT - 1`).
+    #[error("block position {pos:?} is outside the target chunk")]
+    BlockOutsideChunk {
+        /// The offending block position.
+        pos: ferrumc_math::BlockPos,
+    },
 }
