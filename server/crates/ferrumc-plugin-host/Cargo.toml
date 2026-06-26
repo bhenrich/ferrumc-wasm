@@ -6,9 +6,21 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+ferrumc-plugin-api = { workspace = true }
+ferrumc-core = { workspace = true }
+# The host aggregates plugin-registered commands into a CommandTree.
+ferrumc-command = { workspace = true }
+# Classifying error types for registry/lifecycle failures.
+thiserror = { workspace = true }
+# Structured warnings when a plugin panics or overruns its time budget.
+tracing = { workspace = true }
 
 [dev-dependencies]
+# The in-process fixture plugins in tests build versions, permission nodes, and
+# coordinates.
+semver = { workspace = true }
+ferrumc-permission = { workspace = true }
+ferrumc-math = { workspace = true }
 
 [lints]
 workspace = true

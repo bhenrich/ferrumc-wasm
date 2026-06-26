@@ -6,7 +6,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+ferrumc-core = { workspace = true }
+ferrumc-math = { workspace = true }
+ferrumc-command = { workspace = true }
+ferrumc-permission = { workspace = true }
+# Classifying error types for the plugin-facing API surface.
+thiserror = { workspace = true }
+# Plugin versions follow semantic versioning; reuse the workspace semver crate
+# rather than hand-rolling a version type.
+semver = { workspace = true }
 
 [dev-dependencies]
 
