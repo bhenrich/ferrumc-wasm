@@ -355,8 +355,8 @@ ferrumc/  (worktree "core") — repo root holds project meta ONLY
     ├── Cargo.toml                    ← workspace manifest
     ├── Cargo.lock
     ├── .cargo/config.toml
+    ├── app/                          ← the binary
     ├── crates/
-    │   ├── ferrumc-app/              ← the binary
     │   ├── ferrumc-core/
     │   ├── ferrumc-config/
     │   ├── ferrumc-codec/
