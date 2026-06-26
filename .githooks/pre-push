@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# FerrumC pre-push: full gates (clippy + tests). Heavier than pre-commit on purpose.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT/server"
+
+echo "[pre-push] cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "[pre-push] tests"
+if command -v cargo-nextest >/dev/null 2>&1; then
+  cargo nextest run --workspace --all-targets
+else
+  cargo test --workspace
+fi
+
+echo "[pre-push] doc tests"
+cargo test --workspace --doc
+
+echo "[pre-push] ok"
