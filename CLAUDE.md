@@ -1,144 +1,380 @@
-# CLAUDE.md
+# CLAUDE.md — FerrumC v2
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+> You are working on **FerrumC**, a high-performance Minecraft Java Edition server
+> implementation in Rust. This is a clean rewrite. Owner: Saad (GitHub: Sweattypalms).
+> License: MIT. Target protocol: Minecraft Java 1.21.8 (protocol 772).
 
-## Project Overview
+---
 
-FerrumC is a high-performance Minecraft 1.21.8 (protocol 772) server implementation written in Rust. Not a framework (unlike Valence/Minestom) — this is a full vanilla server replacement prioritizing speed and memory efficiency over 1:1 vanilla parity. Uses Bevy ECS for game logic, Tokio for async networking, and LMDB for chunk storage.
+## Architecture — Know This Cold
 
-## Build & Development Commands
-
-```bash
-# Build (requires Rust nightly)
-cargo build                          # debug build
-cargo build --release                # release build
-cargo build --profile production      # release + LTO, stripped, single codegen unit (used by CI releases)
-cargo build --profile hyper          # max optimization (LTO, stripped, abort on panic)
-cargo build --profile profiling      # release + debug symbols
-cargo build --features dashboard     # include web dashboard
-
-# Run server
-cargo run --release                  # defaults to "run" subcommand
-cargo run --release -- setup         # generate config.toml
-cargo run --release -- import --import-path=/path/to/world  # import vanilla world
-cargo run --release -- clear         # clear world data
-cargo run --release -- --log=info    # custom log level (trace/debug/info/warn/error)
-
-# Tests (CI uses cargo-nextest)
-cargo nextest run --all-targets --all-features -E "not kind(bench)"
-cargo nextest run -p ferrumc-nbt     # single crate
-cargo test -p ferrumc-core           # alternative without nextest
-
-# Lints (all enforced in CI)
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo audit --ignore RUSTSEC-2023-0071
-
-# Profiling with Tracy
-cargo run --release --features tracy
-```
-
-## Architecture
-
-### Workspace Structure
-
-Monorepo with ~30 crates under `src/`. All dependencies are declared at workspace level in the root `Cargo.toml` and referenced by member crates.
-
-- **`src/bin`** — Main binary. CLI parsing, server launch, game loop, packet handlers, ECS system registration.
-- **`src/lib/core`** — Core primitives (chunks, connections, identity, transforms). `ferrumc-state` holds the global `ServerState` shared via `Arc`.
-- **`src/lib/net`** — Network layer with custom Minecraft protocol implementation. Sub-crates: `codec` (packet encoding/decoding), `encryption` (AES-128-CFB8 + RSA).
-- **`src/lib/adapters/nbt`** — Custom NBT parser, hand-crafted for performance.
-- **`src/lib/adapters/anvil`** — Custom Anvil chunk format reader using memory-mapped I/O (`memmap2`) and `yazi` compression.
-- **`src/lib/storage`** — Persistent KV storage via `heed` (LMDB-based).
-- **`src/lib/world`** / **`world_gen`** — World management (chunk cache: `DashMap` with `WyHash`) and terrain generation.
-- **`src/lib/scheduler`** — Timed schedule system for the game loop.
-- **`src/lib/components`** / **`entities`** — Bevy ECS components (Health, Gamemode, Abilities) and entity definitions.
-- **`src/lib/registry`** — Block/item registry using perfect hashing (`phf`) with build-time codegen.
-- **`src/lib/commands`** / **`default_commands`** — Trait-based command system.
-- **`src/lib/messages`** — Inter-system event messages for ECS.
-- **`src/lib/dashboard`** — Optional web dashboard (Axum, feature-gated behind `dashboard`).
-- **`src/lib/derive_macros`** — Procedural macros (e.g., `#[packet(...)]`).
-- **`src/lib/utils/`** — Logging (tracing + Tracy), profiling, thread pool, general-purpose utilities.
-- **`src/tests`** — Integration tests (NBT, codec, protocol).
-
-### Dependency Hierarchy
+Five hard-separated layers. Every crate lives in exactly one lane. You do NOT cross lanes.
 
 ```
-ferrumc-core → ferrumc-components → ferrumc-net → ferrumc (bin)
+ferrumc-app          → wiring, config, startup, shutdown, metrics
+  ↓
+ferrumc-net          → Tokio TCP, framing, encryption, compression, packet decode
+  ↓
+ferrumc-session      → player↔shard mapping, packet budgets, state routing
+  ↓
+ferrumc-sim          → deterministic shard workers, chunks, entities, events, plugins
+  ↓
+ferrumc-storage      → redb/lmdb behind traits, async request/response
 ```
 
-### Game Loop (`src/bin/src/game_loop.rs`)
+### The Rules That Matter
 
-Timed schedules via Bevy ECS, managed by a custom `Scheduler`:
+1. **Networking never mutates the world.** It decodes, validates, budgets, and sends typed messages.
+2. **Simulation never owns sockets or database handles.** It owns chunks/entities and talks to net/storage through bounded channels.
+3. **Plugins never see raw internals.** Stable host capabilities only. No raw `SimShard`, no raw `Chunk &mut`, no raw DB handle.
+4. **No broad global locks.** World state is owned by simulation shards. Cross-shard writes are messages applied at tick boundaries.
+5. **Generated protocol code is checked in and verified.** You do NOT hand-edit files in `crates/ferrumc-proto/src/generated/`.
+6. **Every queue is bounded.** If you create a channel, it has a capacity. No `unbounded()`. Ever.
 
-- **tick** (configurable TPS, default 20): Main game logic — packet handling, player updates, commands, physics, mob AI. Uses `MissedTickBehavior::Burst` (catch up to 5 missed ticks).
-- **world_sync** (15s): Persist world to disk. Skips if missed.
-- **chunk_gc** (5s): Unload unused chunks from memory. Skips if missed.
-- **keepalive** (1s, 250ms phase offset): Connection keepalives and ping updates. Skips if missed.
+---
 
-### Networking Flow
+## Crate Map — What Goes Where
 
-TCP connections → dedicated Tokio thread (single-threaded runtime) → `handle_connection` per client → crossbeam channels → ECS systems on main thread.
+Before writing a single line, confirm you're in the right crate. If you're not sure, STOP and ask.
 
-Connection states: Handshake → Login → Configuration → Play
+| Crate | Purpose | Depends on | NEVER depends on |
+|-------|---------|-----------|-----------------|
+| `ferrumc-core` | Shared types: `PlayerId`, `EntityId`, `Tick`, `ServerError`, `Result<T>` | nothing | Tokio, storage, networking |
+| `ferrumc-math` | `BlockPos`, `ChunkPos`, `ShardPos`, `Aabb`, `Vec3` | `core` | anything else |
+| `ferrumc-codec` | `VarInt`, `VarLong`, `BoundedReader`, `BoundedString` — all hostile-input protection | `core` | world, sim, net |
+| `ferrumc-nbt` | NBT parse/write with depth/size/list limits | `codec` | world, sim, net |
+| `ferrumc-registry` | Generated block/item/entity/biome/packet registry data | `core` | sim, net, storage |
+| `ferrumc-proto` | Generated packet enums for 1.21.8. Typed packets. | `codec`, `nbt`, `registry` | sim, storage |
+| `ferrumc-proto-gen` | Code generator. NOT used at runtime. | N/A | everything at runtime |
+| `ferrumc-net` | Tokio TCP, framing, compression, encryption, connection lifecycle | `proto`, `codec` | world, sim, storage |
+| `ferrumc-session` | Bridge net↔sim. `NetEvent→GameInput`, `GameOutput→Packet` | `net`, `proto` | raw world, raw storage |
+| `ferrumc-world` | Pure world model: `Chunk`, `ChunkSection`, `Palette`, `Heightmap` | `math`, `nbt`, `registry` | threads, DB, packets |
+| `ferrumc-storage` | `WorldStore`/`PlayerStore`/`PluginStore` traits + redb impl | `world`, `core` | sim internals, net |
+| `ferrumc-sim` | Tick coordinator, shard workers, entity systems | `world`, `storage` traits | raw net, raw DB handles |
+| `ferrumc-command` | Command tree, parsing, suggestions, execution | `core` | raw sim internals |
+| `ferrumc-permission` | Permission nodes, subjects, grants | `core` | everything else |
+| `ferrumc-plugin-api` | Stable plugin-facing API | `core`, `math`, `command`, `permission` | raw sim, raw world, raw DB |
+| `ferrumc-plugin-host` | Plugin registry, lifecycle, event dispatch, panic isolation | `plugin-api`, `sim` bridge | raw net |
+| `ferrumc-anvil` | Vanilla Anvil import/export (separate from native storage) | `world`, `nbt` | sim, net |
+| `ferrumc-testkit` | Fake clients, fake storage, deterministic tick harness | anything needed | N/A (test only) |
+| `ferrumc-app` | Wires everything. The ONLY crate that depends on (almost) all others. | everything | N/A |
 
-### Key Architectural Decisions
+### One-Crate Rule
 
-- **Bevy ECS** is the core concurrency model — lockless, multithreaded, zero-copy where possible.
-- **Custom serialization everywhere** — NBT, Anvil, and network codec are hand-written for performance, not using off-the-shelf Minecraft protocol libraries.
-- **`DashMap` with `WyHash`** for concurrent chunk caching.
-- **`phf` perfect hashing** for O(1) block/item lookups at runtime, compiled into the binary.
-- Prefer `Arc` over `Mutex` for read-heavy shared data.
+Your PR touches ONE crate. Maybe two if one is `ferrumc-testkit`. If you're about to touch three+ crates, you're doing it wrong. Break the task into smaller PRs.
 
-## Code Conventions
+---
 
-- **No `unwrap()`** — use `expect("descriptive context")` or proper error handling (`match`/`if let`).
-- **Avoid `.clone()`** unless necessary or in one-time startup paths.
-- **New crates must define their own `thiserror`-based error types.**
-- **New dependencies go in the workspace `Cargo.toml`**, not individual crate manifests.
-- **Use `#[expect(lint)]` instead of `#[allow(lint)]`** so suppressions are flagged when unnecessary.
-- **Tests that only generate/dump data must be `#[ignore]`d.**
-- **Use `get_root_path()`** instead of chaining `../` for project-relative paths. No absolute paths.
+## Coding Standards — Hard Rules
 
-### Workspace Lints
+These are not suggestions. Violating these means your PR is rejected.
 
-Denied at workspace level (will fail CI): `wildcard_dependencies`, `cast_lossless`, `cast_ptr_alignment`, `match_bool`, `mut_mut`, `borrow_as_ptr`, `infinite_loop`, `unused_unsafe`, `missing_abi`, `future_incompatible`.
+### Must Do
 
-## Key Patterns
+1. **Bounded channels only.** `tokio::sync::mpsc::channel(N)`, never `unbounded_channel()`. Document why you chose N.
+2. **No `unwrap()`/`expect()` outside tests.** Use `?` or explicit error handling. The only exceptions: startup config validation and test code.
+3. **No blocking in async.** If you need to do CPU work or synchronous I/O inside a Tokio task, use `tokio::task::spawn_blocking` or a dedicated thread. Never `std::thread::sleep` in async.
+4. **Error types classify the problem.** `BadVarInt`, `FrameTooLarge`, `ChunkNotLoaded` — not `anyhow!("something went wrong")`. Use thiserror for library crates, anyhow only in ferrumc-app.
+5. **Every parser needs malformed-input tests.** If you write a decoder, write tests for every way it can fail: too long, too short, negative, overflow, trailing bytes, zero-length, maximum-length.
+6. **Every queue needs documented backpressure behavior.** What happens when it's full? Who blocks? Who drops? Document it.
+7. **No `pub` fields on types that cross crate boundaries.** Use methods. Internal representation is not your API.
+8. **Rustdoc on every public item.** No exceptions. Brief is fine. `/// Decodes a VarInt from the reader, rejecting inputs longer than 5 bytes.`
+9. **No hand-editing generated files.** If `crates/ferrumc-proto/src/generated/` needs changes, fix the generator.
+10. **No new dependencies without justification.** Add a comment in Cargo.toml explaining why. Prefer pure-Rust crates.
+11. **`#![forbid(unsafe_code)]`** in every crate by default. If you genuinely need unsafe, document it in `docs/safety/<crate>.md` and minimize the surface.
+12. **No global mutable state.** No `lazy_static!` mutexes, no `static mut`, no `OnceCell` holding mutable shared state. Pass state through function arguments or channels.
+13. **Coordinates are typed.** `BlockPos`, `ChunkPos`, `ShardPos` — never raw `(i32, i32)` in any public API.
 
-### ECS (Bevy)
+### Style
 
-- Components for entity data, Resources for global state, Systems for game logic.
-- Messages (`src/lib/messages`) for inter-system event communication.
+- `cargo fmt` — no exceptions, no custom rules
+- `cargo clippy -- -D warnings` — treat all warnings as errors
+- Imports: group by std → external crates → internal crates, separated by blank lines
+- Error handling: `thiserror` for library error types, `?` propagation, structured variants
+- Naming: Rust conventions. `snake_case` functions, `PascalCase` types, `SCREAMING_SNAKE` constants
+- Comments: explain WHY, not WHAT. The code shows what. `// Reject frames > 2 MiB to prevent OOM from malicious clients` is good. `// Check if frame is too large` is useless.
 
-### Packets
+### Test Conventions
 
-Follow existing `#[packet(...)]` macro patterns in `ferrumc-net`.
+- Unit tests: `#[cfg(test)] mod tests` in the same file
+- Integration tests: `tests/` directory in the crate
+- Fuzz targets: `fuzz/` directory, run with `cargo fuzz`
+- Fixture data: `fixtures/` at workspace root, committed to git
+- Test helpers: `ferrumc-testkit` crate
+- No wall-clock sleeps in tests. Use `tokio::time::pause()` or deterministic tick harness.
+- No real network in unit tests. Use `ferrumc-testkit::FakeClient`.
 
-### Async
+---
 
-- Tokio for async I/O (networking runs on a separate single-threaded Tokio runtime).
-- crossbeam channels for thread-to-ECS communication (new connections, etc.).
+## Simulation Model — How the Game Works
 
-## Git Worktrees
+### Actor-Sharded, Not Global ECS
 
-This repo uses git worktrees. `gh pr create` cannot auto-detect the current branch in a worktree — always pass `--head <branch-name>` explicitly.
+Each simulation shard is 8×8 chunks. A shard exclusively owns its chunks, entities, and spatial index. No locks required — nothing else can touch them.
 
-## Branch Naming
+```rust
+struct SimShard {
+    shard_pos: ShardPos,
+    chunks: ChunkMap,
+    entities: EntityStore,        // SlotMap + ComponentVecs
+    spatial: EntitySpatialIndex,  // chunk-bucket broadphase
+    players: PlayerSet,
+    inbox: Vec<GameInput>,
+    cross_shard_outbox: Vec<CrossShardMessage>,
+    dirty: DirtyTracker,
+}
+```
 
-- `feature/feature-name`, `fix/fixed-thing`, `rework/refactored-thing`, `housekeeping`, `docs`
-- All PRs target `master`.
+Systems are plain functions: `fn movement_system(ctx: &mut ShardTickCtx)`. Not Bevy systems. Not trait objects. Plain functions called in explicit order.
 
-## Documentation
+### Tick Flow (20 TPS target)
 
-Project documentation lives in `docs/`, organized by topic in subdirectories (`docs/ci/`, `docs/networking/`, etc.). Use the `/document` command to add or update documentation.
+```
+1. Session router drains network inputs → shard inboxes
+2. Storage completions delivered
+3. Plugin scheduled tasks queued
+4. Active shards run IN PARALLEL on sim worker pool
+5. Cross-shard messages collected (applied NEXT tick)
+6. Outputs routed to sessions/network
+7. Dirty chunks/entities queued for storage
+8. Metrics emitted
+```
 
-**All non-trivial systems, pipelines, and architectural decisions must be documented.** When making significant changes (new workflows, new crates, new systems, architectural shifts), update or create the relevant docs. Documentation should reflect the current state of the code, not aspirational designs.
+Cross-shard entity transfer happens at tick boundaries ONLY. No mid-tick cross-shard mutation.
 
-See `docs/` for the full documentation index.
+### Overload Handling (in order)
 
-## Rules for Generated Code
+1. Coalesce movement, defer chunk sends
+2. Reduce plugin schedule budget
+3. Defer chunk generation and entity AI
+4. Tick slower and report lag
+5. **NEVER run catch-up ticks** — that turns lag into server collapse
 
-- Comments must be appropriate for an open source project with multiple contributors — they must NOT be aimed at any individual and must be timeless.
-- **Documentation and comments must use impersonal language.** No "you", "your", "we", or "our" — write for a general audience, not a specific person. Use passive voice or third person where needed (e.g., "Not all stages are required" instead of "You don't need to use all stages").
-- Never co-author commits with Claude.
+---
+
+## Storage Model
+
+Storage is behind traits. The simulation never holds a DB handle.
+
+```rust
+#[async_trait]
+pub trait WorldStore: Send + Sync {
+    async fn load_chunk(&self, key: ChunkKey) -> Result<Option<ChunkRecord>>;
+    async fn save_chunks(&self, chunks: Vec<ChunkSaveRecord>) -> Result<()>;
+    // ...
+}
+```
+
+Implementation runs on a dedicated storage worker thread. Requests go through a bounded queue:
+
+```
+sim/net → StorageRequest → bounded channel → storage worker → DB transaction → response oneshot
+```
+
+**No DB transaction on a sim worker or Tokio worker. Ever.**
+
+Current backend: redb (may switch to LMDB after benchmarking — see `docs/experiments/`).
+
+---
+
+## Plugin Model
+
+### Phase A (current): Compiled Rust plugins for API development
+### Phase A (shipping): Dynamic libraries (.so/.dll) loaded from /plugins/ folder
+### Phase B (later): WASM for language-agnostic plugins
+
+Plugins get:
+- `WorldView<'tick>` — read-only snapshot (NOT `&mut World`)
+- `PlayerApi<'tick>` — send messages, teleport, query
+- `CommandSink<'tick>` — mutation INTENTS, not direct mutation
+- `PermissionApi<'tick>` — query permission nodes
+- `PluginStorageApi` — namespaced private key-value storage
+
+Plugins NEVER get:
+- Raw `SimShard`
+- Raw `Chunk` mutable reference
+- Raw `EntityStore`
+- Raw TCP socket or connection state
+- Raw DB handle or transaction
+- `tokio::Runtime` handle
+- Unbounded sender to anything
+
+`WorldView<'tick>` is `!Send` — plugins literally cannot hold it across `.await` points.
+
+---
+
+## Networking Model
+
+Single Tokio multi-thread runtime. Connection-per-task with reader/writer split.
+
+### Inbound Pipeline
+
+```
+TCP bytes → decrypt → VarInt frame length → frame body → decompress → decode packet → validate → budget check → bounded queue → session router → shard inbox
+```
+
+### Outbound Pipeline (priority queues)
+
+```
+Shard output → session router → encode packet → compress → batch (≤64KiB or 128 frames or 1ms) → encrypt → TCP write
+```
+
+Priority: Critical > State > World > Cosmetic
+
+### Hostile Client Protection
+
+- VarInt max 5 bytes, VarLong max 10 bytes
+- Frame size limits per connection state (handshake: 4 KiB, play: 512 KiB default)
+- Decompressed output caps (2 MiB default)
+- Per-connection packet budget (300 frames/sec sustained)
+- Per-IP rate limiting
+- Trailing byte rejection
+- Immediate disconnect on protocol violation
+
+---
+
+## Project Conventions
+
+### Commit Messages
+
+```
+feat(codec): add bounded VarLong decoder with overflow protection
+fix(net): reject compressed frames below threshold
+test(nbt): add fuzz target for deeply nested compounds
+docs(adr): document redb selection rationale
+refactor(world): extract palette logic to separate module
+chore(ci): add cargo-deny advisory check
+```
+
+Prefix with crate name in parentheses. One logical change per commit.
+
+### Branch Naming
+
+```
+feat/codec-varlong
+fix/net-compression-threshold
+test/nbt-fuzz
+docs/adr-storage
+```
+
+### PR Requirements
+
+- [ ] Touches ≤2 crates (one primary + testkit if needed)
+- [ ] All tests pass: `cargo test -p <crate>`
+- [ ] `cargo fmt --all --check`
+- [ ] `cargo clippy --workspace -- -D warnings`
+- [ ] New public items have rustdoc
+- [ ] New parsers have malformed-input tests
+- [ ] No `unwrap()` outside tests
+- [ ] No unbounded channels
+- [ ] No hand-edited generated files
+- [ ] Fixtures added for new test cases
+
+---
+
+## What You're NOT Building
+
+Don't get clever. Don't scope-creep. If any of these show up in your PR, it's rejected:
+
+- WASM plugin runtime
+- Hot reload
+- Bukkit/Paper/Fabric compatibility
+- Distributed multi-server (the architecture supports it later, not now)
+- Custom region-file database
+- RocksDB integration
+- Full vanilla terrain generation
+- Full vanilla lighting engine
+- Mob AI
+- Redstone
+- Per-core Tokio runtimes
+- Global ECS world
+- Dynamic plugin dependency resolution
+
+These are all "later" items. The current milestone is a vertical slice: status ping → offline login → flat world → storage → one shard → one plugin.
+
+---
+
+## Common Mistakes (Read Before Every PR)
+
+1. **Adding a dependency on the wrong crate.** Check the crate map. `ferrumc-net` does NOT depend on `ferrumc-world`. Ever. If you think you need to, you're putting logic in the wrong crate.
+
+2. **Using `DashMap` instead of ownership.** If you're reaching for a concurrent map, you're probably solving the wrong problem. Data should be owned by a shard, not shared behind a lock.
+
+3. **Making things `pub` that shouldn't be.** Internal types stay `pub(crate)` or `pub(super)`. Only types that cross crate boundaries get `pub`.
+
+4. **Writing `async fn` for CPU-bound work.** Parsing, encoding, palette operations, spatial queries — these are sync. Don't wrap them in async for no reason.
+
+5. **Putting validation in the wrong layer.** Packet validation (frame limits, VarInt bounds, string lengths) → `ferrumc-codec`/`ferrumc-net`. Game validation (can this player break this block?) → `ferrumc-sim`. Don't mix them.
+
+6. **Creating a "utils" or "common" module.** If something is shared, it goes in `ferrumc-core` or `ferrumc-math`. "Utils" is where code goes to become unfindable.
+
+7. **Ignoring backpressure.** "I'll add a capacity later" means you won't. Set it now. Document what happens when it's full.
+
+8. **Testing only the happy path.** Every decoder needs: valid input, empty input, truncated input, oversized input, maximum-boundary input, and malicious input tests.
+
+---
+
+## File Layout Reference
+
+```
+ferrumc/
+├── CLAUDE.md                          ← you are here
+├── Cargo.toml                         ← workspace root
+├── Cargo.lock
+├── .gitignore
+├── LICENSE
+├── README.md
+├── crates/
+│   ├── ferrumc-app/
+│   ├── ferrumc-core/
+│   ├── ferrumc-config/
+│   ├── ferrumc-codec/
+│   ├── ferrumc-nbt/
+│   ├── ferrumc-math/
+│   ├── ferrumc-registry/
+│   ├── ferrumc-proto/
+│   ├── ferrumc-proto-gen/
+│   ├── ferrumc-net/
+│   ├── ferrumc-session/
+│   ├── ferrumc-world/
+│   ├── ferrumc-storage/
+│   ├── ferrumc-sim/
+│   ├── ferrumc-command/
+│   ├── ferrumc-permission/
+│   ├── ferrumc-plugin-api/
+│   ├── ferrumc-plugin-host/
+│   ├── ferrumc-anvil/
+│   ├── ferrumc-observability/
+│   └── ferrumc-testkit/
+├── plugins/
+│   └── ferrumc-plugin-spawn-protect/
+├── xtask/
+├── docs/
+│   ├── architecture/
+│   │   ├── overview.md
+│   │   ├── networking.md
+│   │   ├── simulation.md
+│   │   ├── storage.md
+│   │   └── plugins.md
+│   ├── adr/
+│   │   ├── 0001-clean-rewrite.md
+│   │   ├── 0002-actor-sharded-simulation.md
+│   │   ├── 0003-single-tokio-runtime.md
+│   │   ├── 0004-redb-storage.md
+│   │   ├── 0005-compiled-rust-plugins-first.md
+│   │   └── 0006-c-abi-dynamic-plugins.md
+│   ├── agent-tasks/
+│   │   └── TEMPLATE.md
+│   ├── experiments/
+│   │   ├── README.md
+│   │   └── (benchmark results go here)
+│   └── protocol/
+│       └── 1_21_8/
+├── fixtures/
+│   ├── protocol/1_21_8/
+│   ├── nbt/
+│   ├── anvil/
+│   └── worlds/
+└── .github/
+    └── workflows/
+```

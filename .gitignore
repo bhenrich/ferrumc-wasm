@@ -1,26 +1,42 @@
-**/target
-.idea
-.vscode
-/crates/lib/dummy_lib/Cargo.lock
+# Build artifacts
+/target
+**/*.rs.bk
 
-Cargo.lock
-config.toml
-.temp
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 
-.etc/blocks.json
-
-flame.svg
-
-.direnv
-result
-result-*
-
-profile.json.gz
+# OS
 .DS_Store
+Thumbs.db
 
-/world
-whitelist.txt
+# Environment
+.env
+.env.local
 
-logs/
+# Logs
+*.log
 
-.zed
+# Crash reports
+crash-*.ferrumc
+
+# Profiling
+*.prof
+*.profdata
+perf.data
+flamegraph.svg
+
+# Benchmark results (committed selectively)
+target/criterion/
+
+# World data (for testing only — don't commit actual worlds)
+world/
+world.ferrumdb
+
+# Plugin builds (users compile these separately)
+plugins/*.so
+plugins/*.dll
+plugins/*.dylib
