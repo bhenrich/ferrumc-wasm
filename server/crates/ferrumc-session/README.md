@@ -1,6 +1,6 @@
 # ferrumc-session
 
-Bridge between network and simulation. NetEvent to GameInput routing.
+Bridge between network and simulation. `NetEvent` to `GameInput` routing.
 
 ## Invariants
 

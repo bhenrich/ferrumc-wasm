@@ -6,9 +6,32 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Shared identity/error types: `PlayerId` keys the player<->shard mapping and
+# `ServerError` is the classifying root that `SessionError` converts into.
+ferrumc-core = { workspace = true }
+# Typed coordinates: `Vec3` carries player positions, and `ShardPos`/`BlockPos`/
+# `ChunkPos` implement the position->shard routing policy (never raw tuples).
+ferrumc-math = { workspace = true }
+# Source of the network-side play vocabulary this crate bridges: `DisconnectReason`
+# classifies why a connection ended (carried by `NetEvent::Disconnected`).
+ferrumc-net = { workspace = true }
+# The typed packet enums: serverbound play packets translate into sim inputs and
+# clientbound play packets are the outbound shells sim outputs translate into.
+ferrumc-proto = { workspace = true }
+# The simulation boundary messages: `GameInput` flows to shard inboxes and
+# `GameOutput` flows back out. The router never touches a raw `SimShard`.
+ferrumc-sim = { workspace = true }
+# Bounded `mpsc` channels are the only transport between the router and shards /
+# connections. Only `tokio::sync::mpsc` is used here (the workspace pins "full").
+tokio = { workspace = true }
+# `SessionError` is a thiserror enum so each failure mode is a classified variant
+# with a derived `Display`, per the library error-handling rule.
+thiserror = { workspace = true }
 
 [dev-dependencies]
+# Drive the one async `recv` test on a minimal current-thread runtime; all other
+# tests are runtime-free (bounded-channel `try_send`/`try_recv` need no runtime).
+tokio = { workspace = true }
 
 [lints]
 workspace = true
