@@ -6,7 +6,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Per the crate map, ferrumc-permission depends ONLY on ferrumc-core. Parse and
+# validation errors defined here convert into the shared `ServerError` so callers
+# can propagate them with `?` without learning permission-specific error types.
+ferrumc-core = { workspace = true }
+# Classifying, structured error types (node parse + op-level validation).
+thiserror = { workspace = true }
 
 [dev-dependencies]
 

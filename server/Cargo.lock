@@ -112,6 +112,10 @@ dependencies = [
 [[package]]
 name = "ferrumc-command"
 version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-core",
+ "thiserror",
+]
 
 [[package]]
 name = "ferrumc-config"
@@ -154,6 +158,10 @@ version = "0.2.0-dev"
 [[package]]
 name = "ferrumc-permission"
 version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-core",
+ "thiserror",
+]
 
 [[package]]
 name = "ferrumc-plugin-api"
