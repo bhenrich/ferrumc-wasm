@@ -6,9 +6,28 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Shared `ServerError`/`Result` and id newtypes (`PlayerId`, `EntityId`,
+# `WorldId`, `DimensionId`, `PluginId`, `GameMode`) used by keys and records.
+ferrumc-core = { workspace = true }
+# The `Chunk` value type stored inside a `ChunkRecord` for save/load.
+ferrumc-world = { workspace = true }
+# Typed coordinates: `ChunkKey` carries a `ChunkPos` rather than a raw `(i32,
+# i32)`, as required by the "coordinates are typed" coding standard.
+ferrumc-math = { workspace = true }
+# Classifying error variants for `StorageError`.
+thiserror = { workspace = true }
+# Async methods on the storage traits. `async_trait` is chosen over native
+# async-fn-in-trait so the returned futures are boxed and `Send` and the traits
+# stay dyn-compatible (`Arc<dyn WorldStore>` for the simulation layer); native
+# AFIT cannot express the `Send` bound and trips the `async_fn_in_trait` lint
+# under `-D warnings`. This matches the storage model in CLAUDE.md. Pure-Rust
+# proc-macro, no runtime added.
+async-trait = "0.1"
 
 [dev-dependencies]
+# Drives the `#[tokio::test]` async round-trip tests. Already a workspace
+# dependency; pulled in only for tests, not the library.
+tokio = { workspace = true }
 
 [lints]
 workspace = true
