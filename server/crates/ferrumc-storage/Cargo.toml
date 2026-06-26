@@ -23,11 +23,19 @@ thiserror = { workspace = true }
 # under `-D warnings`. This matches the storage model in CLAUDE.md. Pure-Rust
 # proc-macro, no runtime added.
 async-trait = "0.1"
+# The durable embedded backend (`RedbStore`). Pure-Rust, embedded, ACID, no
+# native deps; the project default per docs/adr/0007-storage-backend.md.
+redb = { workspace = true }
+# `RedbStore` runs every (blocking) redb transaction on `spawn_blocking` so DB
+# work never blocks an async executor worker, satisfying the "no blocking in
+# async" rule. Only the `rt` capability is used; the raw redb handle never
+# escapes the crate.
+tokio = { workspace = true }
 
 [dev-dependencies]
-# Drives the `#[tokio::test]` async round-trip tests. Already a workspace
-# dependency; pulled in only for tests, not the library.
-tokio = { workspace = true }
+# Backs the `RedbStore` round-trip/persistence tests with a throwaway on-disk
+# database under a temp directory. Test-only; not linked into the library.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
