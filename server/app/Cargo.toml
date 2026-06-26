@@ -5,10 +5,59 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "ferrumc"
+path = "src/main.rs"
+
 [dependencies]
-# Add workspace dependencies as needed
+# Shared identity / coordinate types crossing every layer boundary.
+ferrumc-core = { workspace = true }
+ferrumc-math = { workspace = true }
+# Bounded readers / writers and the wire string + blob newtypes used to drive
+# the protocol by hand at the app layer.
+ferrumc-codec = { workspace = true }
+# Typed 1.21.8 packets (handshake / login / configuration / play) the wiring
+# encodes and decodes.
+ferrumc-proto = { workspace = true }
+# Per-version registry constants (dimension geometry, biome, protocol version).
+ferrumc-registry = { workspace = true }
+# Framing, per-state limits, compression, the offline UUID, and the play-phase
+# reader / writer this binary wires onto a real socket.
+ferrumc-net = { workspace = true }
+# The net <-> sim bridge: the player <-> shard router and its event vocabulary.
+ferrumc-session = { workspace = true }
+# Tick coordinator, the single simulation shard, and the chunk load-or-generate
+# flow that brings the spawn area into memory.
+ferrumc-sim = { workspace = true }
+# The flat-world generator and the in-memory chunk model.
+ferrumc-world = { workspace = true }
+# The `WorldStore` trait plus the in-memory backend the slice runs against.
+ferrumc-storage = { workspace = true }
+
+# Single multi-thread Tokio runtime: listener, per-connection tasks, bounded
+# channels, intervals, timeouts, and graceful shutdown.
+tokio = { workspace = true }
+# `BytesMut` buffers backing every encode / decode the wiring performs.
+bytes = { workspace = true }
+# Application-level error context (anyhow is permitted only in this crate).
+anyhow = { workspace = true }
+# Structured startup logging.
+tracing = { workspace = true }
+# Subscriber installed once in `main` to render the logs.
+tracing-subscriber = { workspace = true }
+# Minimal TOML config parsing.
+serde = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
+# The integration test drives a real socket using the same proto encoders and
+# codec primitives the server does.
+ferrumc-proto = { workspace = true }
+ferrumc-codec = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+# Build the player UUID carried by the client's Login Start packet.
+uuid = { workspace = true }
 
 [lints]
 workspace = true
