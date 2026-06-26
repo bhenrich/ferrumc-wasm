@@ -1,0 +1,198 @@
+# Declarative packet spec for Minecraft Java 1.21.8 (protocol 772).
+#
+# This file is the single source of truth for the generated packet codecs in
+# `crates/ferrumc-proto/src/generated/`. Edit this spec, then run
+# `cargo xtask generate` to regenerate the Rust, and `cargo xtask generate
+# --check` to verify the committed tree matches.
+#
+# Scope: the handshake / status / login / configuration states only (the subset
+# needed for status ping and offline login). Play-state packets are deliberately
+# out of scope for this milestone.
+#
+# Field `type` grammar (a closed set; the generator rejects anything else):
+#   varint | varlong              signed LEB128 integers (i32 / i64)
+#   u16 | i64 | i8 | u8           fixed-width big-endian integers
+#   bool                          single byte, 0 = false / non-zero = true
+#   uuid                          16 bytes, big-endian
+#   string(N)                     length-prefixed UTF-8, max N UTF-16 code units
+#   identifier                    a resource location (string capped at 32767)
+#   nbt                           a network-form (unnamed-root) NBT compound
+#   optional<T>                   a bool flag, then T only when the flag is set
+#   prefixed_array<T>             a VarInt count, then that many T
+#   <StructName>                  a composite payload declared in [[struct]]
+#
+# Ids are the wire packet ids for protocol 772. Notable gotchas baked in below:
+#   * Login Success (clientbound 0x02) has NO trailing strict_error_handling
+#     bool in 1.21.8 (removed after 767).
+#   * Client Information (serverbound 0x00) carries particle_status (added
+#     1.21.2), so it is present here.
+
+# --- Shared composite payloads -------------------------------------------------
+
+[[struct]]
+name = "Property"
+fields = [
+    { name = "name", type = "string(64)" },
+    { name = "value", type = "string(32767)" },
+    { name = "signature", type = "optional<string(1024)>" },
+]
+
+[[struct]]
+name = "KnownPack"
+fields = [
+    { name = "namespace", type = "string(32767)" },
+    { name = "id", type = "string(32767)" },
+    { name = "version", type = "string(32767)" },
+]
+
+[[struct]]
+name = "RegistryEntry"
+fields = [
+    { name = "entry_id", type = "identifier" },
+    { name = "data", type = "optional<nbt>" },
+]
+
+# --- Handshaking ---------------------------------------------------------------
+
+[[packet]]
+state = "handshake"
+direction = "serverbound"
+name = "Handshake"
+id = 0x00
+fields = [
+    { name = "protocol_version", type = "varint" },
+    { name = "server_address", type = "string(255)" },
+    { name = "server_port", type = "u16" },
+    { name = "next_state", type = "varint" },
+]
+
+# --- Status --------------------------------------------------------------------
+
+[[packet]]
+state = "status"
+direction = "serverbound"
+name = "StatusRequest"
+id = 0x00
+fields = []
+
+[[packet]]
+state = "status"
+direction = "serverbound"
+name = "PingRequest"
+id = 0x01
+fields = [{ name = "payload", type = "i64" }]
+
+[[packet]]
+state = "status"
+direction = "clientbound"
+name = "StatusResponse"
+id = 0x00
+fields = [{ name = "json", type = "string(32767)" }]
+
+[[packet]]
+state = "status"
+direction = "clientbound"
+name = "PongResponse"
+id = 0x01
+fields = [{ name = "payload", type = "i64" }]
+
+# --- Login ---------------------------------------------------------------------
+
+[[packet]]
+state = "login"
+direction = "serverbound"
+name = "LoginStart"
+id = 0x00
+fields = [
+    { name = "name", type = "string(16)" },
+    { name = "uuid", type = "uuid" },
+]
+
+[[packet]]
+state = "login"
+direction = "serverbound"
+name = "LoginAcknowledged"
+id = 0x03
+fields = []
+
+[[packet]]
+state = "login"
+direction = "clientbound"
+name = "LoginDisconnect"
+id = 0x00
+fields = [{ name = "reason", type = "string(262144)" }]
+
+[[packet]]
+state = "login"
+direction = "clientbound"
+name = "LoginSuccess"
+id = 0x02
+fields = [
+    { name = "uuid", type = "uuid" },
+    { name = "name", type = "string(16)" },
+    { name = "properties", type = "prefixed_array<Property>" },
+]
+
+[[packet]]
+state = "login"
+direction = "clientbound"
+name = "SetCompression"
+id = 0x03
+fields = [{ name = "threshold", type = "varint" }]
+
+# --- Configuration -------------------------------------------------------------
+
+[[packet]]
+state = "configuration"
+direction = "serverbound"
+name = "ClientInformation"
+id = 0x00
+fields = [
+    { name = "locale", type = "string(16)" },
+    { name = "view_distance", type = "i8" },
+    { name = "chat_mode", type = "varint" },
+    { name = "chat_colors", type = "bool" },
+    { name = "displayed_skin_parts", type = "u8" },
+    { name = "main_hand", type = "varint" },
+    { name = "enable_text_filtering", type = "bool" },
+    { name = "allow_server_listings", type = "bool" },
+    { name = "particle_status", type = "varint" },
+]
+
+[[packet]]
+state = "configuration"
+direction = "serverbound"
+name = "AckFinishConfiguration"
+id = 0x03
+fields = []
+
+[[packet]]
+state = "configuration"
+direction = "serverbound"
+name = "ServerboundKnownPacks"
+id = 0x07
+fields = [{ name = "known_packs", type = "prefixed_array<KnownPack>" }]
+
+[[packet]]
+state = "configuration"
+direction = "clientbound"
+name = "FinishConfiguration"
+id = 0x03
+fields = []
+
+[[packet]]
+state = "configuration"
+direction = "clientbound"
+name = "RegistryData"
+id = 0x07
+fields = [
+    { name = "registry_id", type = "identifier" },
+    { name = "entries", type = "prefixed_array<RegistryEntry>" },
+]
+
+[[packet]]
+state = "configuration"
+direction = "clientbound"
+name = "ClientboundKnownPacks"
+id = 0x0E
+fields = [{ name = "known_packs", type = "prefixed_array<KnownPack>" }]

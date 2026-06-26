@@ -1,0 +1,12 @@
+# Pins the toolchain used to build, lint, and — critically — to run `rustfmt`
+# when generating protocol code (`cargo xtask generate`). rustfmt output is the
+# #1 determinism risk for the checked-in `ferrumc-proto/src/generated/` tree: a
+# different rustfmt version can reflow code and make `--check` spuriously fail.
+#
+# We pin the `stable` channel (rather than a numeric version) so contributors do
+# not have to download a one-off toolchain; CI's `cargo xtask generate --check`
+# is the real backstop that catches any cross-version rustfmt drift.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

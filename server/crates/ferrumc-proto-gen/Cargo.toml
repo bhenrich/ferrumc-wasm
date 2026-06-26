@@ -1,0 +1,24 @@
+[package]
+name = "ferrumc-proto-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# Classifying, structured error variants for spec/rustfmt/io/drift failures.
+thiserror = { workspace = true }
+# Derive `Deserialize` for the pinned-spec (manifest.toml) schema.
+serde = { workspace = true }
+# Parse the vendored `manifest.toml` that pins the protocol/data versions.
+toml = { workspace = true }
+
+[dev-dependencies]
+# Round-trip generate/--check tests write into a throwaway directory.
+tempfile = { workspace = true }
+# Cross-check generated packet ids against vendored minecraft-data protocol.json.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

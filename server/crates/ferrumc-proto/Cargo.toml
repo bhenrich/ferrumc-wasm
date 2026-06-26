@@ -6,9 +6,27 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Bounded reader/string/bytes primitives and VarInt codecs the generated
+# packet codecs build on.
+ferrumc-codec = { workspace = true }
+# Network-form NBT used by configuration packets (RegistryData).
+ferrumc-nbt = { workspace = true }
+# Registry constants linked for forward use by registry-bearing packets; bound
+# anonymously in lib.rs until a packet references it directly.
+ferrumc-registry = { workspace = true }
+# `BytesMut`/`BufMut` for the zero-intermediate-allocation encode path.
+bytes = { workspace = true }
+# UUID fields in login packets.
+uuid = { workspace = true }
+# Classifying, structured protocol error variants.
+thiserror = { workspace = true }
 
 [dev-dependencies]
+# Build encode buffers and decode readers in the round-trip / malformed tests.
+bytes = { workspace = true }
+ferrumc-codec = { workspace = true }
+ferrumc-nbt = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true

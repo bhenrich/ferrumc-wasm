@@ -10,7 +10,7 @@ members = [
     "crates/ferrumc-observability",
     "crates/ferrumc-registry",
     "crates/ferrumc-proto",
-    # "crates/ferrumc-proto-gen",  # uncomment when ready
+    "crates/ferrumc-proto-gen",
     "crates/ferrumc-net",
     "crates/ferrumc-session",
     "crates/ferrumc-world",
@@ -91,6 +91,7 @@ ferrumc-nbt = { path = "crates/ferrumc-nbt" }
 ferrumc-observability = { path = "crates/ferrumc-observability" }
 ferrumc-registry = { path = "crates/ferrumc-registry" }
 ferrumc-proto = { path = "crates/ferrumc-proto" }
+ferrumc-proto-gen = { path = "crates/ferrumc-proto-gen" }
 ferrumc-net = { path = "crates/ferrumc-net" }
 ferrumc-session = { path = "crates/ferrumc-session" }
 ferrumc-world = { path = "crates/ferrumc-world" }

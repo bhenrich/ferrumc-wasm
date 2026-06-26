@@ -1,0 +1,4 @@
+# Generated protocol code is byte-stable and verified by
+# `cargo xtask generate --check`. Force LF so the check never fails because of a
+# platform's autocrlf settings rewriting the committed bytes.
+server/crates/ferrumc-proto/src/generated/** text eol=lf

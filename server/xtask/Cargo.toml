@@ -5,3 +5,11 @@ edition = "2021"
 publish = false
 
 [dependencies]
+# Build-time protocol code generator driven by `cargo xtask generate`.
+ferrumc-proto-gen = { workspace = true }
+# Top-level error context/reporting for the developer-facing CLI (binary, not a
+# library), per the workspace rule that anyhow lives only in binaries.
+anyhow = { workspace = true }
+
+[lints]
+workspace = true
