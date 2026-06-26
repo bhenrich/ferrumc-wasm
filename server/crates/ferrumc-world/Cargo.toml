@@ -6,7 +6,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Strongly-typed coordinates: LocalBlockPos indexes a chunk section's blocks.
+ferrumc-math = { workspace = true }
+# Block-state id constants (air) and the pinned flat-world block lookup.
+ferrumc-registry = { workspace = true }
+# Classifying error variants for bit-packing / indexing failures.
+thiserror = { workspace = true }
 
 [dev-dependencies]
 
