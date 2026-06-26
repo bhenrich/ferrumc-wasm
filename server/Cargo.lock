@@ -159,9 +159,13 @@ dependencies = [
  "anyhow",
  "bytes",
  "ferrumc-codec",
+ "ferrumc-command",
  "ferrumc-core",
  "ferrumc-math",
  "ferrumc-net",
+ "ferrumc-permission",
+ "ferrumc-plugin-host",
+ "ferrumc-plugin-spawn-protect",
  "ferrumc-proto",
  "ferrumc-registry",
  "ferrumc-session",
@@ -169,6 +173,7 @@ dependencies = [
  "ferrumc-storage",
  "ferrumc-world",
  "serde",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
@@ -281,6 +286,16 @@ dependencies = [
  "semver",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "ferrumc-plugin-spawn-protect"
+version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-core",
+ "ferrumc-math",
+ "ferrumc-permission",
+ "ferrumc-plugin-api",
 ]
 
 [[package]]
