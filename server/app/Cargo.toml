@@ -33,6 +33,16 @@ ferrumc-sim = { workspace = true }
 ferrumc-world = { workspace = true }
 # The `WorldStore` trait plus the in-memory backend the slice runs against.
 ferrumc-storage = { workspace = true }
+# Command tree powering /spawn and /gamemode.
+ferrumc-command = { workspace = true }
+# Permission subjects/grants backing the spawn-protection bypass check.
+ferrumc-permission = { workspace = true }
+# The plugin host: dynamic loader plus the in-process registry the spawn-protect
+# plugin runs through to seed its namespaced config.
+ferrumc-plugin-host = { workspace = true }
+# The spawn-protection plugin: loaded dynamically (cdylib) and driven in-process
+# (rlib) for its veto policy, config, and bypass permission node.
+ferrumc-plugin-spawn-protect = { workspace = true }
 
 # Single multi-thread Tokio runtime: listener, per-connection tasks, bounded
 # channels, intervals, timeouts, and graceful shutdown.
@@ -58,6 +68,8 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 # Build the player UUID carried by the client's Login Start packet.
 uuid = { workspace = true }
+# Stages the built spawn-protect cdylib in an isolated /plugins directory.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

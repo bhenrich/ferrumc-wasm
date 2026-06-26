@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 use ferrumc_codec::{BoundedReader, BoundedString};
+use ferrumc_command::CommandSource;
 use ferrumc_core::PlayerId;
 use ferrumc_math::Vec3;
 use ferrumc_net::{
@@ -34,11 +35,14 @@ use ferrumc_proto::generated::login::{
     ClientboundLoginPacket, LoginSuccess, ServerboundLoginPacket, SetCompression,
 };
 use ferrumc_proto::generated::play::{
-    ClientboundPlayPacket, ServerboundPlayPacket, SynchronizePlayerPosition,
+    ClientboundPlayPacket, ServerboundPlayPacket, SetPlayerPosition, SynchronizePlayerPosition,
 };
-use ferrumc_session::{NetEvent, PlayerSessionHandle};
+use ferrumc_session::{net_event_to_input, NetEvent, PlayerSessionHandle};
+use ferrumc_sim::GameInput;
 
+use crate::command::SPAWN_COMMAND;
 use crate::driver::SimCommand;
+use crate::plugins::PlayPolicy;
 use crate::world::JoinKit;
 
 /// The `next_state` value in a handshake that selects the login branch.
@@ -63,6 +67,9 @@ pub(crate) struct ConnContext {
     pub(crate) join_kit: Arc<JoinKit>,
     /// Bounded channel to the simulation/session driver.
     pub(crate) commands: mpsc::Sender<SimCommand>,
+    /// The shared play policy: spawn-protection veto, bypass permissions, and the
+    /// command tree consulted for serverbound play packets.
+    pub(crate) policy: Arc<PlayPolicy>,
 }
 
 impl ConnContext {
@@ -306,7 +313,16 @@ async fn enter_play(
     let mut writer = PlayWriter::with_defaults(ctx.limits);
     enqueue_join_kit(&mut writer, ctx, position);
     flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await?;
-    forward_serverbound(&mut decoder, &compression, ctx, player).await?;
+    pump_serverbound(
+        &mut decoder,
+        &compression,
+        ctx,
+        player,
+        name.as_str(),
+        &mut writer,
+    )
+    .await?;
+    flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await?;
 
     let mut read_buf = [0u8; READ_CHUNK];
     let result = loop {
@@ -329,7 +345,16 @@ async fn enter_play(
                     Err(_) => break Err(anyhow::anyhow!("play socket read timed out")),
                     Ok(Err(err)) => break Err(err.into()),
                     Ok(Ok(0)) => break Ok(()),
-                    Ok(Ok(n)) => decode_and_forward(&mut decoder, &compression, ctx, player, &read_buf[..n]).await,
+                    Ok(Ok(n)) => read_and_pump(
+                        &mut decoder,
+                        &compression,
+                        ctx,
+                        player,
+                        name.as_str(),
+                        &mut writer,
+                        &mut stream,
+                        &read_buf[..n],
+                    ).await,
                 };
                 if let Err(err) = outcome {
                     break Err(err);
@@ -391,48 +416,143 @@ fn spawn_sync(position: Vec3) -> SynchronizePlayerPosition {
     )
 }
 
-/// Pushes freshly read bytes through the decoder and forwards complete play
-/// packets to the simulation.
-async fn decode_and_forward(
+/// Pushes freshly read bytes through the decoder, handles every complete play
+/// frame, then flushes any clientbound responses queued while handling them.
+#[allow(clippy::too_many_arguments)] // one play step: framing + policy + I/O state
+async fn read_and_pump(
     decoder: &mut InboundDecoder,
     compression: &CompressionState,
     ctx: &ConnContext,
     player: PlayerId,
+    name: &str,
+    writer: &mut PlayWriter,
+    stream: &mut TcpStream,
     bytes: &[u8],
 ) -> anyhow::Result<()> {
     decoder.push(bytes)?;
-    forward_serverbound(decoder, compression, ctx, player).await
+    pump_serverbound(decoder, compression, ctx, player, name, writer).await?;
+    flush_writer(writer, stream, compression, ctx.io_timeout).await
 }
 
-/// Drains every buffered serverbound play frame and forwards it as a
-/// [`NetEvent`].
-async fn forward_serverbound(
+/// Drains every buffered serverbound play frame and handles each: a
+/// `ChatCommand` runs through the command tree (queuing any clientbound response
+/// into `writer`), a spawn-protected break/place is vetoed, and anything else is
+/// forwarded to the simulation as a [`NetEvent`].
+async fn pump_serverbound(
     decoder: &mut InboundDecoder,
     compression: &CompressionState,
     ctx: &ConnContext,
     player: PlayerId,
+    name: &str,
+    writer: &mut PlayWriter,
 ) -> anyhow::Result<()> {
     while let Some(packet) = decoder.next_packet_compressed(ConnectionState::Play, compression)? {
         let InboundPacket::Play(body) = packet else {
             anyhow::bail!("non-play frame received in the play phase");
         };
-        if let Some(event) = decode_play_event(player, &body) {
-            ctx.commands
-                .send(SimCommand::Event(event))
-                .await
-                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
-        }
+        handle_play_body(ctx, player, name, writer, &body).await?;
     }
     Ok(())
 }
 
-/// Decodes a raw play-frame body into a typed serverbound event, or `None` if it
-/// is not a packet the simulation models.
-fn decode_play_event(player: PlayerId, body: &[u8]) -> Option<NetEvent> {
+/// Handles one decoded serverbound play-frame body.
+///
+/// Unknown or malformed play packets are ignored (the slice models only a
+/// subset). A `ChatCommand` is dispatched locally; every other packet is
+/// forwarded to the simulation unless spawn protection vetoes it.
+async fn handle_play_body(
+    ctx: &ConnContext,
+    player: PlayerId,
+    name: &str,
+    writer: &mut PlayWriter,
+    body: &[u8],
+) -> anyhow::Result<()> {
     let mut reader = BoundedReader::new(body);
-    let id = reader.read_var_int().ok()?;
-    let packet = ServerboundPlayPacket::decode(id, &mut reader).ok()?;
-    Some(NetEvent::play(player, packet))
+    let Ok(id) = reader.read_var_int() else {
+        return Ok(());
+    };
+    let Ok(packet) = ServerboundPlayPacket::decode(id, &mut reader) else {
+        return Ok(());
+    };
+
+    if let ServerboundPlayPacket::ChatCommand(command) = &packet {
+        let command = command.command().as_str().to_owned();
+        return handle_command(ctx, player, name, writer, &command).await;
+    }
+
+    let event = NetEvent::play(player, packet);
+    if is_vetoed(ctx, player, &event) {
+        // Spawn protection: drop the edit so the world is never modified and no
+        // BlockUpdate is broadcast. The actor's optimistic client-side change is
+        // left uncorrected this slice (no clientbound carrier to restore it).
+        return Ok(());
+    }
+    ctx.commands
+        .send(SimCommand::Event(event))
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
+}
+
+/// Returns whether `event` is a break/place that spawn protection should veto:
+/// it targets a protected column and the actor lacks the bypass permission.
+fn is_vetoed(ctx: &ConnContext, player: PlayerId, event: &NetEvent) -> bool {
+    let Some(GameInput::BlockBreak { position, .. } | GameInput::BlockPlace { position, .. }) =
+        net_event_to_input(event)
+    else {
+        return false;
+    };
+    ctx.policy
+        .guard()
+        .vetoes(position, ctx.policy.permissions().has_bypass(player))
+}
+
+/// Dispatches a `/command` for `player` and applies its side effect.
+///
+/// Dispatch goes through the shared command tree with the player's permission
+/// level and a node-string checker backed by the permission registry. On a
+/// successful `/spawn`, the player is teleported: a `SynchronizePlayerPosition`
+/// is queued to their socket and a move is sent to the simulation so the
+/// authoritative position updates and viewers see the teleport. Other commands
+/// (notably `/gamemode`) have no clientbound carrier in this slice, so a
+/// successful dispatch produces no packet. A rejected command is silently
+/// dropped — there is no system-chat packet to report it to the client.
+async fn handle_command(
+    ctx: &ConnContext,
+    player: PlayerId,
+    name: &str,
+    writer: &mut PlayWriter,
+    command: &str,
+) -> anyhow::Result<()> {
+    let policy = &ctx.policy;
+    let source = CommandSource::for_player(player, name, policy.permission_level());
+    let allowed = |node: &str| policy.permissions().is_allowed(player, node);
+    let Ok(result) = policy
+        .command_tree()
+        .dispatch_with(command, &source, &allowed)
+    else {
+        return Ok(());
+    };
+    if !result.is_success() {
+        return Ok(());
+    }
+
+    if command.split_whitespace().next() == Some(SPAWN_COMMAND) {
+        let spawn = policy.spawn();
+        writer.enqueue_classified(ClientboundPlayPacket::SynchronizePlayerPosition(
+            spawn_sync(spawn),
+        ));
+        let move_event = NetEvent::play(
+            player,
+            ServerboundPlayPacket::SetPlayerPosition(SetPlayerPosition::new(
+                spawn.x, spawn.y, spawn.z, 0,
+            )),
+        );
+        ctx.commands
+            .send(SimCommand::Event(move_event))
+            .await
+            .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+    }
+    Ok(())
 }
 
 /// Drains the writer into back-to-back batches and writes each to the socket.

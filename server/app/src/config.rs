@@ -7,6 +7,7 @@
 
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use ferrumc_math::Vec3;
@@ -38,6 +39,10 @@ const DEFAULT_SPAWN_CHUNK_RADIUS: u8 = 2;
 /// Default simulation tick rate, in ticks per second.
 const DEFAULT_TICKS_PER_SECOND: u32 = 20;
 
+/// Default spawn-protection radius, in blocks. Zero disables spawn protection
+/// entirely, which is the default so an unconfigured server protects nothing.
+const DEFAULT_SPAWN_PROTECT_RADIUS: i32 = 0;
+
 /// Validated, runtime-ready server configuration.
 ///
 /// Construct one with [`AppConfig::default`] for the documented defaults, or
@@ -64,6 +69,14 @@ pub struct AppConfig {
     pub spawn_chunk_radius: u8,
     /// The simulation tick rate, in ticks per second.
     pub ticks_per_second: NonZeroU32,
+    /// Directory scanned for dynamic (`cdylib`) plugins at startup, or `None` to
+    /// skip dynamic plugin loading.
+    pub plugins_dir: Option<PathBuf>,
+    /// Spawn-protection radius, in blocks (Chebyshev) around the spawn column.
+    /// Zero disables spawn protection.
+    pub spawn_protect_radius: i32,
+    /// Names of players granted the spawn-protection bypass permission.
+    pub spawn_protect_bypass: Vec<String>,
 }
 
 impl AppConfig {
@@ -104,6 +117,9 @@ impl Default for AppConfig {
             spawn_chunk_radius: DEFAULT_SPAWN_CHUNK_RADIUS,
             ticks_per_second: NonZeroU32::new(DEFAULT_TICKS_PER_SECOND)
                 .expect("default tick rate is non-zero"),
+            plugins_dir: None,
+            spawn_protect_radius: DEFAULT_SPAWN_PROTECT_RADIUS,
+            spawn_protect_bypass: Vec::new(),
         }
     }
 }
@@ -133,6 +149,12 @@ struct RawConfig {
     spawn_chunk_radius: Option<u8>,
     /// Override for [`AppConfig::ticks_per_second`].
     ticks_per_second: Option<u32>,
+    /// Override for [`AppConfig::plugins_dir`], as a filesystem path.
+    plugins_dir: Option<String>,
+    /// Override for [`AppConfig::spawn_protect_radius`].
+    spawn_protect_radius: Option<i32>,
+    /// Override for [`AppConfig::spawn_protect_bypass`].
+    spawn_protect_bypass: Option<Vec<String>>,
 }
 
 impl RawConfig {
@@ -175,6 +197,13 @@ impl RawConfig {
                 .spawn_chunk_radius
                 .unwrap_or(defaults.spawn_chunk_radius),
             ticks_per_second,
+            plugins_dir: self.plugins_dir.map(PathBuf::from).or(defaults.plugins_dir),
+            spawn_protect_radius: self
+                .spawn_protect_radius
+                .unwrap_or(defaults.spawn_protect_radius),
+            spawn_protect_bypass: self
+                .spawn_protect_bypass
+                .unwrap_or(defaults.spawn_protect_bypass),
         })
     }
 }
@@ -201,6 +230,9 @@ mod tests {
             spawn = [1.0, 65.0, 2.0]
             spawn_chunk_radius = 1
             ticks_per_second = 10
+            plugins_dir = "/srv/plugins"
+            spawn_protect_radius = 12
+            spawn_protect_bypass = ["Admin", "Mod"]
         "#;
         let parsed = AppConfig::from_toml_str(toml).expect("valid config");
         assert_eq!(parsed.bind, "0.0.0.0:0".parse().unwrap());
@@ -212,6 +244,17 @@ mod tests {
         assert_eq!(parsed.spawn, Vec3::new(1.0, 65.0, 2.0));
         assert_eq!(parsed.spawn_chunk_radius, 1);
         assert_eq!(parsed.ticks_per_second, NonZeroU32::new(10).unwrap());
+        assert_eq!(parsed.plugins_dir, Some(PathBuf::from("/srv/plugins")));
+        assert_eq!(parsed.spawn_protect_radius, 12);
+        assert_eq!(parsed.spawn_protect_bypass, vec!["Admin", "Mod"]);
+    }
+
+    #[test]
+    fn spawn_protection_defaults_to_disabled() {
+        let parsed = AppConfig::from_toml_str("").expect("empty config is valid");
+        assert_eq!(parsed.spawn_protect_radius, 0);
+        assert!(parsed.spawn_protect_bypass.is_empty());
+        assert_eq!(parsed.plugins_dir, None);
     }
 
     #[test]

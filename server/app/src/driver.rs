@@ -115,14 +115,11 @@ fn run_tick(
     }
 
     let outputs = shard.run_tick();
+    // Routing an output may fan out to many viewers; any whose connection has
+    // closed are returned so we can schedule a clean despawn for each.
     let mut closed = Vec::new();
     for output in &outputs {
-        match router.route_output(output) {
-            Ok(()) => {}
-            // The connection dropped its handle: schedule a clean despawn.
-            Err(SessionError::OutboundClosed { player }) => closed.push(player),
-            Err(err) => tracing::trace!(%err, "dropping simulation output"),
-        }
+        closed.extend(router.route_output(output));
     }
     for player in closed {
         let _ = router.disconnect_player(player);

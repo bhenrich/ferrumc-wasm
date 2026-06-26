@@ -20,6 +20,7 @@ use ferrumc_session::{shard_for_position, SessionRouter};
 use crate::config::AppConfig;
 use crate::connection::{handle_connection, ConnContext};
 use crate::driver;
+use crate::plugins::{build_play_policy, load_plugins};
 use crate::world::build_world;
 
 /// Capacity of the bounded command channel from connections to the driver.
@@ -84,7 +85,26 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     let shard_pos = shard_for_position(config.spawn);
     let setup = build_world(config, shard_pos).await?;
 
+    // Build the play policy (spawn-protection veto, bypass permissions, command
+    // tree) by driving the in-process plugin's config round-trip through storage.
+    let policy = Arc::new(build_play_policy(config)?);
+
+    // Prove the dynamic loader: scan the configured plugins directory across the
+    // C ABI. Failures are logged and never fatal to startup.
+    if let Some(dir) = &config.plugins_dir {
+        match load_plugins(dir) {
+            Ok(count) => {
+                tracing::info!(plugins = count, dir = %dir.display(), "loaded dynamic plugins");
+            }
+            Err(err) => {
+                tracing::warn!(%err, dir = %dir.display(), "failed to scan plugins directory");
+            }
+        }
+    }
+
     let mut router = SessionRouter::new();
+    // Scope multiplayer visibility to the configured play view distance.
+    router.set_view_distance(config.view_distance);
     let shard_rx = router.register_shard(shard_pos);
 
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
@@ -108,6 +128,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         compression_threshold: config.compression_threshold,
         join_kit: setup.join_kit,
         commands: commands_tx,
+        policy,
     };
 
     let accept_task = tokio::spawn(accept_loop(
