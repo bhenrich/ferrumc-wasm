@@ -6,9 +6,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Runtime is intentionally dependency-free: all registry data is hardcoded as
+# deterministic constants with zero boot cost (no JSON parsing at startup).
 
 [dev-dependencies]
+# Drift guards only: parse the vendored minecraft-data snapshots and assert the
+# hardcoded constants + shipped manifest still match the real data.
+serde = { workspace = true }       # derive Deserialize for fixture schemas
+serde_json = { workspace = true }  # parse vendored blocks/biomes/version JSON
+toml = { workspace = true }        # parse manifest.toml for checksum verification
+sha2 = "0.10"                      # recompute fixture sha256 to verify the manifest
 
 [lints]
 workspace = true

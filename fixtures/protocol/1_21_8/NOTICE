@@ -1,0 +1,41 @@
+Attribution for vendored Minecraft 1.21.8 protocol data
+=======================================================
+
+The JSON files in this directory (version.json, blocks.json, biomes.json) are
+vendored, unmodified, from the PrismarineJS/minecraft-data project.
+
+  Project:  minecraft-data
+  Source:   https://github.com/PrismarineJS/minecraft-data
+  Commit:   a8cf733fe44f3069f87f63e7ec3d74b521840ded
+  Path:     data/pc/1.21.8
+  License:  MIT (declared in the project README; see below)
+
+minecraft-data is in turn derived from community protocol documentation,
+primarily the Minecraft Wiki (minecraft.wiki) and the historical wiki.vg
+protocol pages. Credit to those communities for the underlying research.
+
+"Minecraft" is a trademark of Mojang Synergies AB / Microsoft. FerrumC is an
+independent reimplementation and is not affiliated with or endorsed by Mojang
+or Microsoft. No Mojang/Microsoft game assets are included here; only
+community-documented protocol metadata.
+
+----------------------------------------------------------------------
+MIT License (PrismarineJS/minecraft-data)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

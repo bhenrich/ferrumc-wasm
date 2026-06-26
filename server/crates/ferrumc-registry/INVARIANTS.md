@@ -11,4 +11,13 @@
 
 ## Crate-Specific
 
-<!-- Add crate-specific invariants here as the code develops -->
+- The runtime is dependency-free and does no I/O or parsing: all registry data is
+  hardcoded as `const`. JSON/TOML parsing exists only under `#[cfg(test)]`.
+- Block-state ids are fixed protocol constants and MUST equal the default state
+  of the corresponding block in the vendored `blocks.json` at the pinned commit.
+  The drift-guard tests enforce this; do not change a constant without re-pinning
+  and re-vendoring the fixtures + manifest checksums together.
+- Biome and dimension-type ids are server-assigned dynamic-registry indices, not
+  protocol constants; expose resource-location strings, never numeric ids.
+- `manifest.toml` checksums and byte counts must match the vendored fixtures.
+- This crate may depend only on `ferrumc-core`; never on sim, net, or storage.

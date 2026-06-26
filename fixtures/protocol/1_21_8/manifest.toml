@@ -1,0 +1,23 @@
+# Provenance + integrity manifest for the vendored Minecraft 1.21.8 protocol
+# data. Checksums were computed locally (sha256) from the bytes fetched at the
+# pinned commit below. The `fixtures_match_manifest_checksums` test in
+# ferrumc-registry re-verifies every entry against the files on disk.
+
+[source]
+name = "minecraft-data"
+repo = "https://github.com/PrismarineJS/minecraft-data"
+commit = "a8cf733fe44f3069f87f63e7ec3d74b521840ded"
+license = "MIT"
+data_path = "data/pc/1.21.8"
+retrieved = "2026-06-26"
+
+[minecraft]
+version = "1.21.8"
+protocol_version = 772
+data_version = 4440
+
+# sha256 + byte length of each vendored file. Verified live at vendor time.
+[files]
+"version.json" = { sha256 = "4870c01f72974be47f384c3abb047ec2809df84de68088f0f6fa28acdb05964f", bytes = 106 }
+"blocks.json" = { sha256 = "197629a9e61f721462300cbb6d9d8fe6202a00694b80be6860517490632baa70", bytes = 794938 }
+"biomes.json" = { sha256 = "81142998b823856157c46f5385ebc137d61ddc337e9fb4569cd04938cac071d1", bytes = 14129 }
