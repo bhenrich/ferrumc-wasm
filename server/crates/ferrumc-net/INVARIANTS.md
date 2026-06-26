@@ -61,3 +61,31 @@
 - The status path serves only `Handshaking -> Status`. A `next_state` other than
   status (e.g. login) closes the connection cleanly rather than proceeding.
 - The status-response JSON string fields are JSON-escaped before serialization.
+
+## Play reader/writer (M15)
+
+- The play infrastructure performs **no gameplay mutation**: it decodes,
+  budgets, queues, batches, and classifies. It never touches world or sim state
+  and holds no socket — every type is sync and unit-testable without the network.
+- `PlayReader` reuses the M08 framing (per-state frame caps, inbound buffer
+  ceiling, compression) and only adds typed serverbound dispatch plus a budget
+  charge. An over-budget frame is *flagged*, never dropped or errored — the
+  caller decides whether to throttle or disconnect.
+- `PacketBudget` is a deterministic token bucket: time is supplied by the caller
+  as an `Instant`, never read from the clock, and tokens never go negative (an
+  over-budget charge deducts nothing). Refill is capped at the burst size.
+- Every `PlayWriter` priority queue is bounded. A full queue **tail-drops** the
+  incoming packet (preserving the order of already-queued frames) and increments
+  a per-priority drop counter; it never blocks and never grows without limit.
+  Only a full `Critical` queue is fatal — the caller escalates it to
+  `DisconnectReason::OutboundOverflow`.
+- `drain_batch` drains in strict priority order (`Critical > State > World >
+  Cosmetic`) and never sends a lower-priority frame ahead of a still-queued
+  higher-priority one. It stops at the frame-count cap (hard) or the byte cap
+  (soft: a single frame larger than the cap is still emitted so the queue always
+  drains).
+- `MovementCoalescer` keeps only the latest movement packet offered within a
+  tick; non-movement packets are never coalesced. It is "latest wins" only — no
+  validation or interpolation (that is a later simulation milestone).
+- `PlayMetrics` are placeholder in-process counters with no metrics backend; all
+  counters saturate rather than wrap.

@@ -30,6 +30,12 @@
 //!   into the play state. It assigns each player a deterministic UUID with
 //!   [`offline_uuid`] and reuses the [`CompressionState`] framing when a
 //!   compression threshold is configured.
+//!
+//! The [`play`] module (M15) adds the play-phase reader/writer infrastructure on
+//! top of the framing: [`PlayReader`] (budgeted serverbound decode), [`PlayWriter`]
+//! (bounded per-[`OutboundPriority`] queues drained into batches), the
+//! [`MovementCoalescer`] hook, the [`DisconnectReason`] policy, and placeholder
+//! [`PlayMetrics`]. It is pure logic — no gameplay mutation and no socket.
 
 mod accept;
 mod compression;
@@ -39,6 +45,7 @@ mod limits;
 mod login;
 mod offline;
 mod outbound;
+mod play;
 mod server;
 mod state;
 
@@ -55,6 +62,13 @@ pub use limits::{
 pub use login::{LoginFlowError, LoginServer, LoginServerConfig, DEFAULT_KEEP_ALIVE_ID};
 pub use offline::offline_uuid;
 pub use outbound::{OutboundEncoder, OutboundPacket};
+pub use play::{
+    is_movement, BatchLimits, BudgetStatus, DisconnectPolicy, DisconnectReason, EnqueueOutcome,
+    InboundPlayPacket, MovementCoalescer, OfferOutcome, OutboundPriority, PacketBudget, PlayBatch,
+    PlayMetrics, PlayReader, PlayWriter, DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_FRAMES,
+    DEFAULT_COSMETIC_CAPACITY, DEFAULT_CRITICAL_CAPACITY, DEFAULT_PLAY_FRAME_BURST,
+    DEFAULT_PLAY_FRAME_RATE, DEFAULT_STATE_CAPACITY, DEFAULT_WORLD_CAPACITY, PRIORITY_COUNT,
+};
 pub use server::{
     StatusInfo, StatusServer, StatusServerConfig, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_CONNECTIONS,
 };

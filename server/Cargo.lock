@@ -223,10 +223,28 @@ dependencies = [
 [[package]]
 name = "ferrumc-plugin-api"
 version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-command",
+ "ferrumc-core",
+ "ferrumc-math",
+ "ferrumc-permission",
+ "semver",
+ "thiserror",
+]
 
 [[package]]
 name = "ferrumc-plugin-host"
 version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-command",
+ "ferrumc-core",
+ "ferrumc-math",
+ "ferrumc-permission",
+ "ferrumc-plugin-api",
+ "semver",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "ferrumc-proto"
@@ -264,6 +282,15 @@ dependencies = [
 [[package]]
 name = "ferrumc-session"
 version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-core",
+ "ferrumc-math",
+ "ferrumc-net",
+ "ferrumc-proto",
+ "ferrumc-sim",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "ferrumc-sim"
@@ -271,8 +298,10 @@ version = "0.2.0-dev"
 dependencies = [
  "ferrumc-core",
  "ferrumc-math",
+ "ferrumc-storage",
  "ferrumc-world",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -283,6 +312,8 @@ dependencies = [
  "ferrumc-core",
  "ferrumc-math",
  "ferrumc-world",
+ "redb",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
@@ -617,6 +648,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -667,6 +707,16 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"
@@ -892,6 +942,37 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
+
+[[package]]
+name = "tracing"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
+dependencies = [
+ "pin-project-lite",
+ "tracing-attributes",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-attributes"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "tracing-core"
+version = "0.1.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
+dependencies = [
+ "once_cell",
+]
 
 [[package]]
 name = "typenum"
