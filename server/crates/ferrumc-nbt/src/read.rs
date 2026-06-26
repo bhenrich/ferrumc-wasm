@@ -329,6 +329,13 @@ mod tests {
         bytes
     }
 
+    /// `[0x0A][body...]` — wraps a compound body in a network (nameless) root.
+    fn network_root(body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0x0A];
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
     fn default_limits() -> NbtLimits {
         NbtLimits::default()
     }
@@ -883,5 +890,137 @@ mod tests {
             read_named_root_with_consumed(&bytes, &default_limits()).expect("valid");
         assert_eq!(consumed, root_len);
         assert_eq!(&bytes[consumed..], &[0xAA]);
+    }
+
+    // The consumed-bytes variants share the `parse_*` helpers with the
+    // whole-slice readers, so a regression there could surface only on one
+    // path. These tests drive the *internal* limit failures (not just EOF)
+    // through both consumed entry points, with trailing bytes present, to pin
+    // that the limit error — not a truncation or trailing-byte error — wins.
+
+    #[test]
+    fn consumed_named_list_too_long_is_rejected() {
+        // List "l" of 4 bytes; the limit allows only 2. The length check fires
+        // before the elements (or the trailing junk) are ever read.
+        let body = [
+            0x09, 0x00, 0x01, b'l', 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04,
+        ];
+        let mut bytes = named_root(&body);
+        bytes.extend_from_slice(&[0xDE, 0xAD]); // trailing bytes, must be ignored
+        let limits = default_limits().with_max_list_len(2);
+        assert_eq!(
+            read_named_root_with_consumed(&bytes, &limits),
+            Err(NbtError::ListTooLong { len: 4, max: 2 })
+        );
+    }
+
+    #[test]
+    fn consumed_network_list_too_long_is_rejected() {
+        let body = [
+            0x09, 0x00, 0x01, b'l', 0x01, 0x00, 0x00, 0x00, 0x04, 0x01, 0x02, 0x03, 0x04,
+        ];
+        let mut bytes = network_root(&body);
+        bytes.extend_from_slice(&[0xDE, 0xAD]); // trailing bytes, must be ignored
+        let limits = default_limits().with_max_list_len(2);
+        assert_eq!(
+            read_network_root_with_consumed(&bytes, &limits),
+            Err(NbtError::ListTooLong { len: 4, max: 2 })
+        );
+    }
+
+    #[test]
+    fn consumed_named_string_too_long_is_rejected() {
+        // String "s" of 3 bytes "abc"; the limit allows only 2.
+        let body = [0x08, 0x00, 0x01, b's', 0x00, 0x03, b'a', b'b', b'c', 0x00];
+        let mut bytes = named_root(&body);
+        bytes.extend_from_slice(&[0xFF, 0xFF]); // trailing bytes, must be ignored
+        let limits = default_limits().with_max_string_bytes(2);
+        assert_eq!(
+            read_named_root_with_consumed(&bytes, &limits),
+            Err(NbtError::StringTooLong { len: 3, max: 2 })
+        );
+    }
+
+    #[test]
+    fn consumed_network_string_too_long_is_rejected() {
+        let body = [0x08, 0x00, 0x01, b's', 0x00, 0x03, b'a', b'b', b'c', 0x00];
+        let mut bytes = network_root(&body);
+        bytes.extend_from_slice(&[0xFF, 0xFF]); // trailing bytes, must be ignored
+        let limits = default_limits().with_max_string_bytes(2);
+        assert_eq!(
+            read_network_root_with_consumed(&bytes, &limits),
+            Err(NbtError::StringTooLong { len: 3, max: 2 })
+        );
+    }
+
+    #[test]
+    fn consumed_named_depth_exceeded_is_rejected() {
+        // Root {a: {}} — the nested compound sits at depth 2, which max_depth = 1
+        // forbids. The depth check fires before the trailing byte is reached.
+        let body = [
+            0x0A, 0x00, 0x01, b'a', // Compound "a"
+            0x00, // end inner
+            0x00, // end root
+        ];
+        let mut bytes = named_root(&body);
+        bytes.push(0xAA); // trailing byte, must be ignored
+        let limits = default_limits().with_max_depth(1);
+        assert_eq!(
+            read_named_root_with_consumed(&bytes, &limits),
+            Err(NbtError::DepthExceeded { max: 1 })
+        );
+    }
+
+    #[test]
+    fn consumed_network_depth_exceeded_is_rejected() {
+        let body = [
+            0x0A, 0x00, 0x01, b'a', // Compound "a"
+            0x00, // end inner
+            0x00, // end root
+        ];
+        let mut bytes = network_root(&body);
+        bytes.push(0xAA); // trailing byte, must be ignored
+        let limits = default_limits().with_max_depth(1);
+        assert_eq!(
+            read_network_root_with_consumed(&bytes, &limits),
+            Err(NbtError::DepthExceeded { max: 1 })
+        );
+    }
+
+    #[test]
+    fn consumed_named_root_consuming_more_than_max_bytes_is_rejected() {
+        // Mirror of the network coverage: plenty of trailing data, so the slice
+        // is long, but the root needs more than max_bytes to decode and so must
+        // hit EOF inside the capped view rather than reading the trailing bytes.
+        let tag = sample_root();
+        let nbt = write_named_root("root", &tag, &default_limits()).expect("write");
+        let nbt_len = nbt.len();
+
+        let mut buffer = nbt;
+        buffer.extend_from_slice(&[0x00; 64]);
+        let limits = default_limits().with_max_bytes(nbt_len - 1);
+
+        assert!(matches!(
+            read_named_root_with_consumed(&buffer, &limits),
+            Err(NbtError::Codec(CodecError::UnexpectedEof { .. }))
+        ));
+    }
+
+    #[test]
+    fn consumed_named_at_exact_max_bytes_boundary_parses() {
+        let tag = sample_root();
+        let nbt = write_named_root("root", &tag, &default_limits()).expect("write");
+        let nbt_len = nbt.len();
+
+        let mut buffer = nbt;
+        buffer.extend_from_slice(&[0x00; 16]);
+        // max_bytes exactly equal to the root length is enough to consume it.
+        let limits = default_limits().with_max_bytes(nbt_len);
+
+        let (name, decoded, consumed) =
+            read_named_root_with_consumed(&buffer, &limits).expect("valid");
+        assert_eq!(name, "root");
+        assert_eq!(decoded, tag);
+        assert_eq!(consumed, nbt_len);
     }
 }
