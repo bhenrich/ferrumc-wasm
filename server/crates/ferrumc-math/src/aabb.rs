@@ -98,6 +98,16 @@ mod tests {
     }
 
     #[test]
+    fn from_center_half_extents_normalizes_negative_extents() {
+        // Negative half-extents must produce the same well-formed box as their
+        // positive counterparts: the per-axis min/max normalization in
+        // `from_corners` swaps the resulting corners back into order.
+        let a = Aabb::from_center_half_extents(Vec3::ZERO, Vec3::new(-2.0, -2.0, -2.0));
+        assert_eq!(a.min(), Vec3::new(-2.0, -2.0, -2.0));
+        assert_eq!(a.max(), Vec3::new(2.0, 2.0, 2.0));
+    }
+
+    #[test]
     fn contains_interior_and_inclusive_faces() {
         let b = unit_box();
         assert!(b.contains(Vec3::new(0.5, 0.5, 0.5)));

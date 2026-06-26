@@ -66,8 +66,11 @@ impl LocalBlockPos {
     ///
     /// Uses Minecraft's `YZX` ordering (`y` most significant): the index is
     /// `(y << 8) | (z << 4) | x`, which is in `0..4096`.
-    pub fn index(self) -> usize {
-        (usize::from(self.y) << 8) | (usize::from(self.z) << 4) | usize::from(self.x)
+    // `as usize` rather than `usize::from`: the `From` trait is not yet usable in
+    // const fns (rust-lang/rust#143874), and every axis is a `u8`, so the widening
+    // cast is provably lossless.
+    pub const fn index(self) -> usize {
+        ((self.y as usize) << 8) | ((self.z as usize) << 4) | self.x as usize
     }
 }
 
