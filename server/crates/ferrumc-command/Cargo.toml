@@ -6,9 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
-
-[dev-dependencies]
+# Shared value types: `PlayerId` for command sources, `TextComponent` for
+# command feedback, and `ServerError` for error conversion.
+ferrumc-core = { workspace = true }
+# Classifying command error enum (`CommandError`).
+thiserror = { workspace = true }
 
 [lints]
 workspace = true
