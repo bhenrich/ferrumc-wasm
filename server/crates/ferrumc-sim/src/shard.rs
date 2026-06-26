@@ -2,15 +2,68 @@
 //! boundaries.
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 
 use ferrumc_core::{DimensionId, PlayerId, WorldId};
-use ferrumc_math::{ShardPos, Vec3};
+use ferrumc_math::{BlockPos, ShardPos, Vec3};
+use ferrumc_world::BlockStateId;
 
 use crate::error::SimError;
 use crate::loaded::LoadedChunkMap;
 use crate::message::{GameInput, GameOutput};
+
+/// Maximum absolute value allowed for any player position coordinate.
+///
+/// Mirrors the vanilla server's move-packet sanity bound: a client may not place
+/// itself beyond +/-3.0e7 blocks on any axis (just past the maximum world
+/// border). Anything larger — or non-finite — is a malformed or hostile position
+/// and is rejected at the tick boundary rather than corrupting shard state.
+const MAX_POSITION_MAGNITUDE: f64 = 3.0e7;
+
+/// Returns `true` if `position` is a finite, in-range player position.
+///
+/// Rejects NaN, infinities, and any coordinate whose magnitude exceeds
+/// [`MAX_POSITION_MAGNITUDE`]. This is the simulation's only movement check this
+/// milestone: no collision, no speed limit, just finite/range sanity so a bad
+/// packet can never poison player state.
+fn is_valid_position(position: Vec3) -> bool {
+    let in_range = |value: f64| value.is_finite() && value.abs() <= MAX_POSITION_MAGNITUDE;
+    in_range(position.x) && in_range(position.y) && in_range(position.z)
+}
+
+/// Maximum distance, in blocks, between a player and a block they may break or
+/// place.
+///
+/// Measured from the player's position to the centre of the target block. Set a
+/// little above vanilla's ~4.5-block interaction range so creative-mode reach is
+/// comfortably covered. This is the milestone's only interaction-range check:
+/// there is no eye-height offset, line-of-sight, or per-gamemode tuning yet.
+const MAX_REACH: f64 = 6.0;
+
+/// The block-state the simulation writes for an accepted
+/// [`GameInput::BlockPlace`].
+///
+/// This milestone ignores held-item and tool rules, so every place drops the
+/// same fixed block: `minecraft:stone` (block-state id `1` in the pinned
+/// flat-world registry). A break is the inverse, writing [`BlockStateId::AIR`].
+const DEFAULT_PLACED_STATE: BlockStateId = BlockStateId::new(1);
+
+/// Returns `true` if the block at `block` is within [`MAX_REACH`] of an actor
+/// positioned at `actor`.
+///
+/// Distance is measured from `actor` to the centre of the target block and
+/// compared squared to avoid a square root. A non-finite actor position (which
+/// movement validation already rejects before it can be stored) can never make
+/// this return `true`, so it fails closed.
+fn within_reach(actor: Vec3, block: BlockPos) -> bool {
+    let centre = Vec3::new(
+        f64::from(block.x()) + 0.5,
+        f64::from(block.y()) + 0.5,
+        f64::from(block.z()) + 0.5,
+    );
+    (actor - centre).length_squared() <= MAX_REACH * MAX_REACH
+}
 
 /// Builds a [`NonZeroUsize`] in const context, falling back to `1` for a zero
 /// input.
@@ -69,6 +122,34 @@ struct PlayerState {
 /// [`run_tick`](SimShard::run_tick), which drains the whole inbox in FIFO order.
 /// An input enqueued after a `run_tick` returns is therefore applied at the
 /// *next* tick, never mid-tick.
+///
+/// # Movement coalescing and validation
+///
+/// Multiple [`GameInput::PlayerMove`]s for the same player in one tick are
+/// *coalesced*: only the latest valid position is applied at the boundary, and a
+/// single [`GameOutput::PlayerMoved`] is emitted (overload handling step one —
+/// coalesce movement). Coordinates are sanity-checked with [`is_valid_position`]:
+/// a non-finite or out-of-range move is rejected without touching state, and if
+/// no valid move supersedes it the shard emits a
+/// [`GameOutput::PlayerPositionCorrected`] so the desynced client can snap back.
+/// A move for an absent player is ignored, and a [`GameInput::PlayerLeave`]
+/// cancels any pending move/correction for that player.
+///
+/// # Block edits
+///
+/// [`GameInput::BlockBreak`] and [`GameInput::BlockPlace`] mutate the resident
+/// chunk at the tick boundary. Each is validated first (see
+/// [`apply_block_edit`](SimShard::apply_block_edit)): the actor must be present,
+/// the target chunk must be resident in this shard (which also pins the edit to
+/// the shard's dimension), and the target must be within [`MAX_REACH`]. Reach is
+/// measured against the actor's position *as of the start of the tick* — a move
+/// queued in the same tick is coalesced and applied afterwards, so it does not
+/// extend reach for an edit earlier in the same inbox. An accepted break writes
+/// [`BlockStateId::AIR`]; an accepted place writes [`DEFAULT_PLACED_STATE`].
+/// Either way the owning section is marked dirty (by
+/// [`Chunk::set_block`](ferrumc_world::Chunk::set_block)) and a single
+/// [`GameOutput::BlockChanged`] is emitted, in inbox order, for the session
+/// layer to broadcast. A rejected edit mutates nothing and emits nothing.
 ///
 /// # Backpressure
 ///
@@ -198,53 +279,147 @@ impl SimShard {
         Ok(())
     }
 
-    /// Applies every queued input in FIFO order and returns the outputs.
+    /// Applies every queued input at this tick boundary and returns the outputs.
     ///
     /// This is the only method that mutates player state, so all queued inputs
-    /// take effect exactly at this tick boundary. The inbox is empty on return.
+    /// take effect exactly at this boundary. The inbox is empty on return.
+    ///
+    /// Joins and leaves apply in FIFO order; movement is coalesced (latest valid
+    /// position per player) and validated, then applied after the drain — see the
+    /// type-level docs. Spawn/despawn outputs are emitted in inbox order;
+    /// move/correction outputs follow, ordered by [`PlayerId`] so the result is
+    /// fully deterministic for a given inbox.
     pub fn run_tick(&mut self) -> Vec<GameOutput> {
         let mut outputs = Vec::new();
+        // Coalesce movement: keep only the latest *valid* position per player.
+        let mut pending_moves: BTreeMap<PlayerId, Vec3> = BTreeMap::new();
+        // Players whose move was rejected this tick and still need a snap-back
+        // correction (a later valid move removes them again).
+        let mut corrections: BTreeSet<PlayerId> = BTreeSet::new();
+
         while let Some(input) = self.inbox.pop_front() {
-            self.apply(&input, &mut outputs);
+            match input {
+                GameInput::PlayerJoin { player, position } => {
+                    // A duplicate join for an already-present player is ignored:
+                    // the first join wins and re-joining produces no output,
+                    // keeping the result deterministic regardless of retries.
+                    if let Entry::Vacant(slot) = self.players.entry(player) {
+                        slot.insert(PlayerState { position });
+                        outputs.push(GameOutput::PlayerSpawned { player, position });
+                    }
+                }
+                GameInput::PlayerMove { player, position } => {
+                    // Movement for an unknown player is ignored rather than
+                    // implicitly spawning one; there is also nothing to correct.
+                    if !self.players.contains_key(&player) {
+                        continue;
+                    }
+                    if is_valid_position(position) {
+                        // Coalesce: overwrite any earlier move this tick. A valid
+                        // move also clears a pending correction — it supersedes
+                        // the rejected one.
+                        pending_moves.insert(player, position);
+                        corrections.remove(&player);
+                    } else if !pending_moves.contains_key(&player) {
+                        // Reject out-of-range / non-finite coords. Request a
+                        // correction only if no valid move is queued to override
+                        // the client's bad position.
+                        corrections.insert(player);
+                    }
+                }
+                GameInput::PlayerLeave { player } => {
+                    // A leave cancels any queued movement/correction: there is no
+                    // point moving or correcting a player who is gone.
+                    pending_moves.remove(&player);
+                    corrections.remove(&player);
+                    if self.players.remove(&player).is_some() {
+                        outputs.push(GameOutput::PlayerDespawned { player });
+                    }
+                }
+                GameInput::BlockBreak { player, position } => {
+                    // Break -> air. Applied in FIFO order during the drain so the
+                    // BlockChanged output keeps the inbox ordering.
+                    if let Some(output) = self.apply_block_edit(player, position, BlockStateId::AIR)
+                    {
+                        outputs.push(output);
+                    }
+                }
+                GameInput::BlockPlace { player, position } => {
+                    // Place -> the fixed default block (no held-item rules yet).
+                    if let Some(output) =
+                        self.apply_block_edit(player, position, DEFAULT_PLACED_STATE)
+                    {
+                        outputs.push(output);
+                    }
+                }
+            }
         }
+
+        // Apply the coalesced moves at the boundary, in deterministic player
+        // order. Every player here was present at coalesce time and cannot have
+        // left (a leave clears the entry), so the lookup always succeeds.
+        for (player, position) in pending_moves {
+            if let Some(state) = self.players.get_mut(&player) {
+                state.position = position;
+                outputs.push(GameOutput::PlayerMoved { player, position });
+            }
+        }
+
+        // Snap clients back for rejected moves with no superseding valid move.
+        for player in corrections {
+            if let Some(state) = self.players.get(&player) {
+                outputs.push(GameOutput::PlayerPositionCorrected {
+                    player,
+                    position: state.position,
+                });
+            }
+        }
+
         outputs
     }
 
-    /// Applies a single input, pushing any resulting outputs.
+    /// Validates and applies a single block edit at the tick boundary.
     ///
-    /// Takes the input by reference; every field it reads is `Copy`, so no
-    /// ownership is required.
-    fn apply(&mut self, input: &GameInput, outputs: &mut Vec<GameOutput>) {
-        match *input {
-            GameInput::PlayerJoin { player, position } => {
-                // A duplicate join for an already-present player is ignored: the
-                // first join wins and re-joining produces no output, keeping the
-                // result deterministic regardless of upstream retries.
-                if let Entry::Vacant(slot) = self.players.entry(player) {
-                    slot.insert(PlayerState { position });
-                    outputs.push(GameOutput::PlayerSpawned { player, position });
-                }
-            }
-            GameInput::PlayerMove { player, position } => {
-                // Movement for an unknown player is ignored rather than
-                // implicitly spawning one; only an explicit join adds a player.
-                if let Some(state) = self.players.get_mut(&player) {
-                    state.position = position;
-                    outputs.push(GameOutput::PlayerMoved { player, position });
-                }
-            }
-            GameInput::PlayerLeave { player } => {
-                if self.players.remove(&player).is_some() {
-                    outputs.push(GameOutput::PlayerDespawned { player });
-                }
-            }
+    /// Returns the [`GameOutput::BlockChanged`] to broadcast on acceptance, or
+    /// `None` if the edit is rejected. An edit is rejected when:
+    /// - the actor is not present in the shard;
+    /// - the target is beyond [`MAX_REACH`] of the actor's position;
+    /// - the target chunk is not resident in this shard (which also covers a
+    ///   block in another dimension, since the shard's map is dimension-scoped);
+    ///   or
+    /// - the target `y` is outside the buildable range (rejected by
+    ///   [`Chunk::set_block`](ferrumc_world::Chunk::set_block) without panic).
+    ///
+    /// A rejected edit never mutates chunk state. On acceptance the owning
+    /// section is marked dirty by `set_block`, so the chunk is included in the
+    /// next dirty-chunk drain.
+    fn apply_block_edit(
+        &mut self,
+        player: PlayerId,
+        position: BlockPos,
+        state: BlockStateId,
+    ) -> Option<GameOutput> {
+        let actor = self.players.get(&player)?.position;
+        if !within_reach(actor, position) {
+            return None;
         }
+        let chunk = self.chunks.get_mut(position.to_chunk_pos())?;
+        // The chunk was looked up by `position`'s own column, so `set_block` can
+        // only fail on an out-of-range `y`; treat that as a rejected edit rather
+        // than mutating or panicking.
+        chunk.set_block(position, state).ok()?;
+        Some(GameOutput::BlockChanged { position, state })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use ferrumc_math::ChunkPos;
+    use ferrumc_storage::InMemoryStore;
+    use ferrumc_world::FlatWorldGenerator;
+
     use super::*;
+    use crate::ticket::{ChunkTicket, TicketReason};
 
     fn player(name: &str) -> PlayerId {
         PlayerId::offline(name)
@@ -252,6 +427,41 @@ mod tests {
 
     fn shard() -> SimShard {
         SimShard::new(ShardPos::new(0, 0))
+    }
+
+    /// A spawn-position helper: the default world spawn used across block-edit
+    /// tests, comfortably in reach of the flat surface around it.
+    fn spawn() -> Vec3 {
+        Vec3::new(8.0, 64.0, 8.0)
+    }
+
+    /// Builds a shard with `chunk` generated and resident, with its
+    /// freshly-generated dirtiness cleared so later assertions see only the
+    /// edits the test makes.
+    async fn shard_with_loaded_chunk(chunk: ChunkPos) -> SimShard {
+        let mut s = shard();
+        let store = InMemoryStore::new();
+        let generator = FlatWorldGenerator::new();
+        s.loaded_chunks_mut()
+            .acquire(
+                &store,
+                &generator,
+                chunk,
+                ChunkTicket::of(TicketReason::Player),
+            )
+            .await
+            .expect("acquire chunk");
+        // A generated chunk is dirty for its initial save; clear that so a later
+        // dirty check reflects only the test's own edit.
+        let _ = s.loaded_chunks_mut().take_dirty();
+        s
+    }
+
+    /// Reads the block at `pos` from the resident chunk owning it.
+    fn block_at(s: &SimShard, pos: BlockPos) -> Option<BlockStateId> {
+        s.loaded_chunks()
+            .get(pos.to_chunk_pos())
+            .and_then(|c| c.get_block(pos))
     }
 
     #[test]
@@ -295,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_inputs_apply_in_fifo_order_in_one_tick() {
+    fn multiple_moves_in_one_tick_coalesce_to_latest() {
         let mut s = shard();
         let p = player("bob");
         s.enqueue(GameInput::PlayerJoin {
@@ -315,6 +525,8 @@ mod tests {
         .expect("room");
 
         let outputs = s.run_tick();
+        // The two moves coalesce: only the latest position is applied, and a
+        // single PlayerMoved (after the spawn) is emitted.
         assert_eq!(
             outputs,
             vec![
@@ -324,15 +536,151 @@ mod tests {
                 },
                 GameOutput::PlayerMoved {
                     player: p,
-                    position: Vec3::new(5.0, 0.0, 0.0)
-                },
-                GameOutput::PlayerMoved {
-                    player: p,
                     position: Vec3::new(9.0, 0.0, 0.0)
                 },
             ]
         );
         assert_eq!(s.player_position(p), Some(Vec3::new(9.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn invalid_move_is_rejected_and_emits_a_correction() {
+        let mut s = shard();
+        let p = player("nan");
+        let spawn = Vec3::new(8.0, 64.0, 8.0);
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: spawn,
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
+        // Every flavour of bad coordinate is rejected.
+        for bad in [
+            Vec3::new(f64::NAN, 64.0, 8.0),
+            Vec3::new(8.0, f64::INFINITY, 8.0),
+            Vec3::new(8.0, 64.0, f64::NEG_INFINITY),
+            Vec3::new(3.0e7 + 1.0, 64.0, 8.0),
+            Vec3::new(8.0, 64.0, -3.0e7 - 1.0),
+        ] {
+            s.enqueue(GameInput::PlayerMove {
+                player: p,
+                position: bad,
+            })
+            .expect("room");
+            let outputs = s.run_tick();
+            // The rejected move never changes state and yields a snap-back
+            // correction to the last accepted position.
+            assert_eq!(
+                outputs,
+                vec![GameOutput::PlayerPositionCorrected {
+                    player: p,
+                    position: spawn,
+                }]
+            );
+            assert_eq!(s.player_position(p), Some(spawn));
+        }
+    }
+
+    #[test]
+    fn valid_move_supersedes_a_rejected_one_without_correcting() {
+        let mut s = shard();
+        let p = player("oscar");
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: Vec3::ZERO,
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
+        // A rejected move followed by a valid one: the valid position wins and no
+        // correction is emitted (the PlayerMoved is the authoritative update).
+        s.enqueue(GameInput::PlayerMove {
+            player: p,
+            position: Vec3::new(f64::NAN, 0.0, 0.0),
+        })
+        .expect("room");
+        s.enqueue(GameInput::PlayerMove {
+            player: p,
+            position: Vec3::new(3.0, 4.0, 5.0),
+        })
+        .expect("room");
+        let outputs = s.run_tick();
+        assert_eq!(
+            outputs,
+            vec![GameOutput::PlayerMoved {
+                player: p,
+                position: Vec3::new(3.0, 4.0, 5.0),
+            }]
+        );
+        assert_eq!(s.player_position(p), Some(Vec3::new(3.0, 4.0, 5.0)));
+    }
+
+    #[test]
+    fn boundary_coordinates_are_accepted() {
+        let mut s = shard();
+        let p = player("edge");
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: Vec3::ZERO,
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
+        // Exactly at the magnitude limit is in range (inclusive bound).
+        let edge = Vec3::new(3.0e7, -3.0e7, 0.0);
+        s.enqueue(GameInput::PlayerMove {
+            player: p,
+            position: edge,
+        })
+        .expect("room");
+        let outputs = s.run_tick();
+        assert_eq!(
+            outputs,
+            vec![GameOutput::PlayerMoved {
+                player: p,
+                position: edge,
+            }]
+        );
+        assert_eq!(s.player_position(p), Some(edge));
+    }
+
+    #[test]
+    fn leave_cancels_a_pending_move_in_the_same_tick() {
+        let mut s = shard();
+        let p = player("quinn");
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: Vec3::ZERO,
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
+        s.enqueue(GameInput::PlayerMove {
+            player: p,
+            position: Vec3::new(2.0, 0.0, 0.0),
+        })
+        .expect("room");
+        s.enqueue(GameInput::PlayerLeave { player: p })
+            .expect("room");
+        // The leave wins: only a despawn, no stale move for a gone player.
+        let outputs = s.run_tick();
+        assert_eq!(outputs, vec![GameOutput::PlayerDespawned { player: p }]);
+        assert_eq!(s.player_count(), 0);
+    }
+
+    #[test]
+    fn invalid_move_for_absent_player_is_silent() {
+        let mut s = shard();
+        let ghost = player("ghost");
+        s.enqueue(GameInput::PlayerMove {
+            player: ghost,
+            position: Vec3::new(f64::NAN, 0.0, 0.0),
+        })
+        .expect("room");
+        // No player present: no correction, no output at all.
+        assert!(s.run_tick().is_empty());
+        assert_eq!(s.player_count(), 0);
     }
 
     #[test]
@@ -439,5 +787,166 @@ mod tests {
     fn empty_tick_produces_no_outputs() {
         let mut s = shard();
         assert!(s.run_tick().is_empty());
+    }
+
+    #[tokio::test]
+    async fn break_replaces_block_with_air_marks_dirty_and_emits_change() {
+        let chunk = ChunkPos::new(0, 0);
+        let mut s = shard_with_loaded_chunk(chunk).await;
+        let p = player("breaker");
+        let target = BlockPos::new(8, 63, 8); // flat-world grass surface
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: spawn(),
+        })
+        .expect("room");
+        let _ = s.run_tick();
+        // The generated surface block starts non-air, and the chunk is clean.
+        assert_ne!(block_at(&s, target), Some(BlockStateId::AIR));
+        assert!(!s
+            .loaded_chunks()
+            .get(chunk)
+            .expect("resident")
+            .dirty_sections()
+            .any());
+
+        s.enqueue(GameInput::BlockBreak {
+            player: p,
+            position: target,
+        })
+        .expect("room");
+        let outputs = s.run_tick();
+        assert_eq!(
+            outputs,
+            vec![GameOutput::BlockChanged {
+                position: target,
+                state: BlockStateId::AIR,
+            }]
+        );
+        // The chunk reflects the break and the owning section is now dirty.
+        assert_eq!(block_at(&s, target), Some(BlockStateId::AIR));
+        assert!(s
+            .loaded_chunks()
+            .get(chunk)
+            .expect("resident")
+            .dirty_sections()
+            .any());
+    }
+
+    #[tokio::test]
+    async fn place_sets_the_default_block_and_emits_change() {
+        let chunk = ChunkPos::new(0, 0);
+        let mut s = shard_with_loaded_chunk(chunk).await;
+        let p = player("placer");
+        let target = BlockPos::new(8, 65, 8); // air just above the surface
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: spawn(),
+        })
+        .expect("room");
+        let _ = s.run_tick();
+        assert_eq!(block_at(&s, target), Some(BlockStateId::AIR));
+
+        s.enqueue(GameInput::BlockPlace {
+            player: p,
+            position: target,
+        })
+        .expect("room");
+        let outputs = s.run_tick();
+        assert_eq!(
+            outputs,
+            vec![GameOutput::BlockChanged {
+                position: target,
+                state: DEFAULT_PLACED_STATE,
+            }]
+        );
+        assert_eq!(block_at(&s, target), Some(DEFAULT_PLACED_STATE));
+    }
+
+    #[tokio::test]
+    async fn break_in_unloaded_chunk_is_rejected() {
+        // No chunk resident: an otherwise in-reach break is rejected.
+        let mut s = shard();
+        let p = player("homeless");
+        let target = BlockPos::new(8, 63, 8);
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: spawn(),
+        })
+        .expect("room");
+        let _ = s.run_tick();
+        s.enqueue(GameInput::BlockBreak {
+            player: p,
+            position: target,
+        })
+        .expect("room");
+        assert!(s.run_tick().is_empty());
+    }
+
+    #[tokio::test]
+    async fn edit_out_of_reach_is_rejected_even_when_chunk_is_loaded() {
+        // Block (100, 63, 8) lives in chunk (6, 0); load exactly that chunk so
+        // the only reason to reject is the ~92-block distance from spawn.
+        let far_chunk = ChunkPos::new(6, 0);
+        let mut s = shard_with_loaded_chunk(far_chunk).await;
+        let p = player("shortarms");
+        let target = BlockPos::new(100, 63, 8);
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: spawn(),
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
+        s.enqueue(GameInput::BlockBreak {
+            player: p,
+            position: target,
+        })
+        .expect("room");
+        assert!(s.run_tick().is_empty());
+        // The block is untouched (still the generated surface, not air).
+        assert_ne!(block_at(&s, target), Some(BlockStateId::AIR));
+    }
+
+    #[tokio::test]
+    async fn block_edit_for_absent_player_is_ignored() {
+        let chunk = ChunkPos::new(0, 0);
+        let mut s = shard_with_loaded_chunk(chunk).await;
+        let ghost = player("ghost");
+        s.enqueue(GameInput::BlockBreak {
+            player: ghost,
+            position: BlockPos::new(8, 63, 8),
+        })
+        .expect("room");
+        s.enqueue(GameInput::BlockPlace {
+            player: ghost,
+            position: BlockPos::new(8, 65, 8),
+        })
+        .expect("room");
+        assert!(s.run_tick().is_empty());
+    }
+
+    #[tokio::test]
+    async fn block_edit_applies_only_at_tick_boundary() {
+        let chunk = ChunkPos::new(0, 0);
+        let mut s = shard_with_loaded_chunk(chunk).await;
+        let p = player("patient");
+        let target = BlockPos::new(8, 63, 8);
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: spawn(),
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
+        s.enqueue(GameInput::BlockBreak {
+            player: p,
+            position: target,
+        })
+        .expect("room");
+        // Enqueued but not yet applied: the block is unchanged until the tick.
+        assert_ne!(block_at(&s, target), Some(BlockStateId::AIR));
+        let _ = s.run_tick();
+        assert_eq!(block_at(&s, target), Some(BlockStateId::AIR));
     }
 }

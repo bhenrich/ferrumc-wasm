@@ -60,5 +60,10 @@ pub use loaded::{
 };
 pub use message::{GameInput, GameOutput};
 pub use shard::SimShard;
+
+/// Re-exported from [`ferrumc_world`] so callers can name the block-state ids
+/// carried by [`GameOutput::BlockChanged`] / produced by block-edit inputs
+/// without taking a direct dependency on the world crate.
+pub use ferrumc_world::BlockStateId;
 pub use spawn::SpawnChunkTickets;
 pub use ticket::{ChunkTicket, TicketLevel, TicketReason};

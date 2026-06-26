@@ -116,6 +116,73 @@ fn inputs_apply_at_next_tick_boundary_not_mid_tick() {
 }
 
 #[test]
+fn multiple_moves_in_one_tick_coalesce_to_the_latest_position() {
+    let mut harness = SimHarness::new(TickRate::VANILLA, ShardPos::new(0, 0));
+    let p = player("dora");
+    harness
+        .submit(GameInput::PlayerJoin {
+            player: p,
+            position: Vec3::new(0.0, 64.0, 0.0),
+        })
+        .expect("room");
+    let _ = harness.tick().expect("tick");
+
+    // Three moves submitted before one tick collapse to a single applied
+    // position and a single PlayerMoved at the boundary.
+    for x in [1.0, 2.0, 3.0] {
+        harness
+            .submit(GameInput::PlayerMove {
+                player: p,
+                position: Vec3::new(x, 64.0, 0.0),
+            })
+            .expect("room");
+    }
+    let outcome = harness.tick().expect("tick");
+    assert_eq!(
+        outcome.outputs(),
+        &[GameOutput::PlayerMoved {
+            player: p,
+            position: Vec3::new(3.0, 64.0, 0.0)
+        }]
+    );
+    assert_eq!(
+        harness.shard().player_position(p),
+        Some(Vec3::new(3.0, 64.0, 0.0))
+    );
+}
+
+#[test]
+fn invalid_coordinates_are_rejected_at_the_boundary() {
+    let mut harness = SimHarness::new(TickRate::VANILLA, ShardPos::new(0, 0));
+    let p = player("eli");
+    let spawn = Vec3::new(8.0, 64.0, 8.0);
+    harness
+        .submit(GameInput::PlayerJoin {
+            player: p,
+            position: spawn,
+        })
+        .expect("room");
+    let _ = harness.tick().expect("tick");
+
+    harness
+        .submit(GameInput::PlayerMove {
+            player: p,
+            position: Vec3::new(f64::INFINITY, 64.0, 8.0),
+        })
+        .expect("room");
+    let outcome = harness.tick().expect("tick");
+    // Rejected: state is untouched and a snap-back correction is emitted.
+    assert_eq!(
+        outcome.outputs(),
+        &[GameOutput::PlayerPositionCorrected {
+            player: p,
+            position: spawn
+        }]
+    );
+    assert_eq!(harness.shard().player_position(p), Some(spawn));
+}
+
+#[test]
 fn identical_input_sequences_produce_identical_outputs() {
     let scenario = sample_scenario();
     let run_a = run_scenario(&scenario);

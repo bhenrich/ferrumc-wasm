@@ -7,7 +7,8 @@
 //! these typed messages.
 
 use ferrumc_core::PlayerId;
-use ferrumc_math::Vec3;
+use ferrumc_math::{BlockPos, Vec3};
+use ferrumc_world::BlockStateId;
 
 /// An input applied to the simulation at the next tick boundary.
 ///
@@ -39,6 +40,32 @@ pub enum GameInput {
         /// Identity of the leaving player.
         player: PlayerId,
     },
+    /// A player broke (destroyed) the block at `position`.
+    ///
+    /// Decoded upstream from a serverbound `PlayerAction` "start destroying
+    /// block". The simulation validates the edit at the tick boundary
+    /// (actor present, target chunk resident, target within reach) and, on
+    /// acceptance, replaces the block with [`BlockStateId::AIR`]. Held-tool and
+    /// drop rules are out of scope this milestone.
+    BlockBreak {
+        /// Identity of the player breaking the block.
+        player: PlayerId,
+        /// Absolute position of the block to break.
+        position: BlockPos,
+    },
+    /// A player placed a block at `position`.
+    ///
+    /// Decoded upstream from a serverbound `UseItemOn`; `position` is the block
+    /// adjacent to the clicked face. The simulation validates the edit at the
+    /// tick boundary (the same checks as [`BlockBreak`](GameInput::BlockBreak))
+    /// and, on acceptance, sets a fixed default block — held-item rules are out
+    /// of scope this milestone.
+    BlockPlace {
+        /// Identity of the player placing the block.
+        player: PlayerId,
+        /// Absolute position the block is placed at.
+        position: BlockPos,
+    },
 }
 
 /// An output produced by the simulation during a tick.
@@ -63,10 +90,35 @@ pub enum GameOutput {
         /// New world-space position.
         position: Vec3,
     },
+    /// A player's movement was rejected; the client should snap back to this
+    /// authoritative position.
+    ///
+    /// Emitted at the tick boundary when a [`GameInput::PlayerMove`] carried
+    /// non-finite or out-of-range coordinates and no valid move superseded it in
+    /// the same tick. Carries the player's last accepted position so the session
+    /// layer can send a correction to the desynced client.
+    PlayerPositionCorrected {
+        /// Identity of the player to correct.
+        player: PlayerId,
+        /// Authoritative position the client must return to.
+        position: Vec3,
+    },
     /// A player was removed from the shard.
     PlayerDespawned {
         /// Identity of the despawned player.
         player: PlayerId,
+    },
+    /// The block at `position` changed to `state`.
+    ///
+    /// Emitted at the tick boundary after the simulation applies an accepted
+    /// block break (`state` is [`BlockStateId::AIR`]) or place. The session
+    /// layer broadcasts it to viewers in range as a clientbound `BlockUpdate`.
+    /// A rejected edit produces no such output.
+    BlockChanged {
+        /// Absolute position of the changed block.
+        position: BlockPos,
+        /// The block's new state.
+        state: BlockStateId,
     },
 }
 
