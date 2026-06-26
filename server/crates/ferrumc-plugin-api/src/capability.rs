@@ -133,6 +133,27 @@ impl CapabilityManifest {
         self.bits == 0
     }
 
+    /// Returns the raw bitset backing this manifest.
+    ///
+    /// The bit layout is the stable representation carried across the plugin C
+    /// ABI (see [`crate::abi`]); pair it with [`CapabilityManifest::from_bits_truncate`].
+    pub const fn bits(self) -> u32 {
+        self.bits
+    }
+
+    /// Builds a manifest from a raw bitset, discarding any bits that do not
+    /// correspond to a defined [`Capability`].
+    ///
+    /// Used by the host to interpret the capability bitset a dynamically-loaded
+    /// plugin declares across the C ABI: unknown bits are dropped rather than
+    /// trusted, so a malformed or future-versioned plugin can never conjure a
+    /// capability the host does not know about.
+    pub const fn from_bits_truncate(bits: u32) -> Self {
+        Self {
+            bits: bits & ALL_BITS,
+        }
+    }
+
     /// Returns the number of capabilities granted.
     pub const fn len(self) -> u32 {
         self.bits.count_ones()
@@ -212,6 +233,27 @@ mod tests {
         assert!(full.contains_all(some));
         assert!(!some.contains_all(full));
         assert!(some.contains_all(some));
+    }
+
+    #[test]
+    fn bits_round_trip_through_from_bits() {
+        let manifest = CapabilityManifest::empty()
+            .with(Capability::ReadWorld)
+            .with(Capability::Storage);
+        let restored = CapabilityManifest::from_bits_truncate(manifest.bits());
+        assert_eq!(manifest, restored);
+        assert_eq!(CapabilityManifest::all().bits(), ALL_BITS);
+    }
+
+    #[test]
+    fn from_bits_truncate_drops_unknown_bits() {
+        // Every high bit beyond the defined capabilities must be discarded.
+        let garbage = CapabilityManifest::from_bits_truncate(0xFFFF_FFFF);
+        assert_eq!(garbage, CapabilityManifest::all());
+        assert_eq!(
+            CapabilityManifest::from_bits_truncate(0),
+            CapabilityManifest::empty()
+        );
     }
 
     #[test]

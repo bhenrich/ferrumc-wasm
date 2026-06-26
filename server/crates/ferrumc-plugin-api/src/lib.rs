@@ -15,12 +15,18 @@
 //! - [`EventRegistrar`] / [`CommandRegistrar`] — subscribe to events and
 //!   register commands during setup.
 //!
+//! The [`abi`] module additionally defines the narrow C ABI used to load
+//! plugins from dynamic libraries (see ADR-0006). It is the *only* part of this
+//! crate that is layout-stable across Rust versions.
+//!
 //! Access is mediated by a [`CapabilityManifest`] of [`Capability`] grants and
 //! delivered through the [`SetupContext`], [`EventContext`], and
 //! [`TeardownContext`] the host passes to lifecycle hooks. The world, sink,
 //! permission, and storage traits are deliberately *shells* here: the
 //! simulation and storage layers inject the concrete implementations, keeping
 //! this crate free of any dependency on simulation or world internals.
+
+pub mod abi;
 
 mod capability;
 mod command;

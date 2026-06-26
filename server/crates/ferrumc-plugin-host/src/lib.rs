@@ -1,5 +1,9 @@
 #![doc = include_str!("../README.md")]
-#![forbid(unsafe_code)]
+// This crate needs FFI (libloading + `extern "C"`) to load dynamic plugins, so
+// it cannot `forbid` unsafe. It `deny`s it instead and scopes a single
+// `#[allow(unsafe_code)]` to the `dynamic::ffi` module; see
+// `docs/safety/ferrumc-plugin-host.md`.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 //! In-process plugin host: registry, lifecycle, event dispatch, and isolation.
@@ -22,6 +26,19 @@
 //! hands each plugin a view bound to its own namespace, so namespaces are
 //! isolated by construction.
 //!
+//! ## Dynamic plugin loading
+//!
+//! Beyond compiled-in plugins, [`PluginLoader`] loads plugins from `cdylib`
+//! files in a directory across the narrow C ABI defined in
+//! [`ferrumc_plugin_api::abi`] (see ADR-0006). Each library is opened, its ABI
+//! version checked, its metadata read across the boundary, and the result
+//! wrapped in an adapter that implements [`Plugin`](ferrumc_plugin_api::Plugin)
+//! — so once registered it goes through the very same panic-catching and
+//! budget-timing isolation described above. Failures are reported as classified
+//! [`LoadError`]s and never abort the scan or the host. All FFI lives in one
+//! audited `#[allow(unsafe_code)]` module; see
+//! `docs/safety/ferrumc-plugin-host.md`.
+//!
 //! ## A note on `catch_unwind` and unwind safety
 //!
 //! Catching panics is the one place this crate must reason about unwinding. The
@@ -36,12 +53,14 @@
 //! before it can be caught.
 
 mod budget;
+mod dynamic;
 mod error;
 mod host;
 mod state;
 mod storage;
 
 pub use budget::{BudgetOutcome, CallBudget};
+pub use dynamic::{DirLoadReport, LoadError, PluginLoader};
 pub use error::HostError;
 pub use host::{DispatchReport, HostConfig, PluginHost};
 pub use state::{DisableReason, PluginState, PluginStats};

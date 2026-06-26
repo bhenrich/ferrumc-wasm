@@ -14,6 +14,8 @@ ferrumc-command = { workspace = true }
 thiserror = { workspace = true }
 # Structured warnings when a plugin panics or overruns its time budget.
 tracing = { workspace = true }
+# Cross-platform dlopen/dlsym for loading plugin cdylibs across the C ABI.
+libloading = { workspace = true }
 
 [dev-dependencies]
 # The in-process fixture plugins in tests build versions, permission nodes, and
@@ -22,5 +24,21 @@ semver = { workspace = true }
 ferrumc-permission = { workspace = true }
 ferrumc-math = { workspace = true }
 
-[lints]
-workspace = true
+# This crate cannot inherit the workspace `forbid(unsafe_code)`: it needs FFI
+# (libloading + `extern "C"`) for dynamic plugin loading. We mirror the
+# workspace clippy config but downgrade unsafe to `deny` so a single, audited
+# `#[allow(unsafe_code)]` module (`dynamic::ffi`) can opt in. See
+# docs/safety/ferrumc-plugin-host.md.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"

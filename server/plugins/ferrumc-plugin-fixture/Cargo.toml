@@ -1,0 +1,34 @@
+[package]
+name = "ferrumc-plugin-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# A `cdylib` so the loader has a real dynamic library to load across the C ABI.
+# This crate exists only to back `ferrumc-plugin-host`'s integration tests.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The fixture builds its vtable from the shared ABI types and reuses the
+# capability bit layout so the host reads back exactly what it declared.
+ferrumc-plugin-api = { workspace = true }
+
+# This crate cannot inherit the workspace `forbid(unsafe_code)`: exporting the
+# `#[no_mangle]` C entrypoints counts as unsafe code under modern rustc. We
+# downgrade to `deny` and scope a single `#[allow(unsafe_code)]` to the exports.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
