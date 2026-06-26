@@ -1,5 +1,5 @@
 # Build artifacts
-/target
+/server/target
 **/*.rs.bk
 
 # IDE

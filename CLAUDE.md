@@ -317,38 +317,12 @@ These are all "later" items. The current milestone is a vertical slice: status p
 ## File Layout Reference
 
 ```
-ferrumc/
+ferrumc/  (worktree "core") — repo root holds project meta ONLY
 ├── CLAUDE.md                          ← you are here
-├── Cargo.toml                         ← workspace root
-├── Cargo.lock
-├── .gitignore
-├── LICENSE
+├── AGENTS.md
 ├── README.md
-├── crates/
-│   ├── ferrumc-app/
-│   ├── ferrumc-core/
-│   ├── ferrumc-config/
-│   ├── ferrumc-codec/
-│   ├── ferrumc-nbt/
-│   ├── ferrumc-math/
-│   ├── ferrumc-registry/
-│   ├── ferrumc-proto/
-│   ├── ferrumc-proto-gen/
-│   ├── ferrumc-net/
-│   ├── ferrumc-session/
-│   ├── ferrumc-world/
-│   ├── ferrumc-storage/
-│   ├── ferrumc-sim/
-│   ├── ferrumc-command/
-│   ├── ferrumc-permission/
-│   ├── ferrumc-plugin-api/
-│   ├── ferrumc-plugin-host/
-│   ├── ferrumc-anvil/
-│   ├── ferrumc-observability/
-│   └── ferrumc-testkit/
-├── plugins/
-│   └── ferrumc-plugin-spawn-protect/
-├── xtask/
+├── LICENSE
+├── .gitignore
 ├── docs/
 │   ├── architecture/
 │   │   ├── overview.md
@@ -360,7 +334,7 @@ ferrumc/
 │   │   ├── 0001-clean-rewrite.md
 │   │   ├── 0002-actor-sharded-simulation.md
 │   │   ├── 0003-single-tokio-runtime.md
-│   │   ├── 0004-redb-storage.md
+│   │   ├── 0004-storage-backend.md
 │   │   ├── 0005-compiled-rust-plugins-first.md
 │   │   └── 0006-c-abi-dynamic-plugins.md
 │   ├── agent-tasks/
@@ -370,11 +344,40 @@ ferrumc/
 │   │   └── (benchmark results go here)
 │   └── protocol/
 │       └── 1_21_8/
-├── fixtures/
+├── fixtures/                          ← test data (repo root, one level ABOVE the workspace)
 │   ├── protocol/1_21_8/
 │   ├── nbt/
 │   ├── anvil/
 │   └── worlds/
-└── .github/
-    └── workflows/
+├── .github/
+│   └── workflows/
+└── server/                           ← ALL Rust lives here (the Cargo workspace root)
+    ├── Cargo.toml                    ← workspace manifest
+    ├── Cargo.lock
+    ├── .cargo/config.toml
+    ├── crates/
+    │   ├── ferrumc-app/              ← the binary
+    │   ├── ferrumc-core/
+    │   ├── ferrumc-config/
+    │   ├── ferrumc-codec/
+    │   ├── ferrumc-nbt/
+    │   ├── ferrumc-math/
+    │   ├── ferrumc-registry/
+    │   ├── ferrumc-proto/
+    │   ├── ferrumc-proto-gen/
+    │   ├── ferrumc-net/
+    │   ├── ferrumc-session/
+    │   ├── ferrumc-world/
+    │   ├── ferrumc-storage/
+    │   ├── ferrumc-sim/
+    │   ├── ferrumc-command/
+    │   ├── ferrumc-permission/
+    │   ├── ferrumc-plugin-api/
+    │   ├── ferrumc-plugin-host/
+    │   ├── ferrumc-anvil/
+    │   ├── ferrumc-observability/
+    │   └── ferrumc-testkit/
+    ├── plugins/
+    │   └── ferrumc-plugin-spawn-protect/
+    └── xtask/
 ```
