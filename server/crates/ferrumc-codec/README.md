@@ -1,6 +1,6 @@
 # ferrumc-codec
 
-Bounded binary primitives: VarInt, VarLong, BoundedReader, BoundedString. All hostile-input protection.
+Bounded binary primitives: `VarInt`, `VarLong`, `BoundedReader`, `BoundedString`. All hostile-input protection.
 
 ## Invariants
 

@@ -6,7 +6,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Mandated shared-types dependency. Currently linked but unused (ferrumc-core
+# exports no types yet); reserved so CodecError can later convert into the
+# shared ServerError without a churny dependency edit.
+ferrumc-core = { workspace = true }
+# Buf/BufMut power the zero-allocation write side of every primitive.
+bytes = { workspace = true }
+# Structured, classifying error variants for hostile-input failures.
+thiserror = { workspace = true }
 
 [dev-dependencies]
 
