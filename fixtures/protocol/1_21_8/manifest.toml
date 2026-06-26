@@ -21,3 +21,6 @@ data_version = 4440
 "version.json" = { sha256 = "4870c01f72974be47f384c3abb047ec2809df84de68088f0f6fa28acdb05964f", bytes = 106 }
 "blocks.json" = { sha256 = "197629a9e61f721462300cbb6d9d8fe6202a00694b80be6860517490632baa70", bytes = 794938 }
 "biomes.json" = { sha256 = "81142998b823856157c46f5385ebc137d61ddc337e9fb4569cd04938cac071d1", bytes = 14129 }
+# Packet id/type tables. The `spec_ids_match_vendored_protocol_json` test in
+# ferrumc-proto-gen cross-checks every spec packet id against this file.
+"protocol.json" = { sha256 = "06837c1cacd88149f951dde09951cc5ecfcd6280435e6e03729280f8b46e843a", bytes = 288649 }

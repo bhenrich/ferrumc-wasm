@@ -17,13 +17,12 @@ mod error;
 mod wire;
 
 pub mod generated;
+pub mod types;
 
 pub use error::ProtoError;
+pub use types::BlockPosition;
 
 /// A Minecraft protocol connection state.
-///
-/// Only the states this crate models are represented; the play state is out of
-/// scope for the current milestone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum State {
     /// The initial handshaking state.
@@ -34,6 +33,8 @@ pub enum State {
     Login,
     /// The 1.20.2+ configuration state, between login and play.
     Configuration,
+    /// The play state: the in-game world session.
+    Play,
 }
 
 /// The direction a packet travels relative to the server.

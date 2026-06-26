@@ -365,6 +365,7 @@ mod tests {
             State::Status => "status",
             State::Login => "login",
             State::Configuration => "configuration",
+            State::Play => "play",
         };
         let dir_key = |direction: Direction| match direction {
             Direction::Serverbound => "toServer",

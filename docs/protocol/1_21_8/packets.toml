@@ -5,21 +5,40 @@
 # `cargo xtask generate` to regenerate the Rust, and `cargo xtask generate
 # --check` to verify the committed tree matches.
 #
-# Scope: the handshake / status / login / configuration states only (the subset
-# needed for status ping and offline login). Play-state packets are deliberately
-# out of scope for this milestone.
+# Scope: the handshake / status / login / configuration states, plus the minimal
+# play-state subset needed for a flat-world join, player movement, and block
+# changes. The remaining play packets are out of scope for this milestone.
 #
 # Field `type` grammar (a closed set; the generator rejects anything else):
 #   varint | varlong              signed LEB128 integers (i32 / i64)
-#   u16 | i64 | i8 | u8           fixed-width big-endian integers
+#   u16 | i16 | i32 | u32 | i64   fixed-width big-endian integers
+#   i8 | u8                       single signed / unsigned bytes
+#   f32 | f64                     big-endian IEEE-754 floats
 #   bool                          single byte, 0 = false / non-zero = true
 #   uuid                          16 bytes, big-endian
+#   position                      a block pos packed into one i64 (26/26/12 bits)
 #   string(N)                     length-prefixed UTF-8, max N UTF-16 code units
 #   identifier                    a resource location (string capped at 32767)
 #   nbt                           a network-form (unnamed-root) NBT compound
+#   prefixed_bytes(N)             a VarInt byte-length prefix, then <=N raw bytes
+#   remaining_bytes               every remaining body byte (must be the last field)
 #   optional<T>                   a bool flag, then T only when the flag is set
 #   prefixed_array<T>             a VarInt count, then that many T
 #   <StructName>                  a composite payload declared in [[struct]]
+#
+# Play-state modeling notes (DOCUMENTED deviations from a byte-faithful spec):
+#   * Chunk Data and Update Light carries its heavy per-section block/biome
+#     payload (`chunk_data`) and per-section light arrays (`sky_light` /
+#     `block_light`) as opaque length-prefixed `prefixed_bytes` blobs. The chunk
+#     coordinates, heightmaps, block entities, and light bit masks remain typed.
+#     The actual section serialization belongs to a later world<->proto bridge.
+#   * Player Info Update keeps its `action` bit mask typed and carries the
+#     variable, per-action entry list as `remaining_bytes`; the conditional
+#     per-entry layout is decoded by the session<->proto bridge, not here.
+#   * Chunk block-entity `data` is modeled as a present `nbt` value (the wire
+#     form of minecraft-data's "anonOptionalNbt" when data is present); the
+#     degenerate TAG_End "absent" sentinel is not modeled, which is fine for the
+#     flat-world join path that emits no block entities.
 #
 # Ids are the wire packet ids for protocol 772. Notable gotchas baked in below:
 #   * Login Success (clientbound 0x02) has NO trailing strict_error_handling
@@ -50,6 +69,62 @@ name = "RegistryEntry"
 fields = [
     { name = "entry_id", type = "identifier" },
     { name = "data", type = "optional<nbt>" },
+]
+
+# --- Play-state composite payloads ---------------------------------------------
+
+# The optional "you died here" location carried in the join SpawnInfo.
+[[struct]]
+name = "DeathLocation"
+fields = [
+    { name = "dimension_name", type = "identifier" },
+    { name = "location", type = "position" },
+]
+
+# The per-world spawn info embedded in the Login (Join Game) packet.
+[[struct]]
+name = "SpawnInfo"
+fields = [
+    { name = "dimension_type", type = "varint" },
+    { name = "dimension_name", type = "identifier" },
+    { name = "hashed_seed", type = "i64" },
+    # Game mode / previous game mode are single bytes (0..=3, or 255 for "none");
+    # signedness is cosmetic, so both are modeled as u8.
+    { name = "gamemode", type = "u8" },
+    { name = "previous_gamemode", type = "u8" },
+    { name = "is_debug", type = "bool" },
+    { name = "is_flat", type = "bool" },
+    { name = "death_location", type = "optional<DeathLocation>" },
+    { name = "portal_cooldown", type = "varint" },
+    { name = "sea_level", type = "varint" },
+]
+
+# One heightmap in a Chunk Data packet (1.21.5+ networked-heightmap form).
+[[struct]]
+name = "Heightmap"
+fields = [
+    { name = "kind", type = "varint" },
+    { name = "data", type = "prefixed_array<i64>" },
+]
+
+# A block entity carried inline in a Chunk Data packet. `packed_xz` holds the
+# section-relative X in the high nibble and Z in the low nibble.
+[[struct]]
+name = "ChunkBlockEntity"
+fields = [
+    { name = "packed_xz", type = "u8" },
+    { name = "y", type = "i16" },
+    { name = "block_entity_type", type = "varint" },
+    { name = "data", type = "nbt" },
+]
+
+# A spawned entity's initial velocity (three big-endian shorts).
+[[struct]]
+name = "EntityVelocity"
+fields = [
+    { name = "x", type = "i16" },
+    { name = "y", type = "i16" },
+    { name = "z", type = "i16" },
 ]
 
 # --- Handshaking ---------------------------------------------------------------
@@ -196,3 +271,198 @@ direction = "clientbound"
 name = "ClientboundKnownPacks"
 id = 0x0E
 fields = [{ name = "known_packs", type = "prefixed_array<KnownPack>" }]
+
+# --- Play ----------------------------------------------------------------------
+#
+# Ids verified against minecraft-data pc/1.21.8 (commit a8cf733, protocol 772);
+# the minecraft-data packet name for each is noted in a comment.
+
+# minecraft-data: play.toServer.keep_alive
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "ServerboundKeepAlive"
+id = 0x1B
+fields = [{ name = "keep_alive_id", type = "i64" }]
+
+# minecraft-data: play.toServer.position
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "SetPlayerPosition"
+id = 0x1D
+fields = [
+    { name = "x", type = "f64" },
+    { name = "y", type = "f64" },
+    { name = "z", type = "f64" },
+    # MovementFlags bit mask: bit 0 = on ground, bit 1 = horizontal collision.
+    { name = "flags", type = "u8" },
+]
+
+# minecraft-data: play.toServer.position_look
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "SetPlayerPositionAndRotation"
+id = 0x1E
+fields = [
+    { name = "x", type = "f64" },
+    { name = "y", type = "f64" },
+    { name = "z", type = "f64" },
+    { name = "yaw", type = "f32" },
+    { name = "pitch", type = "f32" },
+    { name = "flags", type = "u8" },
+]
+
+# minecraft-data: play.toServer.block_dig ("Player Action").
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "PlayerAction"
+id = 0x28
+fields = [
+    { name = "status", type = "varint" },
+    { name = "location", type = "position" },
+    { name = "face", type = "i8" },
+    { name = "sequence", type = "varint" },
+]
+
+# minecraft-data: play.toServer.block_place ("Use Item On").
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "UseItemOn"
+id = 0x3F
+fields = [
+    { name = "hand", type = "varint" },
+    { name = "location", type = "position" },
+    { name = "direction", type = "varint" },
+    { name = "cursor_x", type = "f32" },
+    { name = "cursor_y", type = "f32" },
+    { name = "cursor_z", type = "f32" },
+    { name = "inside_block", type = "bool" },
+    { name = "world_border_hit", type = "bool" },
+    { name = "sequence", type = "varint" },
+]
+
+# minecraft-data: play.toServer.chat_command (the unsigned command form).
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "ChatCommand"
+id = 0x06
+fields = [{ name = "command", type = "string(256)" }]
+
+# minecraft-data: play.toClient.spawn_entity
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SpawnEntity"
+id = 0x01
+fields = [
+    { name = "entity_id", type = "varint" },
+    { name = "entity_uuid", type = "uuid" },
+    { name = "entity_type", type = "varint" },
+    { name = "x", type = "f64" },
+    { name = "y", type = "f64" },
+    { name = "z", type = "f64" },
+    { name = "pitch", type = "i8" },
+    { name = "yaw", type = "i8" },
+    { name = "head_pitch", type = "i8" },
+    { name = "data", type = "varint" },
+    { name = "velocity", type = "EntityVelocity" },
+]
+
+# minecraft-data: play.toClient.block_change ("Block Update").
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "BlockUpdate"
+id = 0x08
+fields = [
+    { name = "location", type = "position" },
+    { name = "block_state", type = "varint" },
+]
+
+# minecraft-data: play.toClient.keep_alive
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "ClientboundKeepAlive"
+id = 0x26
+fields = [{ name = "keep_alive_id", type = "i64" }]
+
+# minecraft-data: play.toClient.map_chunk ("Chunk Data and Update Light"). The
+# heavy section payload and light arrays are opaque blobs (see the header notes).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "ChunkDataAndLight"
+id = 0x27
+fields = [
+    { name = "x", type = "i32" },
+    { name = "z", type = "i32" },
+    { name = "heightmaps", type = "prefixed_array<Heightmap>" },
+    # Up to 2 MiB of packed section data, decoded by the world<->proto bridge.
+    { name = "chunk_data", type = "prefixed_bytes(2097152)" },
+    { name = "block_entities", type = "prefixed_array<ChunkBlockEntity>" },
+    { name = "sky_light_mask", type = "prefixed_array<i64>" },
+    { name = "block_light_mask", type = "prefixed_array<i64>" },
+    { name = "empty_sky_light_mask", type = "prefixed_array<i64>" },
+    { name = "empty_block_light_mask", type = "prefixed_array<i64>" },
+    # Each entry is a 2048-byte light nibble array, kept opaque.
+    { name = "sky_light", type = "prefixed_array<prefixed_bytes(2048)>" },
+    { name = "block_light", type = "prefixed_array<prefixed_bytes(2048)>" },
+]
+
+# minecraft-data: play.toClient.login ("Login / Join Game").
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "JoinGame"
+id = 0x2B
+fields = [
+    { name = "entity_id", type = "i32" },
+    { name = "is_hardcore", type = "bool" },
+    { name = "world_names", type = "prefixed_array<identifier>" },
+    { name = "max_players", type = "varint" },
+    { name = "view_distance", type = "varint" },
+    { name = "simulation_distance", type = "varint" },
+    { name = "reduced_debug_info", type = "bool" },
+    { name = "enable_respawn_screen", type = "bool" },
+    { name = "do_limited_crafting", type = "bool" },
+    { name = "world_state", type = "SpawnInfo" },
+    { name = "enforces_secure_chat", type = "bool" },
+]
+
+# minecraft-data: play.toClient.position ("Synchronize Player Position").
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SynchronizePlayerPosition"
+id = 0x41
+fields = [
+    { name = "teleport_id", type = "varint" },
+    { name = "x", type = "f64" },
+    { name = "y", type = "f64" },
+    { name = "z", type = "f64" },
+    { name = "dx", type = "f64" },
+    { name = "dy", type = "f64" },
+    { name = "dz", type = "f64" },
+    { name = "yaw", type = "f32" },
+    { name = "pitch", type = "f32" },
+    # PositionUpdateRelatives bit mask (4-byte Int): which fields are relative.
+    { name = "flags", type = "u32" },
+]
+
+# minecraft-data: play.toClient.player_info ("Player Info Update"). The variable
+# per-action entry list is carried opaque (see the header notes).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "PlayerInfoUpdate"
+id = 0x3F
+fields = [
+    { name = "action", type = "u8" },
+    { name = "entries", type = "remaining_bytes" },
+]

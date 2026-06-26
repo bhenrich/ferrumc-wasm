@@ -1,8 +1,9 @@
 Attribution for vendored Minecraft 1.21.8 protocol data
 =======================================================
 
-The JSON files in this directory (version.json, blocks.json, biomes.json) are
-vendored, unmodified, from the PrismarineJS/minecraft-data project.
+The JSON files in this directory (version.json, blocks.json, biomes.json,
+protocol.json) are vendored, unmodified, from the PrismarineJS/minecraft-data
+project.
 
   Project:  minecraft-data
   Source:   https://github.com/PrismarineJS/minecraft-data

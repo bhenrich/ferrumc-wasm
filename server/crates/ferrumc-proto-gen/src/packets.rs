@@ -30,6 +30,8 @@ pub(crate) enum State {
     Login,
     /// The 1.20.2+ configuration state between login and play.
     Configuration,
+    /// The play state: the in-game world session.
+    Play,
 }
 
 impl State {
@@ -40,6 +42,7 @@ impl State {
             "status" => Ok(Self::Status),
             "login" => Ok(Self::Login),
             "configuration" => Ok(Self::Configuration),
+            "play" => Ok(Self::Play),
             other => Err(GenError::PacketsInvalid(format!("unknown state `{other}`"))),
         }
     }
@@ -51,6 +54,7 @@ impl State {
             Self::Status => "status",
             Self::Login => "login",
             Self::Configuration => "configuration",
+            Self::Play => "play",
         }
     }
 
@@ -61,6 +65,7 @@ impl State {
             Self::Status => "Status",
             Self::Login => "Login",
             Self::Configuration => "Configuration",
+            Self::Play => "Play",
         }
     }
 }
@@ -105,22 +110,46 @@ pub(crate) enum WireType {
     VarLong,
     /// `u16`: a fixed-width big-endian unsigned 16-bit integer.
     U16,
+    /// `i16`: a fixed-width big-endian signed 16-bit integer.
+    I16,
+    /// `i32`: a fixed-width big-endian signed 32-bit integer.
+    I32,
+    /// `u32`: a fixed-width big-endian unsigned 32-bit integer (used for the
+    /// play-state teleport-relative bit mask).
+    U32,
     /// `i64`: a fixed-width big-endian signed 64-bit integer.
     I64,
     /// `i8`: a signed byte.
     I8,
     /// `u8`: an unsigned byte.
     U8,
+    /// `f32`: a big-endian IEEE-754 32-bit float.
+    F32,
+    /// `f64`: a big-endian IEEE-754 64-bit float.
+    F64,
     /// `bool`: a single 0/1 byte.
     Bool,
     /// `uuid`: 16 big-endian bytes.
     Uuid,
+    /// `position`: a block position packed into a big-endian `i64`
+    /// (26-bit x, 26-bit z, 12-bit y), decoded to a typed [`BlockPosition`].
+    ///
+    /// [`BlockPosition`]: ../../ferrumc_proto/types/struct.BlockPosition.html
+    Position,
     /// `string(N)`: a length-prefixed UTF-8 string capped at `N` code units.
     Str(usize),
     /// `identifier`: a resource location (a string capped at [`IDENTIFIER_MAX`]).
     Identifier,
     /// `nbt`: a network-form (unnamed-root) NBT compound.
     Nbt,
+    /// `prefixed_bytes(N)`: a `VarInt` byte-length prefix then that many raw
+    /// bytes, capped at `N` (a `BoundedBytes<N>`). Used to carry the heavy chunk
+    /// payload and per-section light arrays as opaque, length-delimited blobs.
+    PrefixedBytes(usize),
+    /// `remaining_bytes`: every byte left in the packet body, verbatim. Must be
+    /// the final field of a packet; used for variable trailing payloads (the
+    /// Player Info Update entry list) the typed grammar cannot yet express.
+    RemainingBytes,
     /// `optional<T>`: a bool flag followed by `T` only when the flag is set.
     Optional(Box<WireType>),
     /// `prefixed_array<T>`: a `VarInt` count followed by that many `T`.
@@ -148,18 +177,31 @@ impl WireType {
                 .map_err(|_| GenError::PacketsInvalid(format!("invalid string size in `{raw}`")))?;
             return Ok(Self::Str(max));
         }
+        if let Some(arg) = wrapped(raw, "prefixed_bytes(", ")") {
+            let max = arg.trim().parse::<usize>().map_err(|_| {
+                GenError::PacketsInvalid(format!("invalid prefixed_bytes size in `{raw}`"))
+            })?;
+            return Ok(Self::PrefixedBytes(max));
+        }
 
         Ok(match raw {
             "varint" => Self::VarInt,
             "varlong" => Self::VarLong,
             "u16" => Self::U16,
+            "i16" => Self::I16,
+            "i32" => Self::I32,
+            "u32" => Self::U32,
             "i64" => Self::I64,
             "i8" => Self::I8,
             "u8" => Self::U8,
+            "f32" => Self::F32,
+            "f64" => Self::F64,
             "bool" => Self::Bool,
             "uuid" => Self::Uuid,
+            "position" => Self::Position,
             "identifier" => Self::Identifier,
             "nbt" => Self::Nbt,
+            "remaining_bytes" => Self::RemainingBytes,
             other if structs.contains(other) => Self::Struct(other.to_owned()),
             other => {
                 return Err(GenError::PacketsInvalid(format!(
@@ -172,16 +214,25 @@ impl WireType {
     /// The Rust type this wire type decodes to.
     pub(crate) fn rust_type(&self) -> String {
         match self {
-            Self::VarInt => "i32".to_owned(),
+            Self::VarInt | Self::I32 => "i32".to_owned(),
             Self::VarLong | Self::I64 => "i64".to_owned(),
             Self::U16 => "u16".to_owned(),
+            Self::I16 => "i16".to_owned(),
+            Self::U32 => "u32".to_owned(),
             Self::I8 => "i8".to_owned(),
             Self::U8 => "u8".to_owned(),
+            Self::F32 => "f32".to_owned(),
+            Self::F64 => "f64".to_owned(),
             Self::Bool => "bool".to_owned(),
             Self::Uuid => "uuid::Uuid".to_owned(),
+            Self::Position => "crate::types::BlockPosition".to_owned(),
             Self::Str(max) => format!("BoundedString<{}>", group_digits(*max)),
             Self::Identifier => format!("BoundedString<{}>", group_digits(IDENTIFIER_MAX)),
             Self::Nbt => "ferrumc_nbt::NbtTag".to_owned(),
+            Self::PrefixedBytes(max) => {
+                format!("ferrumc_codec::BoundedBytes<{}>", group_digits(*max))
+            }
+            Self::RemainingBytes => "Vec<u8>".to_owned(),
             Self::Optional(inner) => format!("Option<{}>", inner.rust_type()),
             Self::PrefixedArray(inner) => format!("Vec<{}>", inner.rust_type()),
             Self::Struct(name) => name.clone(),
@@ -196,11 +247,17 @@ impl WireType {
             Self::VarInt
                 | Self::VarLong
                 | Self::U16
+                | Self::I16
+                | Self::I32
+                | Self::U32
                 | Self::I64
                 | Self::I8
                 | Self::U8
+                | Self::F32
+                | Self::F64
                 | Self::Bool
                 | Self::Uuid
+                | Self::Position
         )
     }
 }
@@ -425,6 +482,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_play_state_wire_types() {
+        let s = names();
+        assert_eq!(WireType::parse("i32", &s).unwrap(), WireType::I32);
+        assert_eq!(WireType::parse("u32", &s).unwrap(), WireType::U32);
+        assert_eq!(WireType::parse("i16", &s).unwrap(), WireType::I16);
+        assert_eq!(WireType::parse("f32", &s).unwrap(), WireType::F32);
+        assert_eq!(WireType::parse("f64", &s).unwrap(), WireType::F64);
+        assert_eq!(WireType::parse("position", &s).unwrap(), WireType::Position);
+        assert_eq!(
+            WireType::parse("remaining_bytes", &s).unwrap(),
+            WireType::RemainingBytes
+        );
+        assert_eq!(
+            WireType::parse("prefixed_bytes(2048)", &s).unwrap(),
+            WireType::PrefixedBytes(2048)
+        );
+        assert_eq!(
+            WireType::parse("prefixed_array<prefixed_bytes(2048)>", &s).unwrap(),
+            WireType::PrefixedArray(Box::new(WireType::PrefixedBytes(2048)))
+        );
+        // f32/f64 map to non-Eq Rust types; position to the hand-written struct.
+        assert_eq!(WireType::F64.rust_type(), "f64");
+        assert_eq!(
+            WireType::Position.rust_type(),
+            "crate::types::BlockPosition"
+        );
+        assert_eq!(
+            WireType::PrefixedBytes(2048).rust_type(),
+            "ferrumc_codec::BoundedBytes<2048>"
+        );
+        assert_eq!(WireType::RemainingBytes.rust_type(), "Vec<u8>");
+    }
+
+    #[test]
     fn rejects_unknown_type_and_dangling_struct() {
         let s = names();
         assert!(matches!(
@@ -521,7 +612,7 @@ mod tests {
         let doc: RawDoc = toml::from_str(
             r#"
             [[packet]]
-            state = "play"
+            state = "transfer"
             direction = "clientbound"
             name = "A"
             id = 0x00

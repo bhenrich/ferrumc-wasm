@@ -51,9 +51,34 @@ pub(crate) fn write_u16(buf: &mut impl BufMut, value: u16) {
     buf.put_u16(value);
 }
 
+/// Writes a big-endian signed 16-bit integer.
+pub(crate) fn write_i16(buf: &mut impl BufMut, value: i16) {
+    buf.put_i16(value);
+}
+
+/// Writes a big-endian signed 32-bit integer.
+pub(crate) fn write_i32(buf: &mut impl BufMut, value: i32) {
+    buf.put_i32(value);
+}
+
+/// Writes a big-endian unsigned 32-bit integer.
+pub(crate) fn write_u32(buf: &mut impl BufMut, value: u32) {
+    buf.put_u32(value);
+}
+
 /// Writes a big-endian signed 64-bit integer.
 pub(crate) fn write_i64(buf: &mut impl BufMut, value: i64) {
     buf.put_i64(value);
+}
+
+/// Writes a big-endian IEEE-754 32-bit float.
+pub(crate) fn write_f32(buf: &mut impl BufMut, value: f32) {
+    buf.put_f32(value);
+}
+
+/// Writes a big-endian IEEE-754 64-bit float.
+pub(crate) fn write_f64(buf: &mut impl BufMut, value: f64) {
+    buf.put_f64(value);
 }
 
 /// Writes raw bytes verbatim (used for inline, self-delimiting payloads such as

@@ -3,7 +3,7 @@
 //! bytes, unknown id) for the generated protocol 772 packet codecs.
 
 use bytes::BytesMut;
-use ferrumc_codec::{BoundedReader, BoundedString};
+use ferrumc_codec::{BoundedBytes, BoundedReader, BoundedString};
 use uuid::Uuid;
 
 use ferrumc_nbt::{NbtCompound, NbtTag};
@@ -16,10 +16,16 @@ use ferrumc_proto::generated::login::{
     ClientboundLoginPacket, LoginAcknowledged, LoginDisconnect, LoginStart, LoginSuccess, Property,
     SetCompression,
 };
+use ferrumc_proto::generated::play::{
+    BlockUpdate, ChatCommand, ChunkBlockEntity, ChunkDataAndLight, ClientboundKeepAlive,
+    ClientboundPlayPacket, DeathLocation, EntityVelocity, Heightmap, JoinGame, PlayerAction,
+    PlayerInfoUpdate, ServerboundKeepAlive, ServerboundPlayPacket, SetPlayerPosition,
+    SetPlayerPositionAndRotation, SpawnEntity, SpawnInfo, SynchronizePlayerPosition, UseItemOn,
+};
 use ferrumc_proto::generated::status::{
     PingRequest, PongResponse, ServerboundStatusPacket, StatusRequest, StatusResponse,
 };
-use ferrumc_proto::ProtoError;
+use ferrumc_proto::{BlockPosition, ProtoError};
 
 /// Encodes `original` (which writes its packet id first), then decodes it back
 /// and asserts equality, the expected id, and that nothing trails.
@@ -290,4 +296,256 @@ fn clientbound_login_dispatch_round_trips() {
     let decoded = ClientboundLoginPacket::decode(id, &mut reader).expect("decode");
     assert_eq!(decoded, original);
     assert_eq!(reader.remaining(), 0);
+}
+
+// --- Play state ---------------------------------------------------------------
+
+#[test]
+fn play_serverbound_packets_round_trip() {
+    roundtrip(
+        &ServerboundKeepAlive::new(0x0102_0304_0506_0708),
+        ServerboundKeepAlive::encode,
+        ServerboundKeepAlive::decode,
+        ServerboundKeepAlive::PACKET_ID,
+    );
+    roundtrip(
+        &SetPlayerPosition::new(1.5, -64.0, 2048.25, 0x01),
+        SetPlayerPosition::encode,
+        SetPlayerPosition::decode,
+        SetPlayerPosition::PACKET_ID,
+    );
+    roundtrip(
+        &SetPlayerPositionAndRotation::new(1.5, -64.0, 2048.25, 90.0, -45.0, 0x03),
+        SetPlayerPositionAndRotation::encode,
+        SetPlayerPositionAndRotation::decode,
+        SetPlayerPositionAndRotation::PACKET_ID,
+    );
+    roundtrip(
+        &PlayerAction::new(0, BlockPosition::new(100, -60, 200), 1, 5),
+        PlayerAction::encode,
+        PlayerAction::decode,
+        PlayerAction::PACKET_ID,
+    );
+    roundtrip(
+        &UseItemOn::new(
+            0,
+            BlockPosition::new(1, 2, 3),
+            1,
+            0.5,
+            0.25,
+            0.75,
+            false,
+            true,
+            9,
+        ),
+        UseItemOn::encode,
+        UseItemOn::decode,
+        UseItemOn::PACKET_ID,
+    );
+    roundtrip(
+        &ChatCommand::new(s::<256>("gamemode creative")),
+        ChatCommand::encode,
+        ChatCommand::decode,
+        ChatCommand::PACKET_ID,
+    );
+}
+
+#[test]
+fn play_clientbound_simple_packets_round_trip() {
+    roundtrip(
+        &ClientboundKeepAlive::new(-1),
+        ClientboundKeepAlive::encode,
+        ClientboundKeepAlive::decode,
+        ClientboundKeepAlive::PACKET_ID,
+    );
+    roundtrip(
+        &BlockUpdate::new(BlockPosition::new(10, 64, -5), 2),
+        BlockUpdate::encode,
+        BlockUpdate::decode,
+        BlockUpdate::PACKET_ID,
+    );
+    roundtrip(
+        &SpawnEntity::new(
+            1,
+            Uuid::from_u128(0xfeed_face),
+            70,
+            8.5,
+            65.0,
+            -16.0,
+            1,
+            2,
+            3,
+            0,
+            EntityVelocity::new(10, -20, 30),
+        ),
+        SpawnEntity::encode,
+        SpawnEntity::decode,
+        SpawnEntity::PACKET_ID,
+    );
+    roundtrip(
+        &SynchronizePlayerPosition::new(7, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 180.0, -90.0, 0x1F),
+        SynchronizePlayerPosition::encode,
+        SynchronizePlayerPosition::decode,
+        SynchronizePlayerPosition::PACKET_ID,
+    );
+    // The Player Info Update entry list is carried as an opaque trailing blob.
+    roundtrip(
+        &PlayerInfoUpdate::new(0x09, vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        PlayerInfoUpdate::encode,
+        PlayerInfoUpdate::decode,
+        PlayerInfoUpdate::PACKET_ID,
+    );
+}
+
+#[test]
+fn join_game_round_trips_with_nested_spawn_info() {
+    let spawn = SpawnInfo::new(
+        0,
+        s::<32767>("minecraft:overworld"),
+        0x0123_4567_89ab_cdef,
+        1,   // gamemode: creative
+        255, // previous gamemode: "none"
+        false,
+        true,
+        Some(DeathLocation::new(
+            s::<32767>("minecraft:the_nether"),
+            BlockPosition::new(1, 2, 3),
+        )),
+        0,
+        63,
+    );
+    let join = JoinGame::new(
+        42,
+        false,
+        vec![
+            s::<32767>("minecraft:overworld"),
+            s::<32767>("minecraft:the_nether"),
+        ],
+        20,
+        10,
+        10,
+        false,
+        true,
+        false,
+        spawn,
+        true,
+    );
+    roundtrip(
+        &join,
+        JoinGame::encode,
+        JoinGame::decode,
+        JoinGame::PACKET_ID,
+    );
+}
+
+#[test]
+fn chunk_data_round_trips_with_opaque_payload_and_block_entity() {
+    let mut be_nbt = NbtCompound::new();
+    be_nbt.push("id", NbtTag::String("minecraft:chest".to_owned()));
+    let block_entity = ChunkBlockEntity::new(0x12, 70, 5, NbtTag::Compound(be_nbt));
+
+    let chunk = ChunkDataAndLight::new(
+        3,
+        -7,
+        vec![Heightmap::new(
+            4,
+            vec![0x0102_0304_0506_0708, 0x1122_3344_5566_7788],
+        )],
+        BoundedBytes::<2_097_152>::new(vec![0xAB; 512]).expect("chunk blob within cap"),
+        vec![block_entity],
+        vec![0x0F],
+        vec![],
+        vec![],
+        vec![],
+        vec![BoundedBytes::<2048>::new(vec![0x77; 2048]).expect("light array within cap")],
+        vec![],
+    );
+    roundtrip(
+        &chunk,
+        ChunkDataAndLight::encode,
+        ChunkDataAndLight::decode,
+        ChunkDataAndLight::PACKET_ID,
+    );
+}
+
+#[test]
+fn play_dispatch_round_trips_both_directions() {
+    let sb = ServerboundPlayPacket::SetPlayerPosition(SetPlayerPosition::new(1.0, 2.0, 3.0, 0x01));
+    let mut buf = BytesMut::new();
+    sb.encode(&mut buf).expect("encode");
+    let mut reader = BoundedReader::new(&buf);
+    let id = reader.read_var_int().expect("id");
+    let decoded = ServerboundPlayPacket::decode(id, &mut reader).expect("decode");
+    assert_eq!(decoded, sb);
+    assert_eq!(decoded.packet_id(), SetPlayerPosition::PACKET_ID);
+    assert_eq!(reader.remaining(), 0);
+
+    let cb = ClientboundPlayPacket::BlockUpdate(BlockUpdate::new(BlockPosition::new(0, 0, 0), 1));
+    let mut buf = BytesMut::new();
+    cb.encode(&mut buf).expect("encode");
+    let mut reader = BoundedReader::new(&buf);
+    let id = reader.read_var_int().expect("id");
+    let decoded = ClientboundPlayPacket::decode(id, &mut reader).expect("decode");
+    assert_eq!(decoded, cb);
+    assert_eq!(decoded.packet_id(), BlockUpdate::PACKET_ID);
+    assert_eq!(reader.remaining(), 0);
+}
+
+#[test]
+fn play_unknown_id_is_classified() {
+    let mut reader = BoundedReader::new(&[]);
+    let err = ClientboundPlayPacket::decode(0x77, &mut reader).expect_err("unknown id");
+    assert!(matches!(
+        err,
+        ProtoError::UnknownPacketId {
+            id: 0x77,
+            state: ferrumc_proto::State::Play,
+            direction: ferrumc_proto::Direction::Clientbound,
+        }
+    ));
+}
+
+#[test]
+fn block_position_round_trips_through_packet() {
+    // Min/max field values must survive the 26/26/12-bit packing.
+    let pos = BlockPosition::new(33_554_431, 2047, -33_554_432);
+    let mut buf = BytesMut::new();
+    BlockUpdate::new(pos, 9).encode(&mut buf).expect("encode");
+    let mut reader = BoundedReader::new(&buf);
+    let _id = reader.read_var_int().expect("id");
+    let decoded = BlockUpdate::decode(&mut reader).expect("decode");
+    assert_eq!(decoded.location(), pos);
+}
+
+#[test]
+fn player_action_truncated_position_is_codec_error() {
+    // status VarInt (1 byte), then only 4 of the 8 position bytes.
+    let buf = [0x00u8, 0x01, 0x02, 0x03, 0x04];
+    let mut reader = BoundedReader::new(&buf);
+    let err = PlayerAction::decode(&mut reader).expect_err("truncated position");
+    assert!(matches!(err, ProtoError::Codec(_)));
+}
+
+#[test]
+fn chunk_data_oversized_blob_prefix_is_rejected() {
+    // x, z, zero heightmaps, then a chunk_data length prefix above the 2 MiB cap.
+    let mut buf = BytesMut::new();
+    buf.extend_from_slice(&3i32.to_be_bytes()); // x
+    buf.extend_from_slice(&(-7i32).to_be_bytes()); // z
+    ferrumc_codec::write_var_int(&mut buf, 0); // heightmaps count
+    ferrumc_codec::write_var_int(&mut buf, 3_000_000); // chunk_data len > cap
+    let mut reader = BoundedReader::new(&buf);
+    let err = ChunkDataAndLight::decode(&mut reader).expect_err("oversized chunk blob");
+    assert!(matches!(err, ProtoError::Codec(_)));
+}
+
+#[test]
+fn chat_command_oversized_string_prefix_is_rejected() {
+    // BoundedString<256> caps at 256*4 bytes; a 5000-byte prefix is rejected
+    // before any body is read.
+    let mut buf = BytesMut::new();
+    ferrumc_codec::write_var_int(&mut buf, 5000);
+    let mut reader = BoundedReader::new(&buf);
+    let err = ChatCommand::decode(&mut reader).expect_err("oversized command");
+    assert!(matches!(err, ProtoError::Codec(_)));
 }

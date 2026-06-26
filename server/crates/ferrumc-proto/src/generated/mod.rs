@@ -15,4 +15,5 @@ pub const PROTOCOL_VERSION: i32 = 772;
 pub mod configuration;
 pub mod handshake;
 pub mod login;
+pub mod play;
 pub mod status;
