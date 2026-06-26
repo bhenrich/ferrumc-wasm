@@ -16,12 +16,29 @@ ferrumc-codec = { workspace = true }
 bytes = { workspace = true }
 # Structured, classifying error variants for hostile-input failures.
 thiserror = { workspace = true }
+# Async runtime for the live TCP status server (M09): listener, per-connection
+# tasks, bounded concurrency (Semaphore), I/O timeouts, and graceful shutdown.
+tokio = { workspace = true }
+# zlib (de)compression for the post-SetCompression packet framing (M10). Pulls
+# the pure-Rust miniz_oxide backend by default; version is workspace-pinned.
+flate2 = { workspace = true }
+# UUID type for the login flow (Login Start / Login Success carry a player UUID).
+# Workspace-pinned; only the always-available `from_bytes`/`as_u128` surface is
+# used (no extra crate feature beyond the workspace default is required).
+uuid = { workspace = true }
+# Pure-Rust SHA-1 (RustCrypto) for the deterministic offline-mode player UUID.
+# Already a workspace dependency (declared for Mojang auth); reused here rather
+# than pulling in MD5, so no new workspace dependency is introduced. See
+# `offline::offline_uuid` for why this is NOT byte-identical to vanilla.
+sha1 = { workspace = true }
 
 [dev-dependencies]
 # Build wire buffers and decode readers in the round-trip / malformed tests.
 bytes = { workspace = true }
 ferrumc-codec = { workspace = true }
 ferrumc-proto = { workspace = true }
+# Decode the player UUID echoed back in Login Success during integration tests.
+uuid = { workspace = true }
 
 [lints]
 workspace = true

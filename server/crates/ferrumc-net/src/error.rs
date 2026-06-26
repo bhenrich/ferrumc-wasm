@@ -156,6 +156,153 @@ pub enum EncodeError {
     Proto(#[from] ProtoError),
 }
 
+/// Every way decoding one inbound frame *through the compression layer* can fail.
+///
+/// This is the error of the compression-aware decode path
+/// ([`crate::InboundDecoder::next_packet_compressed`]): it is either a framing/
+/// typed-decode failure ([`DecodeError`]) or a `data_length`/`zlib` failure
+/// ([`CompressionError`]). Both already classify into a [`DisconnectClass`], so
+/// [`disconnect_class`](Self::disconnect_class) just forwards to the inner error.
+///
+/// The enum is `#[non_exhaustive]`: new failure modes may be added without a
+/// breaking change, so downstream `match`es must include a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum FrameDecodeError {
+    /// A framing or typed-decode failure on the (already decompressed) frame.
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+
+    /// A `data_length` prefix or `zlib` stream failure in the compression layer.
+    #[error(transparent)]
+    Compression(#[from] CompressionError),
+}
+
+impl FrameDecodeError {
+    /// Classifies this error into the [`DisconnectClass`] the connection layer
+    /// should act on, forwarding to the inner error's own classification.
+    pub fn disconnect_class(&self) -> DisconnectClass {
+        match self {
+            Self::Decode(err) => err.disconnect_class(),
+            Self::Compression(err) => err.disconnect_class(),
+        }
+    }
+}
+
+/// Every way encoding one outbound packet *through the compression layer* can
+/// fail.
+///
+/// This is the error of the compression-aware encode path
+/// ([`crate::OutboundEncoder::encode_compressed`]). Both variants describe a
+/// server-side fault (an oversized or unserializable outbound packet), never
+/// hostile input, so — unlike [`FrameDecodeError`] — there is no
+/// `disconnect_class`: the connection layer treats an encode failure as an
+/// internal error and closes the socket.
+///
+/// The enum is `#[non_exhaustive]`: new failure modes may be added without a
+/// breaking change, so downstream `match`es must include a wildcard arm.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum FrameEncodeError {
+    /// The packet body failed to serialize, or the framed body exceeded the
+    /// state's size cap.
+    #[error(transparent)]
+    Encode(#[from] EncodeError),
+
+    /// The compression layer rejected the packet (an outbound packet larger than
+    /// the decompressed-output cap).
+    #[error(transparent)]
+    Compression(#[from] CompressionError),
+}
+
+/// Every way the post-`SetCompression` packet (de)compression layer can fail.
+///
+/// All variants describe hostile *inbound* input except the compress-side use of
+/// [`DeclaredTooLarge`](Self::DeclaredTooLarge), which guards the server's own
+/// oversized output. Each variant classifies into a [`DisconnectClass`] via
+/// [`disconnect_class`](Self::disconnect_class) so the live connection layer
+/// (M09) has an unambiguous teardown action.
+///
+/// The enum is `#[non_exhaustive]`: new failure modes may be added without a
+/// breaking change, so downstream `match`es must include a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CompressionError {
+    /// The `data_length` prefix was not a valid `VarInt`: truncated within a
+    /// fully present frame, or longer than the 5-byte budget.
+    #[error("malformed compressed-packet data-length prefix")]
+    BadDataLength,
+
+    /// The `data_length` prefix decoded to a negative value, which is never
+    /// valid.
+    #[error("compressed-packet data-length prefix was negative: {length}")]
+    NegativeDataLength {
+        /// The offending decoded length.
+        length: i32,
+    },
+
+    /// A compressed packet declared an uncompressed size below the active
+    /// threshold. A conforming client must send such packets uncompressed (with
+    /// a `data_length` of `0`), so this is a protocol violation.
+    #[error("compressed packet declares {declared} bytes, below the threshold of {threshold}")]
+    BelowThreshold {
+        /// The declared uncompressed size.
+        declared: usize,
+        /// The active compression threshold.
+        threshold: usize,
+    },
+
+    /// The declared uncompressed size exceeds the decompressed-output cap. The
+    /// frame is rejected before its output buffer is allocated, so a single
+    /// frame can never drive an out-of-memory condition (zip-bomb defense). On
+    /// the compress side, the same variant guards an oversized outbound packet.
+    #[error("declared uncompressed size {declared} exceeds the cap of {cap} bytes")]
+    DeclaredTooLarge {
+        /// The declared (inbound) or actual (outbound) uncompressed size.
+        declared: usize,
+        /// The configured decompressed-output cap.
+        cap: usize,
+    },
+
+    /// The `zlib` stream decompressed to fewer bytes than its declared size.
+    #[error("decompressed size {actual} does not match the declared {declared} bytes")]
+    SizeMismatch {
+        /// The declared uncompressed size.
+        declared: usize,
+        /// The actual number of bytes the stream produced.
+        actual: usize,
+    },
+
+    /// The `zlib` stream decompressed to more bytes than its declared size — a
+    /// protocol violation and a potential zip-bomb attempt. Decompression stops
+    /// at the declared size, so no over-allocation occurs.
+    #[error("zlib stream decompresses to more than its declared {declared} bytes")]
+    Oversized {
+        /// The declared uncompressed size the stream exceeded.
+        declared: usize,
+    },
+
+    /// The `zlib` stream was corrupt, truncated, or carried trailing bytes after
+    /// a complete stream.
+    #[error("malformed zlib stream")]
+    MalformedZlib,
+}
+
+impl CompressionError {
+    /// Classifies this error into the [`DisconnectClass`] M09 should act on.
+    pub fn disconnect_class(&self) -> DisconnectClass {
+        match self {
+            Self::DeclaredTooLarge { .. } => DisconnectClass::FrameTooLarge,
+            Self::BelowThreshold { .. } => DisconnectClass::ProtocolViolation,
+            Self::BadDataLength
+            | Self::NegativeDataLength { .. }
+            | Self::SizeMismatch { .. }
+            | Self::Oversized { .. }
+            | Self::MalformedZlib => DisconnectClass::Malformed,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

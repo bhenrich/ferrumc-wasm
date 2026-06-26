@@ -16,7 +16,8 @@ use bytes::{Buf, BytesMut};
 use ferrumc_codec::{BoundedReader, CodecError, FrameLengthReader};
 use ferrumc_proto::generated::{configuration, handshake, login, status};
 
-use crate::error::DecodeError;
+use crate::compression::CompressionState;
+use crate::error::{DecodeError, FrameDecodeError};
 use crate::limits::ConnectionLimits;
 use crate::state::ConnectionState;
 
@@ -81,12 +82,51 @@ pub fn decode_inbound_frame(
     limits: &ConnectionLimits,
 ) -> Result<DecodeOutcome, DecodeError> {
     let max = limits.max_frame_size(state);
+    let Some(span) = locate_frame(buf, state, max)? else {
+        return Ok(DecodeOutcome::NeedMore);
+    };
+    let body = buf
+        .get(span.body_start..span.body_end)
+        .ok_or(DecodeError::MalformedBody { state })?;
+    let packet = decode_body(state, body)?;
+    Ok(DecodeOutcome::Decoded {
+        packet,
+        consumed: span.body_end,
+    })
+}
+
+/// The byte range a complete frame's body occupies within the input buffer.
+///
+/// `body_start..body_end` is the frame body (the length prefix is already
+/// stripped); `body_end` is also the total number of bytes the frame consumed
+/// from the front of the buffer (prefix + body).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameSpan {
+    /// Offset of the first body byte (one past the length prefix).
+    pub body_start: usize,
+    /// Offset one past the last body byte; equals the bytes consumed.
+    pub body_end: usize,
+}
+
+/// Locates one complete length-delimited frame at the front of `buf`.
+///
+/// Reads the `VarInt` length prefix against `max` and checks the declared body
+/// is fully present. A truncated prefix or a not-yet-complete body is reported as
+/// `Ok(None)` ("need more"), never an error; only a genuinely malformed or
+/// oversized prefix returns a [`DecodeError`]. The frame body is *not* decoded —
+/// this is the shared front half of both the plain and the compressed inbound
+/// paths.
+pub(crate) fn locate_frame(
+    buf: &[u8],
+    state: ConnectionState,
+    max: usize,
+) -> Result<Option<FrameSpan>, DecodeError> {
     let mut reader = BoundedReader::new(buf);
 
     let frame_len = match FrameLengthReader::new(max).read_length(&mut reader) {
         Ok(len) => len,
         // A prefix that runs off the end of the buffer is simply not here yet.
-        Err(CodecError::UnexpectedEof { .. }) => return Ok(DecodeOutcome::NeedMore),
+        Err(CodecError::UnexpectedEof { .. }) => return Ok(None),
         Err(CodecError::FrameTooLarge { length, .. }) => {
             return Err(DecodeError::FrameTooLarge { state, length, max })
         }
@@ -101,22 +141,17 @@ pub fn decode_inbound_frame(
     let prefix_len = reader.position();
     // The body has not fully arrived yet; wait for more bytes without consuming.
     if reader.remaining() < frame_len {
-        return Ok(DecodeOutcome::NeedMore);
+        return Ok(None);
     }
 
-    let end = prefix_len
+    let body_end = prefix_len
         .checked_add(frame_len)
         .filter(|end| *end <= buf.len())
         .ok_or(DecodeError::MalformedBody { state })?;
-    let body = buf
-        .get(prefix_len..end)
-        .ok_or(DecodeError::MalformedBody { state })?;
-
-    let packet = decode_body(state, body)?;
-    Ok(DecodeOutcome::Decoded {
-        packet,
-        consumed: end,
-    })
+    Ok(Some(FrameSpan {
+        body_start: prefix_len,
+        body_end,
+    }))
 }
 
 /// Decodes a complete frame body into a typed packet for `state`.
@@ -124,7 +159,14 @@ pub fn decode_inbound_frame(
 /// `body` is exactly the frame's bytes — the length prefix is already stripped.
 /// A play frame is surfaced raw; every other state reads the packet id and
 /// dispatches to `ferrumc-proto`, then rejects any trailing bytes.
-fn decode_body(state: ConnectionState, body: &[u8]) -> Result<InboundPacket, DecodeError> {
+///
+/// Shared by the plain path ([`decode_inbound_frame`]) and the compressed path
+/// ([`InboundDecoder::next_packet_compressed`]), which feeds in the *inflated*
+/// `packet_id + body` bytes.
+pub(crate) fn decode_body(
+    state: ConnectionState,
+    body: &[u8],
+) -> Result<InboundPacket, DecodeError> {
     // Play has no typed packets yet: hand back the raw body untouched.
     if state.is_play() {
         return Ok(InboundPacket::Play(bytes::Bytes::copy_from_slice(body)));
@@ -241,11 +283,52 @@ impl InboundDecoder {
             }
         }
     }
+
+    /// Attempts to decode the next serverbound packet for `state`, applying
+    /// `compression` to the frame body first.
+    ///
+    /// This is the post-`SetCompression` counterpart to
+    /// [`next_packet`](Self::next_packet): once compression is negotiated the
+    /// frame body carries a `data_length` prefix and (when at/above the
+    /// threshold) a `zlib` stream, which `compression` strips and inflates before
+    /// the typed decode runs. When `compression` is
+    /// [disabled](CompressionState::disabled) it is a verbatim pass-through, so a
+    /// caller can use this method uniformly for the whole connection lifetime and
+    /// simply enable compression mid-stream.
+    ///
+    /// Returns `Ok(Some(packet))` when a full frame was decoded and consumed,
+    /// `Ok(None)` when more bytes are needed (the buffer is left intact), or a
+    /// [`FrameDecodeError`] on genuine corruption (framing, `zlib`, or typed
+    /// decode). The on-wire frame is bounded by the state's frame cap before
+    /// decompression, and the inflated size by the compression cap, so a single
+    /// frame can never drive an unbounded allocation.
+    pub fn next_packet_compressed(
+        &mut self,
+        state: ConnectionState,
+        compression: &CompressionState,
+    ) -> Result<Option<InboundPacket>, FrameDecodeError> {
+        let max = self.limits.max_frame_size(state);
+        let Some(span) = locate_frame(&self.buffer, state, max)? else {
+            return Ok(None);
+        };
+        // Decompress yields an owned buffer, releasing the borrow on `self.buffer`
+        // before it is advanced below.
+        let inner = {
+            let frame_body = self
+                .buffer
+                .get(span.body_start..span.body_end)
+                .ok_or(DecodeError::MalformedBody { state })?;
+            compression.decompress(frame_body)?
+        };
+        let packet = decode_body(state, &inner)?;
+        self.buffer.advance(span.body_end);
+        Ok(Some(packet))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use bytes::BufMut;
+    use bytes::{BufMut, BytesMut};
 
     use ferrumc_codec::{write_var_int, BoundedString};
     use ferrumc_proto::generated::handshake::ServerboundHandshakePacket;
@@ -253,7 +336,8 @@ mod tests {
     use ferrumc_proto::generated::status::ServerboundStatusPacket;
 
     use super::*;
-    use crate::error::DisconnectClass;
+    use crate::compression::CompressionState;
+    use crate::error::{DisconnectClass, FrameDecodeError};
 
     /// Wraps a packet body in a `VarInt` length prefix, producing a full frame.
     fn frame(body: &[u8]) -> Vec<u8> {
@@ -584,5 +668,93 @@ mod tests {
             panic!("expected decoded frame");
         };
         assert_eq!(packet.state(), ConnectionState::Handshaking);
+    }
+
+    /// Wraps a raw `id + body` packet in the compressed framing for `compression`,
+    /// then the outer length prefix, producing a full on-wire frame.
+    fn compressed_frame(compression: &CompressionState, id_body: &[u8]) -> Vec<u8> {
+        let mut frame_body = BytesMut::new();
+        compression.compress(id_body, &mut frame_body).unwrap();
+        frame(&frame_body)
+    }
+
+    #[test]
+    fn compressed_path_round_trips_a_handshake() {
+        // Threshold 0 compresses every packet, so the frame carries a real zlib
+        // stream that the decode path must inflate before dispatch.
+        let compression = CompressionState::enabled(0);
+        let mut decoder = InboundDecoder::new(ConnectionLimits::default());
+        decoder
+            .push(&compressed_frame(&compression, &handshake_body(2)))
+            .unwrap();
+
+        let packet = decoder
+            .next_packet_compressed(ConnectionState::Handshaking, &compression)
+            .unwrap();
+        assert!(matches!(packet, Some(InboundPacket::Handshake(_))));
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn compressed_path_disabled_matches_plain_decode() {
+        // A disabled compression state is a verbatim pass-through, so the same
+        // plain frame decodes identically through the compressed entry point.
+        let compression = CompressionState::disabled();
+        let mut decoder = InboundDecoder::new(ConnectionLimits::default());
+        decoder.push(&frame(&handshake_body(1))).unwrap();
+        let packet = decoder
+            .next_packet_compressed(ConnectionState::Handshaking, &compression)
+            .unwrap();
+        assert!(matches!(packet, Some(InboundPacket::Handshake(_))));
+    }
+
+    #[test]
+    fn compressed_path_partial_frame_needs_more() {
+        let compression = CompressionState::enabled(0);
+        let mut decoder = InboundDecoder::new(ConnectionLimits::default());
+        // Declare a 10-byte frame but supply only part of it.
+        let mut buf = Vec::new();
+        write_var_int(&mut buf, 10);
+        buf.extend_from_slice(&[0x00, 0x01]);
+        decoder.push(&buf).unwrap();
+        assert!(decoder
+            .next_packet_compressed(ConnectionState::Handshaking, &compression)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn compressed_path_malformed_data_length_is_rejected() {
+        // A fully present frame whose data-length prefix is an overlong VarInt:
+        // a compression-layer failure, surfaced (and classified) as such.
+        let compression = CompressionState::enabled(0);
+        let mut decoder = InboundDecoder::new(ConnectionLimits::default());
+        decoder
+            .push(&frame(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x00]))
+            .unwrap();
+        let err = decoder
+            .next_packet_compressed(ConnectionState::Handshaking, &compression)
+            .unwrap_err();
+        assert!(matches!(err, FrameDecodeError::Compression(_)));
+        assert_eq!(err.disconnect_class(), DisconnectClass::Malformed);
+    }
+
+    #[test]
+    fn compressed_path_oversized_frame_is_rejected() {
+        // The outer frame cap still applies before decompression: an 8 KiB frame
+        // in the handshake state (4 KiB cap) is rejected as a framing failure.
+        let compression = CompressionState::enabled(0);
+        let mut decoder = InboundDecoder::new(ConnectionLimits::default());
+        let mut buf = Vec::new();
+        write_var_int(&mut buf, 8 * 1024);
+        decoder.push(&buf).unwrap();
+        let err = decoder
+            .next_packet_compressed(ConnectionState::Handshaking, &compression)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FrameDecodeError::Decode(DecodeError::FrameTooLarge { .. })
+        ));
+        assert_eq!(err.disconnect_class(), DisconnectClass::FrameTooLarge);
     }
 }
