@@ -1,6 +1,6 @@
 # ferrumc-math
 
-Coordinate types and geometry: BlockPos, ChunkPos, ShardPos, Aabb, Vec3.
+Coordinate types and geometry: `BlockPos`, `ChunkPos`, `ShardPos`, `Aabb`, `Vec3`.
 
 ## Invariants
 
