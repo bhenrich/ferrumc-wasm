@@ -301,6 +301,18 @@ mod tests {
     }
 
     #[test]
+    fn plugin_id_allows_empty_string_per_contract() {
+        // `PluginId::new` documents that it does not validate the identifier and
+        // the caller is responsible for supplying a sensible one. Pin that
+        // contract: an empty string is accepted, stored verbatim, and renders
+        // empty. If validation is ever added, this test must be revisited.
+        let id = PluginId::new("");
+        assert_eq!(id.as_str(), "");
+        assert_eq!(id.to_string(), "");
+        assert_eq!(id, PluginId::new(String::new()));
+    }
+
+    #[test]
     fn distinct_ids_keep_their_ordering() {
         let mut v = [
             ConnectionId::new(3),

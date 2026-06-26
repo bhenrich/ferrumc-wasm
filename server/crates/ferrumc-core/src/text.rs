@@ -4,6 +4,36 @@
 //! enough to be serialized with serde, but pulls in nothing network-related: it
 //! is a plain value type. Styling is applied with a builder-style API, and the
 //! unstyled text can be recovered with [`TextComponent::to_plain_string`].
+//!
+//! # Recursion and untrusted input
+//!
+//! A [`TextComponent`] is a tree: its `extra` children are themselves
+//! `TextComponent`s, so deserialization and [`TextComponent::to_plain_string`]
+//! are both recursive. Per the crate rule against unbounded recursion from
+//! untrusted input, the deserialization depth is bounded — but the bound is
+//! enforced by the serde data format, not by a hand-rolled guard in this crate.
+//!
+//! `serde_json` (and every well-behaved self-describing format) caps nesting
+//! depth while parsing and returns a recursion-limit error instead of
+//! overflowing the stack. `serde_json`'s default limit of 128 nested containers
+//! rejects components nested beyond roughly 63 levels (each level spends two
+//! container frames: the component object and its `extra` array). A maliciously
+//! deep document is therefore turned into an ordinary [`Err`], never a crash.
+//! See the `deeply_nested_*` tests for the pinned behavior.
+//!
+//! Two deliberate consequences of this decision:
+//!
+//! - No custom [`serde::Deserialize`] is implemented to enforce a separate cap.
+//!   A bespoke cap (for example 256) would never fire under `serde_json`, whose
+//!   own limit trips first, and would only add a large, drift-prone manual
+//!   visitor. The format-level bound is the one that matters for untrusted JSON.
+//! - Callers must not feed untrusted JSON through a deserializer configured
+//!   *without* a recursion limit (for instance `serde_json` with
+//!   `disable_recursion_limit`), and must not build pathologically deep trees by
+//!   hand: [`to_plain_string`](TextComponent::to_plain_string) and the
+//!   recursive `Drop` glue would then recurse without bound. Components produced
+//!   from normal gameplay or from limit-respecting deserialization are nowhere
+//!   near deep enough for this to matter.
 
 use core::fmt;
 
@@ -290,5 +320,77 @@ mod tests {
         let back: TextComponent =
             serde_json::from_str("{\"text\":\"x\"}").expect("deserialize minimal");
         assert_eq!(back, TextComponent::text("x"));
+    }
+
+    #[test]
+    fn to_plain_string_concatenates_nested_chain() {
+        // Build a moderately deep linear chain where each level wraps the
+        // previous as its only child, then assert `to_plain_string` flattens it
+        // depth-first ("0" then "1" ... then the leaf). This exercises the
+        // recursive render path on a tree deeper than the trivial fixtures
+        // above without coming anywhere near a stack-overflow depth.
+        let depth = 64usize;
+        let mut component = TextComponent::text((depth - 1).to_string());
+        for level in (0..depth - 1).rev() {
+            component = TextComponent::text(level.to_string()).with_child(component);
+        }
+
+        let expected: String = (0..depth).map(|i| i.to_string()).collect();
+        assert_eq!(component.to_plain_string(), expected);
+    }
+
+    #[cfg(feature = "serde")]
+    fn nested_component_json(depth: usize) -> String {
+        // `depth` nested `extra` arrays around a single leaf component, i.e.
+        // `depth + 1` total component levels.
+        let mut json = String::new();
+        for _ in 0..depth {
+            json.push_str("{\"text\":\"a\",\"extra\":[");
+        }
+        json.push_str("{\"text\":\"a\"}");
+        for _ in 0..depth {
+            json.push_str("]}");
+        }
+        json
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deeply_nested_json_is_rejected_without_overflow() {
+        // A maliciously deep document must surface as an ordinary `Err` (the
+        // serde data format's recursion limit), never a stack overflow. The
+        // limit-respecting parser refuses the document before building the tree,
+        // so this neither overflows on parse nor on drop.
+        let json = nested_component_json(1000);
+        let result: core::result::Result<TextComponent, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "deeply nested component must be rejected by the deserializer"
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn moderate_depth_json_parses_and_renders() {
+        // Well under the format's recursion bound: this must parse and flatten
+        // without panicking. 16 wrapping levels plus the leaf yields 17 "a"s.
+        let json = nested_component_json(16);
+        let component: TextComponent = serde_json::from_str(&json).expect("moderate depth parses");
+        assert_eq!(component.to_plain_string(), "a".repeat(17));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_rejects_invalid_color_string() {
+        // Sanity-check a valid color round-trips so the rejection below is about
+        // the unknown variant, not a malformed document.
+        assert_eq!(
+            serde_json::from_str::<TextColor>("\"dark_blue\"").expect("valid color"),
+            TextColor::DarkBlue
+        );
+        assert!(
+            serde_json::from_str::<TextColor>("\"chartreuse\"").is_err(),
+            "unknown color name must be rejected"
+        );
     }
 }

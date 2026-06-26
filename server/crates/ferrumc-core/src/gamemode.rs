@@ -116,4 +116,20 @@ mod tests {
         let err: ServerError = GameMode::try_from(9).unwrap_err().into();
         assert!(matches!(err, ServerError::InvalidState(_)));
     }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_rejects_unknown_variant_string() {
+        // A valid mode round-trips via its snake_case protocol name...
+        assert_eq!(
+            serde_json::from_str::<GameMode>("\"creative\"").expect("valid mode"),
+            GameMode::Creative
+        );
+        // ...but an unknown string ("god") is rejected rather than silently
+        // defaulting, so bad input never masquerades as a real game mode.
+        assert!(
+            serde_json::from_str::<GameMode>("\"god\"").is_err(),
+            "unknown game mode string must be rejected"
+        );
+    }
 }
