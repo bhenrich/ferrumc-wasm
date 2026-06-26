@@ -5,10 +5,11 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
 
-use ferrumc_core::PlayerId;
+use ferrumc_core::{DimensionId, PlayerId, WorldId};
 use ferrumc_math::{ShardPos, Vec3};
 
 use crate::error::SimError;
+use crate::loaded::LoadedChunkMap;
 use crate::message::{GameInput, GameOutput};
 
 /// Builds a [`NonZeroUsize`] in const context, falling back to `1` for a zero
@@ -28,6 +29,17 @@ const fn non_zero_usize(value: usize) -> NonZeroUsize {
 /// backpressure should kick in.
 const DEFAULT_INBOX_CAPACITY: NonZeroUsize = non_zero_usize(1024);
 
+/// Default world a shard owns chunks for when none is specified.
+///
+/// The current milestone runs a single overworld shard, so [`SimShard::new`]
+/// and friends default to world `0`. Use [`SimShard::in_dimension`] to place a
+/// shard in an explicit world/dimension.
+const DEFAULT_WORLD: WorldId = WorldId::new(0);
+
+/// Default dimension a shard owns chunks for when none is specified (the
+/// overworld, index `0`).
+const DEFAULT_DIMENSION: DimensionId = DimensionId::new(0);
+
 /// Per-player state owned exclusively by the shard.
 #[derive(Debug, Clone, Copy)]
 struct PlayerState {
@@ -36,10 +48,19 @@ struct PlayerState {
 
 /// One simulation shard.
 ///
-/// A shard exclusively owns its players and a bounded inbox, applies queued
-/// [`GameInput`]s **only** at tick boundaries, and returns the resulting
-/// [`GameOutput`]s. This skeleton tracks player presence and position; chunk and
-/// entity ownership arrive in later milestones.
+/// A shard exclusively owns its players, a bounded inbox, and the chunks
+/// resident for its world/dimension (a [`LoadedChunkMap`]). It applies queued
+/// [`GameInput`]s **only** at tick boundaries and returns the resulting
+/// [`GameOutput`]s. Entity ownership arrives in later milestones.
+///
+/// # Chunk ownership
+///
+/// The shard owns chunk *data* through [`loaded_chunks`](SimShard::loaded_chunks)
+/// / [`loaded_chunks_mut`](SimShard::loaded_chunks_mut) but never a database
+/// handle: chunk loading is driven by passing a borrowed
+/// [`WorldStore`](ferrumc_storage::WorldStore) to the map's
+/// [`acquire`](LoadedChunkMap::acquire). Which chunks are resident is governed
+/// entirely by tickets.
 ///
 /// # Tick-boundary application
 ///
@@ -69,31 +90,68 @@ pub struct SimShard {
     inbox: VecDeque<GameInput>,
     inbox_capacity: usize,
     players: BTreeMap<PlayerId, PlayerState>,
+    chunks: LoadedChunkMap,
 }
 
 impl SimShard {
-    /// Creates an empty shard for `shard_pos` with the default inbox capacity.
+    /// Creates an empty shard for `shard_pos` with the default inbox capacity in
+    /// the default single overworld (world `0`, dimension `0`). Use
+    /// [`in_dimension`](SimShard::in_dimension) to place the shard elsewhere.
     pub fn new(shard_pos: ShardPos) -> Self {
-        Self::with_inbox_capacity(shard_pos, DEFAULT_INBOX_CAPACITY)
+        Self::build(
+            shard_pos,
+            DEFAULT_WORLD,
+            DEFAULT_DIMENSION,
+            DEFAULT_INBOX_CAPACITY,
+        )
     }
 
-    /// Creates an empty shard for `shard_pos` with an explicit inbox `capacity`.
+    /// Creates an empty shard for `shard_pos` with an explicit inbox `capacity`
+    /// in the default world/dimension.
     ///
     /// `capacity` is a [`NonZeroUsize`] so a zero-capacity (permanently full)
     /// inbox is unrepresentable. The inbox pre-allocates this capacity once and
     /// never grows beyond it.
     pub fn with_inbox_capacity(shard_pos: ShardPos, capacity: NonZeroUsize) -> Self {
+        Self::build(shard_pos, DEFAULT_WORLD, DEFAULT_DIMENSION, capacity)
+    }
+
+    /// Creates an empty shard for `shard_pos` owning chunks in an explicit
+    /// `world` and `dimension`, with the default inbox capacity.
+    pub fn in_dimension(shard_pos: ShardPos, world: WorldId, dimension: DimensionId) -> Self {
+        Self::build(shard_pos, world, dimension, DEFAULT_INBOX_CAPACITY)
+    }
+
+    /// Shared constructor: builds a shard with every field initialized.
+    fn build(
+        shard_pos: ShardPos,
+        world: WorldId,
+        dimension: DimensionId,
+        capacity: NonZeroUsize,
+    ) -> Self {
         Self {
             shard_pos,
             inbox: VecDeque::with_capacity(capacity.get()),
             inbox_capacity: capacity.get(),
             players: BTreeMap::new(),
+            chunks: LoadedChunkMap::new(world, dimension),
         }
     }
 
     /// Returns the position of this shard in shard coordinates.
     pub const fn shard_pos(&self) -> ShardPos {
         self.shard_pos
+    }
+
+    /// Returns the chunks this shard currently owns in memory.
+    pub const fn loaded_chunks(&self) -> &LoadedChunkMap {
+        &self.chunks
+    }
+
+    /// Returns a mutable handle to the shard's chunks, used to acquire/release
+    /// tickets and collect dirty chunks for saving.
+    pub fn loaded_chunks_mut(&mut self) -> &mut LoadedChunkMap {
+        &mut self.chunks
     }
 
     /// Returns the fixed inbox capacity.

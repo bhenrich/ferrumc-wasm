@@ -23,27 +23,42 @@
 //! - [`GameInput`] / [`GameOutput`] — the minimal typed messages.
 //! - [`TickCoordinator`] / [`TickRate`] — the authoritative [`Tick`] counter,
 //!   advanced one tick at a time with **no catch-up**.
-//! - [`SimShard`] — owns a bounded inbox and the player set, applying inputs
-//!   only at tick boundaries.
+//! - [`SimShard`] — owns a bounded inbox, the player set, and the resident
+//!   chunks, applying inputs only at tick boundaries.
 //! - [`SimHarness`] / [`TickOutcome`] — a deterministic, wall-clock-free driver
 //!   tying a coordinator to one shard, used by tests and replay.
 //!
+//! # Chunk residency
+//!
+//! A shard owns its chunks in a [`LoadedChunkMap`], governed by
+//! [`ChunkTicket`]s: a chunk is resident exactly while it holds a ticket.
+//! [`LoadedChunkMap::acquire`] runs the load-or-generate flow
+//! ([`load_or_generate`]: try the [`WorldStore`](ferrumc_storage::WorldStore),
+//! else generate with [`FlatWorldGenerator`](ferrumc_world::FlatWorldGenerator)),
+//! [`LoadedChunkMap::release`] drops tickets and unloads, and
+//! [`LoadedChunkMap::take_dirty`] hands changed chunks off as save records. The
+//! [`SpawnChunkTickets`] set keeps the world spawn resident. The map collects
+//! dirty chunks but never persists them — flush *policy* is the caller's.
+//!
 //! [`Tick`]: ferrumc_core::Tick
-
-// Mandated crate-map dependency: the simulation layer owns the world model
-// (chunks/entities). This skeleton milestone does not touch chunk data yet, so
-// the crate is bound anonymously to keep the dependency intentional rather than
-// dead weight (mirrors how ferrumc-math binds ferrumc-core).
-use ferrumc_world as _;
 
 mod coordinator;
 mod error;
 mod harness;
+mod loaded;
 mod message;
 mod shard;
+mod spawn;
+mod ticket;
 
 pub use coordinator::{TickCoordinator, TickRate};
 pub use error::{SimError, SimResult};
 pub use harness::{SimHarness, TickOutcome};
+pub use loaded::{
+    load_or_generate, ChunkAcquired, ChunkProvenance, LoadedChunkMap, TicketRelease,
+    CHUNK_SCHEMA_VERSION,
+};
 pub use message::{GameInput, GameOutput};
 pub use shard::SimShard;
+pub use spawn::SpawnChunkTickets;
+pub use ticket::{ChunkTicket, TicketLevel, TicketReason};

@@ -21,3 +21,14 @@
   it never blocks and never silently drops.
 - Player state is held in ordered containers so output ordering is deterministic
   for identical input sequences.
+- A chunk is resident in a `LoadedChunkMap` **iff** it holds at least one
+  ticket. Acquiring the first ticket runs the load-or-generate flow; releasing
+  the last ticket unloads the chunk.
+- The simulation owns chunk *data* but never a database handle: a `WorldStore`
+  is borrowed per `acquire` call, never stored in the map or shard.
+- Dirty chunks are *collected* for saving (`take_dirty`, and on unload) but
+  never persisted here, and no flush policy is implemented — that is the
+  caller's concern.
+- Resident chunks and their tickets live in ordered containers (`BTreeMap`), so
+  the resident set, its iteration order, and dirty batches are deterministic for
+  identical acquire/release/mutate sequences.

@@ -1,6 +1,7 @@
 //! Error types for the simulation layer.
 
 use ferrumc_core::ServerError;
+use ferrumc_math::ChunkPos;
 
 /// A classifying error returned by simulation operations.
 ///
@@ -35,6 +36,22 @@ pub enum SimError {
     /// never wrap silently and the no-panic rule still holds.
     #[error("simulation tick counter overflowed u64")]
     TickOverflow,
+
+    /// Loading a chunk from the [`WorldStore`](ferrumc_storage::WorldStore)
+    /// failed.
+    ///
+    /// Raised by the load-or-generate flow (see
+    /// [`crate::load_or_generate`]) when the store read itself errors — a
+    /// *missing* chunk is not a failure, it is the generate path. The underlying
+    /// [`ServerError`] carries the storage classification.
+    #[error("failed to load chunk at ({},{})", pos.x(), pos.z())]
+    ChunkLoad {
+        /// The position of the chunk whose load failed.
+        pos: ChunkPos,
+        /// The underlying storage error.
+        #[source]
+        source: ServerError,
+    },
 }
 
 impl From<SimError> for ServerError {
@@ -46,6 +63,8 @@ impl From<SimError> for ServerError {
             SimError::TickOverflow => {
                 ServerError::internal("simulation tick counter overflowed u64")
             }
+            // Preserve the storage classification rather than flatten it.
+            SimError::ChunkLoad { source, .. } => source,
         }
     }
 }
@@ -81,6 +100,18 @@ mod tests {
     fn tick_overflow_maps_to_internal_server_error() {
         let server: ServerError = SimError::TickOverflow.into();
         assert!(matches!(server, ServerError::Internal { .. }));
+    }
+
+    #[test]
+    fn chunk_load_displays_position_and_preserves_source() {
+        let err = SimError::ChunkLoad {
+            pos: ChunkPos::new(-3, 4),
+            source: ServerError::not_found("chunk record"),
+        };
+        assert_eq!(err.to_string(), "failed to load chunk at (-3,4)");
+        // Converting back to a ServerError keeps the original classification.
+        let server: ServerError = err.into();
+        assert!(matches!(server, ServerError::NotFound(_)));
     }
 
     #[test]
