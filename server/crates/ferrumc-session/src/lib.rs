@@ -44,5 +44,9 @@ pub use error::SessionError;
 pub use event::NetEvent;
 pub use router::{
     PlayerSessionHandle, SessionRouter, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_SHARD_INPUT_CAPACITY,
+    DEFAULT_VIEW_DISTANCE,
 };
-pub use translate::{net_event_to_input, output_to_clientbound, shard_for_position};
+pub use translate::{
+    net_event_to_input, output_to_clientbound, shard_for_position, PLAYER_INFO_ADD,
+    PLAYER_INFO_REMOVE,
+};

@@ -6,13 +6,16 @@ use std::collections::BTreeMap;
 use tokio::sync::mpsc::{self, error::TrySendError};
 
 use ferrumc_core::PlayerId;
-use ferrumc_math::{ShardPos, Vec3};
+use ferrumc_math::{BlockPos, ChunkPos, ShardPos, Vec3};
 use ferrumc_proto::generated::play::ClientboundPlayPacket;
-use ferrumc_sim::{GameInput, GameOutput};
+use ferrumc_sim::{BlockStateId, GameInput, GameOutput};
 
 use crate::error::SessionError;
 use crate::event::NetEvent;
-use crate::translate::{move_shell, play_packet_to_input, shard_for_position, spawn_shell};
+use crate::translate::{
+    block_update_shell, chunk_for_position, entity_spawn_shell, move_shell, play_packet_to_input,
+    player_info, shard_for_position, PLAYER_INFO_ADD, PLAYER_INFO_REMOVE,
+};
 
 /// Default capacity of each shard's input channel.
 ///
@@ -29,12 +32,35 @@ pub const DEFAULT_SHARD_INPUT_CAPACITY: usize = 1024;
 /// full queue is the caller's cue to disconnect a client that cannot keep up.
 pub const DEFAULT_OUTBOUND_CAPACITY: usize = 256;
 
-/// The router's private per-player record: which shard owns the player and the
-/// sending half of their outbound channel.
+/// Default view distance, in chunks, scoping which viewers a player is broadcast
+/// to.
+///
+/// Matches the app's default play view distance. Visibility is a square
+/// (Chebyshev) chunk-distance test: a subject is shown to a viewer when their
+/// chunks differ by at most this many on both axes.
+pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
+
+/// First network entity id handed to a joining player.
+///
+/// Starts at `2` to stay clear of `0` and of the id `1` the app assigns a client
+/// to *itself* in `JoinGame`, so a remote player's entity can never collide with
+/// a viewer's own.
+const FIRST_ENTITY_ID: i32 = 2;
+
+/// The router's private per-player record.
+///
+/// Holds the routing target (`shard` + `outbound` channel) plus the lightweight
+/// view state the router needs to scope and address visibility broadcasts: the
+/// network `entity_id` other clients see this player as, and the last-known
+/// `position` (seeded at join, refreshed from every movement output). This is
+/// routing metadata mirrored from simulation outputs, not authoritative world
+/// state — the simulation still owns the real positions.
 #[derive(Debug)]
 struct SessionEntry {
     shard: ShardPos,
     outbound: mpsc::Sender<ClientboundPlayPacket>,
+    entity_id: i32,
+    position: Vec3,
 }
 
 /// A handle to one player's session, returned by
@@ -96,39 +122,59 @@ impl PlayerSessionHandle {
 ///   [`PlayerSessionHandle`] for the connection.
 /// - [`route_event`](Self::route_event) translates a [`NetEvent`] and forwards it
 ///   to the player's shard.
-/// - [`route_output`](Self::route_output) translates a [`GameOutput`] and
-///   forwards the clientbound shell to the player's connection.
+/// - [`route_output`](Self::route_output) turns a [`GameOutput`] into the
+///   clientbound packets it implies and delivers them to the relevant
+///   connection(s).
 /// - [`disconnect_player`](Self::disconnect_player) drops the mapping and
 ///   notifies the shard to despawn the player.
 ///
 /// # Backpressure
 ///
 /// Every channel is bounded and routing uses non-blocking sends, so the router
-/// never blocks the tick loop. A full channel surfaces as a classified
-/// [`SessionError`] (`ShardInboxFull` / `OutboundFull`) for the caller to act on;
-/// the message is rejected, never silently dropped.
+/// never blocks the tick loop. A full *shard input* channel surfaces as a
+/// classified [`SessionError::ShardInboxFull`] for the caller to act on. Outbound
+/// position broadcasts and corrections are instead lossy under backpressure — a
+/// full recipient misses the update, which the next one supersedes — and a
+/// recipient whose channel has *closed* is reported by
+/// [`route_output`](Self::route_output) for disconnection.
 ///
 /// # Single-shard binding (this milestone)
 ///
 /// A player stays bound to the shard they joined for the lifetime of the
 /// session: movement routes to that shard even if the new position lies in
 /// another shard's region. Cross-shard handoff is a later milestone.
+///
+/// # Visibility broadcasts (this milestone)
+///
+/// Beyond echoing a player's own outputs, the router gives players sight of one
+/// another. On [`join_player`](Self::join_player) it exchanges a player-list add
+/// plus an entity spawn between the newcomer and every existing player within
+/// view distance; on [`disconnect_player`](Self::disconnect_player) it sends a
+/// player-list remove for the departing player; and
+/// [`route_output`](Self::route_output) broadcasts a mover's new position to the
+/// viewers in range. Visibility is scoped to [`view_distance`](Self::view_distance)
+/// chunks. The router keeps a per-player last-known position to make this
+/// chunk-distance test, refreshed from simulation outputs — never authored here.
 #[derive(Debug)]
 pub struct SessionRouter {
     shards: BTreeMap<ShardPos, mpsc::Sender<GameInput>>,
     players: BTreeMap<PlayerId, SessionEntry>,
     shard_input_capacity: usize,
     outbound_capacity: usize,
+    view_distance: i32,
+    next_entity_id: i32,
 }
 
 impl SessionRouter {
     /// Creates an empty router with the default channel capacities
-    /// ([`DEFAULT_SHARD_INPUT_CAPACITY`] and [`DEFAULT_OUTBOUND_CAPACITY`]).
+    /// ([`DEFAULT_SHARD_INPUT_CAPACITY`] and [`DEFAULT_OUTBOUND_CAPACITY`]) and
+    /// the default [`DEFAULT_VIEW_DISTANCE`].
     pub fn new() -> Self {
         Self::with_capacities(DEFAULT_SHARD_INPUT_CAPACITY, DEFAULT_OUTBOUND_CAPACITY)
     }
 
-    /// Creates an empty router with explicit channel capacities.
+    /// Creates an empty router with explicit channel capacities and the default
+    /// [`DEFAULT_VIEW_DISTANCE`].
     ///
     /// Each capacity is clamped to at least `1`, since a bounded
     /// [`mpsc`] channel cannot have zero capacity.
@@ -138,6 +184,8 @@ impl SessionRouter {
             players: BTreeMap::new(),
             shard_input_capacity: shard_input_capacity.max(1),
             outbound_capacity: outbound_capacity.max(1),
+            view_distance: DEFAULT_VIEW_DISTANCE,
+            next_entity_id: FIRST_ENTITY_ID,
         }
     }
 
@@ -149,6 +197,20 @@ impl SessionRouter {
     /// The configured per-player outbound channel capacity.
     pub fn outbound_capacity(&self) -> usize {
         self.outbound_capacity
+    }
+
+    /// The view distance, in chunks, used to scope visibility broadcasts.
+    pub fn view_distance(&self) -> i32 {
+        self.view_distance
+    }
+
+    /// Sets the view distance, in chunks, used to scope visibility broadcasts.
+    ///
+    /// Clamped to `0` at minimum (a negative distance would hide every player,
+    /// including those sharing a chunk). The app sets this from its configured
+    /// play view distance at startup.
+    pub fn set_view_distance(&mut self, chunks: i32) {
+        self.view_distance = chunks.max(0);
     }
 
     /// The number of shards currently registered.
@@ -189,11 +251,29 @@ impl SessionRouter {
         rx
     }
 
-    /// Joins `player` at `position`, routing them to the owning shard.
+    /// The network entity id a `player` is broadcast to other clients as, or
+    /// `None` if they have no session.
+    pub fn player_entity_id(&self, player: PlayerId) -> Option<i32> {
+        self.players.get(&player).map(|entry| entry.entity_id)
+    }
+
+    /// The last-known position the router holds for `player`, or `None` if they
+    /// have no session.
+    ///
+    /// This is routing metadata (seeded at join, refreshed from movement
+    /// outputs), not the simulation's authoritative position.
+    pub fn player_position(&self, player: PlayerId) -> Option<Vec3> {
+        self.players.get(&player).map(|entry| entry.position)
+    }
+
+    /// Joins `player` at `position`, routing them to the owning shard and making
+    /// them mutually visible to nearby players.
     ///
     /// Determines the shard from `position`, sends a [`GameInput::PlayerJoin`] to
-    /// it, records the mapping, and returns a [`PlayerSessionHandle`] carrying the
-    /// player's outbound channel.
+    /// it, records the mapping (allocating the player's network entity id and
+    /// seeding their position), exchanges player-list + spawn packets with every
+    /// existing player within view distance, and returns a
+    /// [`PlayerSessionHandle`] carrying the player's outbound channel.
     ///
     /// # Errors
     ///
@@ -203,6 +283,9 @@ impl SessionRouter {
     ///   join could not be delivered to the shard.
     ///
     /// On any error nothing is registered, so the join can be retried cleanly.
+    /// The visibility broadcast is best-effort: a viewer whose outbound channel
+    /// is full or closed simply misses the update (a closed viewer is cleaned up
+    /// when its own connection ends), so it never fails the join.
     pub fn join_player(
         &mut self,
         player: PlayerId,
@@ -221,18 +304,74 @@ impl SessionRouter {
         self.send_to_shard(shard, GameInput::PlayerJoin { player, position })?;
 
         let (tx, rx) = mpsc::channel(self.outbound_capacity);
+        let entity_id = self.allocate_entity_id();
         self.players.insert(
             player,
             SessionEntry {
                 shard,
                 outbound: tx,
+                entity_id,
+                position,
             },
         );
+        self.broadcast_join_visibility(player, position);
         Ok(PlayerSessionHandle {
             player,
             shard,
             outbound: rx,
         })
+    }
+
+    /// Allocates the next network entity id, advancing the counter.
+    fn allocate_entity_id(&mut self) -> i32 {
+        let id = self.next_entity_id;
+        // Wrap rather than overflow-panic; a process churning through 2^31 joins
+        // is not a real concern, but a panic in the router would be.
+        self.next_entity_id = self.next_entity_id.wrapping_add(1);
+        id
+    }
+
+    /// Exchanges player-list-add + spawn packets between the joiner and every
+    /// existing player within view distance.
+    ///
+    /// Each in-range existing player is told about the joiner, and the joiner is
+    /// told about each in-range existing player, so visibility is symmetric after
+    /// a single join. All sends are best-effort (see [`join_player`](Self::join_player)).
+    fn broadcast_join_visibility(&self, joiner: PlayerId, joiner_position: Vec3) {
+        let Some(joiner_entry) = self.players.get(&joiner) else {
+            return;
+        };
+        let joiner_chunk = chunk_for_position(joiner_position);
+        for (&other, other_entry) in &self.players {
+            if other == joiner {
+                continue;
+            }
+            if !within_view(
+                joiner_chunk,
+                chunk_for_position(other_entry.position),
+                self.view_distance,
+            ) {
+                continue;
+            }
+            // Show the joiner to the existing player.
+            let _ = other_entry
+                .outbound
+                .try_send(player_info(PLAYER_INFO_ADD, joiner));
+            let _ = other_entry.outbound.try_send(entity_spawn_shell(
+                joiner_entry.entity_id,
+                joiner,
+                joiner_position,
+            ));
+            // Show the existing player to the joiner.
+            let _ = joiner_entry
+                .outbound
+                .try_send(player_info(PLAYER_INFO_ADD, other));
+            let _ = joiner_entry.outbound.try_send(entity_spawn_shell(
+                other_entry.entity_id,
+                other,
+                other_entry.position,
+            ));
+        }
     }
 
     /// Translates and routes a [`NetEvent`] to the player's shard.
@@ -258,38 +397,139 @@ impl SessionRouter {
         }
     }
 
-    /// Translates and routes a simulation [`GameOutput`] to the player's
-    /// connection.
+    /// Routes a simulation [`GameOutput`] to its network recipient(s), returning
+    /// the players whose connection has closed and should be disconnected.
     ///
-    /// Outputs with no clientbound shell this milestone (a despawn, or a future
-    /// variant) are a no-op `Ok(())`.
+    /// The mapping per output:
+    /// - [`GameOutput::PlayerSpawned`] refreshes the player's cached position;
+    ///   the spawn itself was already broadcast to viewers at
+    ///   [`join_player`](Self::join_player) time, so nothing else is sent.
+    /// - [`GameOutput::PlayerMoved`] refreshes the cached position and broadcasts
+    ///   the new position to every *other* player within view distance (the mover
+    ///   is authoritative for its own position and is not echoed).
+    /// - [`GameOutput::PlayerPositionCorrected`] snaps the player itself back to
+    ///   the authoritative position; it is not a broadcast.
+    /// - [`GameOutput::BlockChanged`] broadcasts a `BlockUpdate` to every
+    ///   player whose chunk is within view distance of the changed block's
+    ///   chunk. There is no actor to exclude: the change is authoritative for
+    ///   everyone who can see it, including the player who caused it.
+    /// - [`GameOutput::PlayerDespawned`] (and any future variant) sends nothing:
+    ///   leave notifications are issued by
+    ///   [`disconnect_player`](Self::disconnect_player), where the departing
+    ///   player's identity is still known.
     ///
-    /// # Errors
+    /// # Backpressure
     ///
-    /// - [`SessionError::UnknownPlayer`] if the output targets a player with no
-    ///   session.
-    /// - [`SessionError::OutboundFull`] / [`SessionError::OutboundClosed`] if the
-    ///   packet could not be delivered to the connection.
-    pub fn route_output(&self, output: &GameOutput) -> Result<(), SessionError> {
+    /// Position broadcasts and corrections are lossy under backpressure: a
+    /// recipient whose outbound channel is *full* misses this update, which the
+    /// next move/correction supersedes (so the router never blocks the tick
+    /// loop). A recipient whose channel is *closed* is returned for the caller to
+    /// disconnect.
+    pub fn route_output(&mut self, output: &GameOutput) -> Vec<PlayerId> {
+        let mut closed = Vec::new();
         match output {
             GameOutput::PlayerSpawned { player, position } => {
-                self.send_outbound(*player, spawn_shell(*player, *position))
+                self.update_position(*player, *position);
             }
             GameOutput::PlayerMoved { player, position } => {
-                self.send_outbound(*player, move_shell(*position))
+                self.update_position(*player, *position);
+                self.broadcast_move(*player, *position, &mut closed);
             }
-            // No clientbound shell for a despawn (or future variant) yet.
-            _ => Ok(()),
+            GameOutput::PlayerPositionCorrected { player, position } => {
+                if let Some(entry) = self.players.get(player) {
+                    match entry.outbound.try_send(move_shell(*position)) {
+                        Ok(()) | Err(TrySendError::Full(_)) => {}
+                        Err(TrySendError::Closed(_)) => closed.push(*player),
+                    }
+                }
+            }
+            GameOutput::BlockChanged { position, state } => {
+                self.broadcast_block_update(*position, *state, &mut closed);
+            }
+            // A despawn carries no wire packet here; leave handling lives in
+            // disconnect_player.
+            _ => {}
+        }
+        closed
+    }
+
+    /// Refreshes the cached position the router routes visibility against.
+    fn update_position(&mut self, player: PlayerId, position: Vec3) {
+        if let Some(entry) = self.players.get_mut(&player) {
+            entry.position = position;
         }
     }
 
-    /// Disconnects `player`: drops the player<->shard mapping and notifies the
-    /// shard to despawn them. Returns the shard the player was on.
+    /// Broadcasts `mover`'s new `position` to every other player within view
+    /// distance, recording any closed recipients in `closed`.
+    fn broadcast_move(&self, mover: PlayerId, position: Vec3, closed: &mut Vec<PlayerId>) {
+        let Some(mover_entry) = self.players.get(&mover) else {
+            return;
+        };
+        let mover_chunk = chunk_for_position(position);
+        let packet_for = |viewer: &SessionEntry| {
+            within_view(
+                mover_chunk,
+                chunk_for_position(viewer.position),
+                self.view_distance,
+            )
+        };
+        for (&other, entry) in &self.players {
+            if other == mover || !packet_for(entry) {
+                continue;
+            }
+            match entry.outbound.try_send(entity_spawn_shell(
+                mover_entry.entity_id,
+                mover,
+                position,
+            )) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Closed(_)) => closed.push(other),
+            }
+        }
+    }
+
+    /// Broadcasts a block change at `position` to every player whose chunk is
+    /// within view distance of the block's chunk, recording closed recipients.
     ///
-    /// The mapping is removed first — cleanup is the priority — and only then is
-    /// the despawn [`GameInput::PlayerLeave`] sent on a best-effort basis. A send
-    /// failure is surfaced so the caller knows the despawn notice was lost, but
-    /// the mapping stays removed regardless.
+    /// Unlike a movement broadcast there is no actor to exclude: the change is
+    /// authoritative for everyone who can see the block, including the player who
+    /// caused it. Sends are non-blocking; a recipient whose channel is *full*
+    /// simply misses this update (the simulation still holds the correct world
+    /// state) while a *closed* recipient is recorded in `closed` for the caller
+    /// to disconnect.
+    fn broadcast_block_update(
+        &self,
+        position: BlockPos,
+        state: BlockStateId,
+        closed: &mut Vec<PlayerId>,
+    ) {
+        let block_chunk = position.to_chunk_pos();
+        for (&player, entry) in &self.players {
+            if !within_view(
+                block_chunk,
+                chunk_for_position(entry.position),
+                self.view_distance,
+            ) {
+                continue;
+            }
+            match entry.outbound.try_send(block_update_shell(position, state)) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Closed(_)) => closed.push(player),
+            }
+        }
+    }
+
+    /// Disconnects `player`: removes them from the player list of every remaining
+    /// player, drops the player<->shard mapping, and notifies the shard to
+    /// despawn them. Returns the shard the player was on.
+    ///
+    /// The mapping is removed first — cleanup is the priority. The player-list
+    /// remove is then broadcast to every other player (best-effort; the tab list
+    /// is not range-scoped) while the departing identity is still known, and only
+    /// then is the despawn [`GameInput::PlayerLeave`] sent. A shard send failure
+    /// is surfaced so the caller knows the despawn notice was lost, but the
+    /// mapping stays removed regardless.
     ///
     /// # Errors
     ///
@@ -301,8 +541,23 @@ impl SessionRouter {
             .players
             .remove(&player)
             .ok_or(SessionError::UnknownPlayer { player })?;
+        self.broadcast_leave_visibility(player);
         self.send_to_shard(entry.shard, GameInput::PlayerLeave { player })?;
         Ok(entry.shard)
+    }
+
+    /// Tells every remaining player to drop `departed` from their player list.
+    ///
+    /// Best-effort, like the join broadcast: a viewer that cannot receive it
+    /// simply keeps a stale list entry until it too leaves. The proto has no
+    /// entity-remove packet yet, so only the player-list removal is sent; the
+    /// remote entity lingers on viewers' clients until that packet exists.
+    fn broadcast_leave_visibility(&self, departed: PlayerId) {
+        for entry in self.players.values() {
+            let _ = entry
+                .outbound
+                .try_send(player_info(PLAYER_INFO_REMOVE, departed));
+        }
     }
 
     /// Routes an already-translated input to the player's bound shard.
@@ -325,22 +580,14 @@ impl SessionRouter {
             TrySendError::Closed(_) => SessionError::ShardClosed { shard },
         })
     }
+}
 
-    /// Non-blocking send of `packet` to `player`'s outbound channel.
-    fn send_outbound(
-        &self,
-        player: PlayerId,
-        packet: ClientboundPlayPacket,
-    ) -> Result<(), SessionError> {
-        let entry = self
-            .players
-            .get(&player)
-            .ok_or(SessionError::UnknownPlayer { player })?;
-        entry.outbound.try_send(packet).map_err(|err| match err {
-            TrySendError::Full(_) => SessionError::OutboundFull { player },
-            TrySendError::Closed(_) => SessionError::OutboundClosed { player },
-        })
-    }
+/// Returns `true` if chunks `a` and `b` are within `view_distance` chunks on
+/// both axes (a square/Chebyshev view, as Minecraft scopes view distance).
+fn within_view(a: ChunkPos, b: ChunkPos, view_distance: i32) -> bool {
+    let dx = (a.x() - b.x()).abs();
+    let dz = (a.z() - b.z()).abs();
+    dx.max(dz) <= view_distance
 }
 
 impl Default for SessionRouter {
@@ -492,37 +739,49 @@ mod tests {
     }
 
     #[test]
-    fn output_becomes_the_right_outbound_packet() {
+    fn own_spawn_and_move_are_not_echoed_to_self() {
         let mut router = SessionRouter::new();
         let _inbox = router.register_shard(ShardPos::new(0, 0));
         let p = player("frank");
         let mut handle = router.join_player(p, spawn_pos()).expect("join");
 
-        router
+        // A lone player is never shown their own entity, and an accepted move is
+        // authoritative client-side: neither is echoed back.
+        assert!(router
             .route_output(&GameOutput::PlayerSpawned {
                 player: p,
-                position: Vec3::new(1.0, 2.0, 3.0),
+                position: spawn_pos(),
             })
-            .expect("route spawn");
-        let ClientboundPlayPacket::SpawnEntity(spawn) = handle.try_recv().expect("a spawn packet")
-        else {
-            panic!("expected a SpawnEntity packet");
-        };
-        assert_eq!(spawn.entity_uuid(), p.as_uuid());
-        assert_eq!((spawn.x(), spawn.y(), spawn.z()), (1.0, 2.0, 3.0));
-
-        router
+            .is_empty());
+        assert!(router
             .route_output(&GameOutput::PlayerMoved {
                 player: p,
                 position: Vec3::new(4.0, 5.0, 6.0),
             })
-            .expect("route move");
+            .is_empty());
+        assert!(handle.try_recv().is_none());
+        // The move still refreshed the cached position used for routing.
+        assert_eq!(router.player_position(p), Some(Vec3::new(4.0, 5.0, 6.0)));
+    }
+
+    #[test]
+    fn correction_output_sends_a_synchronize_position_packet() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let p = player("nora");
+        let mut handle = router.join_player(p, spawn_pos()).expect("join");
+
+        let closed = router.route_output(&GameOutput::PlayerPositionCorrected {
+            player: p,
+            position: Vec3::new(8.0, 64.0, 8.0),
+        });
+        assert!(closed.is_empty());
         let ClientboundPlayPacket::SynchronizePlayerPosition(sync) =
             handle.try_recv().expect("a sync packet")
         else {
             panic!("expected a SynchronizePlayerPosition packet");
         };
-        assert_eq!((sync.x(), sync.y(), sync.z()), (4.0, 5.0, 6.0));
+        assert_eq!((sync.x(), sync.y(), sync.z()), (8.0, 64.0, 8.0));
     }
 
     #[test]
@@ -532,27 +791,19 @@ mod tests {
         let p = player("grace");
         let mut handle = router.join_player(p, spawn_pos()).expect("join");
 
-        router
-            .route_output(&GameOutput::PlayerDespawned { player: p })
-            .expect("route despawn");
+        let closed = router.route_output(&GameOutput::PlayerDespawned { player: p });
+        assert!(closed.is_empty());
         assert!(handle.try_recv().is_none());
     }
 
     #[test]
-    fn output_for_unknown_player_is_rejected() {
-        let router = SessionRouter::new();
-        let err = router
-            .route_output(&GameOutput::PlayerMoved {
-                player: player("nobody"),
-                position: Vec3::ZERO,
-            })
-            .expect_err("no session");
-        assert_eq!(
-            err,
-            SessionError::UnknownPlayer {
-                player: player("nobody")
-            }
-        );
+    fn output_for_unknown_player_is_a_no_op() {
+        let mut router = SessionRouter::new();
+        let closed = router.route_output(&GameOutput::PlayerMoved {
+            player: player("nobody"),
+            position: Vec3::ZERO,
+        });
+        assert!(closed.is_empty());
     }
 
     #[test]
@@ -637,44 +888,46 @@ mod tests {
     }
 
     #[test]
-    fn outbound_full_is_classified_reject_backpressure() {
+    fn broadcast_move_is_lossy_when_a_viewer_is_full() {
+        // A capacity-1 outbound channel: the viewer's join visibility already
+        // fills it, so a later move broadcast is dropped (lossy backpressure)
+        // without reporting the viewer as closed.
         let mut router = SessionRouter::with_capacities(16, 1);
         let _inbox = router.register_shard(ShardPos::new(0, 0));
-        let p = player("kate");
-        let _handle = router.join_player(p, spawn_pos()).expect("join");
+        let viewer = player("kate");
+        let mover = player("kurt");
+        let _viewer_handle = router
+            .join_player(viewer, spawn_pos())
+            .expect("viewer join");
+        let _mover_handle = router.join_player(mover, spawn_pos()).expect("mover join");
 
-        // First output fills the capacity-1 outbound channel.
-        router
-            .route_output(&GameOutput::PlayerMoved {
-                player: p,
-                position: Vec3::ZERO,
-            })
-            .expect("first output fits");
-        // Second overflows it.
-        let err = router
-            .route_output(&GameOutput::PlayerMoved {
-                player: p,
-                position: Vec3::new(1.0, 1.0, 1.0),
-            })
-            .expect_err("outbound full");
-        assert_eq!(err, SessionError::OutboundFull { player: p });
+        let closed = router.route_output(&GameOutput::PlayerMoved {
+            player: mover,
+            position: Vec3::new(9.0, 64.0, 9.0),
+        });
+        // The viewer is full, not closed: nothing to disconnect.
+        assert!(closed.is_empty());
     }
 
     #[test]
-    fn dropped_handle_closes_the_outbound_channel() {
+    fn closed_viewer_is_reported_for_disconnect() {
+        // Two players in range. If a viewer drops its handle, a broadcast move
+        // reports it as closed so the caller can disconnect it.
         let mut router = SessionRouter::new();
         let _inbox = router.register_shard(ShardPos::new(0, 0));
-        let p = player("leo");
-        let handle = router.join_player(p, spawn_pos()).expect("join");
-        drop(handle);
+        let viewer = player("leo");
+        let mover = player("mona");
+        let viewer_handle = router
+            .join_player(viewer, spawn_pos())
+            .expect("viewer join");
+        let _mover_handle = router.join_player(mover, spawn_pos()).expect("mover join");
+        drop(viewer_handle);
 
-        let err = router
-            .route_output(&GameOutput::PlayerMoved {
-                player: p,
-                position: Vec3::ZERO,
-            })
-            .expect_err("channel closed");
-        assert_eq!(err, SessionError::OutboundClosed { player: p });
+        let closed = router.route_output(&GameOutput::PlayerMoved {
+            player: mover,
+            position: Vec3::new(9.0, 64.0, 9.0),
+        });
+        assert_eq!(closed, vec![viewer]);
     }
 
     #[test]
@@ -694,23 +947,243 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_recv_awaits_a_routed_output() {
+    async fn handle_recv_awaits_a_routed_correction() {
         let mut router = SessionRouter::new();
         let _inbox = router.register_shard(ShardPos::new(0, 0));
         let p = player("mallory");
         let mut handle = router.join_player(p, spawn_pos()).expect("join");
 
-        router
-            .route_output(&GameOutput::PlayerMoved {
-                player: p,
-                position: Vec3::new(7.0, 8.0, 9.0),
-            })
-            .expect("route move");
+        let closed = router.route_output(&GameOutput::PlayerPositionCorrected {
+            player: p,
+            position: Vec3::new(7.0, 8.0, 9.0),
+        });
+        assert!(closed.is_empty());
 
         let packet = handle.recv().await.expect("a packet");
         let ClientboundPlayPacket::SynchronizePlayerPosition(sync) = packet else {
             panic!("expected a SynchronizePlayerPosition packet");
         };
         assert_eq!((sync.x(), sync.y(), sync.z()), (7.0, 8.0, 9.0));
+    }
+
+    #[test]
+    fn two_players_see_each_other_on_join() {
+        let mut router = SessionRouter::new();
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let a = player("aaa");
+        let b = player("bbb");
+
+        let mut a_handle = router.join_player(a, spawn_pos()).expect("a join");
+        // `a` is alone: no visibility packets yet.
+        assert!(a_handle.try_recv().is_none());
+
+        let mut b_handle = router.join_player(b, spawn_pos()).expect("b join");
+
+        let a_eid = router.player_entity_id(a).expect("a entity id");
+        let b_eid = router.player_entity_id(b).expect("b entity id");
+        // Distinct ids per player, both clear of the local-player id (1).
+        assert_ne!(a_eid, b_eid);
+        assert!(a_eid >= FIRST_ENTITY_ID && b_eid >= FIRST_ENTITY_ID);
+
+        // `a` learns about `b`; `b` learns about `a` (list add + entity spawn).
+        assert_player_info_add(&mut a_handle, b);
+        assert_entity_spawn(&mut a_handle, b, b_eid, spawn_pos());
+        assert_player_info_add(&mut b_handle, a);
+        assert_entity_spawn(&mut b_handle, a, a_eid, spawn_pos());
+
+        // Both joins reached the shard.
+        assert!(
+            matches!(inbox.try_recv(), Ok(GameInput::PlayerJoin { player, .. }) if player == a)
+        );
+        assert!(
+            matches!(inbox.try_recv(), Ok(GameInput::PlayerJoin { player, .. }) if player == b)
+        );
+    }
+
+    #[test]
+    fn move_broadcasts_to_in_range_viewer() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let viewer = player("viewer");
+        let mover = player("mover");
+        let mut viewer_handle = router
+            .join_player(viewer, spawn_pos())
+            .expect("viewer join");
+        let _mover_handle = router.join_player(mover, spawn_pos()).expect("mover join");
+        let mover_eid = router.player_entity_id(mover).expect("mover entity id");
+        // Drain the join-visibility packets the viewer already received.
+        assert_player_info_add(&mut viewer_handle, mover);
+        assert_entity_spawn(&mut viewer_handle, mover, mover_eid, spawn_pos());
+
+        let new_pos = Vec3::new(20.0, 64.0, 20.0);
+        let closed = router.route_output(&GameOutput::PlayerMoved {
+            player: mover,
+            position: new_pos,
+        });
+        assert!(closed.is_empty());
+        // The viewer sees the mover's new position (conveyed as an entity spawn).
+        assert_entity_spawn(&mut viewer_handle, mover, mover_eid, new_pos);
+    }
+
+    #[test]
+    fn far_viewer_is_excluded_by_view_distance() {
+        let mut router = SessionRouter::new();
+        router.set_view_distance(1);
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let near = player("near");
+        let far = player("far");
+        let mut near_handle = router.join_player(near, spawn_pos()).expect("near join");
+        // Block 80 -> chunk 5, still inside shard (0, 0) (blocks 0..128) but five
+        // chunks from the spawn chunk: out of a view distance of one.
+        let far_pos = Vec3::new(80.0, 64.0, 80.0);
+        let mut far_handle = router.join_player(far, far_pos).expect("far join");
+
+        // Out of range on join: neither learns about the other.
+        assert!(near_handle.try_recv().is_none());
+        assert!(far_handle.try_recv().is_none());
+
+        // A far move stays out of range and is not broadcast to the near player.
+        let closed = router.route_output(&GameOutput::PlayerMoved {
+            player: far,
+            position: Vec3::new(81.0, 64.0, 81.0),
+        });
+        assert!(closed.is_empty());
+        assert!(near_handle.try_recv().is_none());
+    }
+
+    #[test]
+    fn block_change_broadcasts_block_update_to_in_range_viewer() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let viewer = player("viewer");
+        let mut viewer_handle = router
+            .join_player(viewer, spawn_pos())
+            .expect("viewer join");
+
+        // A change in the viewer's chunk reaches them as a BlockUpdate (the lone
+        // player got no join-visibility packets, so this is the first one).
+        let closed = router.route_output(&GameOutput::BlockChanged {
+            position: BlockPos::new(8, 63, 8),
+            state: BlockStateId::AIR,
+        });
+        assert!(closed.is_empty());
+        let ClientboundPlayPacket::BlockUpdate(update) =
+            viewer_handle.try_recv().expect("a block update")
+        else {
+            panic!("expected a BlockUpdate");
+        };
+        let loc = update.location();
+        assert_eq!((loc.x(), loc.y(), loc.z()), (8, 63, 8));
+        assert_eq!(update.block_state(), 0);
+    }
+
+    #[test]
+    fn block_change_excludes_a_far_viewer() {
+        let mut router = SessionRouter::new();
+        router.set_view_distance(1);
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let viewer = player("viewer");
+        let mut viewer_handle = router
+            .join_player(viewer, spawn_pos())
+            .expect("viewer join");
+
+        // Block (88, 63, 8) is in chunk x = 5, five chunks from the spawn chunk:
+        // out of a view distance of one, so nothing is broadcast.
+        let closed = router.route_output(&GameOutput::BlockChanged {
+            position: BlockPos::new(88, 63, 8),
+            state: BlockStateId::AIR,
+        });
+        assert!(closed.is_empty());
+        assert!(viewer_handle.try_recv().is_none());
+    }
+
+    #[test]
+    fn block_change_reports_a_closed_viewer() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let viewer = player("viewer");
+        let handle = router
+            .join_player(viewer, spawn_pos())
+            .expect("viewer join");
+        // Dropping the handle closes the outbound channel.
+        drop(handle);
+
+        let closed = router.route_output(&GameOutput::BlockChanged {
+            position: BlockPos::new(8, 63, 8),
+            state: BlockStateId::AIR,
+        });
+        assert_eq!(closed, vec![viewer]);
+    }
+
+    #[test]
+    fn disconnect_broadcasts_player_list_remove() {
+        let mut router = SessionRouter::new();
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let stay = player("stay");
+        let leave = player("leave");
+        let mut stay_handle = router.join_player(stay, spawn_pos()).expect("stay join");
+        let _leave_handle = router.join_player(leave, spawn_pos()).expect("leave join");
+        let leave_eid = router.player_entity_id(leave).expect("leave entity id");
+        // Drain the staying player's join visibility and the two shard joins.
+        assert_player_info_add(&mut stay_handle, leave);
+        assert_entity_spawn(&mut stay_handle, leave, leave_eid, spawn_pos());
+        let _ = inbox.try_recv();
+        let _ = inbox.try_recv();
+
+        router.disconnect_player(leave).expect("disconnect");
+
+        // The staying player is told to drop the leaver from their list.
+        let ClientboundPlayPacket::PlayerInfoUpdate(info) =
+            stay_handle.try_recv().expect("a remove packet")
+        else {
+            panic!("expected a PlayerInfoUpdate");
+        };
+        assert_eq!(info.action(), PLAYER_INFO_REMOVE);
+        assert_eq!(&info.entries()[1..], leave.as_uuid().as_bytes());
+        // The shard was told to despawn the leaver.
+        assert_eq!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerLeave { player: leave })
+        );
+    }
+
+    #[test]
+    fn view_distance_default_and_setter() {
+        let mut router = SessionRouter::new();
+        assert_eq!(router.view_distance(), DEFAULT_VIEW_DISTANCE);
+        router.set_view_distance(4);
+        assert_eq!(router.view_distance(), 4);
+        // A negative distance clamps to zero (chunk-mates still see each other).
+        router.set_view_distance(-3);
+        assert_eq!(router.view_distance(), 0);
+    }
+
+    /// Asserts the next packet on `handle` is a player-list add for `expected`.
+    fn assert_player_info_add(handle: &mut PlayerSessionHandle, expected: PlayerId) {
+        let ClientboundPlayPacket::PlayerInfoUpdate(info) =
+            handle.try_recv().expect("a player-info packet")
+        else {
+            panic!("expected a PlayerInfoUpdate");
+        };
+        assert_eq!(info.action(), PLAYER_INFO_ADD);
+        assert_eq!(info.entries()[0], 1);
+        assert_eq!(&info.entries()[1..], expected.as_uuid().as_bytes());
+    }
+
+    /// Asserts the next packet on `handle` is a spawn of `expected` with the
+    /// given entity id at `pos`.
+    fn assert_entity_spawn(
+        handle: &mut PlayerSessionHandle,
+        expected: PlayerId,
+        eid: i32,
+        pos: Vec3,
+    ) {
+        let ClientboundPlayPacket::SpawnEntity(spawn) = handle.try_recv().expect("a spawn packet")
+        else {
+            panic!("expected a SpawnEntity packet");
+        };
+        assert_eq!(spawn.entity_uuid(), expected.as_uuid());
+        assert_eq!(spawn.entity_id(), eid);
+        assert_eq!((spawn.x(), spawn.y(), spawn.z()), (pos.x, pos.y, pos.z));
     }
 }
