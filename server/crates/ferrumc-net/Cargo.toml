@@ -6,9 +6,22 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Typed packet enums + per-(state, direction) dispatch this crate wires framing
+# into.
+ferrumc-proto = { workspace = true }
+# Frame-length reader, bounded reader, and VarInt codecs the framing builds on.
+ferrumc-codec = { workspace = true }
+# `BytesMut`/`Buf` back the inbound accumulation buffer and the outbound encode
+# buffer without intermediate allocations.
+bytes = { workspace = true }
+# Structured, classifying error variants for hostile-input failures.
+thiserror = { workspace = true }
 
 [dev-dependencies]
+# Build wire buffers and decode readers in the round-trip / malformed tests.
+bytes = { workspace = true }
+ferrumc-codec = { workspace = true }
+ferrumc-proto = { workspace = true }
 
 [lints]
 workspace = true
