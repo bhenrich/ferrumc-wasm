@@ -6,7 +6,22 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Shared types: `Tick` drives the coordinator, `PlayerId` keys per-player state,
+# and `ServerError` is the classifying root that `SimError` converts into.
+ferrumc-core = { workspace = true }
+# Typed coordinates/geometry: `ShardPos` identifies the shard and `Vec3` carries
+# player positions in sim messages (never raw tuples, per the coordinate rule).
+ferrumc-math = { workspace = true }
+# Mandated crate-map dependency: the simulation layer owns the world model
+# (chunks/entities). This milestone delivers only the tick/shard *skeleton* and
+# does not touch chunk data yet, so the crate is bound anonymously in lib.rs to
+# keep the link intentional rather than dead weight — mirroring how ferrumc-math
+# binds ferrumc-core. Storage is deliberately left out entirely: this milestone
+# holds NO database handles.
+ferrumc-world = { workspace = true }
+# `SimError` is a thiserror enum so each failure mode is a classified variant
+# with a derived `Display`, per the library error-handling rule.
+thiserror = { workspace = true }
 
 [dev-dependencies]
 
