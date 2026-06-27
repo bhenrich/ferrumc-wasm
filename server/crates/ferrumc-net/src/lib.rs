@@ -63,11 +63,12 @@ pub use login::{LoginFlowError, LoginServer, LoginServerConfig, DEFAULT_KEEP_ALI
 pub use offline::offline_uuid;
 pub use outbound::{OutboundEncoder, OutboundPacket};
 pub use play::{
-    is_movement, BatchLimits, BudgetStatus, DisconnectPolicy, DisconnectReason, EnqueueOutcome,
-    InboundPlayPacket, MovementCoalescer, OfferOutcome, OutboundPriority, PacketBudget, PlayBatch,
-    PlayMetrics, PlayReader, PlayWriter, DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_FRAMES,
-    DEFAULT_COSMETIC_CAPACITY, DEFAULT_CRITICAL_CAPACITY, DEFAULT_PLAY_FRAME_BURST,
-    DEFAULT_PLAY_FRAME_RATE, DEFAULT_STATE_CAPACITY, DEFAULT_WORLD_CAPACITY, PRIORITY_COUNT,
+    is_movement, BatchLimits, BudgetStatus, Criticality, DisconnectPolicy, DisconnectReason,
+    EnqueueOutcome, InboundPlayPacket, MovementCoalescer, OfferOutcome, OutboundPriority,
+    PacketBudget, PlayBatch, PlayMetrics, PlayReader, PlayWriter, DEFAULT_BATCH_MAX_BYTES,
+    DEFAULT_BATCH_MAX_FRAMES, DEFAULT_COSMETIC_CAPACITY, DEFAULT_CRITICAL_CAPACITY,
+    DEFAULT_PLAY_FRAME_BURST, DEFAULT_PLAY_FRAME_RATE, DEFAULT_STATE_CAPACITY,
+    DEFAULT_WORLD_CAPACITY, PRIORITY_COUNT,
 };
 pub use server::{
     StatusInfo, StatusServer, StatusServerConfig, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_CONNECTIONS,

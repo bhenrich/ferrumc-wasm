@@ -56,9 +56,10 @@ pub enum OutboundPriority {
     /// a full Critical queue is a fatal condition, not a droppable one.
     Critical,
     /// Connection/world state the client needs to stay consistent: join game,
-    /// position synchronization, player-info updates.
+    /// position synchronization, player-info updates, and the entity
+    /// spawn/despawn pair (so neither is tail-dropped behind bulk world traffic).
     State,
-    /// Bulk world content: chunk data, block updates, entity spawns.
+    /// Bulk world content: chunk data, block updates, and entity movement.
     World,
     /// Purely visual, safely droppable traffic: particles and sounds.
     Cosmetic,
@@ -87,6 +88,11 @@ impl OutboundPriority {
     /// keep-alive or a disconnect frame breaks the connection contract, whereas
     /// state, world, and cosmetic frames can be shed (the client recovers via a
     /// later full update or simply misses a visual effect).
+    ///
+    /// This governs the connection writer's drain ("Layer B") only. The
+    /// authoritative must-deliver-or-disconnect signal for the per-player outbound
+    /// *channel* ("Layer A", the router's [`mpsc`](tokio::sync::mpsc) sender) is
+    /// [`Criticality`], which the router applies per send site.
     pub fn is_drop_fatal(self) -> bool {
         matches!(self, Self::Critical)
     }
@@ -112,6 +118,13 @@ impl OutboundPriority {
             // Player Info Remove is the tab-list counterpart of the add above:
             // the client must reliably see a player leave, so it rides State too.
             | ClientboundPlayPacket::RemovePlayerInfo(_)
+            // SpawnEntity / RemoveEntities are the world-side counterparts of the
+            // Player Info add / remove: a dropped spawn leaves a tab-list entry with
+            // no visible body (later moves for an unknown entity id are ignored
+            // client-side) and a dropped despawn leaves a ghost. Both must not be
+            // tail-dropped behind bulk chunk traffic, so they ride State, not World.
+            | ClientboundPlayPacket::SpawnEntity(_)
+            | ClientboundPlayPacket::RemoveEntities(_)
             | ClientboundPlayPacket::GameEvent(_)
             | ClientboundPlayPacket::SetCenterChunk(_)
             // The block-change ack confirms the client's optimistic prediction for
@@ -130,19 +143,102 @@ impl OutboundPriority {
             | ClientboundPlayPacket::Commands(_)
             | ClientboundPlayPacket::TabCompleteResponse(_)
             | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::State,
-            ClientboundPlayPacket::SpawnEntity(_)
-            | ClientboundPlayPacket::BlockUpdate(_)
+            ClientboundPlayPacket::BlockUpdate(_)
             | ClientboundPlayPacket::ChunkDataAndLight(_)
             | ClientboundPlayPacket::UnloadChunk(_)
-            // Entity movement / despawn is bulk position traffic, droppable under
-            // load like SpawnEntity (a later move or the next teleport supersedes
-            // a dropped one); RemoveEntities rides here next to its spawn.
+            // Entity movement is bulk position traffic, droppable under load (a
+            // later move or the next teleport supersedes a dropped one). The spawn
+            // (SpawnEntity) and despawn (RemoveEntities) are deliberately NOT here —
+            // both ride State above so neither is tail-dropped behind bulk chunk
+            // traffic, which would leave an invisible body or a ghost entity.
+            | ClientboundPlayPacket::EntityTeleport(_)
+            | ClientboundPlayPacket::UpdateEntityPosition(_)
+            | ClientboundPlayPacket::UpdateEntityPositionAndRotation(_)
+            | ClientboundPlayPacket::UpdateEntityRotation(_)
+            | ClientboundPlayPacket::SetHeadRotation(_) => Self::World,
+        }
+    }
+}
+
+/// Whether a clientbound play packet **must** reach the client or may be shed
+/// under backpressure.
+///
+/// This is the authoritative droppability signal for the per-player outbound
+/// *channel* ("Layer A": the router's [`mpsc`](tokio::sync::mpsc) sender),
+/// distinct from [`OutboundPriority`], which only orders the connection writer's
+/// drain ("Layer B"). A [`Mandatory`](Self::Mandatory) packet is delivered or the
+/// slow client is disconnected — never silently dropped — because losing it
+/// corrupts the client's later state (a missing ack strands a prediction, a
+/// missing spawn leaves an invisible body, a missing despawn ghosts an entity). A
+/// [`Droppable`](Self::Droppable) packet may
+/// be coalesced or dropped when the channel is full, because a later update
+/// supersedes it (a movement delta) or its loss is merely cosmetic.
+///
+/// Some packets are context-dependent: a `BlockUpdate` is mandatory when it
+/// resyncs the acting player after a rejected edit but droppable as a viewer
+/// broadcast. [`for_packet`](Self::for_packet) gives only the **default** class;
+/// the router passes the criticality explicitly at such call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Criticality {
+    /// Must be delivered; a full or closed channel disconnects the client instead
+    /// of dropping the packet.
+    Mandatory,
+    /// May be coalesced or dropped under backpressure without corrupting later
+    /// client state.
+    Droppable,
+}
+
+impl Criticality {
+    /// The default criticality class for `packet`.
+    ///
+    /// Mandatory: the block-change ack, the entity spawn ([`SpawnEntity`]) and its
+    /// despawns ([`RemoveEntities`] / [`RemovePlayerInfo`]), the player-info add,
+    /// the keep-alive, and the join / login-kit framing ([`JoinGame`],
+    /// [`GameEvent`], [`SetCenterChunk`], [`SynchronizePlayerPosition`],
+    /// [`SetDefaultSpawnPosition`]). Droppable: relative movement deltas, teleports,
+    /// chunk data, ambient block updates, system chat, and the command/tab-complete
+    /// graph.
+    ///
+    /// This is the default only: a `BlockUpdate` carried as an actor resync is
+    /// mandatory despite the droppable default here, so the router classifies such
+    /// context-dependent sends explicitly rather than calling this.
+    ///
+    /// [`SpawnEntity`]: ClientboundPlayPacket::SpawnEntity
+    /// [`RemoveEntities`]: ClientboundPlayPacket::RemoveEntities
+    /// [`RemovePlayerInfo`]: ClientboundPlayPacket::RemovePlayerInfo
+    /// [`JoinGame`]: ClientboundPlayPacket::JoinGame
+    /// [`GameEvent`]: ClientboundPlayPacket::GameEvent
+    /// [`SetCenterChunk`]: ClientboundPlayPacket::SetCenterChunk
+    /// [`SynchronizePlayerPosition`]: ClientboundPlayPacket::SynchronizePlayerPosition
+    /// [`SetDefaultSpawnPosition`]: ClientboundPlayPacket::SetDefaultSpawnPosition
+    pub fn for_packet(packet: &ClientboundPlayPacket) -> Self {
+        match packet {
+            ClientboundPlayPacket::ClientboundKeepAlive(_)
+            | ClientboundPlayPacket::JoinGame(_)
+            | ClientboundPlayPacket::SynchronizePlayerPosition(_)
+            | ClientboundPlayPacket::PlayerInfoUpdate(_)
+            | ClientboundPlayPacket::RemovePlayerInfo(_)
+            | ClientboundPlayPacket::RemoveEntities(_)
+            | ClientboundPlayPacket::GameEvent(_)
+            | ClientboundPlayPacket::SetCenterChunk(_)
+            | ClientboundPlayPacket::AcknowledgeBlockChange(_)
+            // A dropped spawn leaves a tab-list entry with no visible body, the
+            // inverse of the ghost a dropped despawn leaves, and is just as
+            // unrecoverable (later moves for an unknown entity id are ignored
+            // client-side), so SpawnEntity is mandatory alongside the despawns.
+            | ClientboundPlayPacket::SpawnEntity(_)
+            | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::Mandatory,
+            ClientboundPlayPacket::BlockUpdate(_)
+            | ClientboundPlayPacket::ChunkDataAndLight(_)
+            | ClientboundPlayPacket::UnloadChunk(_)
             | ClientboundPlayPacket::EntityTeleport(_)
             | ClientboundPlayPacket::UpdateEntityPosition(_)
             | ClientboundPlayPacket::UpdateEntityPositionAndRotation(_)
             | ClientboundPlayPacket::UpdateEntityRotation(_)
             | ClientboundPlayPacket::SetHeadRotation(_)
-            | ClientboundPlayPacket::RemoveEntities(_) => Self::World,
+            | ClientboundPlayPacket::SystemChat(_)
+            | ClientboundPlayPacket::Commands(_)
+            | ClientboundPlayPacket::TabCompleteResponse(_) => Self::Droppable,
         }
     }
 }
@@ -231,5 +327,65 @@ mod tests {
             OutboundPriority::for_packet(&packet),
             OutboundPriority::State
         );
+    }
+
+    #[test]
+    fn despawn_rides_state_not_world() {
+        use ferrumc_proto::generated::play::RemoveEntities;
+        // A despawn must not be tail-dropped behind bulk World chunk traffic.
+        let despawn = ClientboundPlayPacket::RemoveEntities(RemoveEntities::new(vec![2]));
+        assert_eq!(
+            OutboundPriority::for_packet(&despawn),
+            OutboundPriority::State
+        );
+    }
+
+    #[test]
+    fn spawn_entity_rides_state_and_is_mandatory() {
+        use ferrumc_proto::generated::play::{EntityVelocity, SpawnEntity};
+        // A spawn is the world-side counterpart of a despawn: a dropped spawn
+        // leaves a tab-list entry with no visible body, so it must never be
+        // tail-dropped behind bulk World chunks (it rides State) nor silently
+        // dropped on a full channel (it is Mandatory).
+        let spawn = ClientboundPlayPacket::SpawnEntity(SpawnEntity::new(
+            2,
+            uuid::Uuid::nil(),
+            149,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0,
+            0,
+            0,
+            EntityVelocity::new(0, 0, 0),
+        ));
+        assert_eq!(
+            OutboundPriority::for_packet(&spawn),
+            OutboundPriority::State
+        );
+        assert_eq!(Criticality::for_packet(&spawn), Criticality::Mandatory);
+    }
+
+    #[test]
+    fn mandatory_packets_are_classified_mandatory() {
+        use ferrumc_proto::generated::play::{AcknowledgeBlockChange, RemoveEntities};
+        // The block-change ack and despawns must never be silently dropped.
+        let ack = ClientboundPlayPacket::AcknowledgeBlockChange(AcknowledgeBlockChange::new(1));
+        let despawn = ClientboundPlayPacket::RemoveEntities(RemoveEntities::new(vec![2]));
+        assert_eq!(Criticality::for_packet(&ack), Criticality::Mandatory);
+        assert_eq!(Criticality::for_packet(&despawn), Criticality::Mandatory);
+    }
+
+    #[test]
+    fn movement_and_chunk_packets_are_droppable() {
+        use ferrumc_proto::generated::play::{UnloadChunk, UpdateEntityPosition};
+        // A later move or the next stream pass supersedes these, so they may shed.
+        let mov = ClientboundPlayPacket::UpdateEntityPosition(UpdateEntityPosition::new(
+            2, 1, 0, 0, true,
+        ));
+        let unload = ClientboundPlayPacket::UnloadChunk(UnloadChunk::new(0, 0));
+        assert_eq!(Criticality::for_packet(&mov), Criticality::Droppable);
+        assert_eq!(Criticality::for_packet(&unload), Criticality::Droppable);
     }
 }

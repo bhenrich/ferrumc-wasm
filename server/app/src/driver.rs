@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
-use ferrumc_core::{PlayerId, TextComponent, Tick};
+use ferrumc_core::{GameMode, PlayerId, TextComponent, Tick};
 use ferrumc_math::{ChunkPos, Vec3};
 use ferrumc_observability::{
     CounterRegistry, MutationKind, MutationResult, ServerClock, TickMetrics,
@@ -92,6 +92,19 @@ pub(crate) enum SimCommand {
         content: TextComponent,
         /// Whether to render above the hotbar (action bar) rather than the chat box.
         overlay: bool,
+    },
+    /// Mutate the authoritative server-side game mode of a player after a
+    /// `/gamemode` command.
+    ///
+    /// Routed to the player's shard as a [`GameInput::SetGameMode`] so the
+    /// simulation owns the mode that later enforcement reads. The clientbound
+    /// `GameEvent` that switches the client visually is sent separately by the
+    /// connection task; this only updates authoritative state.
+    SetGameMode {
+        /// The player whose authoritative mode changes.
+        player: PlayerId,
+        /// The new game mode.
+        mode: GameMode,
     },
 }
 
@@ -193,6 +206,15 @@ async fn handle_command(
         }
         SimCommand::BroadcastSystemChat { content, overlay } => {
             router.broadcast_system_chat(&content, overlay);
+        }
+        SimCommand::SetGameMode { player, mode } => {
+            // Route the authoritative mode change to the player's shard. A gone
+            // player (already disconnected) simply has no shard to route to.
+            if let Err(err) =
+                router.route_game_input(player, GameInput::SetGameMode { player, mode })
+            {
+                tracing::trace!(%err, "dropping set-game-mode");
+            }
         }
     }
 }
@@ -304,7 +326,10 @@ fn run_tick(
 
     let outputs = shard.run_tick();
     // Routing an output may fan out to many viewers; any whose connection has
-    // closed are returned so we can schedule a clean despawn for each.
+    // closed — or that overflowed a *mandatory* packet (the slow-client policy) —
+    // are returned so we can schedule a clean despawn for each. Each
+    // `disconnect_player` drains its own leave-broadcast cascade iteratively, so
+    // this loop terminates and never recurses.
     let mut closed = Vec::new();
     for output in &outputs {
         // Classify the block-edit metric from the requested/new state: air means a

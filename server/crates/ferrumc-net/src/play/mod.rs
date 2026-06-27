@@ -39,8 +39,8 @@ pub use coalesce::{is_movement, MovementCoalescer, OfferOutcome};
 pub use disconnect::{DisconnectPolicy, DisconnectReason};
 pub use metrics::PlayMetrics;
 pub use priority::{
-    OutboundPriority, DEFAULT_COSMETIC_CAPACITY, DEFAULT_CRITICAL_CAPACITY, DEFAULT_STATE_CAPACITY,
-    DEFAULT_WORLD_CAPACITY, PRIORITY_COUNT,
+    Criticality, OutboundPriority, DEFAULT_COSMETIC_CAPACITY, DEFAULT_CRITICAL_CAPACITY,
+    DEFAULT_STATE_CAPACITY, DEFAULT_WORLD_CAPACITY, PRIORITY_COUNT,
 };
 pub use reader::{InboundPlayPacket, PlayReader};
 pub use writer::{

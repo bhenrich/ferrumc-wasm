@@ -10,7 +10,8 @@
 //!   acting player receives an `AcknowledgeBlockChange` echoing its sequence;
 //! - a place against a clicked face is accepted, broadcast (the fixed default
 //!   block, `minecraft:stone` = state id `1`), and acked;
-//! - an out-of-reach, unloaded-chunk break is rejected silently — proven by the
+//! - a break in an unloaded chunk by a *present* actor is rejected but still acked
+//!   (its prediction must be ended), and the reject is actor-only — proven by the
 //!   actor sending it *before* a valid break and the viewer's first `BlockUpdate`
 //!   being the valid block, never the rejected position;
 //! - an out-of-reach break in a *loaded* chunk is rejected with a resync: the
@@ -195,19 +196,23 @@ async fn run_flow(addr: SocketAddr) -> anyhow::Result<()> {
     let mut viewer = login_to_play(addr, "Viewer").await?;
     let mut actor = login_to_play(addr, "Actor").await?;
 
-    // Rejected break: (100, 63, 8) is in an unloaded chunk and far out of reach
-    // (radius-1 spawn keeps only chunks within one of spawn resident), so it heals
-    // when the column streams in — no broadcast, no ack. Pipelined ahead of a valid
-    // break of the grass surface directly under the actor.
+    // Rejected break by a PRESENT actor: (100, 63, 8) is in an unloaded chunk and
+    // far out of reach (radius-1 spawn keeps only chunks within one of spawn
+    // resident). Residency is checked after the actor, so this is a ChunkNotLoaded
+    // rejection of a present actor: it is now acked (sequence 1) so the actor's
+    // prediction ends — but the reject is actor-only, never broadcast to viewers.
+    // Pipelined ahead of a valid break of the grass surface directly under the actor.
     send_break(&mut actor, (100, 63, 8), 1).await?;
     send_break(&mut actor, (8, 63, 8), 2).await?;
 
-    // The first BlockUpdate the viewer sees must be the valid break (air); if the
-    // rejected break had leaked it would arrive first (it is earlier in the inbox)
-    // and this would fail.
+    // The first BlockUpdate the viewer sees must be the valid break (air); the
+    // present-actor reject is actor-only, so it never reaches the viewer regardless
+    // of inbox order.
     expect_block_update(&mut viewer, (8, 63, 8), AIR_STATE).await?;
-    // (a) Accepted break: the actor is acked with the break's sequence (it also
-    // receives the broadcast BlockUpdate, so read until the ack).
+    // The present-actor reject of the unloaded chunk is acked first (sequence 1),
+    // ending that prediction; then the accepted break is acked (sequence 2). Both
+    // calls skip the interleaved BlockUpdates and return on the next ack.
+    expect_ack(&mut actor, 1).await?;
     expect_ack(&mut actor, 2).await?;
 
     // Place: click the top of (9, 63, 8) -> stone appears at (9, 64, 8).

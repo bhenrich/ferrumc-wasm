@@ -290,13 +290,23 @@ pub(crate) fn player_info_remove(player: PlayerId) -> ClientboundPlayPacket {
 }
 
 /// Converts a position delta in blocks to the relative-move fixed-point format
-/// (`delta * 4096`, i.e. 12 fractional bits) as an `i16`.
+/// (`delta * 4096`, i.e. 12 fractional bits) as an `i16`, or `None` when the
+/// scaled value does not fit the `i16` range.
 ///
-/// Only valid for moves up to ~8 blocks per axis (`8 * 4096` overflows an
-/// `i16`); larger jumps must use [`entity_teleport_shell`] instead. The cast
-/// saturates, so an out-of-range delta clamps rather than wrapping.
-fn delta_to_fixed_point(delta: f64) -> i16 {
-    (delta * 4096.0) as i16
+/// A relative move can only encode roughly +/-8 blocks per axis: `8 * 4096 =
+/// 32768` is one past `i16::MAX`, so an 8-block step (or larger) returns `None`
+/// and the caller must fall back to [`entity_teleport_shell`]. The value is
+/// rounded to the nearest fixed-point unit and range-checked *before* the cast —
+/// no saturation — so a boundary delta can never silently clamp to `i16::MAX`
+/// (the old `as i16` cast turned an exact 8-block step into a 1/4096-block error
+/// that accumulated every tick).
+fn delta_to_fixed_point_checked(delta: f64) -> Option<i16> {
+    let scaled = (delta * 4096.0).round();
+    if scaled >= f64::from(i16::MIN) && scaled <= f64::from(i16::MAX) {
+        Some(scaled as i16)
+    } else {
+        None
+    }
 }
 
 /// Builds an [`EntityTeleport`] shell repositioning `entity_id` absolutely to
@@ -312,23 +322,27 @@ pub(crate) fn entity_teleport_shell(entity_id: i32, position: Vec3) -> Clientbou
 }
 
 /// Builds an [`UpdateEntityPosition`] shell moving `entity_id` by the relative
-/// delta `(dx, dy, dz)` blocks.
+/// delta `(dx, dy, dz)` blocks, or `None` when any axis does not fit the
+/// 1/4096-block `i16` fixed-point range.
 ///
-/// The deltas are encoded in the 1/4096-block fixed-point wire format. Callers
-/// must only use this for moves within ~8 blocks per axis (the router selects
-/// [`entity_teleport_shell`] for larger jumps).
+/// The deltas are encoded in the 1/4096-block fixed-point wire format, which
+/// tops out near +/-8 blocks per axis. Returning `None` (rather than saturating)
+/// signals the caller — the router's `broadcast_move` — to fall back to an
+/// absolute [`entity_teleport_shell`] so the move is conveyed exactly instead of
+/// drifting by the clamped remainder.
 pub(crate) fn update_entity_position_shell(
     entity_id: i32,
     dx: f64,
     dy: f64,
     dz: f64,
-) -> ClientboundPlayPacket {
-    ClientboundPlayPacket::UpdateEntityPosition(UpdateEntityPosition::new(
-        entity_id,
-        delta_to_fixed_point(dx),
-        delta_to_fixed_point(dy),
-        delta_to_fixed_point(dz),
-        true,
+) -> Option<ClientboundPlayPacket> {
+    // Build only when all three axes fit; a single overflowing axis forces a
+    // teleport for the whole move.
+    let dx = delta_to_fixed_point_checked(dx)?;
+    let dy = delta_to_fixed_point_checked(dy)?;
+    let dz = delta_to_fixed_point_checked(dz)?;
+    Some(ClientboundPlayPacket::UpdateEntityPosition(
+        UpdateEntityPosition::new(entity_id, dx, dy, dz, true),
     ))
 }
 
@@ -703,7 +717,7 @@ mod tests {
 
     #[test]
     fn update_entity_position_encodes_fixed_point_deltas() {
-        let ClientboundPlayPacket::UpdateEntityPosition(rel) =
+        let Some(ClientboundPlayPacket::UpdateEntityPosition(rel)) =
             update_entity_position_shell(7, 1.0, -0.5, 2.0)
         else {
             panic!("expected an UpdateEntityPosition");
@@ -713,6 +727,35 @@ mod tests {
         assert_eq!(rel.delta_x(), 4096);
         assert_eq!(rel.delta_y(), -2048);
         assert_eq!(rel.delta_z(), 8192);
+    }
+
+    #[test]
+    fn relative_move_overflows_to_none_at_the_i16_boundary() {
+        // The fixed-point range is asymmetric: i16 is [-32768, 32767]. A positive
+        // 8-block step (8 * 4096 = 32768) is one past i16::MAX, so it yields no
+        // relative shell (the router teleports) instead of saturating to 32767 and
+        // drifting 1/4096 block.
+        assert!(update_entity_position_shell(1, 8.0, 0.0, 0.0).is_none());
+        assert!(update_entity_position_shell(1, 0.0, 0.0, 9.5).is_none());
+        // A negative 9-block step underflows i16::MIN, so it teleports too.
+        assert!(update_entity_position_shell(1, 0.0, -9.0, 0.0).is_none());
+        // A step comfortably within range still encodes as a relative move.
+        assert!(update_entity_position_shell(1, 7.0, 0.0, 0.0).is_some());
+        // An exact -8-block step lands on i16::MIN (-32768), which still fits.
+        let Some(ClientboundPlayPacket::UpdateEntityPosition(min)) =
+            update_entity_position_shell(1, 0.0, -8.0, 0.0)
+        else {
+            panic!("the i16::MIN boundary delta must still encode as a relative move");
+        };
+        assert_eq!(min.delta_y(), i16::MIN);
+        // The exact i16::MAX boundary value (just under +8 blocks) still fits.
+        let max_blocks = f64::from(i16::MAX) / 4096.0;
+        let Some(ClientboundPlayPacket::UpdateEntityPosition(max)) =
+            update_entity_position_shell(1, max_blocks, 0.0, 0.0)
+        else {
+            panic!("the i16::MAX boundary delta must still encode as a relative move");
+        };
+        assert_eq!(max.delta_x(), i16::MAX);
     }
 
     #[test]

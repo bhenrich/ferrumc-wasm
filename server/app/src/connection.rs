@@ -26,10 +26,10 @@ use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
 
 use ferrumc_codec::{BoundedReader, BoundedString};
 use ferrumc_command::{CommandSource, CommandTree};
-use ferrumc_core::{PlayerId, TextColor, TextComponent};
+use ferrumc_core::{PlayerId, TextColor, TextComponent, Tick};
 use ferrumc_math::{BlockPos, ChunkPos, Vec3};
 use ferrumc_net::{
-    offline_uuid, CompressionState, ConnectionLimits, ConnectionState, DecodeError,
+    offline_uuid, CompressionState, ConnectionLimits, ConnectionState, Criticality, DecodeError,
     DisconnectReason, EnqueueOutcome, FrameDecodeError, InboundDecoder, InboundPacket,
     OutboundEncoder, OutboundPacket, OutboundPriority, PlayWriter, StatusInfo,
 };
@@ -123,6 +123,66 @@ const MAX_CHUNK_LOADS_PER_UPDATE: usize = 16;
 /// distance ceiling) keeps that set — and the work a single boundary crossing can
 /// request — bounded even if the config carries an absurd view distance.
 const STREAM_VIEW_DISTANCE_MAX: i32 = 32;
+
+/// Maximum number of relayed chat lines a connection may burst before the rate
+/// limiter throttles it.
+///
+/// One client must not fan spam into every recipient's bounded outbound channel;
+/// a burst of `8` covers normal conversation while capping a flood.
+const CHAT_BURST: u32 = 8;
+
+/// Server ticks that must elapse to refill one chat token.
+///
+/// At the 20 TPS target, `10` ticks is ~0.5 s, so the sustained relay rate is ~2
+/// lines/second once the burst is spent.
+const CHAT_TICKS_PER_TOKEN: u64 = 10;
+
+/// A per-connection token bucket that paces relayed chat so one client cannot
+/// saturate every recipient's bounded outbound channel.
+///
+/// Driven by the monotonic server tick ([`ServerClock`], no syscall): tokens
+/// refill at [`CHAT_TICKS_PER_TOKEN`] and are capped at [`CHAT_BURST`]. This lives
+/// in the connection task — which is allowed a non-deterministic time source — and
+/// is never consulted from a deterministic sim/session tick path. It is a small,
+/// pure struct so the policy is unit-testable without a live socket.
+struct ChatRateLimiter {
+    /// Tokens currently available; one is spent per relayed line.
+    tokens: u32,
+    /// The tick the token count was last reconciled against.
+    last_tick: Tick,
+}
+
+impl ChatRateLimiter {
+    /// Builds a full bucket as of `now`.
+    fn new(now: Tick) -> Self {
+        Self {
+            tokens: CHAT_BURST,
+            last_tick: now,
+        }
+    }
+
+    /// Refills any tokens earned since the last call, then spends one.
+    ///
+    /// Returns `true` if a token was available (the line may be relayed) or `false`
+    /// if the sender is over budget (drop the line). `last_tick` advances only by
+    /// whole refill intervals, so partial progress toward the next token is not
+    /// lost.
+    fn try_consume(&mut self, now: Tick) -> bool {
+        let elapsed = now.get().saturating_sub(self.last_tick.get());
+        if elapsed >= CHAT_TICKS_PER_TOKEN {
+            let intervals = elapsed / CHAT_TICKS_PER_TOKEN;
+            let refill = u32::try_from(intervals.min(u64::from(CHAT_BURST))).unwrap_or(CHAT_BURST);
+            self.tokens = self.tokens.saturating_add(refill).min(CHAT_BURST);
+            self.last_tick = Tick::new(self.last_tick.get() + intervals * CHAT_TICKS_PER_TOKEN);
+        }
+        if self.tokens > 0 {
+            self.tokens -= 1;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Per-connection chunk-streaming state: which chunk the client is centred on and
 /// which chunk columns it currently holds.
@@ -604,6 +664,11 @@ async fn enter_play(
     // it from there so it never re-sends a spawn chunk and knows what to unload.
     let mut chunk_stream = ChunkStream::new(ctx);
 
+    // Per-connection chat rate limiter, seeded at the current server tick. Lives
+    // here (the connection task may use a non-deterministic time source) and is
+    // never touched by the sim/session deterministic tick path.
+    let mut chat_limiter = ChatRateLimiter::new(ctx.clock.now());
+
     // Replay the keystone payload, then drain any already-buffered play frames.
     let mut writer = PlayWriter::with_defaults(ctx.limits);
     send_join_kit(
@@ -625,6 +690,7 @@ async fn enter_play(
         name.as_str(),
         &mut writer,
         &mut chunk_stream,
+        &mut chat_limiter,
         &mut debug,
     )
     .await?;
@@ -651,7 +717,17 @@ async fn enter_play(
                 let packet = ClientboundPlayPacket::ClientboundKeepAlive(
                     ClientboundKeepAlive::new(keep_alive_id),
                 );
-                enqueue_traced_classified(&mut writer, &mut debug, &compression, &ctx.clock, packet);
+                let criticality = Criticality::for_packet(&packet);
+                let outcome =
+                    enqueue_traced_classified(&mut writer, &mut debug, &compression, &ctx.clock, packet);
+                if is_mandatory_overflow(criticality, outcome) {
+                    // A full Critical queue means the client cannot drain even
+                    // keep-alives: the Layer-B mirror of the router's mandatory
+                    // slow-client policy (DisconnectReason::OutboundOverflow).
+                    break Err(anyhow::anyhow!(
+                        "outbound overflow: a mandatory keep-alive was dropped at the connection writer"
+                    ));
+                }
                 if let Err(err) = flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
                     break Err(err);
                 }
@@ -660,7 +736,18 @@ async fn enter_play(
             outbound = handle.recv() => match outbound {
                 // Clientbound simulation output: queue and flush to the socket.
                 Some(packet) => {
-                    enqueue_traced_classified(&mut writer, &mut debug, &compression, &ctx.clock, packet);
+                    // The session router (Layer A) already disconnects a slow client
+                    // rather than silently drop a mandatory packet; mirror that at the
+                    // connection writer (Layer B) so a full priority queue can never
+                    // silently drop a despawn/spawn/ack/correction either.
+                    let criticality = Criticality::for_packet(&packet);
+                    let outcome =
+                        enqueue_traced_classified(&mut writer, &mut debug, &compression, &ctx.clock, packet);
+                    if is_mandatory_overflow(criticality, outcome) {
+                        break Err(anyhow::anyhow!(
+                            "outbound overflow: a mandatory clientbound packet was dropped at the connection writer"
+                        ));
+                    }
                     if let Err(err) = flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
                         break Err(err);
                     }
@@ -683,6 +770,7 @@ async fn enter_play(
                         &mut writer,
                         &mut stream,
                         &mut chunk_stream,
+                        &mut chat_limiter,
                         &mut debug,
                         &read_buf[..n],
                     ).await,
@@ -895,6 +983,7 @@ async fn read_and_pump(
     writer: &mut PlayWriter,
     stream: &mut TcpStream,
     chunk_stream: &mut ChunkStream,
+    chat_limiter: &mut ChatRateLimiter,
     debug: &mut SessionDebug,
     bytes: &[u8],
 ) -> anyhow::Result<()> {
@@ -907,6 +996,7 @@ async fn read_and_pump(
         name,
         writer,
         chunk_stream,
+        chat_limiter,
         debug,
     )
     .await?;
@@ -930,6 +1020,7 @@ async fn pump_serverbound(
     name: &str,
     writer: &mut PlayWriter,
     chunk_stream: &mut ChunkStream,
+    chat_limiter: &mut ChatRateLimiter,
     debug: &mut SessionDebug,
 ) -> anyhow::Result<()> {
     loop {
@@ -959,6 +1050,7 @@ async fn pump_serverbound(
             name,
             writer,
             chunk_stream,
+            chat_limiter,
             &body,
             debug,
             compression,
@@ -983,6 +1075,7 @@ async fn handle_play_body(
     name: &str,
     writer: &mut PlayWriter,
     chunk_stream: &mut ChunkStream,
+    chat_limiter: &mut ChatRateLimiter,
     body: &[u8],
     debug: &mut SessionDebug,
     compression: &CompressionState,
@@ -1031,6 +1124,16 @@ async fn handle_play_body(
             return handle_command(ctx, player, name, writer, &command, debug, compression).await;
         }
         ServerboundPlayPacket::ChatMessage(chat) => {
+            // Rate-limit at the SOURCE before relaying: one spammer must not fan
+            // spam into every recipient's bounded outbound channel and starve legit
+            // packets. The per-connection token bucket is driven by the server tick
+            // (connection task, allowed a non-deterministic clock). Over budget ->
+            // drop the line (logged, not relayed); the sender is not disconnected
+            // for a transient burst.
+            if !chat_limiter.try_consume(ctx.clock.now()) {
+                tracing::debug!(player = name, "dropping over-budget chat line");
+                return Ok(());
+            }
             // Relay unsigned player chat to everyone as a system message: format it
             // "<name> message" and hand it to the driver, the only owner of every
             // player's outbound channel. enforces_secure_chat = false, so no 1.19
@@ -1084,11 +1187,20 @@ async fn handle_play_body(
         // BlockUpdate is broadcast. Count the rejected mutation, then heal the
         // actor's optimistic client-side prediction: an `AcknowledgeBlockChange`
         // for the edit's sequence ends the client's pending prediction
-        // (endPredictionsUpTo) and reverts the ghost block. The veto changed
-        // nothing, so the client's pre-prediction state is already authoritative —
-        // the ack alone heals it, and the net layer has no world access to read a
-        // `BlockUpdate` anyway. Without the ack a real 1.21.8 client would keep the
-        // ghost block until some later sequence happened to be acked.
+        // (endPredictionsUpTo) and reverts the ghost block.
+        //
+        // The backpressure spec (finding #4) asked for an authoritative
+        // `BlockUpdate` resync alongside this ack. For the *veto* path that is a
+        // documented false positive: the veto changed nothing, so the client's
+        // pre-prediction state is already authoritative, and endPredictionsUpTo
+        // reverts the prediction to exactly that state — the ack alone is
+        // protocol-correct for an unchanged world. Authoring a real `BlockUpdate`
+        // here is also impossible without breaking the hard rule that the net layer
+        // never reads world state. The robust resync (sim-side veto emitting
+        // `BlockChangeRejected` with the real state) is deferred; sim-originated
+        // rejections already get the mandatory resync+ack pair in the router.
+        // Without this ack a real 1.21.8 client would keep the ghost block until
+        // some later sequence happened to be acked.
         ctx.metrics
             .record_block_mutation(kind, MutationResult::Rejected);
         enqueue_traced_classified(
@@ -1394,6 +1506,14 @@ async fn handle_command(
                     f32::from(mode.as_id()),
                 )),
             );
+            // The GameEvent only switches the CLIENT. Also mutate the authoritative
+            // server-side mode (in the sim's PlayerState) so future enforcement
+            // (creative no-decrement, break speed, flight) reads the right mode; the
+            // visual switch and the authoritative state must not diverge.
+            ctx.commands
+                .send(SimCommand::SetGameMode { player, mode })
+                .await
+                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
         }
     }
     Ok(())
@@ -1504,6 +1624,27 @@ fn enqueue_traced_classified(
     outcome
 }
 
+/// Whether a Layer-B (connection writer) enqueue `outcome` for a packet of the
+/// given `criticality` must escalate to a
+/// [`DisconnectReason::OutboundOverflow`](ferrumc_net::DisconnectReason::OutboundOverflow).
+///
+/// The per-player outbound *channel* (Layer A, the session router) already
+/// guarantees mandatory packets are delivered-or-disconnect, but the connection
+/// writer ([`PlayWriter`], Layer B) tail-drops a full priority queue silently.
+/// This is the backstop that turns a dropped *mandatory* frame — a despawn, spawn,
+/// ack, correction, or the keep-alive — into the documented outbound overflow
+/// rather than a silent drop that would ghost an entity, leave an invisible body,
+/// or strand a prediction. Droppable frames (movement, chunks, chat) may still
+/// shed without disconnecting.
+///
+/// A `BlockUpdate` carried as an actor resync is mandatory only by router context,
+/// not by [`Criticality::for_packet`](ferrumc_net::Criticality::for_packet), so
+/// that rare frame is not escalated here; Layer A still guarantees it via a
+/// capacity reservation on the per-player channel.
+fn is_mandatory_overflow(criticality: Criticality, outcome: EnqueueOutcome) -> bool {
+    outcome.is_dropped() && matches!(criticality, Criticality::Mandatory)
+}
+
 /// Enqueues `packet` at an explicit priority, recording an outbound trace only
 /// when it is actually queued (see [`enqueue_traced_classified`] for the
 /// drop-vs-trace policy).
@@ -1596,11 +1737,67 @@ async fn write_all(
 
 #[cfg(test)]
 mod tests {
-    use super::tab_complete_reply;
+    use ferrumc_core::Tick;
+
+    use super::{tab_complete_reply, ChatRateLimiter, CHAT_BURST, CHAT_TICKS_PER_TOKEN};
     use crate::command::{build_command_tree, GAMEMODE_COMMAND, SPAWN_COMMAND};
 
     const OP_LEVEL: u8 = 4;
     const MEMBER_LEVEL: u8 = 0;
+
+    #[test]
+    fn chat_rate_limiter_allows_a_burst_then_throttles_until_refill() {
+        let mut limiter = ChatRateLimiter::new(Tick::new(0));
+        // The full burst is allowed within a single tick.
+        for _ in 0..CHAT_BURST {
+            assert!(
+                limiter.try_consume(Tick::new(0)),
+                "burst line within budget"
+            );
+        }
+        // The next line at the same tick is over budget and dropped.
+        assert!(
+            !limiter.try_consume(Tick::new(0)),
+            "over-budget line throttled"
+        );
+        // One refill interval later, exactly one more line is allowed.
+        assert!(limiter.try_consume(Tick::new(CHAT_TICKS_PER_TOKEN)));
+        assert!(!limiter.try_consume(Tick::new(CHAT_TICKS_PER_TOKEN)));
+    }
+
+    #[test]
+    fn chat_rate_limiter_refill_is_capped_at_the_burst() {
+        let mut limiter = ChatRateLimiter::new(Tick::new(0));
+        // Spend the whole burst.
+        for _ in 0..CHAT_BURST {
+            assert!(limiter.try_consume(Tick::new(0)));
+        }
+        // A long idle gap refills at most CHAT_BURST tokens, never more.
+        let far = Tick::new(CHAT_TICKS_PER_TOKEN * u64::from(CHAT_BURST) * 100);
+        for _ in 0..CHAT_BURST {
+            assert!(limiter.try_consume(far), "refilled up to the burst cap");
+        }
+        assert!(!limiter.try_consume(far), "cannot exceed the burst cap");
+    }
+
+    #[test]
+    fn mandatory_layer_b_drop_escalates_droppable_does_not() {
+        use ferrumc_net::{Criticality, EnqueueOutcome, OutboundPriority};
+
+        use super::is_mandatory_overflow;
+
+        let dropped = EnqueueOutcome::Dropped {
+            priority: OutboundPriority::State,
+        };
+        let enqueued = EnqueueOutcome::Enqueued { depth: 1 };
+
+        // A dropped mandatory frame is an outbound overflow; a dropped droppable
+        // frame is tolerated, and a successfully enqueued frame never escalates.
+        assert!(is_mandatory_overflow(Criticality::Mandatory, dropped));
+        assert!(!is_mandatory_overflow(Criticality::Droppable, dropped));
+        assert!(!is_mandatory_overflow(Criticality::Mandatory, enqueued));
+        assert!(!is_mandatory_overflow(Criticality::Droppable, enqueued));
+    }
 
     #[test]
     fn tab_complete_offers_literal_completion_for_a_prefix() {

@@ -5,7 +5,7 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 
-use ferrumc_core::{DimensionId, PlayerId, WorldId};
+use ferrumc_core::{DimensionId, GameMode, PlayerId, WorldId};
 use ferrumc_math::{BlockPos, ShardPos, Vec3};
 use ferrumc_world::BlockStateId;
 
@@ -98,6 +98,10 @@ const DEFAULT_DIMENSION: DimensionId = DimensionId::new(0);
 #[derive(Debug, Clone, Copy)]
 struct PlayerState {
     position: Vec3,
+    /// The authoritative server-side game mode. Seeded to [`GameMode::default`] on
+    /// join and mutated by [`GameInput::SetGameMode`]; later milestones read it to
+    /// enforce mode-specific rules (creative no-decrement, break speed, flight).
+    game_mode: GameMode,
 }
 
 /// One simulation shard.
@@ -269,6 +273,11 @@ impl SimShard {
         self.players.get(&player).map(|state| state.position)
     }
 
+    /// Returns the authoritative game mode of `player`, or `None` if absent.
+    pub fn player_game_mode(&self, player: PlayerId) -> Option<GameMode> {
+        self.players.get(&player).map(|state| state.game_mode)
+    }
+
     /// Enqueues `input` for application at the next tick boundary.
     ///
     /// Returns [`SimError::InboxFull`] without modifying the inbox if it is
@@ -308,8 +317,18 @@ impl SimShard {
                     // the first join wins and re-joining produces no output,
                     // keeping the result deterministic regardless of retries.
                     if let Entry::Vacant(slot) = self.players.entry(player) {
-                        slot.insert(PlayerState { position });
+                        slot.insert(PlayerState {
+                            position,
+                            game_mode: GameMode::default(),
+                        });
                         outputs.push(GameOutput::PlayerSpawned { player, position });
+                    }
+                }
+                GameInput::SetGameMode { player, mode } => {
+                    // Mutate the authoritative mode in place; a mode change for an
+                    // absent player is a silent no-op and emits nothing.
+                    if let Some(state) = self.players.get_mut(&player) {
+                        state.game_mode = mode;
                     }
                 }
                 GameInput::PlayerMove { player, position } => {
@@ -502,11 +521,13 @@ impl SimShard {
 ///
 /// An [`Applied`](MutationResult::Applied) edit becomes a
 /// [`GameOutput::BlockChanged`] (broadcast to viewers, acked to the actor). A
-/// [`Rejected`](MutationResult::Rejected) edit becomes a
-/// [`GameOutput::BlockChangeRejected`] (a targeted resync to the actor) *unless*
-/// there is no client to heal: an absent actor has no session, and an unloaded
-/// chunk's authoritative column reaches the client when it streams in — both emit
-/// nothing.
+/// [`Rejected`](MutationResult::Rejected) edit by a present player becomes a
+/// [`GameOutput::BlockChangeRejected`] (a targeted resync + ack to the actor) —
+/// including a [`ChunkNotLoaded`](RejectionReason::ChunkNotLoaded) rejection,
+/// which only a *present* actor can reach (residency is checked after the actor),
+/// so its prediction must be ended rather than ghosted. The single case that
+/// emits nothing is an [`ActorAbsent`](RejectionReason::ActorAbsent) rejection:
+/// there is no client session to heal. A non-player cause also emits nothing.
 fn block_change_output(
     cause: MutationCause,
     sequence: i32,
@@ -525,17 +546,21 @@ fn block_change_output(
             reason,
             authoritative_state,
         } => {
-            if matches!(
-                reason,
-                RejectionReason::ActorAbsent | RejectionReason::ChunkNotLoaded
-            ) {
-                return None;
-            }
-            // Only a player edit has an actor to resync; non-player causes have no
-            // client to heal this milestone.
+            // Only a player edit has an actor to resync; non-player causes
+            // (command/plugin/test) have no client to heal this milestone.
             let MutationCause::PlayerCreative { player } = cause else {
                 return None;
             };
+            // A genuinely absent actor has no session to ack or resync — stay
+            // silent. But ChunkNotLoaded is NOT silenced here: apply_block_edit
+            // checks ActorAbsent *before* ChunkNotLoaded, so a ChunkNotLoaded
+            // rejection means the actor WAS present. Silencing it stranded that
+            // client's optimistic prediction as a ghost block; instead emit a
+            // rejection so the actor gets the ack (+ best-known resync) that ends
+            // the prediction. The real column corrects it when it streams in.
+            if matches!(reason, RejectionReason::ActorAbsent) {
+                return None;
+            }
             Some(GameOutput::BlockChangeRejected {
                 player,
                 position,
@@ -1005,10 +1030,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn break_in_unloaded_chunk_is_rejected_with_no_resync() {
-        // No chunk resident: an otherwise in-reach break is rejected, and because
-        // the chunk is absent there is no authoritative state to resync — the
-        // client gets the real column when it streams in, so nothing is emitted.
+    async fn break_in_unloaded_chunk_by_present_actor_is_rejected_with_resync() {
+        // No chunk resident, but the actor IS present: residency is checked after
+        // the actor, so this reaches a ChunkNotLoaded rejection. A present actor
+        // optimistically predicted the break, so it must be healed (ack + best-known
+        // resync) rather than ghosted; the real column corrects it when it streams
+        // in. The authoritative state is air (the chunk is absent).
         let mut s = shard();
         let p = player("homeless");
         let target = BlockPos::new(8, 63, 8);
@@ -1024,7 +1051,48 @@ mod tests {
             sequence: 1,
         })
         .expect("room");
+        assert_eq!(
+            s.run_tick(),
+            vec![GameOutput::BlockChangeRejected {
+                player: p,
+                position: target,
+                sequence: 1,
+                requested_state: BlockStateId::AIR,
+                authoritative_state: BlockStateId::AIR,
+            }]
+        );
+    }
+
+    #[test]
+    fn set_game_mode_mutates_present_player_and_ignores_absent() {
+        let mut s = shard();
+        let p = player("modeswitcher");
+        let ghost = player("ghost");
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: Vec3::ZERO,
+        })
+        .expect("room");
+        let _ = s.run_tick();
+        // The authoritative mode starts at the default and survives a tick.
+        assert_eq!(s.player_game_mode(p), Some(GameMode::default()));
+
+        s.enqueue(GameInput::SetGameMode {
+            player: p,
+            mode: GameMode::Creative,
+        })
+        .expect("room");
+        // Setting an absent player's mode is a silent no-op (no panic, no spawn).
+        s.enqueue(GameInput::SetGameMode {
+            player: ghost,
+            mode: GameMode::Creative,
+        })
+        .expect("room");
+        // A mode change emits no output.
         assert!(s.run_tick().is_empty());
+        assert_eq!(s.player_game_mode(p), Some(GameMode::Creative));
+        assert_eq!(s.player_game_mode(ghost), None);
+        assert_eq!(s.player_count(), 1);
     }
 
     #[tokio::test]

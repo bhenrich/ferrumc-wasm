@@ -6,7 +6,7 @@
 //! sessions/network. The simulation never touches sockets; it only exchanges
 //! these typed messages.
 
-use ferrumc_core::PlayerId;
+use ferrumc_core::{GameMode, PlayerId};
 use ferrumc_math::{BlockPos, Vec3};
 use ferrumc_world::BlockStateId;
 
@@ -73,6 +73,19 @@ pub enum GameInput {
         /// The block-action sequence the client stamped on the originating
         /// `UseItemOn`, echoed back in an `AcknowledgeBlockChange` on accept.
         sequence: i32,
+    },
+    /// Set the authoritative server-side game mode of a player.
+    ///
+    /// Produced by the app's `/gamemode` command path (in addition to the
+    /// clientbound `GameEvent` that switches the client visually) so the
+    /// simulation owns the mode that later enforcement reads (creative
+    /// no-decrement, block-break speed, flight). Applied at the tick boundary;
+    /// a `SetGameMode` for an absent player is a silent no-op. Emits no output.
+    SetGameMode {
+        /// Identity of the player whose mode changes.
+        player: PlayerId,
+        /// The new authoritative game mode.
+        mode: GameMode,
     },
 }
 
