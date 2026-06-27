@@ -277,6 +277,16 @@ fields = [{ name = "known_packs", type = "prefixed_array<KnownPack>" }]
 # Ids verified against minecraft-data pc/1.21.8 (commit a8cf733, protocol 772);
 # the minecraft-data packet name for each is noted in a comment.
 
+# minecraft-data: play.toServer.teleport_confirm ("Confirm Teleportation"). The
+# client replies with the teleport_id from a Synchronize Player Position; the
+# server needs no further response.
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "ConfirmTeleportation"
+id = 0x00
+fields = [{ name = "teleport_id", type = "varint" }]
+
 # minecraft-data: play.toServer.keep_alive
 [[packet]]
 state = "play"
@@ -384,6 +394,20 @@ fields = [
     { name = "block_state", type = "varint" },
 ]
 
+# minecraft-data: play.toClient.game_state_change ("Game Event"). `reason` is an
+# event code (e.g. 13 = level_chunks_load_start, sent to leave the loading
+# screen); `value` is the event's float parameter (game mode for reason 3, 0.0
+# otherwise).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "GameEvent"
+id = 0x22
+fields = [
+    { name = "reason", type = "u8" },
+    { name = "value", type = "f32" },
+]
+
 # minecraft-data: play.toClient.keep_alive
 [[packet]]
 state = "play"
@@ -465,4 +489,28 @@ id = 0x3F
 fields = [
     { name = "action", type = "u8" },
     { name = "entries", type = "remaining_bytes" },
+]
+
+# minecraft-data: play.toClient.update_view_position ("Set Center Chunk"). Tells
+# the client which chunk the player is centered on; must precede the chunk sends.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SetCenterChunk"
+id = 0x57
+fields = [
+    { name = "chunk_x", type = "varint" },
+    { name = "chunk_z", type = "varint" },
+]
+
+# minecraft-data: play.toClient.spawn_position ("Set Default Spawn Position").
+# `angle` is the spawn yaw in degrees.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SetDefaultSpawnPosition"
+id = 0x5A
+fields = [
+    { name = "location", type = "position" },
+    { name = "angle", type = "f32" },
 ]

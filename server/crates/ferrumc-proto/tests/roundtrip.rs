@@ -18,8 +18,9 @@ use ferrumc_proto::generated::login::{
 };
 use ferrumc_proto::generated::play::{
     BlockUpdate, ChatCommand, ChunkBlockEntity, ChunkDataAndLight, ClientboundKeepAlive,
-    ClientboundPlayPacket, DeathLocation, EntityVelocity, Heightmap, JoinGame, PlayerAction,
-    PlayerInfoUpdate, ServerboundKeepAlive, ServerboundPlayPacket, SetPlayerPosition,
+    ClientboundPlayPacket, ConfirmTeleportation, DeathLocation, EntityVelocity, GameEvent,
+    Heightmap, JoinGame, PlayerAction, PlayerInfoUpdate, ServerboundKeepAlive,
+    ServerboundPlayPacket, SetCenterChunk, SetDefaultSpawnPosition, SetPlayerPosition,
     SetPlayerPositionAndRotation, SpawnEntity, SpawnInfo, SynchronizePlayerPosition, UseItemOn,
 };
 use ferrumc_proto::generated::status::{
@@ -348,6 +349,12 @@ fn play_serverbound_packets_round_trip() {
         ChatCommand::decode,
         ChatCommand::PACKET_ID,
     );
+    roundtrip(
+        &ConfirmTeleportation::new(1),
+        ConfirmTeleportation::encode,
+        ConfirmTeleportation::decode,
+        ConfirmTeleportation::PACKET_ID,
+    );
 }
 
 #[test]
@@ -394,6 +401,25 @@ fn play_clientbound_simple_packets_round_trip() {
         PlayerInfoUpdate::encode,
         PlayerInfoUpdate::decode,
         PlayerInfoUpdate::PACKET_ID,
+    );
+    // Game Event: reason 13 (level_chunks_load_start) leaves the loading screen.
+    roundtrip(
+        &GameEvent::new(13, 0.0),
+        GameEvent::encode,
+        GameEvent::decode,
+        GameEvent::PACKET_ID,
+    );
+    roundtrip(
+        &SetCenterChunk::new(0, -7),
+        SetCenterChunk::encode,
+        SetCenterChunk::decode,
+        SetCenterChunk::PACKET_ID,
+    );
+    roundtrip(
+        &SetDefaultSpawnPosition::new(BlockPosition::new(8, 64, 8), 90.0),
+        SetDefaultSpawnPosition::encode,
+        SetDefaultSpawnPosition::decode,
+        SetDefaultSpawnPosition::PACKET_ID,
     );
 }
 
@@ -547,5 +573,41 @@ fn chat_command_oversized_string_prefix_is_rejected() {
     ferrumc_codec::write_var_int(&mut buf, 5000);
     let mut reader = BoundedReader::new(&buf);
     let err = ChatCommand::decode(&mut reader).expect_err("oversized command");
+    assert!(matches!(err, ProtoError::Codec(_)));
+}
+
+#[test]
+fn confirm_teleportation_bad_varint_is_rejected() {
+    // teleport_id is a VarInt; six continuation bytes overrun the 5-byte budget.
+    let buf = [0x80u8, 0x80, 0x80, 0x80, 0x80, 0x00];
+    let mut reader = BoundedReader::new(&buf);
+    let err = ConfirmTeleportation::decode(&mut reader).expect_err("bad varint");
+    assert!(matches!(err, ProtoError::Codec(_)));
+}
+
+#[test]
+fn game_event_truncated_value_is_codec_error() {
+    // reason (1 byte) is present, but only 2 of the value f32's 4 bytes follow.
+    let buf = [0x0Du8, 0x00, 0x00];
+    let mut reader = BoundedReader::new(&buf);
+    let err = GameEvent::decode(&mut reader).expect_err("truncated f32");
+    assert!(matches!(err, ProtoError::Codec(_)));
+}
+
+#[test]
+fn set_center_chunk_bad_varint_is_rejected() {
+    // chunk_x is a VarInt; six continuation bytes overrun the 5-byte budget.
+    let buf = [0x80u8, 0x80, 0x80, 0x80, 0x80, 0x00];
+    let mut reader = BoundedReader::new(&buf);
+    let err = SetCenterChunk::decode(&mut reader).expect_err("bad varint");
+    assert!(matches!(err, ProtoError::Codec(_)));
+}
+
+#[test]
+fn set_default_spawn_position_truncated_is_codec_error() {
+    // The packed position needs 8 bytes; supply only 4 before the angle.
+    let buf = [0x00u8, 0x01, 0x02, 0x03];
+    let mut reader = BoundedReader::new(&buf);
+    let err = SetDefaultSpawnPosition::decode(&mut reader).expect_err("truncated position");
     assert!(matches!(err, ProtoError::Codec(_)));
 }

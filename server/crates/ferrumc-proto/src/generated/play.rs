@@ -380,6 +380,40 @@ impl SpawnInfo {
     }
 }
 
+/// `ConfirmTeleportation`: the play serverbound packet (wire id `0x00`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmTeleportation {
+    teleport_id: i32,
+}
+
+impl ConfirmTeleportation {
+    /// The wire packet id for `ConfirmTeleportation`.
+    pub const PACKET_ID: i32 = 0x00;
+
+    /// Creates a new `ConfirmTeleportation` from its wire fields.
+    pub fn new(teleport_id: i32) -> Self {
+        Self { teleport_id }
+    }
+
+    /// Returns the `teleport_id` field.
+    pub fn teleport_id(&self) -> i32 {
+        self.teleport_id
+    }
+
+    /// Decodes a `ConfirmTeleportation` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let teleport_id = reader.read_var_int()?;
+        Ok(Self { teleport_id })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        ferrumc_codec::write_var_int(buf, self.teleport_id);
+        Ok(())
+    }
+}
+
 /// `ChatCommand`: the play serverbound packet (wire id `0x06`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatCommand {
@@ -997,6 +1031,48 @@ impl BlockUpdate {
         ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
         self.location.write(buf);
         ferrumc_codec::write_var_int(buf, self.block_state);
+        Ok(())
+    }
+}
+
+/// `GameEvent`: the play clientbound packet (wire id `0x22`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GameEvent {
+    reason: u8,
+    value: f32,
+}
+
+impl GameEvent {
+    /// The wire packet id for `GameEvent`.
+    pub const PACKET_ID: i32 = 0x22;
+
+    /// Creates a new `GameEvent` from its wire fields.
+    pub fn new(reason: u8, value: f32) -> Self {
+        Self { reason, value }
+    }
+
+    /// Returns the `reason` field.
+    pub fn reason(&self) -> u8 {
+        self.reason
+    }
+
+    /// Returns the `value` field.
+    pub fn value(&self) -> f32 {
+        self.value
+    }
+
+    /// Decodes a `GameEvent` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let reason = reader.read_u8()?;
+        let value = reader.read_f32()?;
+        Ok(Self { reason, value })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        wire::write_u8(buf, self.reason);
+        wire::write_f32(buf, self.value);
         Ok(())
     }
 }
@@ -1626,9 +1702,95 @@ impl SynchronizePlayerPosition {
     }
 }
 
+/// `SetCenterChunk`: the play clientbound packet (wire id `0x57`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetCenterChunk {
+    chunk_x: i32,
+    chunk_z: i32,
+}
+
+impl SetCenterChunk {
+    /// The wire packet id for `SetCenterChunk`.
+    pub const PACKET_ID: i32 = 0x57;
+
+    /// Creates a new `SetCenterChunk` from its wire fields.
+    pub fn new(chunk_x: i32, chunk_z: i32) -> Self {
+        Self { chunk_x, chunk_z }
+    }
+
+    /// Returns the `chunk_x` field.
+    pub fn chunk_x(&self) -> i32 {
+        self.chunk_x
+    }
+
+    /// Returns the `chunk_z` field.
+    pub fn chunk_z(&self) -> i32 {
+        self.chunk_z
+    }
+
+    /// Decodes a `SetCenterChunk` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let chunk_x = reader.read_var_int()?;
+        let chunk_z = reader.read_var_int()?;
+        Ok(Self { chunk_x, chunk_z })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        ferrumc_codec::write_var_int(buf, self.chunk_x);
+        ferrumc_codec::write_var_int(buf, self.chunk_z);
+        Ok(())
+    }
+}
+
+/// `SetDefaultSpawnPosition`: the play clientbound packet (wire id `0x5a`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetDefaultSpawnPosition {
+    location: crate::types::BlockPosition,
+    angle: f32,
+}
+
+impl SetDefaultSpawnPosition {
+    /// The wire packet id for `SetDefaultSpawnPosition`.
+    pub const PACKET_ID: i32 = 0x5a;
+
+    /// Creates a new `SetDefaultSpawnPosition` from its wire fields.
+    pub fn new(location: crate::types::BlockPosition, angle: f32) -> Self {
+        Self { location, angle }
+    }
+
+    /// Returns the `location` field.
+    pub fn location(&self) -> crate::types::BlockPosition {
+        self.location
+    }
+
+    /// Returns the `angle` field.
+    pub fn angle(&self) -> f32 {
+        self.angle
+    }
+
+    /// Decodes a `SetDefaultSpawnPosition` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let location = crate::types::BlockPosition::read(reader)?;
+        let angle = reader.read_f32()?;
+        Ok(Self { location, angle })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        self.location.write(buf);
+        wire::write_f32(buf, self.angle);
+        Ok(())
+    }
+}
+
 /// serverbound packets in the play state, dispatched by wire id.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerboundPlayPacket {
+    /// The `ConfirmTeleportation` packet.
+    ConfirmTeleportation(ConfirmTeleportation),
     /// The `ChatCommand` packet.
     ChatCommand(ChatCommand),
     /// The `ServerboundKeepAlive` packet.
@@ -1647,6 +1809,9 @@ impl ServerboundPlayPacket {
     /// Decodes a serverbound play packet body selected by its wire `id`.
     pub fn decode(id: i32, reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
         match id {
+            ConfirmTeleportation::PACKET_ID => Ok(Self::ConfirmTeleportation(
+                ConfirmTeleportation::decode(reader)?,
+            )),
             ChatCommand::PACKET_ID => Ok(Self::ChatCommand(ChatCommand::decode(reader)?)),
             ServerboundKeepAlive::PACKET_ID => Ok(Self::ServerboundKeepAlive(
                 ServerboundKeepAlive::decode(reader)?,
@@ -1670,6 +1835,7 @@ impl ServerboundPlayPacket {
     /// Returns the wire packet id of this packet.
     pub fn packet_id(&self) -> i32 {
         match self {
+            Self::ConfirmTeleportation(_) => ConfirmTeleportation::PACKET_ID,
             Self::ChatCommand(_) => ChatCommand::PACKET_ID,
             Self::ServerboundKeepAlive(_) => ServerboundKeepAlive::PACKET_ID,
             Self::SetPlayerPosition(_) => SetPlayerPosition::PACKET_ID,
@@ -1682,6 +1848,7 @@ impl ServerboundPlayPacket {
     /// Encodes this packet (id followed by its body) into `buf`.
     pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
         match self {
+            Self::ConfirmTeleportation(packet) => packet.encode(buf),
             Self::ChatCommand(packet) => packet.encode(buf),
             Self::ServerboundKeepAlive(packet) => packet.encode(buf),
             Self::SetPlayerPosition(packet) => packet.encode(buf),
@@ -1699,6 +1866,8 @@ pub enum ClientboundPlayPacket {
     SpawnEntity(SpawnEntity),
     /// The `BlockUpdate` packet.
     BlockUpdate(BlockUpdate),
+    /// The `GameEvent` packet.
+    GameEvent(GameEvent),
     /// The `ClientboundKeepAlive` packet.
     ClientboundKeepAlive(ClientboundKeepAlive),
     /// The `ChunkDataAndLight` packet.
@@ -1709,6 +1878,10 @@ pub enum ClientboundPlayPacket {
     PlayerInfoUpdate(PlayerInfoUpdate),
     /// The `SynchronizePlayerPosition` packet.
     SynchronizePlayerPosition(SynchronizePlayerPosition),
+    /// The `SetCenterChunk` packet.
+    SetCenterChunk(SetCenterChunk),
+    /// The `SetDefaultSpawnPosition` packet.
+    SetDefaultSpawnPosition(SetDefaultSpawnPosition),
 }
 
 impl ClientboundPlayPacket {
@@ -1717,6 +1890,7 @@ impl ClientboundPlayPacket {
         match id {
             SpawnEntity::PACKET_ID => Ok(Self::SpawnEntity(SpawnEntity::decode(reader)?)),
             BlockUpdate::PACKET_ID => Ok(Self::BlockUpdate(BlockUpdate::decode(reader)?)),
+            GameEvent::PACKET_ID => Ok(Self::GameEvent(GameEvent::decode(reader)?)),
             ClientboundKeepAlive::PACKET_ID => Ok(Self::ClientboundKeepAlive(
                 ClientboundKeepAlive::decode(reader)?,
             )),
@@ -1729,6 +1903,10 @@ impl ClientboundPlayPacket {
             }
             SynchronizePlayerPosition::PACKET_ID => Ok(Self::SynchronizePlayerPosition(
                 SynchronizePlayerPosition::decode(reader)?,
+            )),
+            SetCenterChunk::PACKET_ID => Ok(Self::SetCenterChunk(SetCenterChunk::decode(reader)?)),
+            SetDefaultSpawnPosition::PACKET_ID => Ok(Self::SetDefaultSpawnPosition(
+                SetDefaultSpawnPosition::decode(reader)?,
             )),
             other => Err(ProtoError::UnknownPacketId {
                 state: State::Play,
@@ -1743,11 +1921,14 @@ impl ClientboundPlayPacket {
         match self {
             Self::SpawnEntity(_) => SpawnEntity::PACKET_ID,
             Self::BlockUpdate(_) => BlockUpdate::PACKET_ID,
+            Self::GameEvent(_) => GameEvent::PACKET_ID,
             Self::ClientboundKeepAlive(_) => ClientboundKeepAlive::PACKET_ID,
             Self::ChunkDataAndLight(_) => ChunkDataAndLight::PACKET_ID,
             Self::JoinGame(_) => JoinGame::PACKET_ID,
             Self::PlayerInfoUpdate(_) => PlayerInfoUpdate::PACKET_ID,
             Self::SynchronizePlayerPosition(_) => SynchronizePlayerPosition::PACKET_ID,
+            Self::SetCenterChunk(_) => SetCenterChunk::PACKET_ID,
+            Self::SetDefaultSpawnPosition(_) => SetDefaultSpawnPosition::PACKET_ID,
         }
     }
 
@@ -1756,11 +1937,14 @@ impl ClientboundPlayPacket {
         match self {
             Self::SpawnEntity(packet) => packet.encode(buf),
             Self::BlockUpdate(packet) => packet.encode(buf),
+            Self::GameEvent(packet) => packet.encode(buf),
             Self::ClientboundKeepAlive(packet) => packet.encode(buf),
             Self::ChunkDataAndLight(packet) => packet.encode(buf),
             Self::JoinGame(packet) => packet.encode(buf),
             Self::PlayerInfoUpdate(packet) => packet.encode(buf),
             Self::SynchronizePlayerPosition(packet) => packet.encode(buf),
+            Self::SetCenterChunk(packet) => packet.encode(buf),
+            Self::SetDefaultSpawnPosition(packet) => packet.encode(buf),
         }
     }
 }
