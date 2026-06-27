@@ -45,6 +45,9 @@ pub(crate) enum SimCommand {
     Join {
         /// The joining player's identity.
         player: PlayerId,
+        /// The joining player's display name (shown on viewers' tab list and the
+        /// nameplate above the spawned entity).
+        name: String,
         /// The world-space position to join at.
         position: Vec3,
         /// One-shot channel the driver replies on with the new session handle (or
@@ -159,10 +162,11 @@ async fn handle_command(
     match command {
         SimCommand::Join {
             player,
+            name,
             position,
             reply,
         } => {
-            let result = router.join_player(player, position);
+            let result = router.join_player(player, &name, position);
             // The connection task may have already gone away; a failed reply send
             // means the join handle is simply discarded.
             let _ = reply.send(result);

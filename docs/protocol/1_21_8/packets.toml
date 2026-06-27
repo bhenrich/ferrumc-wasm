@@ -577,3 +577,119 @@ fields = [
     { name = "location", type = "position" },
     { name = "angle", type = "f32" },
 ]
+
+# --- Entity movement / despawn (remote-player visibility) -----------------------
+#
+# These six entity packets plus RemovePlayerInfo back the remote-player
+# visibility path in `ferrumc-session`: a join spawns the remote entity, moves
+# update it relatively or by teleport, and a leave despawns it and drops the
+# tab-list entry. Ids/field shapes verified against
+# `fixtures/protocol/1_21_8/protocol.json` (protocol 772) and the pv772 wiki.
+
+# minecraft-data: play.toClient.sync_entity_position ("Teleport Entity"). Absolute
+# reposition for jumps larger than a relative move can encode (>8 blocks). NOTE:
+# the resource is `sync_entity_position` (0x1F), NOT `entity_teleport` — the latter
+# name maps to a different packet (0x76) with f32 yaw/pitch replaced by i8 angle
+# bytes and no velocity fields, so using that name would point at the wrong id and
+# the wrong field shape. `velocity_*` are the per-second delta fields (protocol.json
+# calls them dx/dy/dz).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "EntityTeleport"
+id = 0x1F
+fields = [
+    { name = "entity_id", type = "varint" },
+    { name = "x", type = "f64" },
+    { name = "y", type = "f64" },
+    { name = "z", type = "f64" },
+    { name = "velocity_x", type = "f64" },
+    { name = "velocity_y", type = "f64" },
+    { name = "velocity_z", type = "f64" },
+    { name = "yaw", type = "f32" },
+    { name = "pitch", type = "f32" },
+    { name = "on_ground", type = "bool" },
+]
+
+# minecraft-data: play.toClient.rel_entity_move ("Update Entity Position"). Relative
+# move with no rotation; each delta is `(new - lastSent) * 4096` (12 fractional
+# bits) clamped to an i16, so it only encodes moves up to ~8 blocks per axis.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "UpdateEntityPosition"
+id = 0x2E
+fields = [
+    { name = "entity_id", type = "varint" },
+    { name = "delta_x", type = "i16" },
+    { name = "delta_y", type = "i16" },
+    { name = "delta_z", type = "i16" },
+    { name = "on_ground", type = "bool" },
+]
+
+# minecraft-data: play.toClient.entity_move_look ("Update Entity Position and
+# Rotation"). Relative move plus yaw/pitch as angle bytes (256 = 360 degrees).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "UpdateEntityPositionAndRotation"
+id = 0x2F
+fields = [
+    { name = "entity_id", type = "varint" },
+    { name = "delta_x", type = "i16" },
+    { name = "delta_y", type = "i16" },
+    { name = "delta_z", type = "i16" },
+    { name = "yaw", type = "i8" },
+    { name = "pitch", type = "i8" },
+    { name = "on_ground", type = "bool" },
+]
+
+# minecraft-data: play.toClient.entity_look ("Update Entity Rotation"). Rotation
+# only; yaw/pitch are angle bytes (256 = 360 degrees).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "UpdateEntityRotation"
+id = 0x31
+fields = [
+    { name = "entity_id", type = "varint" },
+    { name = "yaw", type = "i8" },
+    { name = "pitch", type = "i8" },
+    { name = "on_ground", type = "bool" },
+]
+
+# minecraft-data: play.toClient.player_remove ("Player Info Remove"). A real
+# tab-list removal: a prefixed array of UUIDs. The dedicated 0x3E packet, NOT a
+# PlayerInfoUpdate (0x3F) action — the latter has no remove action and is a no-op
+# on a real client.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "RemovePlayerInfo"
+id = 0x3E
+fields = [
+    { name = "players", type = "prefixed_array<uuid>" },
+]
+
+# minecraft-data: play.toClient.entity_destroy ("Remove Entities"). Despawns the
+# listed entity ids on the client.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "RemoveEntities"
+id = 0x46
+fields = [
+    { name = "entity_ids", type = "prefixed_array<varint>" },
+]
+
+# minecraft-data: play.toClient.entity_head_rotation ("Set Head Rotation").
+# `head_yaw` is an angle byte (256 = 360 degrees), separate from the body yaw.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SetHeadRotation"
+id = 0x4C
+fields = [
+    { name = "entity_id", type = "varint" },
+    { name = "head_yaw", type = "i8" },
+]

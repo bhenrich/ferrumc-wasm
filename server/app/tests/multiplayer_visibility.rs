@@ -41,34 +41,57 @@ fn player_info_uuid(info: &PlayerInfoUpdate) -> Uuid {
 }
 
 /// Reads play packets from `client` until it has seen both a player-list add and
-/// an entity spawn for `target`.
-async fn observe_appearance(client: &mut TestClient, target: Uuid) -> anyhow::Result<()> {
+/// an entity spawn for `target`, returning the network entity id of the spawn.
+///
+/// The spawn must carry the `minecraft:player` entity type (149) so the client
+/// renders a player model, not a placeholder — this is what the original
+/// entity-type bug (type 0 = a boat) got wrong.
+async fn observe_appearance(client: &mut TestClient, target: Uuid) -> anyhow::Result<i32> {
     let mut info = false;
-    let mut spawn = false;
-    while !(info && spawn) {
+    let mut entity_id = None;
+    while !(info && entity_id.is_some()) {
         match client.next_play().await? {
             ClientboundPlayPacket::PlayerInfoUpdate(p)
                 if p.action() == PLAYER_INFO_ADD && player_info_uuid(&p) == target =>
             {
                 info = true;
             }
-            ClientboundPlayPacket::SpawnEntity(s) if s.entity_uuid() == target => spawn = true,
+            ClientboundPlayPacket::SpawnEntity(s) if s.entity_uuid() == target => {
+                anyhow::ensure!(
+                    s.entity_type() == 149,
+                    "remote player must spawn as minecraft:player (149), got {}",
+                    s.entity_type()
+                );
+                entity_id = Some(s.entity_id());
+            }
             _ => {}
         }
     }
-    Ok(())
+    Ok(entity_id.expect("entity id captured"))
 }
 
-/// Reads play packets from `client` until it sees `target` at `expected`,
-/// conveyed as a (re)spawn — the milestone's position-broadcast carrier.
-async fn observe_move(
+/// Reads play packets from `client` until it sees `entity_id` teleported to
+/// `expected` — the carrier for a move larger than 8 blocks.
+async fn observe_teleport(
     client: &mut TestClient,
-    target: Uuid,
+    entity_id: i32,
     expected: (f64, f64, f64),
 ) -> anyhow::Result<()> {
     loop {
-        if let ClientboundPlayPacket::SpawnEntity(s) = client.next_play().await? {
-            if s.entity_uuid() == target && (s.x(), s.y(), s.z()) == expected {
+        if let ClientboundPlayPacket::EntityTeleport(t) = client.next_play().await? {
+            if t.entity_id() == entity_id && (t.x(), t.y(), t.z()) == expected {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Reads play packets from `client` until it sees `entity_id` despawned via a
+/// Remove Entities packet — the leave-side counterpart of the spawn.
+async fn observe_despawn(client: &mut TestClient, entity_id: i32) -> anyhow::Result<()> {
+    loop {
+        if let ClientboundPlayPacket::RemoveEntities(r) = client.next_play().await? {
+            if r.entity_ids().contains(&entity_id) {
                 return Ok(());
             }
         }
@@ -85,17 +108,24 @@ async fn run_flow(addr: SocketAddr) -> anyhow::Result<()> {
     // Second client joins; the server now makes the two mutually visible.
     let mut c2 = login_to_play(addr, "Notch").await?;
 
-    // Each client is told about the other (player-list add + entity spawn).
-    observe_appearance(&mut c1, notch).await?;
+    // Each client is told about the other (player-list add + entity spawn). Keep
+    // Notch's entity id so c1 can match the relative/teleport move that follows.
+    let notch_eid = observe_appearance(&mut c1, notch).await?;
     observe_appearance(&mut c2, saad).await?;
 
-    // One client moves; the other must receive the broadcast position.
+    // One client jumps far (spawn 8,64,8 -> 20,64,20, ~17 blocks); the other must
+    // receive it as an absolute EntityTeleport (a relative move cannot encode it).
     let new_pos = (20.0_f64, 64.0_f64, 20.0_f64);
     c2.send_frame(&encode(|buf| {
         SetPlayerPosition::new(new_pos.0, new_pos.1, new_pos.2, 0).encode(buf)
     }))
     .await?;
-    observe_move(&mut c1, notch, new_pos).await?;
+    observe_teleport(&mut c1, notch_eid, new_pos).await?;
+
+    // Notch leaves (drop the socket): Saad must see the entity despawn, not a
+    // lingering ghost. This is the RemoveEntities the leave path now broadcasts.
+    drop(c2);
+    observe_despawn(&mut c1, notch_eid).await?;
 
     Ok(())
 }

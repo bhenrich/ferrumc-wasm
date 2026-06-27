@@ -123,6 +123,15 @@ pub(crate) fn clientbound_play_name(packet: &ClientboundPlayPacket) -> &'static 
         ClientboundPlayPacket::SetCenterChunk(_) => "set_center_chunk",
         ClientboundPlayPacket::SetDefaultSpawnPosition(_) => "set_default_spawn_position",
         ClientboundPlayPacket::SystemChat(_) => "system_chat",
+        ClientboundPlayPacket::EntityTeleport(_) => "entity_teleport",
+        ClientboundPlayPacket::UpdateEntityPosition(_) => "update_entity_position",
+        ClientboundPlayPacket::UpdateEntityPositionAndRotation(_) => {
+            "update_entity_position_and_rotation"
+        }
+        ClientboundPlayPacket::UpdateEntityRotation(_) => "update_entity_rotation",
+        ClientboundPlayPacket::SetHeadRotation(_) => "set_head_rotation",
+        ClientboundPlayPacket::RemoveEntities(_) => "remove_entities",
+        ClientboundPlayPacket::RemovePlayerInfo(_) => "remove_player_info",
     }
 }
 

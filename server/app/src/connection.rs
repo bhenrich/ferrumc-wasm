@@ -598,7 +598,7 @@ async fn enter_play(
     debug.set_session(name.as_str());
     let player = PlayerId::offline(name.as_str());
     let position = ctx.join_kit.spawn_position();
-    let mut handle = join_simulation(ctx, player, position).await?;
+    let mut handle = join_simulation(ctx, player, name.as_str(), position).await?;
 
     // The client already holds the spawn batch after the join kit; stream tracks
     // it from there so it never re-sends a spawn chunk and knows what to unload.
@@ -612,6 +612,8 @@ async fn enter_play(
         &compression,
         ctx,
         &mut debug,
+        player,
+        name.as_str(),
         position,
     )
     .await?;
@@ -724,12 +726,14 @@ async fn enter_play(
 async fn join_simulation(
     ctx: &ConnContext,
     player: PlayerId,
+    name: &str,
     position: Vec3,
 ) -> anyhow::Result<PlayerSessionHandle> {
     let (reply_tx, reply_rx) = oneshot::channel();
     ctx.commands
         .send(SimCommand::Join {
             player,
+            name: name.to_owned(),
             position,
             reply: reply_tx,
         })
@@ -758,12 +762,15 @@ async fn join_simulation(
 /// # Errors
 ///
 /// Returns an error if any stage fails to encode or write to the socket.
+#[allow(clippy::too_many_arguments)] // one cohesive step: framing + self player-info + I/O + trace state
 async fn send_join_kit(
     writer: &mut PlayWriter,
     stream: &mut TcpStream,
     compression: &CompressionState,
     ctx: &ConnContext,
     debug: &mut SessionDebug,
+    player: PlayerId,
+    name: &str,
     position: Vec3,
 ) -> anyhow::Result<()> {
     let kit = &ctx.join_kit;
@@ -777,6 +784,17 @@ async fn send_join_kit(
         compression,
         clock,
         ClientboundPlayPacket::JoinGame(kit.join_game().clone()),
+    );
+    // Put the local player on their own tab list: a Player Info Update "Add
+    // Player" for themselves. Other players' entries arrive from the session
+    // router's join-visibility broadcast; this is the one entry the router cannot
+    // send (a player is not in their own viewer set).
+    enqueue_traced_classified(
+        writer,
+        debug,
+        compression,
+        clock,
+        ferrumc_session::player_info_add(player, name),
     );
     enqueue_traced_classified(
         writer,

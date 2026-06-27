@@ -109,6 +109,9 @@ impl OutboundPriority {
             ClientboundPlayPacket::JoinGame(_)
             | ClientboundPlayPacket::SynchronizePlayerPosition(_)
             | ClientboundPlayPacket::PlayerInfoUpdate(_)
+            // Player Info Remove is the tab-list counterpart of the add above:
+            // the client must reliably see a player leave, so it rides State too.
+            | ClientboundPlayPacket::RemovePlayerInfo(_)
             | ClientboundPlayPacket::GameEvent(_)
             | ClientboundPlayPacket::SetCenterChunk(_)
             // The block-change ack confirms the client's optimistic prediction for
@@ -124,7 +127,16 @@ impl OutboundPriority {
             ClientboundPlayPacket::SpawnEntity(_)
             | ClientboundPlayPacket::BlockUpdate(_)
             | ClientboundPlayPacket::ChunkDataAndLight(_)
-            | ClientboundPlayPacket::UnloadChunk(_) => Self::World,
+            | ClientboundPlayPacket::UnloadChunk(_)
+            // Entity movement / despawn is bulk position traffic, droppable under
+            // load like SpawnEntity (a later move or the next teleport supersedes
+            // a dropped one); RemoveEntities rides here next to its spawn.
+            | ClientboundPlayPacket::EntityTeleport(_)
+            | ClientboundPlayPacket::UpdateEntityPosition(_)
+            | ClientboundPlayPacket::UpdateEntityPositionAndRotation(_)
+            | ClientboundPlayPacket::UpdateEntityRotation(_)
+            | ClientboundPlayPacket::SetHeadRotation(_)
+            | ClientboundPlayPacket::RemoveEntities(_) => Self::World,
         }
     }
 }

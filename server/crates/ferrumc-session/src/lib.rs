@@ -49,6 +49,5 @@ pub use router::{
 };
 pub use text::system_chat;
 pub use translate::{
-    net_event_to_input, output_to_clientbound, shard_for_position, PLAYER_INFO_ADD,
-    PLAYER_INFO_REMOVE,
+    net_event_to_input, output_to_clientbound, player_info_add, shard_for_position, PLAYER_INFO_ADD,
 };

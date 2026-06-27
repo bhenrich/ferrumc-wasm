@@ -176,36 +176,68 @@ fn info_uuid(info: &PlayerInfoUpdate) -> Option<Uuid> {
 }
 
 /// Reads until `client` has seen both a player-list add and an entity spawn for
-/// `target` — i.e. the two players are mutually visible.
-async fn observe_appearance(client: &mut TestClient, target: Uuid) -> anyhow::Result<()> {
+/// `target` — i.e. the two players are mutually visible — returning the network
+/// entity id of the spawn.
+///
+/// Asserts the spawn carries the `minecraft:player` entity type (149); the
+/// original bug spawned remote players as type 0 (a boat).
+async fn observe_appearance(client: &mut TestClient, target: Uuid) -> anyhow::Result<i32> {
     let mut info = false;
-    let mut spawn = false;
-    while !(info && spawn) {
+    let mut entity_id = None;
+    while !(info && entity_id.is_some()) {
         match client.next_play().await? {
             ClientboundPlayPacket::PlayerInfoUpdate(p)
                 if p.action() == PLAYER_INFO_ADD && info_uuid(&p) == Some(target) =>
             {
                 info = true;
             }
-            ClientboundPlayPacket::SpawnEntity(s) if s.entity_uuid() == target => spawn = true,
+            ClientboundPlayPacket::SpawnEntity(s) if s.entity_uuid() == target => {
+                anyhow::ensure!(
+                    s.entity_type() == 149,
+                    "remote player must spawn as minecraft:player (149), got {}",
+                    s.entity_type()
+                );
+                entity_id = Some(s.entity_id());
+            }
             _ => {}
         }
     }
-    Ok(())
+    Ok(entity_id.expect("entity id captured"))
 }
 
-/// Reads until `client` sees `target` at `expected` (conveyed as a spawn shell).
+/// The relative-move fixed-point encoding of a per-axis block delta.
+fn delta_fp(delta: f64) -> i16 {
+    (delta * 4096.0) as i16
+}
+
+/// Reads until `client` sees `entity_id` move from `from` to `to`, matching the
+/// distance-based carrier the server picks: a relative `UpdateEntityPosition`
+/// (deltas in 1/4096-block units) for a step of at most 8 blocks, or an absolute
+/// `EntityTeleport` for a larger jump.
 async fn observe_move(
     client: &mut TestClient,
-    target: Uuid,
-    expected: (f64, f64, f64),
+    entity_id: i32,
+    from: (f64, f64, f64),
+    to: (f64, f64, f64),
 ) -> anyhow::Result<()> {
-    read_until(client, |packet| {
-        matches!(packet, ClientboundPlayPacket::SpawnEntity(s)
-            if s.entity_uuid() == target && (s.x(), s.y(), s.z()) == expected)
-    })
-    .await
-    .map(|_| ())
+    let (dx, dy, dz) = (to.0 - from.0, to.1 - from.1, to.2 - from.2);
+    if dx * dx + dy * dy + dz * dz <= 64.0 {
+        let expected = (delta_fp(dx), delta_fp(dy), delta_fp(dz));
+        read_until(client, |packet| {
+            matches!(packet, ClientboundPlayPacket::UpdateEntityPosition(u)
+                if u.entity_id() == entity_id
+                    && (u.delta_x(), u.delta_y(), u.delta_z()) == expected)
+        })
+        .await
+        .map(|_| ())
+    } else {
+        read_until(client, |packet| {
+            matches!(packet, ClientboundPlayPacket::EntityTeleport(t)
+                if t.entity_id() == entity_id && (t.x(), t.y(), t.z()) == to)
+        })
+        .await
+        .map(|_| ())
+    }
 }
 
 /// Reads until `client` sees a `BlockUpdate` at `pos` carrying `state`.
@@ -226,14 +258,15 @@ async fn observe_block_update(
     .map(|_| ())
 }
 
-/// Reads until `client` sees `target` move to `move_to`, asserting that **no**
-/// `BlockUpdate` at `forbidden` arrives first.
+/// Reads until `client` sees `entity_id` teleport to `move_to`, asserting that
+/// **no** `BlockUpdate` at `forbidden` arrives first.
 ///
 /// Because a vetoed break is pipelined ahead of the move from the same actor (and
 /// both share the shard inbox FIFO), a leaked edit would surface before the move.
+/// The move here is a large jump, so it arrives as an absolute `EntityTeleport`.
 async fn move_without_block_update(
     client: &mut TestClient,
-    target: Uuid,
+    entity_id: i32,
     move_to: (f64, f64, f64),
     forbidden: (i32, i32, i32),
 ) -> anyhow::Result<()> {
@@ -246,8 +279,8 @@ async fn move_without_block_update(
                     "spawn protection leaked: BlockUpdate at the protected position {forbidden:?}",
                 );
             }
-            ClientboundPlayPacket::SpawnEntity(s)
-                if s.entity_uuid() == target && (s.x(), s.y(), s.z()) == move_to =>
+            ClientboundPlayPacket::EntityTeleport(t)
+                if t.entity_id() == entity_id && (t.x(), t.y(), t.z()) == move_to =>
             {
                 return Ok(());
             }
@@ -387,13 +420,18 @@ async fn run_flow(addr: SocketAddr) -> anyhow::Result<()> {
     let mut admin = login_to_play(addr, "Admin").await?;
     let mut griefer = login_to_play(addr, "Griefer").await?;
 
-    // Point 5: the viewer and admin are mutually visible.
-    observe_appearance(&mut viewer, admin_uuid).await?;
+    // Point 5: the viewer and admin are mutually visible. Capture the admin's and
+    // griefer's entity ids from their spawns so the moves below can be matched
+    // (relative/teleport packets carry only the entity id, not the UUID). They are
+    // captured in arrival order so neither spawn is read past and lost.
+    let admin_eid = observe_appearance(&mut viewer, admin_uuid).await?;
+    let griefer_eid = observe_appearance(&mut viewer, griefer_uuid).await?;
     observe_appearance(&mut admin, viewer_uuid).await?;
 
-    // Point 4: the admin moves and the viewer sees the broadcast position.
+    // Point 4: the admin takes a small step and the viewer sees a relative move.
+    let spawn = (8.0, 64.0, 8.0);
     send_move(&mut admin, (10.0, 64.0, 9.0)).await?;
-    observe_move(&mut viewer, admin_uuid, (10.0, 64.0, 9.0)).await?;
+    observe_move(&mut viewer, admin_eid, spawn, (10.0, 64.0, 9.0)).await?;
 
     // Point 6 + Point 9 (bypass allowed): the admin breaks and places inside the
     // protected area; both go through because the admin holds bypass.
@@ -403,14 +441,16 @@ async fn run_flow(addr: SocketAddr) -> anyhow::Result<()> {
     observe_block_update(&mut viewer, (9, 64, 8), STONE_STATE).await?;
 
     // Point 9 (veto): the griefer's break inside the protected area is vetoed.
-    // Pipelined ahead of a move so the move fences the (absent) broadcast.
+    // Pipelined ahead of a far move (teleport) so the move fences the (absent)
+    // broadcast.
     send_break(&mut griefer, (10, 63, 8)).await?;
     send_move(&mut griefer, (20.0, 64.0, 20.0)).await?;
-    move_without_block_update(&mut viewer, griefer_uuid, (20.0, 64.0, 20.0), (10, 63, 8)).await?;
+    move_without_block_update(&mut viewer, griefer_eid, (20.0, 64.0, 20.0), (10, 63, 8)).await?;
 
-    // Point 7: /spawn teleports the admin back to spawn; the viewer sees it.
+    // Point 7: /spawn teleports the admin back to spawn; the viewer sees the
+    // relative move back from (10, 64, 9).
     send_command(&mut admin, "spawn").await?;
-    observe_move(&mut viewer, admin_uuid, (8.0, 64.0, 8.0)).await?;
+    observe_move(&mut viewer, admin_eid, (10.0, 64.0, 9.0), spawn).await?;
 
     // Point 8: /gamemode is accepted over the wire (the connection survives), and
     // a follow-up move still broadcasts — proving the command was consumed
@@ -419,7 +459,7 @@ async fn run_flow(addr: SocketAddr) -> anyhow::Result<()> {
     // here we read the viewer's stream, so they don't interfere.
     send_command(&mut admin, "gamemode 1").await?;
     send_move(&mut admin, (12.0, 64.0, 12.0)).await?;
-    observe_move(&mut viewer, admin_uuid, (12.0, 64.0, 12.0)).await?;
+    observe_move(&mut viewer, admin_eid, spawn, (12.0, 64.0, 12.0)).await?;
 
     Ok(())
 }

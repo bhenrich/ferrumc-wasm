@@ -18,11 +18,12 @@ use ferrumc_proto::generated::login::{
 };
 use ferrumc_proto::generated::play::{
     BlockUpdate, ChatCommand, ChunkBlockEntity, ChunkDataAndLight, ClientboundKeepAlive,
-    ClientboundPlayPacket, ConfirmTeleportation, DeathLocation, EntityVelocity, GameEvent,
-    Heightmap, JoinGame, PlayerAction, PlayerInfoUpdate, ServerboundKeepAlive,
-    ServerboundPlayPacket, SetCenterChunk, SetDefaultSpawnPosition, SetPlayerPosition,
-    SetPlayerPositionAndRotation, SpawnEntity, SpawnInfo, SynchronizePlayerPosition, UnloadChunk,
-    UseItemOn,
+    ClientboundPlayPacket, ConfirmTeleportation, DeathLocation, EntityTeleport, EntityVelocity,
+    GameEvent, Heightmap, JoinGame, PlayerAction, PlayerInfoUpdate, RemoveEntities,
+    RemovePlayerInfo, ServerboundKeepAlive, ServerboundPlayPacket, SetCenterChunk,
+    SetDefaultSpawnPosition, SetHeadRotation, SetPlayerPosition, SetPlayerPositionAndRotation,
+    SpawnEntity, SpawnInfo, SynchronizePlayerPosition, UnloadChunk, UpdateEntityPosition,
+    UpdateEntityPositionAndRotation, UpdateEntityRotation, UseItemOn,
 };
 use ferrumc_proto::generated::status::{
     PingRequest, PongResponse, ServerboundStatusPacket, StatusRequest, StatusResponse,
@@ -429,6 +430,58 @@ fn play_clientbound_simple_packets_round_trip() {
         UnloadChunk::encode,
         UnloadChunk::decode,
         UnloadChunk::PACKET_ID,
+    );
+}
+
+/// Round-trips the entity movement / despawn packets backing remote-player
+/// visibility, including the two new `prefixed_array` element-type usages
+/// (`<varint>` ids and `<uuid>`).
+#[test]
+fn play_clientbound_entity_packets_round_trip() {
+    // Entity movement / despawn packets (remote-player visibility).
+    roundtrip(
+        &EntityTeleport::new(42, 1.5, 64.0, -2.5, 0.0, 0.0, 0.0, 90.0, -45.0, true),
+        EntityTeleport::encode,
+        EntityTeleport::decode,
+        EntityTeleport::PACKET_ID,
+    );
+    roundtrip(
+        &UpdateEntityPosition::new(42, 4096, -2048, 8192, true),
+        UpdateEntityPosition::encode,
+        UpdateEntityPosition::decode,
+        UpdateEntityPosition::PACKET_ID,
+    );
+    roundtrip(
+        &UpdateEntityPositionAndRotation::new(42, 1, -1, 2, 64, -32, false),
+        UpdateEntityPositionAndRotation::encode,
+        UpdateEntityPositionAndRotation::decode,
+        UpdateEntityPositionAndRotation::PACKET_ID,
+    );
+    roundtrip(
+        &UpdateEntityRotation::new(42, 64, -32, true),
+        UpdateEntityRotation::encode,
+        UpdateEntityRotation::decode,
+        UpdateEntityRotation::PACKET_ID,
+    );
+    roundtrip(
+        &SetHeadRotation::new(42, -100),
+        SetHeadRotation::encode,
+        SetHeadRotation::decode,
+        SetHeadRotation::PACKET_ID,
+    );
+    // Prefixed array of varint entity ids (a new generator element type usage).
+    roundtrip(
+        &RemoveEntities::new(vec![2, 3, 5, 8]),
+        RemoveEntities::encode,
+        RemoveEntities::decode,
+        RemoveEntities::PACKET_ID,
+    );
+    // Prefixed array of UUIDs (a new generator element type usage).
+    roundtrip(
+        &RemovePlayerInfo::new(vec![Uuid::from_u128(0xfeed_face), Uuid::from_u128(0x1234)]),
+        RemovePlayerInfo::encode,
+        RemovePlayerInfo::decode,
+        RemovePlayerInfo::PACKET_ID,
     );
 }
 

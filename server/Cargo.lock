@@ -344,6 +344,7 @@ dependencies = [
 name = "ferrumc-session"
 version = "0.2.0-dev"
 dependencies = [
+ "ferrumc-codec",
  "ferrumc-core",
  "ferrumc-math",
  "ferrumc-nbt",

@@ -12,6 +12,10 @@ ferrumc-core = { workspace = true }
 # Typed coordinates: `Vec3` carries player positions, and `ShardPos`/`BlockPos`/
 # `ChunkPos` implement the position->shard routing policy (never raw tuples).
 ferrumc-math = { workspace = true }
+# `write_var_int` hand-encodes the variable per-action entry list of the
+# clientbound Player Info Update "Add Player" body (count + name length + property
+# count), which the typed grammar carries as opaque `remaining_bytes`.
+ferrumc-codec = { workspace = true }
 # Source of the network-side play vocabulary this crate bridges: `DisconnectReason`
 # classifies why a connection ended (carried by `NetEvent::Disconnected`).
 ferrumc-net = { workspace = true }
