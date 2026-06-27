@@ -30,8 +30,11 @@ use ferrumc_core::PlayerId;
 use ferrumc_math::{BlockPos, ChunkPos, Vec3};
 use ferrumc_net::{
     offline_uuid, CompressionState, ConnectionLimits, ConnectionState, DecodeError,
-    DisconnectReason, FrameDecodeError, InboundDecoder, InboundPacket, OutboundEncoder,
-    OutboundPacket, OutboundPriority, PlayWriter, StatusInfo,
+    DisconnectReason, EnqueueOutcome, FrameDecodeError, InboundDecoder, InboundPacket,
+    OutboundEncoder, OutboundPacket, OutboundPriority, PlayWriter, StatusInfo,
+};
+use ferrumc_observability::{
+    CounterRegistry, MutationKind, MutationResult, PacketState, ServerClock, SessionDebug,
 };
 use ferrumc_proto::generated::configuration::{
     ClientboundConfigurationPacket, ClientboundKnownPacks, FinishConfiguration,
@@ -53,6 +56,7 @@ use ferrumc_sim::GameInput;
 
 use crate::command::SPAWN_COMMAND;
 use crate::driver::SimCommand;
+use crate::observe;
 use crate::plugins::PlayPolicy;
 use crate::registries::ConfigRegistries;
 use crate::world::JoinKit;
@@ -186,6 +190,12 @@ pub(crate) struct ConnContext {
     /// streamed around a player as they move (clamped to a sane maximum per
     /// connection, see [`STREAM_VIEW_DISTANCE_MAX`]).
     pub(crate) view_distance: i32,
+    /// The shared metric registry every connection task feeds (chunk sends,
+    /// decode errors, vetoed mutations, outbound queue depth).
+    pub(crate) metrics: Arc<CounterRegistry>,
+    /// The shared server clock (driver-written, connection-read) used to stamp
+    /// packet traces with the current simulation tick.
+    pub(crate) clock: ServerClock,
 }
 
 impl ConnContext {
@@ -282,17 +292,26 @@ struct Connection<'a> {
     compression: CompressionState,
     /// Shared connection context.
     ctx: &'a ConnContext,
+    /// Per-connection rolling packet-trace holder, dumped on disconnect or a
+    /// decode error. Boxed so the large trace rings live on the heap rather than
+    /// bloating the connection task's stack/async frame.
+    debug: Box<SessionDebug>,
 }
 
 impl<'a> Connection<'a> {
     /// Builds the framing state for a freshly accepted `stream`.
     fn new(stream: TcpStream, ctx: &'a ConnContext) -> Self {
+        // Label the session by peer address until login upgrades it to the name.
+        let label = stream
+            .peer_addr()
+            .map_or_else(|_| "unknown".to_string(), |addr| addr.to_string());
         Self {
             stream,
             decoder: InboundDecoder::new(ctx.limits),
             encoder: OutboundEncoder::new(ctx.limits),
             compression: CompressionState::disabled(),
             ctx,
+            debug: Box::new(SessionDebug::new(label)),
         }
     }
 
@@ -301,6 +320,11 @@ impl<'a> Connection<'a> {
         let mut buf = BytesMut::new();
         self.encoder
             .encode_compressed(packet, &mut buf, &self.compression)?;
+        // Record an outbound trace with the exact on-wire frame size. This covers
+        // the login / status / configuration phases; play frames are traced where
+        // they are enqueued into the `PlayWriter`.
+        let trace = observe::trace_outbound(packet, buf.len(), &self.compression, &self.ctx.clock);
+        self.debug.record_outbound(trace);
         write_all(&mut self.stream, &buf, self.ctx.io_timeout).await
     }
 
@@ -391,16 +415,24 @@ async fn run_login(
             .decoder
             .next_packet_compressed(state, &conn.compression)
         {
-            Ok(Some(packet)) => match advance(conn, &mut phase, &mut name, &packet).await? {
-                LoginProgress::Continue => continue,
-                LoginProgress::Close => return Ok(None),
-                LoginProgress::Play => {
-                    return name
-                        .take()
-                        .map(Some)
-                        .ok_or_else(|| anyhow::anyhow!("reached play without a login name"));
+            Ok(Some(packet)) => {
+                // Record the inbound trace before dispatch. The login-phase
+                // decoder does not surface the body length, so size is `0`
+                // (documented); play-phase inbound records an exact size.
+                let trace =
+                    observe::trace_inbound_login(&packet, &conn.compression, &conn.ctx.clock);
+                conn.debug.record_inbound(trace);
+                match advance(conn, &mut phase, &mut name, &packet).await? {
+                    LoginProgress::Continue => continue,
+                    LoginProgress::Close => return Ok(None),
+                    LoginProgress::Play => {
+                        return name
+                            .take()
+                            .map(Some)
+                            .ok_or_else(|| anyhow::anyhow!("reached play without a login name"));
+                    }
                 }
-            },
+            }
             // Buffer holds no complete frame yet: fall through and read more.
             Ok(None) => {}
             // A well-framed frame carrying an unmodelled packet id in login or
@@ -418,7 +450,16 @@ async fn run_login(
                 conn.decoder.skip_frame(state)?;
                 continue;
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                // A fatal login/status/config decode error: count it and dump the
+                // retained traces before propagating (acceptance: decode-error).
+                conn.ctx.metrics.record_packet_decode_error(
+                    observe::state_of(state),
+                    observe::decode_error_label(&err),
+                );
+                conn.debug.dump("login_decode_error");
+                return Err(err.into());
+            }
         }
 
         let io_timeout = conn.ctx.io_timeout;
@@ -532,6 +573,7 @@ async fn advance(
 
 /// Joins the simulation and replays the join kit, then pumps the play link until
 /// the client disconnects or the server shuts down.
+#[allow(clippy::too_many_lines)] // one cohesive lifecycle: join, replay, pump, dump
 async fn enter_play(
     conn: Connection<'_>,
     name: BoundedString<16>,
@@ -542,8 +584,12 @@ async fn enter_play(
         mut decoder,
         compression,
         ctx,
+        mut debug,
         ..
     } = conn;
+    // Upgrade the session label from the peer address to the player name now that
+    // login has completed.
+    debug.set_session(name.as_str());
     let player = PlayerId::offline(name.as_str());
     let position = ctx.join_kit.spawn_position();
     let mut handle = join_simulation(ctx, player, position).await?;
@@ -554,7 +600,15 @@ async fn enter_play(
 
     // Replay the keystone payload, then drain any already-buffered play frames.
     let mut writer = PlayWriter::with_defaults(ctx.limits);
-    send_join_kit(&mut writer, &mut stream, &compression, ctx, position).await?;
+    send_join_kit(
+        &mut writer,
+        &mut stream,
+        &compression,
+        ctx,
+        &mut debug,
+        position,
+    )
+    .await?;
     pump_serverbound(
         &mut decoder,
         &compression,
@@ -563,9 +617,11 @@ async fn enter_play(
         name.as_str(),
         &mut writer,
         &mut chunk_stream,
+        &mut debug,
     )
     .await?;
     flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await?;
+    observe_queue_len(&mut debug, ctx, &writer);
 
     // Keep Alive: a real client disconnects if it hears nothing for 20 s. Ping on
     // an interval; the client echoes with a serverbound Keep Alive the play pump
@@ -584,20 +640,23 @@ async fn enter_play(
             _ = shutdown.changed() => break Ok(()),
             _ = keep_alive.tick() => {
                 keep_alive_id = keep_alive_id.wrapping_add(1);
-                writer.enqueue_classified(ClientboundPlayPacket::ClientboundKeepAlive(
+                let packet = ClientboundPlayPacket::ClientboundKeepAlive(
                     ClientboundKeepAlive::new(keep_alive_id),
-                ));
+                );
+                enqueue_traced_classified(&mut writer, &mut debug, &compression, &ctx.clock, packet);
                 if let Err(err) = flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
                     break Err(err);
                 }
+                observe_queue_len(&mut debug, ctx, &writer);
             }
             outbound = handle.recv() => match outbound {
                 // Clientbound simulation output: queue and flush to the socket.
                 Some(packet) => {
-                    writer.enqueue_classified(packet);
+                    enqueue_traced_classified(&mut writer, &mut debug, &compression, &ctx.clock, packet);
                     if let Err(err) = flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
                         break Err(err);
                     }
+                    observe_queue_len(&mut debug, ctx, &writer);
                 }
                 // The router dropped the session.
                 None => break Ok(()),
@@ -616,6 +675,7 @@ async fn enter_play(
                         &mut writer,
                         &mut stream,
                         &mut chunk_stream,
+                        &mut debug,
                         &read_buf[..n],
                     ).await,
                 };
@@ -625,6 +685,12 @@ async fn enter_play(
             },
         }
     };
+
+    // The play link has ended (clean close, EOF, shutdown, or error). Sample the
+    // final outbound queue depth and dump the retained traces (acceptance:
+    // disconnect).
+    observe_queue_len(&mut debug, ctx, &writer);
+    debug.dump("disconnect");
 
     // Release every chunk this connection had the client holding so its player
     // tickets stop pinning chunks resident after it leaves. Best-effort: a gone
@@ -691,32 +757,71 @@ async fn send_join_kit(
     stream: &mut TcpStream,
     compression: &CompressionState,
     ctx: &ConnContext,
+    debug: &mut SessionDebug,
     position: Vec3,
 ) -> anyhow::Result<()> {
     let kit = &ctx.join_kit;
+    let clock = &ctx.clock;
 
     // Stage 1: enter play, cue the client to expect spawn chunks, fix the world
     // spawn, and teleport the player in — all before any chunk is sent.
-    writer.enqueue_classified(ClientboundPlayPacket::JoinGame(kit.join_game().clone()));
-    writer.enqueue_classified(ClientboundPlayPacket::GameEvent(GameEvent::new(
-        GAME_EVENT_LEVEL_CHUNKS_LOAD_START,
-        0.0,
-    )));
-    writer.enqueue_classified(ClientboundPlayPacket::SetCenterChunk(SetCenterChunk::new(
-        kit.spawn_chunk().x(),
-        kit.spawn_chunk().z(),
-    )));
-    writer.enqueue_classified(ClientboundPlayPacket::SetDefaultSpawnPosition(
-        SetDefaultSpawnPosition::new(kit.spawn_block(), 0.0),
-    ));
-    writer.enqueue_classified(ClientboundPlayPacket::SynchronizePlayerPosition(
-        spawn_sync(JOIN_TELEPORT_ID, position),
-    ));
+    enqueue_traced_classified(
+        writer,
+        debug,
+        compression,
+        clock,
+        ClientboundPlayPacket::JoinGame(kit.join_game().clone()),
+    );
+    enqueue_traced_classified(
+        writer,
+        debug,
+        compression,
+        clock,
+        ClientboundPlayPacket::GameEvent(GameEvent::new(GAME_EVENT_LEVEL_CHUNKS_LOAD_START, 0.0)),
+    );
+    enqueue_traced_classified(
+        writer,
+        debug,
+        compression,
+        clock,
+        ClientboundPlayPacket::SetCenterChunk(SetCenterChunk::new(
+            kit.spawn_chunk().x(),
+            kit.spawn_chunk().z(),
+        )),
+    );
+    enqueue_traced_classified(
+        writer,
+        debug,
+        compression,
+        clock,
+        ClientboundPlayPacket::SetDefaultSpawnPosition(SetDefaultSpawnPosition::new(
+            kit.spawn_block(),
+            0.0,
+        )),
+    );
+    enqueue_traced_classified(
+        writer,
+        debug,
+        compression,
+        clock,
+        ClientboundPlayPacket::SynchronizePlayerPosition(spawn_sync(JOIN_TELEPORT_ID, position)),
+    );
     flush_writer(writer, stream, compression, ctx.io_timeout).await?;
 
     // Stage 2: the spawn-area chunk column packets (includes the player's chunk).
     for chunk in kit.chunks() {
-        writer.enqueue_classified(ClientboundPlayPacket::ChunkDataAndLight(chunk.clone()));
+        let outcome = enqueue_traced_classified(
+            writer,
+            debug,
+            compression,
+            clock,
+            ClientboundPlayPacket::ChunkDataAndLight(chunk.clone()),
+        );
+        // Count only chunks that actually entered the queue; a tail-dropped chunk
+        // never reaches the wire and must not inflate the counter.
+        if outcome.is_enqueued() {
+            ctx.metrics.incr_chunk_sent(1);
+        }
     }
     flush_writer(writer, stream, compression, ctx.io_timeout).await
 }
@@ -740,7 +845,7 @@ fn spawn_sync(teleport_id: i32, position: Vec3) -> SynchronizePlayerPosition {
 
 /// Pushes freshly read bytes through the decoder, handles every complete play
 /// frame, then flushes any clientbound responses queued while handling them.
-#[allow(clippy::too_many_arguments)] // one play step: framing + policy + I/O state
+#[allow(clippy::too_many_arguments)] // one play step: framing + policy + I/O + trace state
 async fn read_and_pump(
     decoder: &mut InboundDecoder,
     compression: &CompressionState,
@@ -750,6 +855,7 @@ async fn read_and_pump(
     writer: &mut PlayWriter,
     stream: &mut TcpStream,
     chunk_stream: &mut ChunkStream,
+    debug: &mut SessionDebug,
     bytes: &[u8],
 ) -> anyhow::Result<()> {
     decoder.push(bytes)?;
@@ -761,6 +867,7 @@ async fn read_and_pump(
         name,
         writer,
         chunk_stream,
+        debug,
     )
     .await?;
     flush_writer(writer, stream, compression, ctx.io_timeout).await
@@ -774,6 +881,7 @@ async fn read_and_pump(
 /// After the whole buffered batch is drained, a single chunk-streaming pass runs
 /// against the latest position the batch reported, so many coalesced move packets
 /// trigger at most one streaming evaluation per read.
+#[allow(clippy::too_many_arguments)] // one play drain: framing + policy + trace state
 async fn pump_serverbound(
     decoder: &mut InboundDecoder,
     compression: &CompressionState,
@@ -782,14 +890,42 @@ async fn pump_serverbound(
     name: &str,
     writer: &mut PlayWriter,
     chunk_stream: &mut ChunkStream,
+    debug: &mut SessionDebug,
 ) -> anyhow::Result<()> {
-    while let Some(packet) = decoder.next_packet_compressed(ConnectionState::Play, compression)? {
+    loop {
+        let next = match decoder.next_packet_compressed(ConnectionState::Play, compression) {
+            Ok(next) => next,
+            Err(err) => {
+                // A frame/compression-level decode error during play: count it and
+                // dump the retained traces before propagating (acceptance:
+                // decode-error).
+                ctx.metrics.record_packet_decode_error(
+                    PacketState::Play,
+                    observe::decode_error_label(&err),
+                );
+                debug.dump("play_decode_error");
+                return Err(err.into());
+            }
+        };
+        let Some(packet) = next else {
+            break;
+        };
         let InboundPacket::Play(body) = packet else {
             anyhow::bail!("non-play frame received in the play phase");
         };
-        handle_play_body(ctx, player, name, writer, chunk_stream, &body).await?;
+        handle_play_body(
+            ctx,
+            player,
+            name,
+            writer,
+            chunk_stream,
+            &body,
+            debug,
+            compression,
+        )
+        .await?;
     }
-    apply_chunk_stream(ctx, writer, chunk_stream).await
+    apply_chunk_stream(ctx, writer, chunk_stream, debug, compression).await
 }
 
 /// Handles one decoded serverbound play-frame body.
@@ -800,6 +936,7 @@ async fn pump_serverbound(
 /// to the simulation unless spawn protection vetoes it. A position packet is also
 /// recorded on the chunk stream so the post-drain pass can react to a boundary
 /// crossing.
+#[allow(clippy::too_many_arguments)] // one play step: framing + policy + trace state
 async fn handle_play_body(
     ctx: &ConnContext,
     player: PlayerId,
@@ -807,14 +944,39 @@ async fn handle_play_body(
     writer: &mut PlayWriter,
     chunk_stream: &mut ChunkStream,
     body: &[u8],
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
 ) -> anyhow::Result<()> {
     let mut reader = BoundedReader::new(body);
     let Ok(id) = reader.read_var_int() else {
+        // A play frame whose body has no readable packet id is malformed.
+        ctx.metrics
+            .record_packet_decode_error(PacketState::Play, "bad_packet_id");
+        debug.dump("play_packet_decode_error");
         return Ok(());
     };
-    let Ok(packet) = ServerboundPlayPacket::decode(id, &mut reader) else {
-        return Ok(());
+    let packet = match ServerboundPlayPacket::decode(id, &mut reader) {
+        Ok(packet) => packet,
+        Err(err) => {
+            // An unknown id is an expected unmodelled packet (counted, not dumped);
+            // a malformed body is a genuine decode error (counted and dumped).
+            let (label, dump) = observe::play_decode_error(&err);
+            ctx.metrics
+                .record_packet_decode_error(PacketState::Play, label);
+            if dump {
+                debug.dump("play_packet_decode_error");
+            }
+            return Ok(());
+        }
     };
+
+    // Record the inbound play trace with the exact frame-body size.
+    debug.record_inbound(observe::trace_inbound_play(
+        &packet,
+        body.len(),
+        compression,
+        &ctx.clock,
+    ));
 
     // Track the client's reported position for chunk streaming. The packet is
     // still forwarded to the simulation below — this only mirrors the position the
@@ -826,7 +988,7 @@ async fn handle_play_body(
     match &packet {
         ServerboundPlayPacket::ChatCommand(command) => {
             let command = command.command().as_str().to_owned();
-            return handle_command(ctx, player, name, writer, &command).await;
+            return handle_command(ctx, player, name, writer, &command, debug, compression).await;
         }
         // The teleport confirmation (reply to the join position sync) and the
         // Keep Alive echo are accepted and need no action: the slice does not
@@ -837,10 +999,13 @@ async fn handle_play_body(
     }
 
     let event = NetEvent::play(player, packet);
-    if is_vetoed(ctx, player, &event) {
+    if let Some(kind) = veto_kind(ctx, player, &event) {
         // Spawn protection: drop the edit so the world is never modified and no
-        // BlockUpdate is broadcast. The actor's optimistic client-side change is
-        // left uncorrected this slice (no clientbound carrier to restore it).
+        // BlockUpdate is broadcast. Count the rejected mutation. The actor's
+        // optimistic client-side change is left uncorrected this slice (no
+        // clientbound carrier to restore it).
+        ctx.metrics
+            .record_block_mutation(kind, MutationResult::Rejected);
         return Ok(());
     }
     ctx.commands
@@ -880,18 +1045,27 @@ async fn apply_chunk_stream(
     ctx: &ConnContext,
     writer: &mut PlayWriter,
     chunk_stream: &mut ChunkStream,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
 ) -> anyhow::Result<()> {
     let Some(position) = chunk_stream.pending_position.take() else {
         return Ok(());
     };
+    let clock = &ctx.clock;
 
     let new_center = chunk_of(position);
     if new_center != chunk_stream.center {
         chunk_stream.center = new_center;
-        writer.enqueue_classified(ClientboundPlayPacket::SetCenterChunk(SetCenterChunk::new(
-            new_center.x(),
-            new_center.z(),
-        )));
+        enqueue_traced_classified(
+            writer,
+            debug,
+            compression,
+            clock,
+            ClientboundPlayPacket::SetCenterChunk(SetCenterChunk::new(
+                new_center.x(),
+                new_center.z(),
+            )),
+        );
     }
 
     let desired = desired_chunks(new_center, chunk_stream.view_distance);
@@ -910,10 +1084,20 @@ async fn apply_chunk_stream(
     // Drop the departed columns from the client now (tiny packets) and from the
     // tracked set; the driver releases their tickets via the command below.
     for pos in &to_unload {
-        writer.enqueue(
+        let outcome = enqueue_traced(
+            writer,
+            debug,
+            compression,
+            clock,
             OutboundPriority::World,
             ClientboundPlayPacket::UnloadChunk(UnloadChunk::new(pos.z(), pos.x())),
         );
+        // Count only unloads that actually reach the queue. The column always
+        // leaves the tracked set, though: the driver releases its ticket via the
+        // `StreamChunks` command below regardless of whether the packet queued.
+        if outcome.is_enqueued() {
+            ctx.metrics.incr_chunk_unloaded(1);
+        }
         chunk_stream.loaded.remove(pos);
     }
 
@@ -933,13 +1117,23 @@ async fn apply_chunk_stream(
     // Only the chunks the driver actually built come back; record exactly those so
     // a skipped chunk is retried on a later update rather than treated as sent.
     for packet in packets {
-        chunk_stream
-            .loaded
-            .insert(ChunkPos::new(packet.x(), packet.z()));
-        writer.enqueue(
+        let pos = ChunkPos::new(packet.x(), packet.z());
+        // Track the column unconditionally: the driver already took a player ticket
+        // for it, and `loaded` is what the disconnect/unload path uses to release
+        // that ticket. Gating this on the enqueue would leak the ticket on a
+        // tail-drop. Only the send *counter* is gated on a real enqueue.
+        chunk_stream.loaded.insert(pos);
+        let outcome = enqueue_traced(
+            writer,
+            debug,
+            compression,
+            clock,
             OutboundPriority::World,
             ClientboundPlayPacket::ChunkDataAndLight(packet),
         );
+        if outcome.is_enqueued() {
+            ctx.metrics.incr_chunk_sent(1);
+        }
     }
     Ok(())
 }
@@ -982,17 +1176,27 @@ fn chebyshev_distance(a: ChunkPos, b: ChunkPos) -> i64 {
     dx.max(dz)
 }
 
-/// Returns whether `event` is a break/place that spawn protection should veto:
-/// it targets a protected column and the actor lacks the bypass permission.
-fn is_vetoed(ctx: &ConnContext, player: PlayerId, event: &NetEvent) -> bool {
-    let Some(GameInput::BlockBreak { position, .. } | GameInput::BlockPlace { position, .. }) =
-        net_event_to_input(event)
-    else {
-        return false;
+/// Returns the mutation kind if `event` is a break/place that spawn protection
+/// should veto (it targets a protected column and the actor lacks the bypass
+/// permission), or `None` if it is not a vetoed edit.
+///
+/// Returning the [`MutationKind`] lets the caller record the rejected mutation
+/// against `ferrumc_block_mutation_total{kind,result=rejected}`.
+fn veto_kind(ctx: &ConnContext, player: PlayerId, event: &NetEvent) -> Option<MutationKind> {
+    let (position, kind) = match net_event_to_input(event) {
+        Some(GameInput::BlockBreak { position, .. }) => (position, MutationKind::Break),
+        Some(GameInput::BlockPlace { position, .. }) => (position, MutationKind::Place),
+        _ => return None,
     };
-    ctx.policy
+    if ctx
+        .policy
         .guard()
         .vetoes(position, ctx.policy.permissions().has_bypass(player))
+    {
+        Some(kind)
+    } else {
+        None
+    }
 }
 
 /// Dispatches a `/command` for `player` and applies its side effect.
@@ -1011,6 +1215,8 @@ async fn handle_command(
     name: &str,
     writer: &mut PlayWriter,
     command: &str,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
 ) -> anyhow::Result<()> {
     let policy = &ctx.policy;
     let source = CommandSource::for_player(player, name, policy.permission_level());
@@ -1027,9 +1233,13 @@ async fn handle_command(
 
     if command.split_whitespace().next() == Some(SPAWN_COMMAND) {
         let spawn = policy.spawn();
-        writer.enqueue_classified(ClientboundPlayPacket::SynchronizePlayerPosition(
-            spawn_sync(JOIN_TELEPORT_ID, spawn),
-        ));
+        enqueue_traced_classified(
+            writer,
+            debug,
+            compression,
+            &ctx.clock,
+            ClientboundPlayPacket::SynchronizePlayerPosition(spawn_sync(JOIN_TELEPORT_ID, spawn)),
+        );
         let move_event = NetEvent::play(
             player,
             ServerboundPlayPacket::SetPlayerPosition(SetPlayerPosition::new(
@@ -1042,6 +1252,58 @@ async fn handle_command(
             .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
     }
     Ok(())
+}
+
+/// Enqueues `packet` at its default priority, recording an outbound trace only
+/// when it is actually queued.
+///
+/// Returns the [`EnqueueOutcome`] so the caller can gate per-packet counters
+/// (e.g. `ferrumc_chunk_sent_total`) on a real enqueue. A tail-dropped packet
+/// (queue at capacity) is neither traced nor counted: the disconnect dump and the
+/// send counters then reflect what entered the outbound pipeline rather than
+/// intent, so backpressure cannot inflate them.
+fn enqueue_traced_classified(
+    writer: &mut PlayWriter,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+    clock: &ServerClock,
+    packet: ClientboundPlayPacket,
+) -> EnqueueOutcome {
+    // Build the trace before the packet is moved into the queue; recording it is
+    // deferred until the enqueue is known to have succeeded.
+    let trace = observe::trace_outbound_play(&packet, compression, clock);
+    let outcome = writer.enqueue_classified(packet);
+    if outcome.is_enqueued() {
+        debug.record_outbound(trace);
+    }
+    outcome
+}
+
+/// Enqueues `packet` at an explicit priority, recording an outbound trace only
+/// when it is actually queued (see [`enqueue_traced_classified`] for the
+/// drop-vs-trace policy).
+fn enqueue_traced(
+    writer: &mut PlayWriter,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+    clock: &ServerClock,
+    priority: OutboundPriority,
+    packet: ClientboundPlayPacket,
+) -> EnqueueOutcome {
+    let trace = observe::trace_outbound_play(&packet, compression, clock);
+    let outcome = writer.enqueue(priority, packet);
+    if outcome.is_enqueued() {
+        debug.record_outbound(trace);
+    }
+    outcome
+}
+
+/// Samples the writer's outbound queue depth into both the per-session dump and
+/// the `ferrumc_session_outbound_queue_len{session}` aggregate gauge.
+fn observe_queue_len(debug: &mut SessionDebug, ctx: &ConnContext, writer: &PlayWriter) {
+    let depth = writer.total_queued();
+    debug.observe_outbound_queue_len(depth);
+    ctx.metrics.observe_outbound_queue_len(depth);
 }
 
 /// Drains the writer into back-to-back batches and writes each to the socket.

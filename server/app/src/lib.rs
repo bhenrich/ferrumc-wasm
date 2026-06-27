@@ -18,6 +18,7 @@ mod command;
 mod config;
 mod connection;
 mod driver;
+mod observe;
 mod plugins;
 mod registries;
 mod server;

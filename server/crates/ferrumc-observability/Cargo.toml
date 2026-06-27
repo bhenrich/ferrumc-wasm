@@ -6,9 +6,21 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# `Tick` is stamped on every packet trace and tick metric; the crate's default
+# `serde` feature makes `Tick` serialize into the JSON snapshots.
+ferrumc-core = { workspace = true }
+# Structured dump/snapshot events (session dump = `warn`, metrics = `info`).
+tracing = { workspace = true }
+# `derive(Serialize)` on the trace / metric / snapshot DTOs.
+serde = { workspace = true }
+# On-demand JSON rendering for the dump events and a future exporter.
+serde_json = { workspace = true }
 
 [dev-dependencies]
+# Round-trips the JSON snapshots in unit tests.
+serde_json = { workspace = true }
+# Captures the `dump()` tracing events to assert the end-to-end emission path.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

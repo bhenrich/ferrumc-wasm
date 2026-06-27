@@ -163,6 +163,7 @@ dependencies = [
  "ferrumc-core",
  "ferrumc-math",
  "ferrumc-net",
+ "ferrumc-observability",
  "ferrumc-permission",
  "ferrumc-plugin-host",
  "ferrumc-plugin-spawn-protect",
@@ -245,6 +246,13 @@ dependencies = [
 [[package]]
 name = "ferrumc-observability"
 version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-core",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "ferrumc-permission"

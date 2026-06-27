@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 
 use ferrumc_net::ConnectionLimits;
+use ferrumc_observability::{CounterRegistry, ServerClock};
 use ferrumc_session::{shard_for_position, SessionRouter};
 
 use crate::config::AppConfig;
@@ -46,6 +47,10 @@ pub struct RunningServer {
     accept_task: JoinHandle<()>,
     /// The simulation/session driver task.
     driver_task: JoinHandle<()>,
+    /// The shared metric registry, fed by the driver and every connection task.
+    /// Exposed for an on-demand metrics snapshot (see [`metrics`](Self::metrics)
+    /// and [`dump_metrics`](Self::dump_metrics)).
+    metrics: Arc<CounterRegistry>,
 }
 
 impl RunningServer {
@@ -53,6 +58,24 @@ impl RunningServer {
     #[must_use]
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The shared metric registry.
+    ///
+    /// Call [`snapshot`](ferrumc_observability::CounterRegistry::snapshot) on it
+    /// for an owned, serializable view of every metric (the on-demand JSON
+    /// snapshot surface a future exporter or admin command can scrape).
+    #[must_use]
+    pub fn metrics(&self) -> &CounterRegistry {
+        &self.metrics
+    }
+
+    /// Emits the current metrics as one structured tracing event carrying JSON.
+    ///
+    /// A convenience over [`metrics`](Self::metrics) for operators who just want
+    /// the snapshot in the logs (for example on a future SIGUSR1 or admin hook).
+    pub fn dump_metrics(&self) {
+        self.metrics.dump();
     }
 
     /// Signals shutdown and waits for the accept loop and driver to finish.
@@ -115,6 +138,12 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    // Shared observability state: one atomic-backed metric registry fed by the
+    // driver and every connection task, and a single-writer server clock the
+    // driver publishes each tick so connection tasks can stamp packet traces.
+    let metrics = Arc::new(CounterRegistry::new());
+    let clock = ServerClock::new();
+
     let driver_task = tokio::spawn(driver::run(
         router,
         setup.shard,
@@ -123,6 +152,8 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         shard_rx,
         commands_rx,
         config.tick_period(),
+        Arc::clone(&metrics),
+        clock.clone(),
         shutdown_rx.clone(),
     ));
 
@@ -146,6 +177,8 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         policy,
         status_response,
         view_distance: config.view_distance,
+        metrics: Arc::clone(&metrics),
+        clock,
     };
 
     let accept_task = tokio::spawn(accept_loop(
@@ -160,6 +193,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         shutdown: shutdown_tx,
         accept_task,
         driver_task,
+        metrics,
     })
 }
 

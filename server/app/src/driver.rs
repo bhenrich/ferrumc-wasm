@@ -17,16 +17,20 @@
 //! never blocks: channel sends are non-blocking inside the router, and a full
 //! inbox defers inputs rather than stalling.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
-use ferrumc_core::PlayerId;
+use ferrumc_core::{PlayerId, Tick};
 use ferrumc_math::{ChunkPos, Vec3};
+use ferrumc_observability::{
+    CounterRegistry, MutationKind, MutationResult, ServerClock, TickMetrics,
+};
 use ferrumc_proto::generated::play::ChunkDataAndLight;
 use ferrumc_session::{NetEvent, PlayerSessionHandle, SessionError, SessionRouter};
-use ferrumc_sim::{ChunkTicket, GameInput, SimShard, TicketReason};
+use ferrumc_sim::{ChunkTicket, GameInput, GameOutput, SimShard, TicketReason};
 use ferrumc_storage::{InMemoryStore, WorldStore, MAX_SAVE_BATCH};
 use ferrumc_world::FlatWorldGenerator;
 
@@ -102,20 +106,29 @@ pub(crate) async fn run(
     mut shard_rx: mpsc::Receiver<GameInput>,
     mut commands: mpsc::Receiver<SimCommand>,
     tick_period: Duration,
+    metrics: Arc<CounterRegistry>,
+    clock: ServerClock,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(tick_period);
     // Lag must not trigger catch-up ticks: skip missed deadlines instead.
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // The driver owns the authoritative tick counter: it advances once per
+    // `run_tick` and publishes the value through `clock` so connection tasks can
+    // stamp their packet traces with the current tick.
+    let mut tick = Tick::ZERO;
+
     loop {
         tokio::select! {
             biased;
             _ = shutdown.changed() => break,
-            _ = ticker.tick() => run_tick(&mut router, &mut shard, &mut shard_rx),
+            _ = ticker.tick() => {
+                run_tick(&mut router, &mut shard, &mut shard_rx, &metrics, &clock, &mut tick);
+            }
             maybe_command = commands.recv() => match maybe_command {
                 Some(command) => {
-                    handle_command(&mut router, &mut shard, &store, &generator, command).await;
+                    handle_command(&mut router, &mut shard, &store, &generator, &metrics, command).await;
                 }
                 None => break,
             },
@@ -129,6 +142,7 @@ async fn handle_command(
     shard: &mut SimShard,
     store: &InMemoryStore,
     generator: &FlatWorldGenerator,
+    metrics: &CounterRegistry,
     command: SimCommand,
 ) {
     match command {
@@ -154,13 +168,13 @@ async fn handle_command(
         } => {
             // Release first (frees tickets the new view no longer needs) before
             // acquiring, so a chunk that both left and re-entered nets out cleanly.
-            release_chunks(shard, store, &unload).await;
+            release_chunks(shard, store, metrics, &unload).await;
             let packets = load_chunks(shard, store, generator, &load).await;
             // A gone connection just discards the packets; nothing to clean up.
             let _ = reply.send(packets);
         }
         SimCommand::ReleaseChunks { positions } => {
-            release_chunks(shard, store, &positions).await;
+            release_chunks(shard, store, metrics, &positions).await;
         }
     }
 }
@@ -212,7 +226,12 @@ async fn load_chunks(
 /// Releases the player ticket on each chunk in `positions`, persisting the save
 /// record of any chunk that unloads with unsaved edits so a streamed-out chunk is
 /// not lost.
-async fn release_chunks(shard: &mut SimShard, store: &InMemoryStore, positions: &[ChunkPos]) {
+async fn release_chunks(
+    shard: &mut SimShard,
+    store: &InMemoryStore,
+    metrics: &CounterRegistry,
+    positions: &[ChunkPos],
+) {
     let ticket = ChunkTicket::of(TicketReason::Player);
     let mut dirty = Vec::new();
     for &pos in positions {
@@ -227,35 +246,92 @@ async fn release_chunks(shard: &mut SimShard, store: &InMemoryStore, positions: 
     while !dirty.is_empty() {
         let take = dirty.len().min(MAX_SAVE_BATCH);
         let batch: Vec<_> = dirty.drain(..take).collect();
-        if let Err(err) = store.save_chunks(batch).await {
+        // Time each persist call for ferrumc_storage_flush_ms.
+        let start = Instant::now();
+        let result = store.save_chunks(batch).await;
+        metrics.record_storage_flush_ms(start.elapsed().as_millis() as u64);
+        if let Err(err) = result {
             tracing::warn!(%err, "failed to persist streamed-out chunks");
         }
     }
 }
 
 /// Drains queued inputs into the shard, advances one tick, and routes outputs.
+///
+/// Also records the per-tick observability metrics: it times the tick
+/// (`ferrumc_tick_ms{shard}`), counts accepted block edits
+/// (`ferrumc_block_mutation_total{kind,result=accepted}`), advances and publishes
+/// the authoritative tick through `clock`, and emits a structured tick event.
 fn run_tick(
     router: &mut SessionRouter,
     shard: &mut SimShard,
     shard_rx: &mut mpsc::Receiver<GameInput>,
+    metrics: &CounterRegistry,
+    clock: &ServerClock,
+    tick: &mut Tick,
 ) {
+    let start = Instant::now();
+
     // Move everything the router queued since the last tick into the inbox; a
     // full inbox stops the drain (reject backpressure) and retries next tick.
+    let mut inputs_drained = 0usize;
     while let Ok(input) = shard_rx.try_recv() {
         if let Err(err) = shard.enqueue(input) {
             tracing::warn!(%err, "shard inbox full; deferring inputs to next tick");
             break;
         }
+        inputs_drained += 1;
     }
+    let inbox_len = shard.inbox_len();
 
     let outputs = shard.run_tick();
     // Routing an output may fan out to many viewers; any whose connection has
     // closed are returned so we can schedule a clean despawn for each.
     let mut closed = Vec::new();
     for output in &outputs {
+        // An accepted block edit surfaces here as a BlockChanged: air means the
+        // edit was a break, any other state a place. Rejected edits emit no output
+        // and are counted at the app veto site instead.
+        if let GameOutput::BlockChanged { state, .. } = output {
+            let kind = if state.is_air() {
+                MutationKind::Break
+            } else {
+                MutationKind::Place
+            };
+            metrics.record_block_mutation(kind, MutationResult::Accepted);
+        }
         closed.extend(router.route_output(output));
     }
     for player in closed {
         let _ = router.disconnect_player(player);
     }
+
+    // Advance and publish the authoritative tick (saturating: it never wraps
+    // silently), then record the tick metrics for this shard.
+    *tick = tick.saturating_add(1);
+    clock.set(*tick);
+    let shard_pos = shard.shard_pos();
+    let tick_metrics = TickMetrics {
+        shard_x: shard_pos.x(),
+        shard_z: shard_pos.z(),
+        tick: *tick,
+        duration_us: start.elapsed().as_micros() as u64,
+        inputs_drained,
+        outputs_emitted: outputs.len(),
+        players: shard.player_count(),
+        inbox_len,
+    };
+    metrics.record_tick(&tick_metrics);
+    tracing::debug!(
+        target: "ferrumc::observability::tick",
+        shard_x = tick_metrics.shard_x,
+        shard_z = tick_metrics.shard_z,
+        tick = tick_metrics.tick.get(),
+        duration_us = tick_metrics.duration_us,
+        inputs_drained = tick_metrics.inputs_drained,
+        outputs_emitted = tick_metrics.outputs_emitted,
+        players = tick_metrics.players,
+        inbox_len = tick_metrics.inbox_len,
+        "tick"
+    );
 }

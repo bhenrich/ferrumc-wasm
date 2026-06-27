@@ -43,6 +43,9 @@ ferrumc-plugin-host = { workspace = true }
 # The spawn-protection plugin: loaded dynamically (cdylib) and driven in-process
 # (rlib) for its veto policy, config, and bypass permission node.
 ferrumc-plugin-spawn-protect = { workspace = true }
+# Packet tracing + the metric registry / server clock wired into the connection
+# and driver hot paths; the app is the only crate that can fire those hooks.
+ferrumc-observability = { workspace = true }
 
 # Single multi-thread Tokio runtime: listener, per-connection tasks, bounded
 # channels, intervals, timeouts, and graceful shutdown.
