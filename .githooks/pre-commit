@@ -10,7 +10,7 @@ CHANGED="$(git diff --cached --name-only)"
 
 # Guard: generated files must change only via the generator/fixtures, never by hand.
 if echo "$CHANGED" | grep -E '/src/generated/' >/dev/null 2>&1; then
-  if ! echo "$CHANGED" | grep -E '^server/crates/ferrumc-proto-gen/|^server/xtask/|^server/fixtures/protocol/' >/dev/null 2>&1; then
+  if ! echo "$CHANGED" | grep -E '^server/crates/ferrumc-proto-gen/|^server/xtask/|^server/fixtures/protocol/|^docs/protocol/' >/dev/null 2>&1; then
     echo "[pre-commit] Generated files changed without a generator/fixture change."
     echo "             Fix the generator or source fixture; do not hand-edit generated files."
     exit 1
