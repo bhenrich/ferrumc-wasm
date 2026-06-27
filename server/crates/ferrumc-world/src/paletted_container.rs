@@ -116,9 +116,10 @@ pub(crate) fn write_var_u32(out: &mut Vec<u8>, mut value: u32) {
 ///
 /// The chunk-section wire format writes the backing words verbatim (the bit
 /// pattern is what the client unpacks), so this is a straight big-endian dump.
-/// The mandatory `VarInt` word count that vanilla prefixes every long array with
-/// is written by the caller ([`PalettedContainer::encode_network`]) immediately
-/// before this dump.
+/// Since 1.21.5 the long array carries **no** length prefix: the client derives
+/// the word count from the `bits_per_entry` byte and the container's entry count
+/// (`ceil(entries / floor(64 / bits))`), so nothing precedes this dump but the
+/// palette.
 fn write_packed_longs(out: &mut Vec<u8>, words: &[u64]) {
     for &word in words {
         out.extend_from_slice(&word.to_be_bytes());
@@ -126,21 +127,19 @@ fn write_packed_longs(out: &mut Vec<u8>, words: &[u64]) {
 }
 
 /// Appends a single-valued paletted container to `out`: a zero `bits_per_entry`
-/// byte, the palette `value` as a `VarInt`, and a `VarInt(0)` length prefix for
-/// the (empty) long array.
+/// byte followed by the palette `value` as a `VarInt`.
 ///
-/// Vanilla's `FriendlyByteBuf.writeLongArray` (used by `PalettedContainer.Data`)
-/// always writes that count, even for the empty array a single-valued container
-/// carries; the client's `readLongArray` reads it first, so omitting it desyncs
-/// the section parse. This is the one place that layout lives: it backs both
+/// A `bits_per_entry` of `0` selects the single-value palette, whose backing
+/// storage is empty. Since the 1.21.5 chunk-format change the long array no
+/// longer carries a `VarInt` length prefix; with `bits_per_entry = 0` the client
+/// derives a word count of zero and reads no longs, so the container ends right
+/// after the value. This is the one place that layout lives: it backs both
 /// [`PalettedContainer::encode_network`]'s single-value branch and the
 /// single-valued biome container the chunk-blob assembler in [`crate::network`]
 /// emits, so the two can never drift.
 pub(crate) fn write_single_value_container(out: &mut Vec<u8>, value: u32) {
     out.push(0);
     write_var_u32(out, value);
-    // Empty long array, but the VarInt count is mandatory on the wire.
-    write_var_u32(out, 0);
 }
 
 impl<const CAPACITY: usize> PalettedContainer<CAPACITY> {
@@ -303,22 +302,21 @@ impl<const CAPACITY: usize> PalettedContainer<CAPACITY> {
     /// Appends this container's chunk-section wire encoding to `out`.
     ///
     /// The layout matches the Minecraft 1.21.8 `PalettedContainer`: a
-    /// `bits_per_entry` byte, then the palette, then the packed long array. The
-    /// long array is **always** preceded by a `VarInt` word count, exactly as
-    /// vanilla's `FriendlyByteBuf.writeLongArray` emits it — the client's
-    /// `readLongArray` reads that count first, so even a single-valued section
-    /// must write `VarInt(0)`.
+    /// `bits_per_entry` byte, then the palette, then the packed long array. As of
+    /// the 1.21.5 chunk-format change the long array carries **no** length prefix:
+    /// the client derives the word count from `bits_per_entry` and the container's
+    /// entry count (`ceil(entries / floor(64 / bits_per_entry))`), so the words
+    /// follow the palette directly. Emitting a spurious `VarInt` count here would
+    /// shift every following byte and desync the client's section parse.
     ///
     /// - [`ContainerKind::Single`]: `bits_per_entry = 0`, one `VarInt` palette
-    ///   value, then a `VarInt(0)` empty long array (see
-    ///   [`write_single_value_container`]).
+    ///   value, and no longs (see [`write_single_value_container`]).
     /// - [`ContainerKind::Indirect`]: `bits_per_entry` is the palette-index width,
     ///   followed by a `VarInt` palette length, that many `VarInt` ids, then the
-    ///   long array's `VarInt` word count and the non-spanning words
-    ///   ([`PackedArray::words`]).
+    ///   non-spanning words ([`PackedArray::words`]) with no count.
     /// - [`ContainerKind::Direct`]: `bits_per_entry = direct_wire_bits`, no
-    ///   palette, then the long array's `VarInt` word count and the words
-    ///   repacked to `direct_wire_bits`.
+    ///   palette, then the words repacked to `direct_wire_bits`, again with no
+    ///   count.
     ///
     /// `direct_wire_bits` is the bits-per-entry the direct representation uses on
     /// the wire (15 for block states in 1.21.8). It is ignored for the single and
@@ -343,19 +341,16 @@ impl<const CAPACITY: usize> PalettedContainer<CAPACITY> {
                 for id in palette {
                     write_var_u32(out, id.as_u32());
                 }
-                let words = indices.words();
-                // The long array is prefixed with its word count, vanilla-style.
-                write_var_u32(out, u32::try_from(words.len()).unwrap_or(u32::MAX));
-                write_packed_longs(out, words);
+                // The long array follows the palette directly: no length prefix
+                // since 1.21.5; the client recomputes the word count.
+                write_packed_longs(out, indices.words());
             }
             Repr::Direct(data) => {
                 out.push(direct_wire_bits);
                 // The in-memory layout is 32-bit for lossless storage; the wire
                 // uses the narrower vanilla width, so repack before emitting.
                 let wire = data.resized(direct_wire_bits)?;
-                let words = wire.words();
-                write_var_u32(out, u32::try_from(words.len()).unwrap_or(u32::MAX));
-                write_packed_longs(out, words);
+                write_packed_longs(out, wire.words());
             }
         }
         Ok(())
@@ -573,13 +568,13 @@ mod tests {
     const DIRECT_WIRE_BITS: u8 = 15;
 
     #[test]
-    fn encode_single_air_is_bpe_zero_one_varint_then_zero_count() {
+    fn encode_single_air_is_bpe_zero_one_varint_no_longs() {
         let c = Container::new();
         let mut out = Vec::new();
         c.encode_network(&mut out, DIRECT_WIRE_BITS).unwrap();
-        // bits_per_entry = 0, the single palette value (air = 0), then the
-        // mandatory VarInt(0) long-array count. No longs follow.
-        assert_eq!(out, vec![0x00, 0x00, 0x00]);
+        // bits_per_entry = 0 selects the single-value palette; the value (air = 0)
+        // is the only payload. Since 1.21.5 no long-array count follows.
+        assert_eq!(out, vec![0x00, 0x00]);
     }
 
     #[test]
@@ -587,8 +582,8 @@ mod tests {
         let c = Container::filled(BlockStateId::new(5));
         let mut out = Vec::new();
         c.encode_network(&mut out, DIRECT_WIRE_BITS).unwrap();
-        // bpe 0, palette value 5, then the empty long-array count.
-        assert_eq!(out, vec![0x00, 0x05, 0x00]);
+        // bpe 0, palette value 5, and nothing else (no long-array count).
+        assert_eq!(out, vec![0x00, 0x05]);
     }
 
     #[test]
@@ -596,8 +591,8 @@ mod tests {
         use super::write_single_value_container;
         let mut out = Vec::new();
         write_single_value_container(&mut out, 300);
-        // bpe 0, value 300 (VarInt [0xAC, 0x02]), empty long-array count 0.
-        assert_eq!(out, vec![0x00, 0xAC, 0x02, 0x00]);
+        // bpe 0, value 300 (VarInt [0xAC, 0x02]); no trailing long-array count.
+        assert_eq!(out, vec![0x00, 0xAC, 0x02]);
     }
 
     #[test]
@@ -618,18 +613,17 @@ mod tests {
         assert_eq!(out[2], 0);
         assert_eq!(out[3], 1);
 
-        // 4 bits/entry -> 16 entries per long -> ceil(4096 / 16) = 256 longs,
-        // and the long array is prefixed with that count as a VarInt
-        // (256 = [0x80, 0x02]).
-        assert_eq!(&out[4..6], &[0x80, 0x02]);
-        let long_bytes = out.len() - 6;
+        // 4 bits/entry -> 16 entries per long -> ceil(4096 / 16) = 256 longs.
+        // The words follow the palette directly with no count prefix, so they
+        // start at out[4]. The client recomputes 256 from the bpe byte.
+        let long_bytes = out.len() - 4;
         assert_eq!(long_bytes % 8, 0);
         assert_eq!(long_bytes / 8, 256);
 
         // Block index 0 maps to palette index 1 (stone) in the low nibble of the
         // first long; every other entry is palette index 0.
-        assert_eq!(&out[6..14], &[0, 0, 0, 0, 0, 0, 0, 1]);
-        assert!(out[14..].iter().all(|&b| b == 0));
+        assert_eq!(&out[4..12], &[0, 0, 0, 0, 0, 0, 0, 1]);
+        assert!(out[12..].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -646,11 +640,9 @@ mod tests {
 
         // bits_per_entry is the *wire* width (15), not the internal 32.
         assert_eq!(out[0], DIRECT_WIRE_BITS);
-        // No palette is written for direct; 15 bits -> 4 entries per long ->
-        // ceil(4096 / 4) = 1024 longs, prefixed by that count as a VarInt
-        // (1024 = [0x80, 0x08]).
-        assert_eq!(&out[1..3], &[0x80, 0x08]);
-        let long_bytes = out.len() - 3;
+        // No palette and no count for direct; 15 bits -> 4 entries per long ->
+        // ceil(4096 / 4) = 1024 longs follow the bpe byte directly.
+        let long_bytes = out.len() - 1;
         assert_eq!(long_bytes, 1024 * 8);
     }
 

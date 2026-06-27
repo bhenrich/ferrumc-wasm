@@ -71,9 +71,13 @@ const ALL_LIGHT_SECTIONS_MASK: i64 = (1i64 << LIGHT_SECTION_COUNT) - 1;
 /// 2. `block_states`: a [`PalettedContainer`](crate::PalettedContainer) of block
 ///    states (see [`PalettedContainer::encode_network`](crate::PalettedContainer::encode_network)).
 /// 3. `biomes`: a [`PalettedContainer`](crate::PalettedContainer) of biomes,
-///    here always a single-valued `plains` container (`bits_per_entry = 0`, one
-///    `VarInt` value, then a `VarInt(0)` empty long-array count) because the
-///    crate has no biome storage yet.
+///    here always a single-valued `plains` container (`bits_per_entry = 0` then
+///    one `VarInt` value, with no long array) because the crate has no biome
+///    storage yet.
+///
+/// Since the 1.21.5 chunk-format change neither container prefixes its long array
+/// with a word count; the client recomputes it from `bits_per_entry` and the
+/// container's entry count (4096 for block states, 64 for biomes).
 ///
 /// # Errors
 ///
@@ -95,10 +99,10 @@ pub fn encode_chunk_section_data(chunk: &Chunk) -> Result<Vec<u8>, WorldError> {
             .block_states()
             .encode_network(&mut out, DIRECT_WIRE_BITS_BLOCK)?;
 
-        // Biomes: a single-valued plains container for the whole section. Its
-        // (empty) long array still carries the mandatory VarInt(0) count; the
-        // shared single-value encoder writes bpe, the value, and that count so
-        // this matches the block-states container's single-value form exactly.
+        // Biomes: a single-valued plains container for the whole section. With
+        // bits_per_entry 0 the client reads no longs, so the shared single-value
+        // encoder writes just the bpe byte and the value, matching the
+        // block-states container's single-value form exactly.
         write_single_value_container(&mut out, PLAINS_BIOME_ID);
     }
     Ok(out)
@@ -260,58 +264,108 @@ mod tests {
         }
     }
 
-    /// A decoded section header from the blob: its non-air count and the
+    /// The block-states entry count per section (`16 * 16 * 16`).
+    const BLOCK_ENTRIES: usize = 4096;
+
+    /// The biome entry count per section (`4 * 4 * 4`). Biomes are stored at
+    /// quarter resolution, so a 1.21.8 client sizes a biome container's long
+    /// array to 64 entries, not 4096 — the distinction only matters for a
+    /// multi-valued biome container, which this crate never emits, but the parser
+    /// honours it to stay faithful to the real client.
+    const BIOME_ENTRIES: usize = 64;
+
+    /// A `PalettedContainer` decoded the way a client does: its bits-per-entry
+    /// and, for a single-valued container, the lone palette value.
+    struct ParsedContainer {
+        bpe: u8,
+        single_value: Option<u32>,
+    }
+
+    /// Reads one `PalettedContainer` exactly as a Minecraft 1.21.8 client does,
+    /// advancing `pos`.
+    ///
+    /// The client reads the `bits_per_entry` byte and the palette, then — since
+    /// the 1.21.5 chunk-format change dropped the long-array length prefix —
+    /// **computes** the word count from the bpe and `entries`
+    /// (`ceil(entries / floor(64 / bpe))`) and consumes exactly that many longs.
+    /// It never reads a count off the wire; an encoder that writes one shifts
+    /// every following byte and desyncs this parse, which is exactly the bug a
+    /// real client hits.
+    fn client_read_container(bytes: &[u8], pos: &mut usize, entries: usize) -> ParsedContainer {
+        let bpe = bytes[*pos];
+        *pos += 1;
+
+        if bpe == 0 {
+            // Single-value palette: one VarInt value and no long array.
+            let single_value = Some(read_var_u32(bytes, pos));
+            return ParsedContainer { bpe, single_value };
+        }
+        if bpe <= 8 {
+            // Indirect palette (linear/hashmap on the client): length + ids.
+            // Above 8 bits the block strategy switches to the direct/global
+            // palette, which carries no palette on the wire.
+            let len = read_var_u32(bytes, pos);
+            for _ in 0..len {
+                let _ = read_var_u32(bytes, pos);
+            }
+        }
+        let values_per_word = 64 / usize::from(bpe);
+        let long_count = entries.div_ceil(values_per_word);
+        *pos += long_count * 8;
+        ParsedContainer {
+            bpe,
+            single_value: None,
+        }
+    }
+
+    /// A section decoded from the blob: its non-air `block_count` and the
     /// block-states bits-per-entry.
     struct SectionHeader {
         count: i16,
         block_bpe: u8,
     }
 
-    /// Walks one `PalettedContainer` at `pos`, returning its bits-per-entry and
-    /// advancing `pos` past the palette and long array.
-    fn skip_container(bytes: &[u8], pos: &mut usize) -> u8 {
-        let bpe = bytes[*pos];
-        *pos += 1;
-        if bpe == 0 {
-            // Single value: one varint palette value, then the mandatory
-            // VarInt(0) empty long-array count.
-            let _ = read_var_u32(bytes, pos);
-            let long_count = read_var_u32(bytes, pos);
-            assert_eq!(long_count, 0, "single-valued container carries no longs");
-            return bpe;
-        }
-        if bpe <= 8 {
-            // Indirect: palette length, that many ids.
-            let len = read_var_u32(bytes, pos);
-            for _ in 0..len {
-                let _ = read_var_u32(bytes, pos);
-            }
-        }
-        // Indirect and direct both prefix the non-spanning long array with its
-        // word count, which must equal ceil(4096 / (64 / bpe)).
-        let long_count = read_var_u32(bytes, pos) as usize;
-        let values_per_word = 64 / usize::from(bpe);
-        let expected = 4096usize.div_ceil(values_per_word);
-        assert_eq!(long_count, expected, "long count matches the packed layout");
-        *pos += long_count * 8;
-        bpe
-    }
-
-    /// Fully parses the section-data blob into per-section headers, asserting it
-    /// is consumed exactly (no trailing bytes).
-    fn parse_blob(bytes: &[u8]) -> Vec<SectionHeader> {
+    /// Parses the whole section-data blob the way a client does and asserts the
+    /// vanilla invariants, returning each section's header.
+    ///
+    /// Asserts, for all [`SECTION_COUNT`] sections: the block bpe obeys vanilla's
+    /// palette rules (0 for single, `4..=8` for the indirect range — never
+    /// `1/2/3` — or 15 for direct); every biome container is single-valued plains
+    /// (`bpe == 0`, value `0`); and the parse consumes the blob **exactly**. A
+    /// shortfall or leftover here is precisely the byte-offset desync that makes a
+    /// real client read a bogus biome id and crash.
+    fn client_parse_blob(bytes: &[u8]) -> Vec<SectionHeader> {
         let mut pos = 0usize;
-        let mut headers = Vec::new();
-        for _ in 0..SECTION_COUNT {
+        let mut headers = Vec::with_capacity(SECTION_COUNT);
+        for index in 0..SECTION_COUNT {
             let count = i16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
             pos += 2;
-            let block_bpe = skip_container(bytes, &mut pos);
-            // Biome container: single-valued plains.
-            let biome_bpe = skip_container(bytes, &mut pos);
-            assert_eq!(biome_bpe, 0, "biome container must be single-valued");
-            headers.push(SectionHeader { count, block_bpe });
+
+            let block = client_read_container(bytes, &mut pos, BLOCK_ENTRIES);
+            assert!(
+                block.bpe == 0 || (4..=8).contains(&block.bpe) || block.bpe == 15,
+                "section {index} block bpe {} violates vanilla palette rules",
+                block.bpe
+            );
+
+            let biome = client_read_container(bytes, &mut pos, BIOME_ENTRIES);
+            assert_eq!(biome.bpe, 0, "section {index} biome must be single-valued");
+            assert_eq!(
+                biome.single_value,
+                Some(0),
+                "section {index} biome single value must be plains (0)"
+            );
+
+            headers.push(SectionHeader {
+                count,
+                block_bpe: block.bpe,
+            });
         }
-        assert_eq!(pos, bytes.len(), "blob has trailing bytes");
+        assert_eq!(
+            pos,
+            bytes.len(),
+            "client parse must consume the blob exactly (no shortfall or leftover)"
+        );
         headers
     }
 
@@ -320,12 +374,13 @@ mod tests {
         let chunk = Chunk::new(ChunkPos::ORIGIN);
         let blob = encode_chunk_section_data(&chunk).unwrap();
         // 24 sections, each: i16 count (2) + block single-air container (bpe 0,
-        // value 0, long-count 0 = 3) + biome single-plains container (3) = 8.
-        assert_eq!(blob.len(), SECTION_COUNT * 8);
-        for section in blob.chunks_exact(8) {
-            assert_eq!(section, &[0, 0, 0, 0, 0, 0, 0, 0]);
+        // value 0 = 2) + biome single-plains container (2) = 6. No long-array
+        // count prefixes since 1.21.5.
+        assert_eq!(blob.len(), SECTION_COUNT * 6);
+        for section in blob.chunks_exact(6) {
+            assert_eq!(section, &[0, 0, 0, 0, 0, 0]);
         }
-        let headers = parse_blob(&blob);
+        let headers = client_parse_blob(&blob);
         assert_eq!(headers.len(), SECTION_COUNT);
         for header in &headers {
             assert_eq!(header.count, 0);
@@ -337,7 +392,7 @@ mod tests {
     fn flat_chunk_blob_has_solid_and_air_sections() {
         let chunk = FlatWorldGenerator::new().generate(ChunkPos::ORIGIN);
         let blob = encode_chunk_section_data(&chunk).unwrap();
-        let headers = parse_blob(&blob);
+        let headers = client_parse_blob(&blob);
         assert_eq!(headers.len(), SECTION_COUNT);
 
         for (index, header) in headers.iter().enumerate() {
@@ -352,6 +407,40 @@ mod tests {
                 assert_eq!(header.block_bpe, 0, "section {index} bpe");
             }
         }
+    }
+
+    #[test]
+    fn flat_spawn_chunk_blob_parses_like_a_vanilla_client() {
+        // End-to-end regression for the `No value with id N` crash: a 1.21.8
+        // client parses each section as i16 block_count + block PalettedContainer
+        // + biome PalettedContainer, computing every long-array word count from
+        // the bits-per-entry byte (no length prefix since 1.21.5). If the encoder
+        // emits a spurious VarInt long count, the block container over-reads, the
+        // biome container's bits byte is taken from the wrong offset, and the
+        // client looks a garbage id up in the single-entry biome registry and
+        // dies. `client_parse_blob` reproduces that parse exactly and asserts the
+        // blob is consumed to the byte, so this fails on the buggy encoder and
+        // passes once the prefix is gone.
+        let chunk = FlatWorldGenerator::new().generate(ChunkPos::ORIGIN);
+        let blob = encode_chunk_section_data(&chunk).unwrap();
+
+        let headers = client_parse_blob(&blob);
+        assert_eq!(headers.len(), SECTION_COUNT);
+        for (index, header) in headers.iter().enumerate() {
+            let (count, bpe) = if index < 8 { (4096, 4) } else { (0, 0) };
+            assert_eq!(header.count, count, "section {index} count");
+            assert_eq!(header.block_bpe, bpe, "section {index} bpe");
+        }
+
+        // Pin section 0's opening bytes so the spurious count cannot creep back:
+        // i16 block_count = 4096, then the block container bpe(4), palette length
+        // (3) and ids [air=0, bedrock=85, stone=1].
+        assert_eq!(&blob[0..7], &[0x10, 0x00, 0x04, 0x03, 0x00, 0x55, 0x01]);
+        // The packed longs must follow the palette immediately. The buggy encoder
+        // wrote a VarInt(256) word count (`0x80 0x02`) here, shifting the stream;
+        // the first long is the bedrock layer (palette index 1 in every nibble =
+        // 0x1111_1111_1111_1111), so its first byte is 0x11, not 0x80.
+        assert_eq!(&blob[7..15], &[0x11; 8]);
     }
 
     #[test]
