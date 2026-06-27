@@ -448,6 +448,51 @@ impl ChatCommand {
     }
 }
 
+/// `ChatMessage`: the play serverbound packet (wire id `0x08`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    message: BoundedString<256>,
+    rest: Vec<u8>,
+}
+
+impl ChatMessage {
+    /// The wire packet id for `ChatMessage`.
+    pub const PACKET_ID: i32 = 0x08;
+
+    /// Creates a new `ChatMessage` from its wire fields.
+    pub fn new(message: BoundedString<256>, rest: Vec<u8>) -> Self {
+        Self { message, rest }
+    }
+
+    /// Returns the `message` field.
+    pub fn message(&self) -> &BoundedString<256> {
+        &self.message
+    }
+
+    /// Returns the `rest` field.
+    pub fn rest(&self) -> &[u8] {
+        &self.rest
+    }
+
+    /// Decodes a `ChatMessage` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let message = BoundedString::<256>::read(reader)?;
+        let rest = {
+            let remaining = reader.remaining();
+            reader.read_bytes(remaining)?.to_vec()
+        };
+        Ok(Self { message, rest })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        self.message.write(buf);
+        wire::write_raw(buf, &self.rest);
+        Ok(())
+    }
+}
+
 /// `ServerboundKeepAlive`: the play serverbound packet (wire id `0x1b`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerboundKeepAlive {
@@ -1862,6 +1907,61 @@ impl SetDefaultSpawnPosition {
     }
 }
 
+/// `SystemChat`: the play clientbound packet (wire id `0x72`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SystemChat {
+    content: ferrumc_nbt::NbtTag,
+    overlay: bool,
+}
+
+impl SystemChat {
+    /// The wire packet id for `SystemChat`.
+    pub const PACKET_ID: i32 = 0x72;
+
+    /// Creates a new `SystemChat` from its wire fields.
+    pub fn new(content: ferrumc_nbt::NbtTag, overlay: bool) -> Self {
+        Self { content, overlay }
+    }
+
+    /// Returns the `content` field.
+    pub fn content(&self) -> &ferrumc_nbt::NbtTag {
+        &self.content
+    }
+
+    /// Returns the `overlay` field.
+    pub fn overlay(&self) -> bool {
+        self.overlay
+    }
+
+    /// Decodes a `SystemChat` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let content = {
+            let available = reader.remaining();
+            let bytes = reader.read_bytes(available)?;
+            let (tag, consumed) = ferrumc_nbt::read_network_root_with_consumed(
+                bytes,
+                &ferrumc_nbt::NbtLimits::default(),
+            )?;
+            *reader = BoundedReader::new(bytes.get(consumed..).unwrap_or_default());
+            tag
+        };
+        let overlay = wire::read_bool(reader)?;
+        Ok(Self { content, overlay })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        {
+            let nbt_bytes =
+                ferrumc_nbt::write_network_root(&self.content, &ferrumc_nbt::NbtLimits::default())?;
+            wire::write_raw(buf, &nbt_bytes);
+        }
+        wire::write_bool(buf, self.overlay);
+        Ok(())
+    }
+}
+
 /// serverbound packets in the play state, dispatched by wire id.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerboundPlayPacket {
@@ -1869,6 +1969,8 @@ pub enum ServerboundPlayPacket {
     ConfirmTeleportation(ConfirmTeleportation),
     /// The `ChatCommand` packet.
     ChatCommand(ChatCommand),
+    /// The `ChatMessage` packet.
+    ChatMessage(ChatMessage),
     /// The `ServerboundKeepAlive` packet.
     ServerboundKeepAlive(ServerboundKeepAlive),
     /// The `SetPlayerPosition` packet.
@@ -1889,6 +1991,7 @@ impl ServerboundPlayPacket {
                 ConfirmTeleportation::decode(reader)?,
             )),
             ChatCommand::PACKET_ID => Ok(Self::ChatCommand(ChatCommand::decode(reader)?)),
+            ChatMessage::PACKET_ID => Ok(Self::ChatMessage(ChatMessage::decode(reader)?)),
             ServerboundKeepAlive::PACKET_ID => Ok(Self::ServerboundKeepAlive(
                 ServerboundKeepAlive::decode(reader)?,
             )),
@@ -1913,6 +2016,7 @@ impl ServerboundPlayPacket {
         match self {
             Self::ConfirmTeleportation(_) => ConfirmTeleportation::PACKET_ID,
             Self::ChatCommand(_) => ChatCommand::PACKET_ID,
+            Self::ChatMessage(_) => ChatMessage::PACKET_ID,
             Self::ServerboundKeepAlive(_) => ServerboundKeepAlive::PACKET_ID,
             Self::SetPlayerPosition(_) => SetPlayerPosition::PACKET_ID,
             Self::SetPlayerPositionAndRotation(_) => SetPlayerPositionAndRotation::PACKET_ID,
@@ -1926,6 +2030,7 @@ impl ServerboundPlayPacket {
         match self {
             Self::ConfirmTeleportation(packet) => packet.encode(buf),
             Self::ChatCommand(packet) => packet.encode(buf),
+            Self::ChatMessage(packet) => packet.encode(buf),
             Self::ServerboundKeepAlive(packet) => packet.encode(buf),
             Self::SetPlayerPosition(packet) => packet.encode(buf),
             Self::SetPlayerPositionAndRotation(packet) => packet.encode(buf),
@@ -1962,6 +2067,8 @@ pub enum ClientboundPlayPacket {
     SetCenterChunk(SetCenterChunk),
     /// The `SetDefaultSpawnPosition` packet.
     SetDefaultSpawnPosition(SetDefaultSpawnPosition),
+    /// The `SystemChat` packet.
+    SystemChat(SystemChat),
 }
 
 impl ClientboundPlayPacket {
@@ -1992,6 +2099,7 @@ impl ClientboundPlayPacket {
             SetDefaultSpawnPosition::PACKET_ID => Ok(Self::SetDefaultSpawnPosition(
                 SetDefaultSpawnPosition::decode(reader)?,
             )),
+            SystemChat::PACKET_ID => Ok(Self::SystemChat(SystemChat::decode(reader)?)),
             other => Err(ProtoError::UnknownPacketId {
                 state: State::Play,
                 direction: Direction::Clientbound,
@@ -2015,6 +2123,7 @@ impl ClientboundPlayPacket {
             Self::SynchronizePlayerPosition(_) => SynchronizePlayerPosition::PACKET_ID,
             Self::SetCenterChunk(_) => SetCenterChunk::PACKET_ID,
             Self::SetDefaultSpawnPosition(_) => SetDefaultSpawnPosition::PACKET_ID,
+            Self::SystemChat(_) => SystemChat::PACKET_ID,
         }
     }
 
@@ -2033,6 +2142,7 @@ impl ClientboundPlayPacket {
             Self::SynchronizePlayerPosition(packet) => packet.encode(buf),
             Self::SetCenterChunk(packet) => packet.encode(buf),
             Self::SetDefaultSpawnPosition(packet) => packet.encode(buf),
+            Self::SystemChat(packet) => packet.encode(buf),
         }
     }
 }

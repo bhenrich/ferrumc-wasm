@@ -36,14 +36,20 @@
 //!   root that reads further is rejected at end of input.
 //! * **Array limits.** Byte, int, and long arrays share the `max_list_len` cap
 //!   with lists rather than carrying a separate knob.
-//! * **`UTF-8` handling.** Strings are validated as strict `UTF-8`. Java's
-//!   Modified `UTF-8` (the `0xC0 0x80` encoding of `NUL` and surrogate-pair
-//!   encodings of astral characters) is rejected as [`NbtError::InvalidUtf8`]
-//!   rather than silently accepted. This is sufficient for the current
-//!   milestone, whose strings are standard `UTF-8`.
+//! * **`String` encoding.** `TAG_String` uses Java Modified `UTF-8` — the same
+//!   scheme as `DataOutput.writeUTF` / `DataInput.readUTF`, which a 1.21.8
+//!   client requires. It is byte-identical to standard `UTF-8` for ASCII and
+//!   most BMP text, but encodes `NUL` as `0xC0 0x80` and an astral character
+//!   (e.g. an emoji) as a six-byte surrogate pair rather than the four-byte
+//!   standard form. Writing standard `UTF-8` for an astral character would make
+//!   a real client's NBT reader raise `UTFDataFormatException` and disconnect;
+//!   the `mutf8` module performs the conversion in both directions. Byte
+//!   sequences that are not valid Modified `UTF-8` are rejected as
+//!   [`NbtError::InvalidUtf8`].
 
 mod error;
 mod limits;
+mod mutf8;
 mod read;
 mod tag;
 mod write;

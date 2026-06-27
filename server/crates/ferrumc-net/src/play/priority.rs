@@ -116,6 +116,10 @@ impl OutboundPriority {
             // rides the State class (not droppable World traffic) alongside the
             // other client-reconciliation frames.
             | ClientboundPlayPacket::AcknowledgeBlockChange(_)
+            // System chat carries command feedback and relayed player chat: the
+            // client should reliably see it, so it rides the high-priority State
+            // class (still non-fatal if the queue is ever saturated).
+            | ClientboundPlayPacket::SystemChat(_)
             | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::State,
             ClientboundPlayPacket::SpawnEntity(_)
             | ClientboundPlayPacket::BlockUpdate(_)

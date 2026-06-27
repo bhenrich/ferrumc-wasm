@@ -17,6 +17,7 @@
 
 use crate::error::NbtError;
 use crate::limits::NbtLimits;
+use crate::mutf8;
 use crate::tag::{NbtTag, TagType};
 use crate::Result;
 
@@ -144,14 +145,20 @@ fn write_seq_len(out: &mut Vec<u8>, len: usize) -> Result<()> {
     Ok(())
 }
 
-/// Writes a `TAG_String`: a `u16` big-endian byte length then the bytes.
+/// Writes a `TAG_String`: a `u16` big-endian byte length then the string in Java
+/// Modified UTF-8 (see [`mutf8`]).
+///
+/// The length prefix counts the *encoded* Modified UTF-8 bytes, which is what the
+/// reader (and a real client) consume; it is computed without allocating so an
+/// over-long string is rejected before any bytes are written.
 fn write_string(out: &mut Vec<u8>, text: &str) -> Result<()> {
-    let len = u16::try_from(text.len()).map_err(|_| NbtError::StringTooLong {
-        len: text.len(),
+    let len = mutf8::encoded_len(text);
+    let prefix = u16::try_from(len).map_err(|_| NbtError::StringTooLong {
+        len,
         max: U16_LEN_MAX,
     })?;
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(&prefix.to_be_bytes());
+    mutf8::encode(out, text);
     Ok(())
 }
 
@@ -292,6 +299,24 @@ mod tests {
             write_network_root(&NbtTag::Compound(root), &limits),
             Err(NbtError::DepthExceeded { max: 16 })
         );
+    }
+
+    #[test]
+    fn astral_string_round_trips_and_is_modified_utf8() {
+        // An emoji in a TAG_String must survive write -> read and must be written
+        // in the Modified UTF-8 surrogate-pair form, never the four-byte standard
+        // UTF-8 sequence whose 0xF0 lead a real client's NBT reader rejects.
+        let mut root = NbtCompound::new();
+        root.push("msg", NbtTag::String("hi \u{1F600}".to_owned()));
+        let tag = NbtTag::Compound(root);
+
+        let bytes = write_network_root(&tag, &NbtLimits::default()).expect("write");
+        assert!(
+            !bytes.iter().any(|&b| (0xF0..=0xF4).contains(&b)),
+            "no standard-UTF-8 four-byte astral lead may appear on the wire"
+        );
+        let parsed = read_network_root(&bytes, &NbtLimits::default()).expect("read");
+        assert_eq!(parsed, tag);
     }
 
     #[test]

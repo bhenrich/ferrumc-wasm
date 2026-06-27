@@ -23,7 +23,7 @@
 //! in-process plugin still exercises the full SDK the deliverable names:
 //! namespaced storage for its config and the permission API for the bypass node.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use ferrumc_core::PlayerId;
@@ -35,13 +35,14 @@ use ferrumc_plugin_spawn_protect::{bypass_node, SpawnProtect, SpawnProtectPlugin
 use crate::command::build_command_tree;
 use crate::config::AppConfig;
 
-/// Permission *level* granted to every player in this slice.
+/// Permission *level* granted to a configured operator.
 ///
-/// The slice advertises creative mode and is a developer vertical slice, so
-/// players run at operator level; richer per-player levels arrive later. This
-/// is what lets a player run `/gamemode` (which requires
-/// [`GAMEMODE_LEVEL`](crate::command::GAMEMODE_LEVEL)).
-pub(crate) const PLAYER_PERMISSION_LEVEL: u8 = 4;
+/// Mirrors vanilla's top operator tier (level 4): it satisfies every operator
+/// gate, including [`GAMEMODE_LEVEL`](crate::command::GAMEMODE_LEVEL). Only the
+/// players named in [`AppConfig::ops`] act at this level; everyone else acts at
+/// the configured [`AppConfig::default_permission_level`] (0 by default), so the
+/// gate is meaningful instead of granting every connection operator rights.
+pub(crate) const OPERATOR_PERMISSION_LEVEL: u8 = 4;
 
 /// A read-only registry mapping players to their permission [`Subject`].
 ///
@@ -108,7 +109,10 @@ pub(crate) struct PlayPolicy {
     permissions: PermissionRegistry,
     command_tree: ferrumc_command::CommandTree,
     spawn: Vec3,
-    permission_level: u8,
+    /// Players granted operator status; they act at [`OPERATOR_PERMISSION_LEVEL`].
+    ops: BTreeSet<PlayerId>,
+    /// Level every non-operator player acts at.
+    default_permission_level: u8,
 }
 
 impl PlayPolicy {
@@ -132,9 +136,14 @@ impl PlayPolicy {
         self.spawn
     }
 
-    /// Returns the permission level players act at.
-    pub(crate) fn permission_level(&self) -> u8 {
-        self.permission_level
+    /// Returns the permission level `player` acts at: [`OPERATOR_PERMISSION_LEVEL`]
+    /// for a configured operator, otherwise the configured default level.
+    pub(crate) fn permission_level(&self, player: PlayerId) -> u8 {
+        if self.ops.contains(&player) {
+            OPERATOR_PERMISSION_LEVEL
+        } else {
+            self.default_permission_level
+        }
     }
 }
 
@@ -168,13 +177,19 @@ pub(crate) fn build_play_policy(config: &AppConfig) -> anyhow::Result<PlayPolicy
         .unwrap_or(seed);
 
     let permissions = PermissionRegistry::from_bypass_names(&config.spawn_protect_bypass)?;
+    let ops = config
+        .ops
+        .iter()
+        .map(|name| PlayerId::offline(name))
+        .collect();
 
     Ok(PlayPolicy {
         guard,
         permissions,
         command_tree: build_command_tree(),
         spawn: config.spawn,
-        permission_level: PLAYER_PERMISSION_LEVEL,
+        ops,
+        default_permission_level: config.default_permission_level,
     })
 }
 
@@ -233,6 +248,21 @@ mod tests {
         assert!(!policy
             .permissions()
             .has_bypass(PlayerId::offline("Griefer")));
+    }
+
+    #[test]
+    fn operators_act_at_operator_level_others_at_the_default() {
+        let config = AppConfig {
+            ops: vec!["Admin".to_string()],
+            default_permission_level: 0,
+            ..AppConfig::default()
+        };
+        let policy = build_play_policy(&config).expect("policy builds");
+        assert_eq!(
+            policy.permission_level(PlayerId::offline("Admin")),
+            OPERATOR_PERMISSION_LEVEL
+        );
+        assert_eq!(policy.permission_level(PlayerId::offline("Random")), 0);
     }
 
     #[test]

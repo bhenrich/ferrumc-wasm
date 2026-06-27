@@ -27,6 +27,7 @@ use ferrumc_codec::BoundedReader;
 
 use crate::error::NbtError;
 use crate::limits::NbtLimits;
+use crate::mutf8;
 use crate::tag::{NbtCompound, NbtTag, TagType};
 use crate::Result;
 
@@ -302,7 +303,8 @@ fn read_len(reader: &mut BoundedReader<'_>) -> Result<usize> {
     Ok(raw as usize)
 }
 
-/// Reads a `TAG_String`: a `u16` byte length, bounded, then validated `UTF-8`.
+/// Reads a `TAG_String`: a `u16` byte length, bounded, then decoded from Java
+/// Modified UTF-8 (see [`mutf8`]).
 fn read_string(reader: &mut BoundedReader<'_>, limits: &NbtLimits) -> Result<String> {
     let len = usize::from(reader.read_u16()?);
     if len > limits.max_string_bytes() {
@@ -312,8 +314,7 @@ fn read_string(reader: &mut BoundedReader<'_>, limits: &NbtLimits) -> Result<Str
         });
     }
     let bytes = reader.read_bytes(len)?;
-    let text = core::str::from_utf8(bytes).map_err(|_| NbtError::InvalidUtf8)?;
-    Ok(text.to_owned())
+    mutf8::decode(bytes)
 }
 
 #[cfg(test)]
@@ -492,7 +493,8 @@ mod tests {
 
     #[test]
     fn invalid_utf8_string_is_rejected() {
-        // String "s" of length 1 with byte 0xFF, which is not valid UTF-8.
+        // String "s" of length 1 with byte 0xFF, which is not a valid Modified
+        // UTF-8 lead byte.
         let body = [0x08, 0x00, 0x01, b's', 0x00, 0x01, 0xFF, 0x00];
         let bytes = named_root(&body);
         assert_eq!(

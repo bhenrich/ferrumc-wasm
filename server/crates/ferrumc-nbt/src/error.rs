@@ -58,11 +58,14 @@ pub enum NbtError {
         id: u8,
     },
 
-    /// A string's bytes were not valid `UTF-8`.
+    /// A string's bytes were not valid Java Modified `UTF-8`.
     ///
-    /// Java's Modified `UTF-8` is intentionally not accepted; see the crate
-    /// documentation for the rationale and the affected byte sequences.
-    #[error("NBT string was not valid UTF-8")]
+    /// `TAG_String` is encoded with Java's Modified `UTF-8` (the encoding of
+    /// `DataInput.readUTF`); see the crate documentation. Byte sequences that do
+    /// not form valid Modified `UTF-8` — an invalid lead byte, a missing or
+    /// malformed continuation byte, or an unpaired surrogate — are rejected with
+    /// this error.
+    #[error("NBT string was not valid Modified UTF-8")]
     InvalidUtf8,
 
     /// A list or array declared a negative length, which is never valid.

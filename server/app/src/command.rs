@@ -54,6 +54,22 @@ pub fn build_command_tree() -> CommandTree {
     tree
 }
 
+/// Parses the [`GameMode`] a `/gamemode <id>` command selects, or `None` if
+/// `command` is not a `/gamemode` invocation or its mode argument is missing or
+/// out of range.
+///
+/// The connection uses this after a successful dispatch to apply the game-mode
+/// change side effect (a clientbound `GameEvent`), parsing the same argument the
+/// handler validated so the two agree on the selected mode.
+pub fn parse_gamemode(command: &str) -> Option<GameMode> {
+    let mut tokens = command.split_whitespace();
+    if tokens.next() != Some(GAMEMODE_COMMAND) {
+        return None;
+    }
+    let id: i64 = tokens.next()?.parse().ok()?;
+    u8::try_from(id).ok().and_then(GameMode::from_id)
+}
+
 #[cfg(test)]
 mod tests {
     use ferrumc_command::{CommandError, CommandSource};
@@ -91,6 +107,21 @@ mod tests {
             .dispatch("gamemode 9", &op())
             .expect_err("9 is out of range");
         assert!(matches!(err, CommandError::IntegerOutOfRange { .. }));
+    }
+
+    #[test]
+    fn parse_gamemode_extracts_a_valid_mode() {
+        assert_eq!(parse_gamemode("gamemode 0"), Some(GameMode::Survival));
+        assert_eq!(parse_gamemode("gamemode 1"), Some(GameMode::Creative));
+        assert_eq!(parse_gamemode("gamemode 3"), Some(GameMode::Spectator));
+    }
+
+    #[test]
+    fn parse_gamemode_rejects_non_gamemode_or_bad_arg() {
+        assert_eq!(parse_gamemode("spawn"), None);
+        assert_eq!(parse_gamemode("gamemode"), None);
+        assert_eq!(parse_gamemode("gamemode 9"), None);
+        assert_eq!(parse_gamemode("gamemode x"), None);
     }
 
     #[test]

@@ -363,6 +363,23 @@ name = "ChatCommand"
 id = 0x06
 fields = [{ name = "command", type = "string(256)" }]
 
+# minecraft-data: play.toServer.chat_message ("Chat Message", the unsigned form).
+# Modelled lossily on purpose: the server relays only the message text and ignores
+# the 1.19 signing tail (timestamp / salt / signature / acknowledged-bitset), which
+# is sound because Join Game advertises enforces_secure_chat = false. The text is
+# the typed `message`; everything after it is swallowed as `rest` so the decoder
+# stops being an UnknownPacketId without needing a fixed-size buffer(N) type for the
+# signature. The generated serverbound encode exists but is exercised only by tests.
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "ChatMessage"
+id = 0x08
+fields = [
+    { name = "message", type = "string(256)" },
+    { name = "rest", type = "remaining_bytes" },
+]
+
 # minecraft-data: play.toClient.spawn_entity
 [[packet]]
 state = "play"
@@ -434,6 +451,24 @@ id = 0x22
 fields = [
     { name = "reason", type = "u8" },
     { name = "value", type = "f32" },
+]
+
+# minecraft-data: play.toClient.system_chat ("System Chat Message"). One packet
+# carries BOTH the chat box and the action bar: `content` is a text component
+# encoded as network (anonymous-root) NBT — NOT a JSON string in 1.20.3+ — and
+# `overlay = true` renders it above the hotbar (action bar) instead of in the chat
+# box. Being a system message it is unsigned, so it sidesteps the entire 1.19
+# chat-signing apparatus. The `nbt` type maps to a `ferrumc_nbt::NbtTag` written by
+# `ferrumc_nbt::write_network_root` (the anonymous-root compound form the client
+# expects); the session crate builds that NbtTag from a `TextComponent`.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SystemChat"
+id = 0x72
+fields = [
+    { name = "content", type = "nbt" },
+    { name = "overlay", type = "bool" },
 ]
 
 # minecraft-data: play.toClient.keep_alive

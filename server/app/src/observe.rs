@@ -122,6 +122,7 @@ pub(crate) fn clientbound_play_name(packet: &ClientboundPlayPacket) -> &'static 
         ClientboundPlayPacket::SynchronizePlayerPosition(_) => "synchronize_player_position",
         ClientboundPlayPacket::SetCenterChunk(_) => "set_center_chunk",
         ClientboundPlayPacket::SetDefaultSpawnPosition(_) => "set_default_spawn_position",
+        ClientboundPlayPacket::SystemChat(_) => "system_chat",
     }
 }
 
@@ -137,6 +138,7 @@ fn serverbound_play_name(packet: &ServerboundPlayPacket) -> &'static str {
         }
         ServerboundPlayPacket::PlayerAction(_) => "player_action",
         ServerboundPlayPacket::UseItemOn(_) => "use_item_on",
+        ServerboundPlayPacket::ChatMessage(_) => "chat_message",
     }
 }
 

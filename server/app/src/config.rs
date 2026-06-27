@@ -50,6 +50,14 @@ const DEFAULT_SPAWN_PROTECT_RADIUS: i32 = 0;
 /// without a wall-clock wait.
 const DEFAULT_KEEP_ALIVE_INTERVAL_MS: u64 = 10_000;
 
+/// Default permission level granted to a non-operator player.
+///
+/// Zero is the vanilla "ordinary player" tier: it satisfies no operator gate, so
+/// commands like `/gamemode` (which require an operator level) are refused for
+/// everyone except the players listed in [`AppConfig::ops`]. This is what makes
+/// the operator gate meaningful instead of granting every connection level 4.
+const DEFAULT_PERMISSION_LEVEL: u8 = 0;
+
 /// Validated, runtime-ready server configuration.
 ///
 /// Construct one with [`AppConfig::default`] for the documented defaults, or
@@ -86,6 +94,13 @@ pub struct AppConfig {
     pub spawn_protect_bypass: Vec<String>,
     /// Interval between clientbound play-phase Keep Alive pings.
     pub keep_alive_interval: Duration,
+    /// Names of players granted operator status (permission level 4), letting
+    /// them run operator-gated commands such as `/gamemode`. Everyone else acts
+    /// at [`default_permission_level`](Self::default_permission_level).
+    pub ops: Vec<String>,
+    /// Permission level granted to a player who is not an operator. Defaults to
+    /// `0` (ordinary player), so the operator gate is meaningful.
+    pub default_permission_level: u8,
 }
 
 impl AppConfig {
@@ -130,6 +145,8 @@ impl Default for AppConfig {
             spawn_protect_radius: DEFAULT_SPAWN_PROTECT_RADIUS,
             spawn_protect_bypass: Vec::new(),
             keep_alive_interval: Duration::from_millis(DEFAULT_KEEP_ALIVE_INTERVAL_MS),
+            ops: Vec::new(),
+            default_permission_level: DEFAULT_PERMISSION_LEVEL,
         }
     }
 }
@@ -167,6 +184,10 @@ struct RawConfig {
     spawn_protect_bypass: Option<Vec<String>>,
     /// Override for [`AppConfig::keep_alive_interval`], expressed in milliseconds.
     keep_alive_interval_ms: Option<u64>,
+    /// Override for [`AppConfig::ops`].
+    ops: Option<Vec<String>>,
+    /// Override for [`AppConfig::default_permission_level`].
+    default_permission_level: Option<u8>,
 }
 
 impl RawConfig {
@@ -219,6 +240,10 @@ impl RawConfig {
             keep_alive_interval: self
                 .keep_alive_interval_ms
                 .map_or(defaults.keep_alive_interval, Duration::from_millis),
+            ops: self.ops.unwrap_or(defaults.ops),
+            default_permission_level: self
+                .default_permission_level
+                .unwrap_or(defaults.default_permission_level),
         })
     }
 }
@@ -249,6 +274,8 @@ mod tests {
             spawn_protect_radius = 12
             spawn_protect_bypass = ["Admin", "Mod"]
             keep_alive_interval_ms = 250
+            ops = ["Admin"]
+            default_permission_level = 1
         "#;
         let parsed = AppConfig::from_toml_str(toml).expect("valid config");
         assert_eq!(parsed.bind, "0.0.0.0:0".parse().unwrap());
@@ -264,6 +291,8 @@ mod tests {
         assert_eq!(parsed.spawn_protect_radius, 12);
         assert_eq!(parsed.spawn_protect_bypass, vec!["Admin", "Mod"]);
         assert_eq!(parsed.keep_alive_interval, Duration::from_millis(250));
+        assert_eq!(parsed.ops, vec!["Admin"]);
+        assert_eq!(parsed.default_permission_level, 1);
     }
 
     #[test]
@@ -272,6 +301,13 @@ mod tests {
         assert_eq!(parsed.spawn_protect_radius, 0);
         assert!(parsed.spawn_protect_bypass.is_empty());
         assert_eq!(parsed.plugins_dir, None);
+    }
+
+    #[test]
+    fn operators_default_to_empty_with_player_level_zero() {
+        let parsed = AppConfig::from_toml_str("").expect("empty config is valid");
+        assert!(parsed.ops.is_empty());
+        assert_eq!(parsed.default_permission_level, 0);
     }
 
     #[test]

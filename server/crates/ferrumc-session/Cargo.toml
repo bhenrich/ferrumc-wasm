@@ -18,6 +18,12 @@ ferrumc-net = { workspace = true }
 # The typed packet enums: serverbound play packets translate into sim inputs and
 # clientbound play packets are the outbound shells sim outputs translate into.
 ferrumc-proto = { workspace = true }
+# Builds the network-form (anonymous-root) NBT `NbtTag` that the clientbound
+# `SystemChat` packet carries: the `TextComponent` -> NBT encoder lives here
+# because this is the only crate that depends on both `ferrumc-core` (owns
+# `TextComponent`) and `ferrumc-proto` (owns `SystemChat`). `ferrumc-proto` does
+# not depend on `ferrumc-core`, so the encoder cannot live there.
+ferrumc-nbt = { workspace = true }
 # The simulation boundary messages: `GameInput` flows to shard inboxes and
 # `GameOutput` flows back out. The router never touches a raw `SimShard`.
 ferrumc-sim = { workspace = true }

@@ -67,6 +67,9 @@ toml = { workspace = true }
 # codec primitives the server does.
 ferrumc-proto = { workspace = true }
 ferrumc-codec = { workspace = true }
+# Decodes the network-NBT `content` of a clientbound `SystemChat` so the chat /
+# command-feedback integration test can assert on the rendered text.
+ferrumc-nbt = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 # Build the player UUID carried by the client's Login Start packet.

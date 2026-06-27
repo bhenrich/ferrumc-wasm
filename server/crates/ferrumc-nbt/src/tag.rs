@@ -29,8 +29,8 @@ pub enum NbtTag {
     Double(f64),
     /// `TAG_Byte_Array`: a length-prefixed run of signed bytes.
     ByteArray(Vec<i8>),
-    /// `TAG_String`: a `UTF-8` string (see the crate docs for the modified
-    /// `UTF-8` caveat).
+    /// `TAG_String`: a string encoded on the wire as Java Modified `UTF-8` (see
+    /// the crate docs).
     String(String),
     /// `TAG_List`: a homogeneous sequence of unnamed payloads.
     List(Vec<NbtTag>),

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use tokio::sync::mpsc::{self, error::TrySendError};
 
-use ferrumc_core::PlayerId;
+use ferrumc_core::{PlayerId, TextComponent};
 use ferrumc_math::{BlockPos, ChunkPos, ShardPos, Vec3};
 use ferrumc_proto::generated::play::ClientboundPlayPacket;
 use ferrumc_sim::{BlockStateId, GameInput, GameOutput, MutationCause};
@@ -617,6 +617,28 @@ impl SessionRouter {
         }
     }
 
+    /// Broadcasts a System Chat Message carrying `component` to **every**
+    /// connected player (including the sender, matching vanilla chat relay).
+    ///
+    /// `overlay = true` renders the message above the hotbar (action bar);
+    /// `overlay = false` renders it in the chat box. The packet is built once via
+    /// [`crate::system_chat`] and a clone is delivered to each player's outbound
+    /// channel.
+    ///
+    /// # Backpressure
+    ///
+    /// Best-effort and lossy, like the visibility broadcasts: a recipient whose
+    /// outbound channel is *full* or *closed* simply misses this message (a closed
+    /// channel is cleaned up when that connection's own loop ends). A dropped chat
+    /// line is never worth stalling the driver, so this never blocks and never
+    /// fails.
+    pub fn broadcast_system_chat(&self, component: &TextComponent, overlay: bool) {
+        let packet = crate::system_chat(component, overlay);
+        for entry in self.players.values() {
+            let _ = entry.outbound.try_send(packet.clone());
+        }
+    }
+
     /// Routes an already-translated input to the shard that should apply it.
     ///
     /// A block edit is routed by the *block's* chunk (see
@@ -1083,6 +1105,39 @@ mod tests {
         assert!(
             matches!(inbox.try_recv(), Ok(GameInput::PlayerJoin { player, .. }) if player == b)
         );
+    }
+
+    #[test]
+    fn system_chat_reaches_every_connected_player() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let a = player("aaa");
+        let b = player("bbb");
+        let mut a_handle = router.join_player(a, spawn_pos()).expect("a join");
+        let mut b_handle = router.join_player(b, spawn_pos()).expect("b join");
+        // Drain the mutual join-visibility packets so only the chat remains.
+        let a_eid = router.player_entity_id(a).expect("a entity id");
+        let b_eid = router.player_entity_id(b).expect("b entity id");
+        assert_player_info_add(&mut a_handle, b);
+        assert_entity_spawn(&mut a_handle, b, b_eid, spawn_pos());
+        assert_player_info_add(&mut b_handle, a);
+        assert_entity_spawn(&mut b_handle, a, a_eid, spawn_pos());
+
+        let message = TextComponent::text("<aaa> hi everyone");
+        router.broadcast_system_chat(&message, false);
+
+        // Both players (the sender included) receive the same chat-box SystemChat.
+        for handle in [&mut a_handle, &mut b_handle] {
+            let ClientboundPlayPacket::SystemChat(chat) =
+                handle.try_recv().expect("a system chat packet")
+            else {
+                panic!("expected a SystemChat");
+            };
+            assert!(
+                !chat.overlay(),
+                "chat relay targets the chat box, not the action bar"
+            );
+        }
     }
 
     #[test]

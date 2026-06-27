@@ -26,7 +26,7 @@ use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
 
 use ferrumc_codec::{BoundedReader, BoundedString};
 use ferrumc_command::CommandSource;
-use ferrumc_core::PlayerId;
+use ferrumc_core::{PlayerId, TextColor, TextComponent};
 use ferrumc_math::{BlockPos, ChunkPos, Vec3};
 use ferrumc_net::{
     offline_uuid, CompressionState, ConnectionLimits, ConnectionState, DecodeError,
@@ -55,7 +55,7 @@ use ferrumc_proto::generated::status::{
 use ferrumc_session::{net_event_to_input, NetEvent, PlayerSessionHandle};
 use ferrumc_sim::GameInput;
 
-use crate::command::SPAWN_COMMAND;
+use crate::command::{parse_gamemode, GAMEMODE_COMMAND, SPAWN_COMMAND};
 use crate::driver::SimCommand;
 use crate::observe;
 use crate::plugins::PlayPolicy;
@@ -90,6 +90,11 @@ const READ_CHUNK: usize = 4096;
 /// `JoinGame` to tell the client the spawn chunks are on their way; without it
 /// the client never leaves the "Loading terrain" screen.
 const GAME_EVENT_LEVEL_CHUNKS_LOAD_START: u8 = 13;
+
+/// `Game Event` reason `3`: "change game mode". The event `value` is the game-mode
+/// id as a float; sending it switches the issuing client's mode (the carrier
+/// `/gamemode` uses, since there is no dedicated set-game-mode packet).
+const GAME_EVENT_CHANGE_GAMEMODE: u8 = 3;
 
 /// Teleport id carried by the join `SynchronizePlayerPosition`.
 ///
@@ -991,6 +996,32 @@ async fn handle_play_body(
             let command = command.command().as_str().to_owned();
             return handle_command(ctx, player, name, writer, &command, debug, compression).await;
         }
+        ServerboundPlayPacket::ChatMessage(chat) => {
+            // Relay unsigned player chat to everyone as a system message: format it
+            // "<name> message" and hand it to the driver, the only owner of every
+            // player's outbound channel. enforces_secure_chat = false, so no 1.19
+            // signing apparatus is needed (the signature tail was decoded into the
+            // ignored `rest` field). The relay reaches the sender via its own
+            // session outbound channel, so it is NOT also enqueued on the writer.
+            //
+            // Strip legacy section-sign (§, U+00A7) codes from the untrusted
+            // message first: a client still interprets `§k`/`§l`/§<colour> inside
+            // a component's `text`, so leaving them in would let a player inject
+            // colour/obfuscation formatting into the relayed line. The name is
+            // not user-controlled (usernames are `[A-Za-z0-9_]`), so only the
+            // message body needs sanitising.
+            let sanitized = chat.message().as_str().replace('\u{00A7}', "");
+            let line = format!("<{name}> {sanitized}");
+            let content = TextComponent::text(line);
+            return ctx
+                .commands
+                .send(SimCommand::BroadcastSystemChat {
+                    content,
+                    overlay: false,
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("simulation driver is gone"));
+        }
         // The teleport confirmation (reply to the join position sync) and the
         // Keep Alive echo are accepted and need no action: the slice does not
         // validate teleport ids and the keep-alive timer is fire-and-forget.
@@ -1218,16 +1249,23 @@ fn veto_kind(ctx: &ConnContext, player: PlayerId, event: &NetEvent) -> Option<(M
     }
 }
 
-/// Dispatches a `/command` for `player` and applies its side effect.
+/// Dispatches a `/command` for `player`, reports the outcome to them, and applies
+/// its side effect.
 ///
-/// Dispatch goes through the shared command tree with the player's permission
-/// level and a node-string checker backed by the permission registry. On a
-/// successful `/spawn`, the player is teleported: a `SynchronizePlayerPosition`
-/// is queued to their socket and a move is sent to the simulation so the
-/// authoritative position updates and viewers see the teleport. Other commands
-/// (notably `/gamemode`) have no clientbound carrier in this slice, so a
-/// successful dispatch produces no packet. A rejected command is silently
-/// dropped — there is no system-chat packet to report it to the client.
+/// Dispatch goes through the shared command tree with the player's per-player
+/// permission level and a node-string checker backed by the permission registry.
+/// Every outcome is now reported to the issuer as a `SystemChat` on their writer:
+/// a dispatch failure (unknown command, bad argument, permission denied) becomes a
+/// red error line and the command stops there, while a handler that ran reports
+/// its [`CommandResult`](ferrumc_command::CommandResult) feedback (for success or
+/// logical failure).
+///
+/// On a successful `/spawn` the player is also teleported: a
+/// `SynchronizePlayerPosition` is queued to their socket and a move is sent to the
+/// simulation so the authoritative position updates and viewers see the teleport.
+/// On a successful `/gamemode <id>` a `GameEvent` with reason `3`
+/// (`change_game_mode`) carrying the mode id is queued so the client actually
+/// switches mode.
 async fn handle_command(
     ctx: &ConnContext,
     player: PlayerId,
@@ -1238,19 +1276,43 @@ async fn handle_command(
     compression: &CompressionState,
 ) -> anyhow::Result<()> {
     let policy = &ctx.policy;
-    let source = CommandSource::for_player(player, name, policy.permission_level());
+    let source = CommandSource::for_player(player, name, policy.permission_level(player));
     let allowed = |node: &str| policy.permissions().is_allowed(player, node);
-    let Ok(result) = policy
+    let result = match policy
         .command_tree()
         .dispatch_with(command, &source, &allowed)
-    else {
-        return Ok(());
+    {
+        Ok(result) => result,
+        Err(err) => {
+            // The handler never ran (unknown command / bad argument / permission
+            // denied): report why to the issuer as a red system-chat line.
+            let message = TextComponent::text(err.to_string()).with_color(TextColor::Red);
+            enqueue_traced_classified(
+                writer,
+                debug,
+                compression,
+                &ctx.clock,
+                ferrumc_session::system_chat(&message, false),
+            );
+            return Ok(());
+        }
     };
+
+    // The handler ran: show its feedback to the issuer (covers both a success and a
+    // `CommandResult::failure`).
+    enqueue_traced_classified(
+        writer,
+        debug,
+        compression,
+        &ctx.clock,
+        ferrumc_session::system_chat(result.feedback(), false),
+    );
     if !result.is_success() {
         return Ok(());
     }
 
-    if command.split_whitespace().next() == Some(SPAWN_COMMAND) {
+    let first_token = command.split_whitespace().next();
+    if first_token == Some(SPAWN_COMMAND) {
         let spawn = policy.spawn();
         enqueue_traced_classified(
             writer,
@@ -1269,6 +1331,22 @@ async fn handle_command(
             .send(SimCommand::Event(move_event))
             .await
             .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+    } else if first_token == Some(GAMEMODE_COMMAND) {
+        // Make the mode change observable: a GameEvent (reason 3 = change_game_mode)
+        // carrying the mode id switches the client's mode. The argument is parsed
+        // the same way the handler validated it so the two always agree.
+        if let Some(mode) = parse_gamemode(command) {
+            enqueue_traced_classified(
+                writer,
+                debug,
+                compression,
+                &ctx.clock,
+                ClientboundPlayPacket::GameEvent(GameEvent::new(
+                    GAME_EVENT_CHANGE_GAMEMODE,
+                    f32::from(mode.as_id()),
+                )),
+            );
+        }
     }
     Ok(())
 }

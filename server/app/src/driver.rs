@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
-use ferrumc_core::{PlayerId, Tick};
+use ferrumc_core::{PlayerId, TextComponent, Tick};
 use ferrumc_math::{ChunkPos, Vec3};
 use ferrumc_observability::{
     CounterRegistry, MutationKind, MutationResult, ServerClock, TickMetrics,
@@ -78,6 +78,17 @@ pub(crate) enum SimCommand {
     ReleaseChunks {
         /// Chunk columns whose player ticket should be dropped.
         positions: Vec<ChunkPos>,
+    },
+    /// Broadcast a System Chat Message to every connected player.
+    ///
+    /// The connection task cannot reach other players' outbound channels (only the
+    /// driver-owned [`SessionRouter`] holds them), so relayed player chat routes
+    /// through here. `overlay = true` renders the message on the action bar.
+    BroadcastSystemChat {
+        /// The message to render, as a structured text component.
+        content: TextComponent,
+        /// Whether to render above the hotbar (action bar) rather than the chat box.
+        overlay: bool,
     },
 }
 
@@ -175,6 +186,9 @@ async fn handle_command(
         }
         SimCommand::ReleaseChunks { positions } => {
             release_chunks(shard, store, metrics, &positions).await;
+        }
+        SimCommand::BroadcastSystemChat { content, overlay } => {
+            router.broadcast_system_chat(&content, overlay);
         }
     }
 }

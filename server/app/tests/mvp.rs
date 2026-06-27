@@ -13,9 +13,12 @@
 //! 5. **two clients see each other** — player-list add + entity spawn each way.
 //! 6. **break/place updates chunk + viewers** — viewers receive `BlockUpdate`s.
 //! 7. **/spawn** — a moved player is teleported back to spawn (viewer-observed).
-//! 8. **/gamemode** — accepted over the wire without dropping the connection, and
-//!    asserted directly against the command tree (no clientbound carrier exists
-//!    for game mode in the pinned packet set).
+//! 8. **/gamemode** — accepted over the wire without dropping the connection (and
+//!    asserted directly against the command tree). The wire path now also feeds
+//!    the issuer a `SystemChat` confirmation and a `GameEvent` (reason 3) that
+//!    switches the mode; those clientbound frames are covered end to end in
+//!    `chat_and_commands.rs`, so here we only confirm the command is consumed
+//!    cleanly (a follow-up move still broadcasts).
 //! 9. **spawn protection** — an unauthorized break near spawn is vetoed (no
 //!    broadcast) while a bypassing player's edits go through.
 //! 10. **clean shutdown** — the server winds down within the guard.
@@ -411,7 +414,9 @@ async fn run_flow(addr: SocketAddr) -> anyhow::Result<()> {
 
     // Point 8: /gamemode is accepted over the wire (the connection survives), and
     // a follow-up move still broadcasts — proving the command was consumed
-    // cleanly. Game mode itself has no clientbound carrier this slice.
+    // cleanly. The issuer's own feedback (SystemChat) and the change_game_mode
+    // GameEvent now queue on the admin's stream (asserted in chat_and_commands.rs);
+    // here we read the viewer's stream, so they don't interfere.
     send_command(&mut admin, "gamemode 1").await?;
     send_move(&mut admin, (12.0, 64.0, 12.0)).await?;
     observe_move(&mut viewer, admin_uuid, (12.0, 64.0, 12.0)).await?;
@@ -447,6 +452,8 @@ async fn mvp_end_to_end() {
         spawn_chunk_radius: 1,
         spawn_protect_radius: PROTECT_RADIUS,
         spawn_protect_bypass: vec!["Admin".to_string()],
+        // The admin is an operator so `/gamemode` (operator-gated) actually runs.
+        ops: vec!["Admin".to_string()],
         plugins_dir: Some(plugins.path().to_path_buf()),
         ..AppConfig::default()
     };
