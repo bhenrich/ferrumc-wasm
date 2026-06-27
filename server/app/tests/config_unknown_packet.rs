@@ -238,7 +238,7 @@ async fn drive_client_with_unknown_config(addr: SocketAddr) -> anyhow::Result<Ve
     }
 
     // Acknowledge configuration to enter play, then record the keystone play
-    // packets in arrival order, up to and including the position sync.
+    // packets in arrival order, up to and including the first spawn chunk.
     client
         .send_frame(&encode(|buf| AckFinishConfiguration.encode(buf)))
         .await?;
@@ -252,17 +252,23 @@ async fn drive_client_with_unknown_config(addr: SocketAddr) -> anyhow::Result<Ve
                 play_order.push("game_event");
             }
             ClientboundPlayPacket::SetCenterChunk(_) => play_order.push("center"),
+            ClientboundPlayPacket::SynchronizePlayerPosition(_) => {
+                // Record the first sync only, to capture its position in the order.
+                if !play_order.contains(&"sync") {
+                    play_order.push("sync");
+                }
+            }
             ClientboundPlayPacket::ChunkDataAndLight(_) => {
                 // Record the first chunk only, to capture its position in the order.
                 if !play_order.contains(&"chunk") {
                     play_order.push("chunk");
                 }
             }
-            ClientboundPlayPacket::SynchronizePlayerPosition(_) => {
-                play_order.push("sync");
-                break;
-            }
             _ => {}
+        }
+        // The position sync precedes the chunk column; stop once both arrive.
+        if play_order.contains(&"sync") && play_order.contains(&"chunk") {
+            break;
         }
     }
 
@@ -287,7 +293,7 @@ async fn unknown_configuration_packets_are_ignored_and_client_reaches_play() {
     // The server skipped every Plugin Message and still drove the full join.
     assert_eq!(
         play_order,
-        vec!["join", "game_event", "center", "chunk", "sync"],
+        vec!["join", "game_event", "center", "sync", "chunk"],
         "join sequence out of order after ignoring unknown configuration packets",
     );
 

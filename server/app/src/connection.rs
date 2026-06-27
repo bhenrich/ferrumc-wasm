@@ -586,13 +586,18 @@ async fn join_simulation(
 }
 
 /// Sends the join kit in the order a real client needs to leave the loading
-/// screen: `JoinGame`, `GameEvent(13)`, `SetCenterChunk`, the spawn-area chunks,
-/// `SetDefaultSpawnPosition`, then a non-zero `SynchronizePlayerPosition`.
+/// screen: `JoinGame`, `GameEvent(13)`, `SetCenterChunk`, `SetDefaultSpawnPosition`,
+/// a non-zero `SynchronizePlayerPosition`, then the spawn-area chunks.
 ///
-/// The sequence is flushed in three stages because the [`PlayWriter`] drains by
-/// priority (State before World): flushing the framing packets, then the chunks,
-/// then the spawn/position sync guarantees the chunks land *between* `SetCenterChunk`
-/// and the position sync rather than being reordered after them.
+/// The position sync goes out *before* the chunks so the client's spawn point is
+/// fixed first: the loading-screen gate releases on the chunk that contains the
+/// player's position, and sending the sync first guarantees that chunk is among
+/// the spawn-area column packets that follow, regardless of where spawn lands.
+///
+/// The sequence is flushed in two stages because the [`PlayWriter`] drains by
+/// priority (State before World): flushing the framing-and-position packets, then
+/// the chunks, guarantees the position sync lands ahead of the chunk column
+/// rather than being reordered after it.
 ///
 /// # Errors
 ///
@@ -606,7 +611,8 @@ async fn send_join_kit(
 ) -> anyhow::Result<()> {
     let kit = &ctx.join_kit;
 
-    // Stage 1: enter play and cue the client to expect spawn chunks.
+    // Stage 1: enter play, cue the client to expect spawn chunks, fix the world
+    // spawn, and teleport the player in — all before any chunk is sent.
     writer.enqueue_classified(ClientboundPlayPacket::JoinGame(kit.join_game().clone()));
     writer.enqueue_classified(ClientboundPlayPacket::GameEvent(GameEvent::new(
         GAME_EVENT_LEVEL_CHUNKS_LOAD_START,
@@ -616,21 +622,18 @@ async fn send_join_kit(
         kit.spawn_chunk().x(),
         kit.spawn_chunk().z(),
     )));
-    flush_writer(writer, stream, compression, ctx.io_timeout).await?;
-
-    // Stage 2: the spawn-area chunk column packets (includes the player's chunk).
-    for chunk in kit.chunks() {
-        writer.enqueue_classified(ClientboundPlayPacket::ChunkDataAndLight(chunk.clone()));
-    }
-    flush_writer(writer, stream, compression, ctx.io_timeout).await?;
-
-    // Stage 3: fix the world spawn, then teleport the player into it.
     writer.enqueue_classified(ClientboundPlayPacket::SetDefaultSpawnPosition(
         SetDefaultSpawnPosition::new(kit.spawn_block(), 0.0),
     ));
     writer.enqueue_classified(ClientboundPlayPacket::SynchronizePlayerPosition(
         spawn_sync(JOIN_TELEPORT_ID, position),
     ));
+    flush_writer(writer, stream, compression, ctx.io_timeout).await?;
+
+    // Stage 2: the spawn-area chunk column packets (includes the player's chunk).
+    for chunk in kit.chunks() {
+        writer.enqueue_classified(ClientboundPlayPacket::ChunkDataAndLight(chunk.clone()));
+    }
     flush_writer(writer, stream, compression, ctx.io_timeout).await
 }
 

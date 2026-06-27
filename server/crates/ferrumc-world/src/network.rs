@@ -21,7 +21,7 @@ use crate::chunk::{Chunk, SECTION_COUNT};
 use crate::error::WorldError;
 use crate::heightmap::HeightmapKind;
 use crate::packed_array::PackedArray;
-use crate::paletted_container::write_var_u32;
+use crate::paletted_container::write_single_value_container;
 
 /// Bits-per-entry the *direct* block-states representation uses on the wire.
 ///
@@ -72,7 +72,8 @@ const ALL_LIGHT_SECTIONS_MASK: i64 = (1i64 << LIGHT_SECTION_COUNT) - 1;
 ///    states (see [`PalettedContainer::encode_network`](crate::PalettedContainer::encode_network)).
 /// 3. `biomes`: a [`PalettedContainer`](crate::PalettedContainer) of biomes,
 ///    here always a single-valued `plains` container (`bits_per_entry = 0`, one
-///    `VarInt` value, no data) because the crate has no biome storage yet.
+///    `VarInt` value, then a `VarInt(0)` empty long-array count) because the
+///    crate has no biome storage yet.
 ///
 /// # Errors
 ///
@@ -94,10 +95,11 @@ pub fn encode_chunk_section_data(chunk: &Chunk) -> Result<Vec<u8>, WorldError> {
             .block_states()
             .encode_network(&mut out, DIRECT_WIRE_BITS_BLOCK)?;
 
-        // Biomes: a single-valued plains container for the whole section.
-        out.push(0); // bits_per_entry = 0 -> single value
-        write_var_u32(&mut out, PLAINS_BIOME_ID);
-        // no biome data array
+        // Biomes: a single-valued plains container for the whole section. Its
+        // (empty) long array still carries the mandatory VarInt(0) count; the
+        // shared single-value encoder writes bpe, the value, and that count so
+        // this matches the block-states container's single-value form exactly.
+        write_single_value_container(&mut out, PLAINS_BIOME_ID);
     }
     Ok(out)
 }
@@ -271,8 +273,11 @@ mod tests {
         let bpe = bytes[*pos];
         *pos += 1;
         if bpe == 0 {
-            // Single value: one varint, no longs.
+            // Single value: one varint palette value, then the mandatory
+            // VarInt(0) empty long-array count.
             let _ = read_var_u32(bytes, pos);
+            let long_count = read_var_u32(bytes, pos);
+            assert_eq!(long_count, 0, "single-valued container carries no longs");
             return bpe;
         }
         if bpe <= 8 {
@@ -282,11 +287,13 @@ mod tests {
                 let _ = read_var_u32(bytes, pos);
             }
         }
-        // Indirect and direct both carry a non-spanning long array of length
-        // ceil(4096 / (64 / bpe)).
+        // Indirect and direct both prefix the non-spanning long array with its
+        // word count, which must equal ceil(4096 / (64 / bpe)).
+        let long_count = read_var_u32(bytes, pos) as usize;
         let values_per_word = 64 / usize::from(bpe);
-        let longs = 4096usize.div_ceil(values_per_word);
-        *pos += longs * 8;
+        let expected = 4096usize.div_ceil(values_per_word);
+        assert_eq!(long_count, expected, "long count matches the packed layout");
+        *pos += long_count * 8;
         bpe
     }
 
@@ -312,10 +319,11 @@ mod tests {
     fn empty_chunk_blob_is_all_single_air() {
         let chunk = Chunk::new(ChunkPos::ORIGIN);
         let blob = encode_chunk_section_data(&chunk).unwrap();
-        // 24 sections, each: i16 count (2) + block single-air (2) + biome (2).
-        assert_eq!(blob.len(), SECTION_COUNT * 6);
-        for chunk6 in blob.chunks_exact(6) {
-            assert_eq!(chunk6, &[0, 0, 0, 0, 0, 0]);
+        // 24 sections, each: i16 count (2) + block single-air container (bpe 0,
+        // value 0, long-count 0 = 3) + biome single-plains container (3) = 8.
+        assert_eq!(blob.len(), SECTION_COUNT * 8);
+        for section in blob.chunks_exact(8) {
+            assert_eq!(section, &[0, 0, 0, 0, 0, 0, 0, 0]);
         }
         let headers = parse_blob(&blob);
         assert_eq!(headers.len(), SECTION_COUNT);
