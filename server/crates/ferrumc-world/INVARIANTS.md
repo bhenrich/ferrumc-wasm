@@ -40,3 +40,24 @@
   equal `Chunk`, and the per-column profile is identical for every column and
   every chunk. Layer layout: `y = -64` bedrock, `-63..=59` stone, `60..=62`
   dirt, `63` grass, `64..=319` air.
+
+## Network encoding (`network` module)
+
+- `PalettedContainer::encode_network` writes the 1.21.5+ wire layout:
+  `bits_per_entry` byte, palette, then the packed long array with **no length
+  prefix** (the client recomputes the long count from `bits_per_entry` and
+  `CAPACITY`). Single: `bpe = 0`, one `VarInt` value, no longs. Indirect:
+  `VarInt` palette length + ids, then `ceil(CAPACITY / (64 / bpe))` longs. Direct:
+  no palette, longs repacked to the `direct_wire_bits` argument.
+- In-memory direct storage is 32 bits per entry for lossless ids, but the wire
+  uses the vanilla width (15 for block states), applied only at encode time. A
+  flat world never reaches the direct representation.
+- `encode_chunk_section_data` emits exactly `SECTION_COUNT` (24) sections
+  bottom-to-top, each `i16` non-air count + block-states container + a
+  single-valued `plains` (id 0) biomes container.
+- `pack_motion_blocking_heightmap` returns 37 longs (256 columns, 9 bits each,
+  7 per long). Each entry is `(highest_y + 1) - MIN_Y`, or `0` for an all-air
+  column.
+- `ChunkLightData::full_bright` marks all `LIGHT_SECTION_COUNT` (26) sections in
+  the sky-light and empty-block-light masks (`0x03FF_FFFF`), supplies 26 `0xFF`
+  2048-byte sky arrays, and leaves block light and the other two masks empty.

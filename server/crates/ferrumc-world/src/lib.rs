@@ -22,6 +22,11 @@
 //!   ([`BlockEntity`]).
 //! - [`FlatWorldGenerator`] — deterministically fills a [`Chunk`] with a flat
 //!   overworld profile (bedrock floor, stone fill, dirt, grass surface, air).
+//!
+//! The network encoder turns a [`Chunk`] into the wire bytes a 1.21.8 client
+//! expects: [`encode_chunk_section_data`] for the paletted section blob,
+//! [`pack_motion_blocking_heightmap`] for the heightmap long array, and
+//! [`ChunkLightData`] for the light masks and full-bright sky arrays.
 
 mod block_state;
 mod chunk;
@@ -30,6 +35,7 @@ mod dirty;
 mod error;
 mod generator;
 mod heightmap;
+mod network;
 mod packed_array;
 mod paletted_container;
 
@@ -40,5 +46,9 @@ pub use dirty::DirtySections;
 pub use error::WorldError;
 pub use generator::FlatWorldGenerator;
 pub use heightmap::{Heightmap, HeightmapKind};
+pub use network::{
+    encode_chunk_section_data, pack_motion_blocking_heightmap, ChunkLightData, LIGHT_SECTION_BYTES,
+    LIGHT_SECTION_COUNT,
+};
 pub use packed_array::PackedArray;
 pub use paletted_container::{ContainerKind, PalettedContainer};

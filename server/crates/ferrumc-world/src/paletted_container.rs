@@ -15,13 +15,19 @@ const MIN_INDIRECT_BITS: u8 = 4;
 /// representation is used instead.
 const MAX_INDIRECT_BITS: u8 = 8;
 
-/// Bits-per-entry for the direct representation.
+/// Bits-per-entry for the *internal* direct representation.
 ///
 /// Direct storage holds full [`BlockStateId`] values, so it uses the entire
-/// `u32` width. This is wider than vanilla (which sizes the direct palette to
-/// the global block-state count) but is always correct regardless of how high
-/// an id climbs, and the direct representation is only reached by sections with
-/// more than 256 distinct states.
+/// `u32` width. This is wider than vanilla (1.21.8 sizes the direct palette to
+/// `ceil(log2(global block-state count))`, which is 15 bits) but is always
+/// correct regardless of how high an id climbs, and the direct representation is
+/// only reached by sections with more than 256 distinct states.
+///
+/// The wire format uses the narrower vanilla width: [`PalettedContainer::encode_network`]
+/// takes a `direct_wire_bits` argument and repacks a direct container to that
+/// width on the way out (15 for block states), so the bytes a client receives
+/// match vanilla even though the in-memory layout is 32-bit. A flat world never
+/// reaches the direct representation, so this repack is exercised only by tests.
 const DIRECT_BITS: u8 = 32;
 
 /// Which internal representation a [`PalettedContainer`] is currently using.
@@ -83,6 +89,37 @@ const fn index_bits_for_len(len: usize) -> u32 {
         0
     } else {
         usize::BITS - (len - 1).leading_zeros()
+    }
+}
+
+/// Appends `value` to `out` as a Minecraft `VarInt` (1–5 bytes).
+///
+/// Only non-negative values are encoded here (palette ids and palette lengths),
+/// for which the unsigned 7-bit grouping is identical to the protocol's signed
+/// `VarInt`. The high bit of each byte is the continuation flag. Shared with the
+/// chunk-blob assembler in [`crate::network`], which writes the single-valued
+/// biome container the same way.
+pub(crate) fn write_var_u32(out: &mut Vec<u8>, mut value: u32) {
+    loop {
+        // Mask to the low 7 bits before narrowing so the cast can never truncate.
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Appends each packed `u64` word to `out` as a big-endian 8-byte long.
+///
+/// The chunk-section wire format writes the backing words verbatim (the bit
+/// pattern is what the client unpacks), so this is a straight big-endian dump
+/// with no length prefix.
+fn write_packed_longs(out: &mut Vec<u8>, words: &[u64]) {
+    for &word in words {
+        out.extend_from_slice(&word.to_be_bytes());
     }
 }
 
@@ -240,6 +277,60 @@ impl<const CAPACITY: usize> PalettedContainer<CAPACITY> {
         }
 
         self.adjust_count(old, state);
+        Ok(())
+    }
+
+    /// Appends this container's chunk-section wire encoding to `out`.
+    ///
+    /// The layout matches the Minecraft 1.21.5+ `PalettedContainer`: a
+    /// `bits_per_entry` byte, then the palette, then the packed long array — with
+    /// **no length prefix** on the long array (its length is recomputed by the
+    /// client from `bits_per_entry` and the fixed `CAPACITY`).
+    ///
+    /// - [`ContainerKind::Single`]: `bits_per_entry = 0`, one `VarInt` palette
+    ///   value, and no long array.
+    /// - [`ContainerKind::Indirect`]: `bits_per_entry` is the palette-index width,
+    ///   followed by a `VarInt` palette length, that many `VarInt` ids, then the
+    ///   non-spanning long array ([`PackedArray::words`]).
+    /// - [`ContainerKind::Direct`]: `bits_per_entry = direct_wire_bits`, no
+    ///   palette, then the long array repacked to `direct_wire_bits`.
+    ///
+    /// `direct_wire_bits` is the bits-per-entry the direct representation uses on
+    /// the wire (15 for block states in 1.21.8). It is ignored for the single and
+    /// indirect forms, which a flat world is the only thing that emits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::ValueTooWide`] if the container is direct and holds
+    /// an id that does not fit in `direct_wire_bits` bits. Real block-state ids
+    /// fit in 15 bits, so this cannot happen for genuine chunk data.
+    pub fn encode_network(
+        &self,
+        out: &mut Vec<u8>,
+        direct_wire_bits: u8,
+    ) -> Result<(), WorldError> {
+        match &self.repr {
+            Repr::Single(state) => {
+                out.push(0);
+                write_var_u32(out, state.as_u32());
+            }
+            Repr::Indirect { palette, indices } => {
+                out.push(indices.bits_per_entry());
+                // Palette length and ids are small non-negative values.
+                write_var_u32(out, u32::try_from(palette.len()).unwrap_or(u32::MAX));
+                for id in palette {
+                    write_var_u32(out, id.as_u32());
+                }
+                write_packed_longs(out, indices.words());
+            }
+            Repr::Direct(data) => {
+                out.push(direct_wire_bits);
+                // The in-memory layout is 32-bit for lossless storage; the wire
+                // uses the narrower vanilla width, so repack before emitting.
+                let wire = data.resized(direct_wire_bits)?;
+                write_packed_longs(out, wire.words());
+            }
+        }
         Ok(())
     }
 
@@ -448,6 +539,110 @@ mod tests {
                 capacity
             }) if index == CAP && capacity == CAP
         ));
+    }
+
+    /// Bits-per-entry the direct representation uses on the wire for block
+    /// states in 1.21.8 (`ceil(log2(global block-state count))`).
+    const DIRECT_WIRE_BITS: u8 = 15;
+
+    #[test]
+    fn encode_single_air_is_bpe_zero_one_varint_no_longs() {
+        let c = Container::new();
+        let mut out = Vec::new();
+        c.encode_network(&mut out, DIRECT_WIRE_BITS).unwrap();
+        // bits_per_entry = 0, then the single palette value (air = 0), no longs.
+        assert_eq!(out, vec![0x00, 0x00]);
+    }
+
+    #[test]
+    fn encode_single_non_air_value() {
+        let c = Container::filled(BlockStateId::new(5));
+        let mut out = Vec::new();
+        c.encode_network(&mut out, DIRECT_WIRE_BITS).unwrap();
+        assert_eq!(out, vec![0x00, 0x05]);
+    }
+
+    #[test]
+    fn encode_indirect_layout_and_long_count() {
+        // One stone block over an otherwise-air section: palette [air, stone],
+        // clamped to 4 bits per entry.
+        let mut c = Container::new();
+        c.set(0, BlockStateId::new(1)).unwrap();
+        assert_eq!(c.kind(), ContainerKind::Indirect);
+        assert_eq!(c.bits_per_entry(), 4);
+
+        let mut out = Vec::new();
+        c.encode_network(&mut out, DIRECT_WIRE_BITS).unwrap();
+
+        // Header: bpe = 4, palette length = 2, ids [air=0, stone=1].
+        assert_eq!(out[0], 4);
+        assert_eq!(out[1], 2);
+        assert_eq!(out[2], 0);
+        assert_eq!(out[3], 1);
+
+        // 4 bits/entry -> 16 entries per long -> ceil(4096 / 16) = 256 longs.
+        let long_bytes = out.len() - 4;
+        assert_eq!(long_bytes % 8, 0);
+        assert_eq!(long_bytes / 8, 256);
+
+        // Block index 0 maps to palette index 1 (stone) in the low nibble of the
+        // first long; every other entry is palette index 0.
+        assert_eq!(&out[4..12], &[0, 0, 0, 0, 0, 0, 0, 1]);
+        assert!(out[12..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn encode_direct_uses_wire_bits_and_no_palette() {
+        // Drive the container to direct (more than 256 distinct ids).
+        let mut c = Container::new();
+        for i in 1..=256u32 {
+            c.set(i as usize, BlockStateId::new(i)).unwrap();
+        }
+        assert_eq!(c.kind(), ContainerKind::Direct);
+
+        let mut out = Vec::new();
+        c.encode_network(&mut out, DIRECT_WIRE_BITS).unwrap();
+
+        // bits_per_entry is the *wire* width (15), not the internal 32.
+        assert_eq!(out[0], DIRECT_WIRE_BITS);
+        // No palette is written for direct; 15 bits -> 4 entries per long ->
+        // ceil(4096 / 4) = 1024 longs, and nothing else.
+        let long_bytes = out.len() - 1;
+        assert_eq!(long_bytes, 1024 * 8);
+    }
+
+    #[test]
+    fn encode_direct_rejects_ids_wider_than_wire_bits() {
+        let mut c = Container::new();
+        for i in 1..=256u32 {
+            c.set(i as usize, BlockStateId::new(i)).unwrap();
+        }
+        assert_eq!(c.kind(), ContainerKind::Direct);
+        // An id beyond 15 bits cannot be repacked to the block wire width.
+        c.set(500, BlockStateId::new(40_000)).unwrap();
+        let mut out = Vec::new();
+        assert!(matches!(
+            c.encode_network(&mut out, DIRECT_WIRE_BITS),
+            Err(WorldError::ValueTooWide { .. })
+        ));
+    }
+
+    #[test]
+    fn write_var_u32_known_encodings() {
+        use super::write_var_u32;
+        let cases: &[(u32, &[u8])] = &[
+            (0, &[0x00]),
+            (1, &[0x01]),
+            (127, &[0x7F]),
+            (128, &[0x80, 0x01]),
+            (300, &[0xAC, 0x02]),
+            (25_565, &[0xDD, 0xC7, 0x01]),
+        ];
+        for &(value, expected) in cases {
+            let mut out = Vec::new();
+            write_var_u32(&mut out, value);
+            assert_eq!(out, expected, "value={value}");
+        }
     }
 
     #[test]

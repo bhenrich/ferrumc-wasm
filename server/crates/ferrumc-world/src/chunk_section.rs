@@ -58,6 +58,14 @@ impl ChunkSection {
         self.blocks.non_air_count()
     }
 
+    /// Returns the section's block-state storage for network encoding.
+    ///
+    /// Used by [`crate::network`] to write the section's block-states
+    /// `PalettedContainer` into the chunk-data blob.
+    pub(crate) const fn block_states(&self) -> &PalettedContainer<SECTION_VOLUME> {
+        &self.blocks
+    }
+
     /// Returns `true` if the section contains no non-air blocks.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
