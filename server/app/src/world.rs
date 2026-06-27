@@ -97,17 +97,34 @@ impl JoinKit {
     pub(crate) fn chunks(&self) -> &[ChunkDataAndLight] {
         &self.chunks
     }
+
+    /// The chunk positions covered by the spawn batch sent at join.
+    ///
+    /// A connection seeds its per-player loaded-chunk set with these so chunk
+    /// streaming never re-sends a chunk the client already received at join.
+    pub(crate) fn chunk_positions(&self) -> impl Iterator<Item = ChunkPos> + '_ {
+        self.chunks
+            .iter()
+            .map(|chunk| ChunkPos::new(chunk.x(), chunk.z()))
+    }
 }
 
 /// The simulation pieces produced by [`build_world`], ready to drive.
 ///
 /// The shard already owns the resident spawn chunks; `join_kit` is the shared
-/// clientbound payload derived from them.
+/// clientbound payload derived from them. The `store` and `generator` are handed
+/// to the driver so it can run the load-or-generate flow for chunks streamed in
+/// around a moving player (the same store the spawn area was loaded from, so
+/// chunk persistence stays consistent).
 pub(crate) struct WorldSetup {
     /// The single simulation shard owning the spawn area.
     pub(crate) shard: SimShard,
     /// The shared join payload replayed to connecting players.
     pub(crate) join_kit: std::sync::Arc<JoinKit>,
+    /// The chunk store the driver streams new chunks through.
+    pub(crate) store: InMemoryStore,
+    /// The terrain generator the driver uses on a store miss.
+    pub(crate) generator: FlatWorldGenerator,
 }
 
 /// Returns the chunk position the spawn point falls in.
@@ -143,7 +160,12 @@ pub(crate) async fn build_world(
         .await?;
 
     let join_kit = std::sync::Arc::new(build_join_kit(config, &shard, &spawn)?);
-    Ok(WorldSetup { shard, join_kit })
+    Ok(WorldSetup {
+        shard,
+        join_kit,
+        store,
+        generator,
+    })
 }
 
 /// Assembles the [`JoinKit`] from the shard's resident spawn chunks.
@@ -211,12 +233,16 @@ fn build_join_game(config: &AppConfig) -> anyhow::Result<JoinGame> {
 /// [`pack_motion_blocking_heightmap`], and the full-bright sky light from
 /// [`ChunkLightData::full_bright`] (no block light). Block entities are empty.
 ///
+/// Shared by the join-kit builder (for the spawn batch) and the driver (for
+/// chunks streamed in around a moving player), so both emit byte-identical chunk
+/// packets.
+///
 /// # Errors
 ///
 /// Returns an error if the section blob or a packed heightmap cannot be produced
 /// (only for out-of-range block data, which the flat generator never emits), or
 /// if an encoded buffer exceeds its protocol length bound.
-fn chunk_packet(pos: ChunkPos, chunk: &Chunk) -> anyhow::Result<ChunkDataAndLight> {
+pub(crate) fn chunk_packet(pos: ChunkPos, chunk: &Chunk) -> anyhow::Result<ChunkDataAndLight> {
     let blob = BoundedBytes::<2_097_152>::new(encode_chunk_section_data(chunk)?)
         .map_err(|err| anyhow::anyhow!("chunk blob exceeds protocol bound: {err}"))?;
 

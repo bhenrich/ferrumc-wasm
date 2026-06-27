@@ -118,6 +118,8 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     let driver_task = tokio::spawn(driver::run(
         router,
         setup.shard,
+        setup.store,
+        setup.generator,
         shard_rx,
         commands_rx,
         config.tick_period(),
@@ -143,6 +145,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         commands: commands_tx,
         policy,
         status_response,
+        view_distance: config.view_distance,
     };
 
     let accept_task = tokio::spawn(accept_loop(

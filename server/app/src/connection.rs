@@ -14,6 +14,7 @@
 //! spawn-area chunk packets. From there it pumps serverbound play packets into
 //! the simulation and clientbound outputs back to the socket.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,11 +27,11 @@ use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
 use ferrumc_codec::{BoundedReader, BoundedString};
 use ferrumc_command::CommandSource;
 use ferrumc_core::PlayerId;
-use ferrumc_math::Vec3;
+use ferrumc_math::{BlockPos, ChunkPos, Vec3};
 use ferrumc_net::{
     offline_uuid, CompressionState, ConnectionLimits, ConnectionState, DecodeError,
     DisconnectReason, FrameDecodeError, InboundDecoder, InboundPacket, OutboundEncoder,
-    OutboundPacket, PlayWriter, StatusInfo,
+    OutboundPacket, OutboundPriority, PlayWriter, StatusInfo,
 };
 use ferrumc_proto::generated::configuration::{
     ClientboundConfigurationPacket, ClientboundKnownPacks, FinishConfiguration,
@@ -42,7 +43,7 @@ use ferrumc_proto::generated::login::{
 };
 use ferrumc_proto::generated::play::{
     ClientboundKeepAlive, ClientboundPlayPacket, GameEvent, ServerboundPlayPacket, SetCenterChunk,
-    SetDefaultSpawnPosition, SetPlayerPosition, SynchronizePlayerPosition,
+    SetDefaultSpawnPosition, SetPlayerPosition, SynchronizePlayerPosition, UnloadChunk,
 };
 use ferrumc_proto::generated::status::{
     ClientboundStatusPacket, PongResponse, ServerboundStatusPacket, StatusResponse,
@@ -91,6 +92,68 @@ const GAME_EVENT_LEVEL_CHUNKS_LOAD_START: u8 = 13;
 /// it, which the server decodes and ignores.
 const JOIN_TELEPORT_ID: i32 = 1;
 
+/// Maximum number of `ChunkDataAndLight` packets a single streaming evaluation
+/// will request and send for one player.
+///
+/// Each chunk packet carries the full section + light payload (tens of KiB), so
+/// an uncapped burst — a teleport that makes the whole view square new, or the
+/// initial gap between the small spawn batch and a large view distance — could
+/// dump megabytes onto one socket at once. Capping the per-update load count
+/// paces the stream: the leftover chunks are picked up on the next position
+/// update (the desired-vs-loaded diff is recomputed every move), nearest-first,
+/// so the player always gets the chunks closest to them first. Unloads are tiny
+/// (8 bytes) and are not capped. `16` keeps a normal single-chunk step fully
+/// served in one update while bounding a teleport flood.
+const MAX_CHUNK_LOADS_PER_UPDATE: usize = 16;
+
+/// Upper bound applied to the configured view distance when streaming chunks.
+///
+/// The streamed view is a `(2 * r + 1)` square, so the per-player loaded-chunk
+/// set is bounded by `(2 * r + 1)^2`. Clamping `r` here (to the vanilla view-
+/// distance ceiling) keeps that set — and the work a single boundary crossing can
+/// request — bounded even if the config carries an absurd view distance.
+const STREAM_VIEW_DISTANCE_MAX: i32 = 32;
+
+/// Per-connection chunk-streaming state: which chunk the client is centred on and
+/// which chunk columns it currently holds.
+///
+/// This is connection/session bookkeeping, not world state: it records what has
+/// been *sent to this client* so the stream never re-sends a chunk and knows what
+/// to unload. The authoritative chunk data still lives in the simulation shard;
+/// the connection only ever asks the driver (via [`SimCommand::StreamChunks`]) to
+/// load-or-generate and never touches the chunk map itself.
+struct ChunkStream {
+    /// The chunk the client is currently centred on (the last `Set Center Chunk`).
+    center: ChunkPos,
+    /// The square radius, in chunks, of the streamed view (already clamped).
+    view_distance: i32,
+    /// The chunk columns the client currently holds (spawn batch + streamed in),
+    /// bounded by `(2 * view_distance + 1)^2`.
+    loaded: BTreeSet<ChunkPos>,
+    /// The latest position reported by the client since the last evaluation, or
+    /// `None` if nothing new — coalescing many move packets in one read into a
+    /// single streaming pass.
+    pending_position: Option<Vec3>,
+}
+
+impl ChunkStream {
+    /// Seeds the stream from the join kit: centred on the spawn chunk and already
+    /// holding the spawn-batch columns the client received at join.
+    fn new(ctx: &ConnContext) -> Self {
+        Self {
+            center: ctx.join_kit.spawn_chunk(),
+            view_distance: ctx.view_distance.clamp(0, STREAM_VIEW_DISTANCE_MAX),
+            loaded: ctx.join_kit.chunk_positions().collect(),
+            pending_position: None,
+        }
+    }
+
+    /// Records the client's latest reported position for the next evaluation.
+    fn observe(&mut self, position: Vec3) {
+        self.pending_position = Some(position);
+    }
+}
+
 /// Immutable context shared by every connection task.
 ///
 /// Cloned cheaply (it is small and the [`JoinKit`] is behind an [`Arc`]) and
@@ -119,6 +182,10 @@ pub(crate) struct ConnContext {
     /// replayed for every status (`next_state == 1`) handshake. Behind an [`Arc`]
     /// so cloning the context per connection is a pointer bump, not a re-render.
     pub(crate) status_response: Arc<OutboundPacket>,
+    /// The configured play view distance, in chunks: the square radius of chunks
+    /// streamed around a player as they move (clamped to a sane maximum per
+    /// connection, see [`STREAM_VIEW_DISTANCE_MAX`]).
+    pub(crate) view_distance: i32,
 }
 
 impl ConnContext {
@@ -481,6 +548,10 @@ async fn enter_play(
     let position = ctx.join_kit.spawn_position();
     let mut handle = join_simulation(ctx, player, position).await?;
 
+    // The client already holds the spawn batch after the join kit; stream tracks
+    // it from there so it never re-sends a spawn chunk and knows what to unload.
+    let mut chunk_stream = ChunkStream::new(ctx);
+
     // Replay the keystone payload, then drain any already-buffered play frames.
     let mut writer = PlayWriter::with_defaults(ctx.limits);
     send_join_kit(&mut writer, &mut stream, &compression, ctx, position).await?;
@@ -491,6 +562,7 @@ async fn enter_play(
         player,
         name.as_str(),
         &mut writer,
+        &mut chunk_stream,
     )
     .await?;
     flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await?;
@@ -543,6 +615,7 @@ async fn enter_play(
                         name.as_str(),
                         &mut writer,
                         &mut stream,
+                        &mut chunk_stream,
                         &read_buf[..n],
                     ).await,
                 };
@@ -552,6 +625,17 @@ async fn enter_play(
             },
         }
     };
+
+    // Release every chunk this connection had the client holding so its player
+    // tickets stop pinning chunks resident after it leaves. Best-effort: a gone
+    // driver just means the whole simulation is winding down anyway.
+    if !chunk_stream.loaded.is_empty() {
+        let positions = chunk_stream.loaded.iter().copied().collect();
+        let _ = ctx
+            .commands
+            .send(SimCommand::ReleaseChunks { positions })
+            .await;
+    }
 
     // Best-effort despawn notice regardless of how the link ended.
     let _ = ctx
@@ -665,10 +749,20 @@ async fn read_and_pump(
     name: &str,
     writer: &mut PlayWriter,
     stream: &mut TcpStream,
+    chunk_stream: &mut ChunkStream,
     bytes: &[u8],
 ) -> anyhow::Result<()> {
     decoder.push(bytes)?;
-    pump_serverbound(decoder, compression, ctx, player, name, writer).await?;
+    pump_serverbound(
+        decoder,
+        compression,
+        ctx,
+        player,
+        name,
+        writer,
+        chunk_stream,
+    )
+    .await?;
     flush_writer(writer, stream, compression, ctx.io_timeout).await
 }
 
@@ -676,6 +770,10 @@ async fn read_and_pump(
 /// `ChatCommand` runs through the command tree (queuing any clientbound response
 /// into `writer`), a spawn-protected break/place is vetoed, and anything else is
 /// forwarded to the simulation as a [`NetEvent`].
+///
+/// After the whole buffered batch is drained, a single chunk-streaming pass runs
+/// against the latest position the batch reported, so many coalesced move packets
+/// trigger at most one streaming evaluation per read.
 async fn pump_serverbound(
     decoder: &mut InboundDecoder,
     compression: &CompressionState,
@@ -683,14 +781,15 @@ async fn pump_serverbound(
     player: PlayerId,
     name: &str,
     writer: &mut PlayWriter,
+    chunk_stream: &mut ChunkStream,
 ) -> anyhow::Result<()> {
     while let Some(packet) = decoder.next_packet_compressed(ConnectionState::Play, compression)? {
         let InboundPacket::Play(body) = packet else {
             anyhow::bail!("non-play frame received in the play phase");
         };
-        handle_play_body(ctx, player, name, writer, &body).await?;
+        handle_play_body(ctx, player, name, writer, chunk_stream, &body).await?;
     }
-    Ok(())
+    apply_chunk_stream(ctx, writer, chunk_stream).await
 }
 
 /// Handles one decoded serverbound play-frame body.
@@ -698,12 +797,15 @@ async fn pump_serverbound(
 /// Unknown or malformed play packets are ignored (the slice models only a
 /// subset), as are the teleport confirmation and the Keep Alive echo. A
 /// `ChatCommand` is dispatched locally; every other modelled packet is forwarded
-/// to the simulation unless spawn protection vetoes it.
+/// to the simulation unless spawn protection vetoes it. A position packet is also
+/// recorded on the chunk stream so the post-drain pass can react to a boundary
+/// crossing.
 async fn handle_play_body(
     ctx: &ConnContext,
     player: PlayerId,
     name: &str,
     writer: &mut PlayWriter,
+    chunk_stream: &mut ChunkStream,
     body: &[u8],
 ) -> anyhow::Result<()> {
     let mut reader = BoundedReader::new(body);
@@ -713,6 +815,13 @@ async fn handle_play_body(
     let Ok(packet) = ServerboundPlayPacket::decode(id, &mut reader) else {
         return Ok(());
     };
+
+    // Track the client's reported position for chunk streaming. The packet is
+    // still forwarded to the simulation below — this only mirrors the position the
+    // stream centres on; the simulation stays authoritative.
+    if let Some(position) = reported_position(&packet) {
+        chunk_stream.observe(position);
+    }
 
     match &packet {
         ServerboundPlayPacket::ChatCommand(command) => {
@@ -738,6 +847,139 @@ async fn handle_play_body(
         .send(SimCommand::Event(event))
         .await
         .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
+}
+
+/// The absolute position a serverbound play packet reports, if any.
+///
+/// Both absolute-move packets carry a position; the rotation-only and other
+/// packets do not move the player and so report nothing.
+fn reported_position(packet: &ServerboundPlayPacket) -> Option<Vec3> {
+    match packet {
+        ServerboundPlayPacket::SetPlayerPosition(p) => Some(Vec3::new(p.x(), p.y(), p.z())),
+        ServerboundPlayPacket::SetPlayerPositionAndRotation(p) => {
+            Some(Vec3::new(p.x(), p.y(), p.z()))
+        }
+        _ => None,
+    }
+}
+
+/// Streams chunks to follow the client's latest reported position.
+///
+/// Does nothing until the client has reported a new position. On a chunk-boundary
+/// crossing it sends `Set Center Chunk`; either way it diffs the square of chunks
+/// within view distance against the per-player loaded set, sends `Unload Chunk`
+/// for any column that left the radius, and asks the driver (via
+/// [`SimCommand::StreamChunks`]) to load-or-generate the columns newly in range —
+/// nearest-first and capped at [`MAX_CHUNK_LOADS_PER_UPDATE`] per call, with the
+/// remainder caught on a later position update. A chunk already in the loaded set
+/// is never re-requested or re-sent.
+///
+/// The connection never generates chunks itself: it only decides the desired set
+/// and renders the packets the driver returns.
+async fn apply_chunk_stream(
+    ctx: &ConnContext,
+    writer: &mut PlayWriter,
+    chunk_stream: &mut ChunkStream,
+) -> anyhow::Result<()> {
+    let Some(position) = chunk_stream.pending_position.take() else {
+        return Ok(());
+    };
+
+    let new_center = chunk_of(position);
+    if new_center != chunk_stream.center {
+        chunk_stream.center = new_center;
+        writer.enqueue_classified(ClientboundPlayPacket::SetCenterChunk(SetCenterChunk::new(
+            new_center.x(),
+            new_center.z(),
+        )));
+    }
+
+    let desired = desired_chunks(new_center, chunk_stream.view_distance);
+    let to_unload: Vec<ChunkPos> = chunk_stream.loaded.difference(&desired).copied().collect();
+    let mut to_load: Vec<ChunkPos> = desired.difference(&chunk_stream.loaded).copied().collect();
+    if to_load.is_empty() && to_unload.is_empty() {
+        return Ok(());
+    }
+
+    // Nearest-first so the player always receives the chunks closest to them when
+    // the per-update cap defers the rest; the coordinate tiebreak keeps it
+    // deterministic.
+    to_load.sort_by_key(|pos| (chebyshev_distance(new_center, *pos), pos.x(), pos.z()));
+    to_load.truncate(MAX_CHUNK_LOADS_PER_UPDATE);
+
+    // Drop the departed columns from the client now (tiny packets) and from the
+    // tracked set; the driver releases their tickets via the command below.
+    for pos in &to_unload {
+        writer.enqueue(
+            OutboundPriority::World,
+            ClientboundPlayPacket::UnloadChunk(UnloadChunk::new(pos.z(), pos.x())),
+        );
+        chunk_stream.loaded.remove(pos);
+    }
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    ctx.commands
+        .send(SimCommand::StreamChunks {
+            load: to_load,
+            unload: to_unload,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+    let packets = reply_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver dropped the chunk-stream reply"))?;
+
+    // Only the chunks the driver actually built come back; record exactly those so
+    // a skipped chunk is retried on a later update rather than treated as sent.
+    for packet in packets {
+        chunk_stream
+            .loaded
+            .insert(ChunkPos::new(packet.x(), packet.z()));
+        writer.enqueue(
+            OutboundPriority::World,
+            ClientboundPlayPacket::ChunkDataAndLight(packet),
+        );
+    }
+    Ok(())
+}
+
+/// The chunk column the world `position` falls in (flooring so negatives land on
+/// the correct column).
+fn chunk_of(position: Vec3) -> ChunkPos {
+    BlockPos::new(
+        position.x.floor() as i32,
+        position.y.floor() as i32,
+        position.z.floor() as i32,
+    )
+    .to_chunk_pos()
+}
+
+/// The `(2 * radius + 1)` square of chunk columns centred on `center`.
+///
+/// Coordinates are added saturating so a centre at the edge of the coordinate
+/// range can never overflow; any realistic position is exact.
+fn desired_chunks(center: ChunkPos, radius: i32) -> BTreeSet<ChunkPos> {
+    let mut set = BTreeSet::new();
+    for dz in -radius..=radius {
+        for dx in -radius..=radius {
+            set.insert(ChunkPos::new(
+                center.x().saturating_add(dx),
+                center.z().saturating_add(dz),
+            ));
+        }
+    }
+    set
+}
+
+/// The Chebyshev (square/king-move) chunk distance between `a` and `b`.
+///
+/// Computed in `i64` so the difference cannot overflow at the coordinate
+/// extremes.
+fn chebyshev_distance(a: ChunkPos, b: ChunkPos) -> i64 {
+    let dx = (i64::from(a.x()) - i64::from(b.x())).abs();
+    let dz = (i64::from(a.z()) - i64::from(b.z())).abs();
+    dx.max(dz)
 }
 
 /// Returns whether `event` is a break/place that spawn protection should veto:

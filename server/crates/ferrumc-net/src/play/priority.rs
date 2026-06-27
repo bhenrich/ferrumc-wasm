@@ -114,7 +114,8 @@ impl OutboundPriority {
             | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::State,
             ClientboundPlayPacket::SpawnEntity(_)
             | ClientboundPlayPacket::BlockUpdate(_)
-            | ClientboundPlayPacket::ChunkDataAndLight(_) => Self::World,
+            | ClientboundPlayPacket::ChunkDataAndLight(_)
+            | ClientboundPlayPacket::UnloadChunk(_) => Self::World,
         }
     }
 }
