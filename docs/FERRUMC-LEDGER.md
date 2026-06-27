@@ -180,14 +180,92 @@ Other vendored data in `core/fixtures/protocol/1_21_8/`: `blocks.json` (block-st
 `biomes.json`, `version.json`. All checksummed in `manifest.toml` and re-verified by a
 `ferrumc-registry` test.
 
-### Additional protocol files (owner-maintained — fill in as added)
+### Reference Troves (curated wiki dump + v1 impl)
 
-Saad is adding more protocol references. Index them here as they land so an assistant can find them.
+Two durable reference troves live at the **ferrumc ROOT** (`/Users/saad/dev/personal/apps/ferrumc/`,
+a sibling of `core/` — which is why they were missed before). They sit **below** the three references
+above in the precedence chain:
 
-- **TODO (placeholder):** durable copies of any new protocol dumps Saad adds → record path + provenance here.
-- Transient staging (NOT durable — `/tmp` is wiped): `/private/tmp/protocol-1.21.8.{txt,raw.wikitext,rendered.html}`
-  are the source artifacts that produced the pinned skill `.txt` (the `.txt` is byte-identical to the
-  skill copy). Treat the **skill copy** as the canonical one; don't reference `/tmp` paths in code or docs.
+> **Precedence:** `fixtures/protocol/1_21_8/protocol.json` = machine-readable **ground truth** →
+> `wiki/protocol/` = human-readable **1.21.8 reference** → `ref/` = **v1 impl, inspiration only**.
+> When anything disagrees, protocol.json wins.
+
+The earlier warning still stands: **the LIVE minecraft.wiki is 1.21.9 / protocol 773 — do not use it.**
+The `wiki/` trove below is a **pinned, curated 1.21.8 snapshot saved to disk** (safe to use), NOT the
+live site. Licensing: the wiki pages are **CC BY-SA 3.0 Unported** — fine to reference for
+implementation, but attribute appropriately in any derivative/reproduction.
+
+> ⚠️ **Version caveat inside the dump:** the main packets file IS pinned to 1.21.8/772, but a few of the
+> "current list" articles were saved at a LATER version: **`Entity_metadata.txt` is 26.1**,
+> **`Particles.txt` is 1.21.10**, **`Protocol_History.txt` goes up to 26.1.2 / 775**. Their *structure*
+> is fine, but **verify any concrete entity / particle / status IDs against the fixtures**, not against these.
+
+#### TROVE 1 — `wiki/` (curated minecraft.wiki 1.21.8 dump, CC BY-SA 3.0)
+
+`wiki/protocol/` — the human-readable companion to `fixtures/protocol/1_21_8/protocol.json`:
+
+| File | Use it for |
+|---|---|
+| `Java_Edition_protocol_Packets_1.21.8_pv772.txt` | **THE authoritative 1.21.8 / pv772 packet list** — every packet per state + direction, with fields, types, and notes. 264 KB; the prose companion to protocol.json. |
+| `Chunk_format.txt` | Chunk Data & Update Light internals: chunk columns vs sections, global/local palettes, paletted containers, bits-per-entry, heightmaps, light. **Source of GOTCHA #1–#2 in §7.** |
+| `Data_types.txt` | Primitive wire encodings: VarInt/VarLong, Boolean, numeric types, Position, big-endian rules. |
+| `Slot_Data.txt` | The Slot structure (item stacks): item count, item id, structured-component add/remove arrays. Item serialization. |
+| `Inventory.txt` | Inventory window types + slot-index ranges/meanings per window (chest, furnace, horse, …). |
+| `Entity_metadata.txt` | Per-entity metadata field layouts + the entity-type ID table. ⚠ content is **26.1** — verify IDs vs fixtures. |
+| `Entity_statuses.txt` | Entity status/event codes (Entity Event packet) per entity. |
+| `Object_Data.txt` | Meaning of the `Data` field in Spawn Entity, per entity type (e.g. item-frame orientation). |
+| `Block_actions.txt` | Block Action packet action IDs per block (note block, piston, chest, …). |
+| `Command_data.txt` | Command-graph structure: root/literal/argument nodes, flags, redirects (Commands packet). |
+| `Registries.txt` | Built-in vs data-driven vs synchronized registries; which registries are sent on join. |
+| `Particles.txt` | Particle type IDs + per-particle data formats. ⚠ content is **1.21.10** — verify IDs vs fixtures. |
+| `Plugin_channels.txt` | Built-in plugin channels (`minecraft:brand`, register/unregister, …) over custom payload. |
+| `Server_List_Ping.txt` | Status ping (SLP) flow + status-response JSON; modern and legacy 1.6 ping. |
+| `Protocol_Encryption.txt` | Online-mode login encryption: Encryption Request/Response, server-ID hash, AES. |
+| `Protocol_FAQ.txt` | Protocol overview, the normal login sequence, common Q&A. |
+| `Protocol_History.txt` | Per-version protocol changelog ("what changed when"). ⚠ runs up to **26.1.2 / 775**. |
+| `Protocol_version_numbers.txt` | MC release ↔ protocol-number table (confirm 1.21.8 = 772). |
+
+Other `wiki/` subdirs (peek before relying on them):
+
+- **`wiki/auth/`** — online-mode auth. `Microsoft_authentication.txt` (Xbox/MSA OAuth2 flow),
+  `Mojang_API.txt` (profile/UUID/skin endpoints + ratelimits), `Yggdrasil.txt` + `Legacy_Minecraft_authentication.txt`
+  (both **outdated**, pre-MSA). Pair with `Protocol_Encryption.txt` for online-mode login.
+- **`wiki/storage/`** — `NBT.txt` (NBT binary format), `Anvil_file_format.txt` (Anvil chunk storage),
+  `Region_Files.txt` (region container). For `ferrumc-nbt` / `ferrumc-anvil` / `ferrumc-storage`.
+- **`wiki/text/`** — `Raw_JSON_text_format.txt` (text component / SNBT since 1.21.5), `Text_formatting.txt`
+  (legacy `§` color codes), `Chat.txt` (chat system + chat modes). For `TextComponent` / chat.
+- **`wiki/registry/`** — `Data_Generators.txt` (how Mojang's data generators produce registry/block reports —
+  i.e. how the fixtures were generated).
+- **`wiki/misc/`** — `Map_item_format.txt` (map items), `Query.txt` (UDP query protocol), `RCON.txt`
+  (remote-console TCP protocol), `Units_of_Measurement.txt` (block/pixel/coordinate units).
+
+#### TROVE 2 — `ref/` (FerrumC **v1**, a complete older Rust MC server — inspiration only)
+
+`ref/` is a full v1 implementation (it's a git worktree of this same repo: `core/.git/worktrees/ref`).
+Architecture differs sharply from v2: **Bevy ECS + Tokio + LMDB (heed) + DashMap chunk cache + phf
+registries** — i.e. a global-ish ECS, not v2's actor-sharded lanes. Its own `CLAUDE.md` also claims
+1.21.8/772, **but it is a separate codebase with hand-maintained data** — so treat its IDs/layouts as
+*inspiration* and **verify against `protocol.json` before copying**.
+
+Consult `ref/` for **"how did FerrumC v1 implement X"** — chunk encoding, packet handling, NBT/Anvil,
+encryption, registries — not for ground-truth wire bytes. Useful entry points:
+
+| Path | What's there |
+|---|---|
+| `ref/assets/data/packets.json` | v1's packet id↔name map per state/direction (`protocol_id`). |
+| `ref/assets/data/registry_packets.json` | v1's registry-data packet payloads. |
+| `ref/assets/extracted/*.json` (49 files) | v1's data-generator dumps: `packets.json`, `blocks.json`, `items.json`, `entities.json`, `damage_type.json`, `synced_registries.json`, `particles.json`, `entity_statuses.json`, … (NOTE the path is `assets/extracted/`, **not** `assets/data/extracted/`). |
+| `ref/scripts/new_packet.py` | How v1 scaffolded a packet (`#[packet(packet_id, state)]` + `NetEncode`/`NetDecode` macros) — contrast with v2's `packets.toml` codegen (§6). |
+| `ref/src/lib/` (~30 crates) | `net` (+`codec`, `encryption` AES-128-CFB8+RSA), `adapters/nbt`, `adapters/anvil` (memmap2+yazi), `storage` (heed/LMDB), `world`/`world_gen`, `registry`, `commands`, `inventories`, `particles`, `physics`, `plugins`. |
+| `ref/src/bin/src/` | `game_loop.rs`, `packet_handlers/play_packets/*` (real handlers: `place_block`, `player_action`, `set_creative_mode_slot`, `chunk_batch_ack`, …), `systems/*` (`chunk_sending`, `physics/*`, `keep_alive`, `mobs/*`). |
+| `ref/docs/` | `protocol-flow.md` (state machine + code refs), `vanilla_parity_feature_list_aggregations_todolist.md` (big feature checklist), `ci/`. |
+| `ref/.etc/` | Sample binary fixtures: NBT files, `r.0.0.mca` region, `registry.nbt`/`registry.packet`, `raw_chunk.dat` — handy test-data references. |
+
+### Transient / scout staging (NOT durable)
+
+- Source artifacts that produced the pinned skill `.txt` (NOT durable — `/tmp` is wiped):
+  `/private/tmp/protocol-1.21.8.{txt,raw.wikitext,rendered.html}`. The `.txt` is byte-identical to the
+  **skill copy**; treat the skill copy as canonical and don't reference `/tmp` paths in code or docs.
 - Scout/spec notes from the real-join session (also transient `/tmp/...scratchpad/`, copy anything worth
   keeping into `docs/`): `realjoin-spec.md` (login→spawn byte spec), `scout-protocol-lane-notes.md`
   (packet subset + IDs), `scout-m04-registry-notes.md` (registry data).
