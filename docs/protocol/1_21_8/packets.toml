@@ -383,6 +383,20 @@ fields = [
     { name = "velocity", type = "EntityVelocity" },
 ]
 
+# minecraft-data: play.toClient.block_changed_ack ("Acknowledge Block Change").
+# Echoes the sequence number from a serverbound block action (Player Action /
+# Use Item On) once the server has accepted (or finished resolving) the edit, so
+# the client stops predicting and trusts the authoritative state. A rejected edit
+# is healed with a Block Update instead, never an ack.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "AcknowledgeBlockChange"
+id = 0x04
+fields = [
+    { name = "sequence", type = "varint" },
+]
+
 # minecraft-data: play.toClient.block_change ("Block Update").
 [[packet]]
 state = "play"

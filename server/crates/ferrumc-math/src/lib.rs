@@ -27,15 +27,14 @@
 //! `0`). Truncating toward zero would leave a one-block-wide seam of
 //! mis-assigned coordinates straddling every axis at the origin.
 
-// ferrumc-core is the mandated shared-types dependency. This crate currently
-// needs none of its types (coordinates are self-contained value types), so the
-// link is bound anonymously to keep it intentional rather than dead weight.
-use ferrumc_core as _;
-
+// ferrumc-core is the mandated shared-types dependency. The coordinate/geometry
+// types are self-contained, but `WorldIntent` (in `intent`) genuinely uses
+// core's `PlayerId` / `TextComponent`, so the dependency is now live.
 mod aabb;
 mod block_pos;
 mod chunk_pos;
 mod direction;
+mod intent;
 mod local_block_pos;
 mod region_pos;
 mod section_pos;
@@ -46,6 +45,7 @@ pub use aabb::Aabb;
 pub use block_pos::BlockPos;
 pub use chunk_pos::ChunkPos;
 pub use direction::Direction;
+pub use intent::WorldIntent;
 pub use local_block_pos::LocalBlockPos;
 pub use region_pos::RegionPos;
 pub use section_pos::SectionPos;

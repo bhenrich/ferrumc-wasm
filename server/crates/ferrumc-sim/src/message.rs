@@ -10,6 +10,8 @@ use ferrumc_core::PlayerId;
 use ferrumc_math::{BlockPos, Vec3};
 use ferrumc_world::BlockStateId;
 
+use crate::mutation::MutationCause;
+
 /// An input applied to the simulation at the next tick boundary.
 ///
 /// Inputs are intentionally minimal for this milestone: player presence and
@@ -52,6 +54,9 @@ pub enum GameInput {
         player: PlayerId,
         /// Absolute position of the block to break.
         position: BlockPos,
+        /// The block-action sequence the client stamped on the originating
+        /// `PlayerAction`, echoed back in an `AcknowledgeBlockChange` on accept.
+        sequence: i32,
     },
     /// A player placed a block at `position`.
     ///
@@ -65,6 +70,9 @@ pub enum GameInput {
         player: PlayerId,
         /// Absolute position the block is placed at.
         position: BlockPos,
+        /// The block-action sequence the client stamped on the originating
+        /// `UseItemOn`, echoed back in an `AcknowledgeBlockChange` on accept.
+        sequence: i32,
     },
 }
 
@@ -112,13 +120,48 @@ pub enum GameOutput {
     ///
     /// Emitted at the tick boundary after the simulation applies an accepted
     /// block break (`state` is [`BlockStateId::AIR`]) or place. The session
-    /// layer broadcasts it to viewers in range as a clientbound `BlockUpdate`.
-    /// A rejected edit produces no such output.
+    /// layer broadcasts it to viewers in range as a clientbound `BlockUpdate`
+    /// and, for a [`MutationCause::PlayerCreative`] edit, echoes `sequence` back
+    /// to the acting player as an `AcknowledgeBlockChange`.
     BlockChanged {
         /// Absolute position of the changed block.
         position: BlockPos,
         /// The block's new state.
         state: BlockStateId,
+        /// The originating block-action sequence to acknowledge to the actor.
+        sequence: i32,
+        /// What caused the mutation (carries the acting player for the ack).
+        cause: MutationCause,
+    },
+    /// A player's block edit was rejected; the actor's predicted change must heal
+    /// to the authoritative state.
+    ///
+    /// Emitted at the tick boundary when an edit that has a client to heal is
+    /// refused — the actor is present and the target chunk is resident, so the
+    /// authoritative state is readable (e.g. the target is out of reach). The
+    /// session layer sends only the actor a `BlockUpdate` carrying
+    /// `authoritative_state` at `position` *followed by* an
+    /// `AcknowledgeBlockChange` echoing `sequence`: the `BlockUpdate` sets the
+    /// client's known server state and the ack ends its pending prediction so
+    /// that state is what it displays. The ack is what actually reverts the ghost
+    /// block on a real 1.21.8 client (a `BlockUpdate` alone is swallowed while a
+    /// prediction is pending), so it is mandatory on reject just as on accept.
+    /// Nothing is broadcast (viewers never saw the predicted change). Rejections
+    /// with no client to heal (absent actor, unloaded chunk) emit nothing.
+    BlockChangeRejected {
+        /// The player whose predicted edit must be undone.
+        player: PlayerId,
+        /// Absolute position of the rejected edit.
+        position: BlockPos,
+        /// The originating block-action sequence to acknowledge to the actor, so
+        /// its pending client-side prediction ends and reverts to the
+        /// authoritative state.
+        sequence: i32,
+        /// The state the client optimistically predicted (air for a break, the
+        /// placed block for a place); used by the app to classify the metric.
+        requested_state: BlockStateId,
+        /// The authoritative state to resync the actor to.
+        authoritative_state: BlockStateId,
     },
 }
 

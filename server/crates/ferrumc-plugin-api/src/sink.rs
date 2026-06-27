@@ -1,41 +1,8 @@
-//! Mutation intents and the sink a plugin submits them to.
+//! The sink a plugin submits mutation intents to.
 
-use ferrumc_core::{PlayerId, TextComponent};
-use ferrumc_math::{BlockPos, Vec3};
+use ferrumc_math::WorldIntent;
 
 use crate::error::IntentError;
-
-/// A requested world change a plugin asks the simulation to perform.
-///
-/// Plugins never mutate the world directly; they submit *intents* through a
-/// [`CommandSink`]. The simulation validates and applies them at a tick
-/// boundary (or rejects them), preserving the rule that simulation state is only
-/// changed by the simulation itself. The enum is `#[non_exhaustive]`.
-#[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
-pub enum WorldIntent {
-    /// Set the block at `pos` to the given block-state id.
-    SetBlock {
-        /// Where to place the block.
-        pos: BlockPos,
-        /// The opaque registry block-state id to place.
-        block_state_id: u32,
-    },
-    /// Teleport `player` to `position`.
-    Teleport {
-        /// The player to move.
-        player: PlayerId,
-        /// The destination.
-        position: Vec3,
-    },
-    /// Send `message` to `player`.
-    Message {
-        /// The recipient.
-        player: PlayerId,
-        /// The chat message to send.
-        message: TextComponent,
-    },
-}
 
 /// Accepts mutation intents from a plugin during a single event.
 ///

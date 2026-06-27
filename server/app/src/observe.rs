@@ -111,6 +111,7 @@ fn outbound_id(packet: &OutboundPacket) -> i32 {
 pub(crate) fn clientbound_play_name(packet: &ClientboundPlayPacket) -> &'static str {
     match packet {
         ClientboundPlayPacket::SpawnEntity(_) => "spawn_entity",
+        ClientboundPlayPacket::AcknowledgeBlockChange(_) => "acknowledge_block_change",
         ClientboundPlayPacket::BlockUpdate(_) => "block_update",
         ClientboundPlayPacket::UnloadChunk(_) => "unload_chunk",
         ClientboundPlayPacket::GameEvent(_) => "game_event",

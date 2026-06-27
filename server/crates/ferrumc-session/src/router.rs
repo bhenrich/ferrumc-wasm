@@ -8,13 +8,13 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use ferrumc_core::PlayerId;
 use ferrumc_math::{BlockPos, ChunkPos, ShardPos, Vec3};
 use ferrumc_proto::generated::play::ClientboundPlayPacket;
-use ferrumc_sim::{BlockStateId, GameInput, GameOutput};
+use ferrumc_sim::{BlockStateId, GameInput, GameOutput, MutationCause};
 
 use crate::error::SessionError;
 use crate::event::NetEvent;
 use crate::translate::{
-    block_update_shell, chunk_for_position, entity_spawn_shell, move_shell, play_packet_to_input,
-    player_info, shard_for_position, PLAYER_INFO_ADD, PLAYER_INFO_REMOVE,
+    ack_shell, block_update_shell, chunk_for_position, entity_spawn_shell, move_shell,
+    play_packet_to_input, player_info, shard_for_position, PLAYER_INFO_ADD, PLAYER_INFO_REMOVE,
 };
 
 /// Default capacity of each shard's input channel.
@@ -411,8 +411,18 @@ impl SessionRouter {
     ///   the authoritative position; it is not a broadcast.
     /// - [`GameOutput::BlockChanged`] broadcasts a `BlockUpdate` to every
     ///   player whose chunk is within view distance of the changed block's
-    ///   chunk. There is no actor to exclude: the change is authoritative for
-    ///   everyone who can see it, including the player who caused it.
+    ///   chunk (the actor is included — the change is authoritative for everyone
+    ///   who can see it) and, for a [`MutationCause::PlayerCreative`] edit, also
+    ///   sends the acting player alone an `AcknowledgeBlockChange` echoing the
+    ///   sequence.
+    /// - [`GameOutput::BlockChangeRejected`] sends only the acting player a
+    ///   `BlockUpdate` carrying the authoritative state followed by an
+    ///   `AcknowledgeBlockChange` echoing the rejected sequence: the `BlockUpdate`
+    ///   sets the client's known server state and the ack ends its pending
+    ///   prediction so the ghost block reverts. The ack is what actually heals a
+    ///   real client (a `BlockUpdate` alone is swallowed while a prediction is
+    ///   pending), so it is mandatory on reject as on accept. Never a broadcast,
+    ///   since viewers never saw the predicted change.
     /// - [`GameOutput::PlayerDespawned`] (and any future variant) sends nothing:
     ///   leave notifications are issued by
     ///   [`disconnect_player`](Self::disconnect_player), where the departing
@@ -443,8 +453,55 @@ impl SessionRouter {
                     }
                 }
             }
-            GameOutput::BlockChanged { position, state } => {
+            GameOutput::BlockChanged {
+                position,
+                state,
+                sequence,
+                cause,
+            } => {
                 self.broadcast_block_update(*position, *state, &mut closed);
+                // Acknowledge the sequence to the acting player alone so its
+                // client-side prediction is confirmed. Only a player edit has an
+                // actor to ack; other causes broadcast to viewers but ack no one.
+                if let MutationCause::PlayerCreative { player } = cause {
+                    if let Some(entry) = self.players.get(player) {
+                        match entry.outbound.try_send(ack_shell(*sequence)) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Closed(_)) => closed.push(*player),
+                        }
+                    }
+                }
+            }
+            GameOutput::BlockChangeRejected {
+                player,
+                position,
+                sequence,
+                authoritative_state,
+                ..
+            } => {
+                // Heal only the actor; viewers never saw the predicted change. The
+                // `BlockUpdate` sets the client's known server state at the block
+                // and the `AcknowledgeBlockChange` then ends its pending prediction
+                // so that authoritative state is displayed. On a real 1.21.8 client
+                // the ack is what actually reverts the ghost block
+                // (endPredictionsUpTo); a `BlockUpdate` alone is swallowed while the
+                // prediction is pending, so the ack is mandatory here too.
+                if let Some(entry) = self.players.get(player) {
+                    match entry
+                        .outbound
+                        .try_send(block_update_shell(*position, *authoritative_state))
+                    {
+                        // The resync queued (or was dropped under backpressure); the
+                        // ack must still follow to end the client's prediction.
+                        Ok(()) | Err(TrySendError::Full(_)) => {
+                            match entry.outbound.try_send(ack_shell(*sequence)) {
+                                Ok(()) | Err(TrySendError::Full(_)) => {}
+                                Err(TrySendError::Closed(_)) => closed.push(*player),
+                            }
+                        }
+                        Err(TrySendError::Closed(_)) => closed.push(*player),
+                    }
+                }
             }
             // A despawn carries no wire packet here; leave handling lives in
             // disconnect_player.
@@ -560,13 +617,41 @@ impl SessionRouter {
         }
     }
 
-    /// Routes an already-translated input to the player's bound shard.
+    /// Routes an already-translated input to the shard that should apply it.
+    ///
+    /// A block edit is routed by the *block's* chunk (see
+    /// [`shard_for_block`](Self::shard_for_block)); every other input routes to
+    /// the player's bound shard.
     fn route_input(&self, player: PlayerId, input: GameInput) -> Result<(), SessionError> {
         let entry = self
             .players
             .get(&player)
             .ok_or(SessionError::UnknownPlayer { player })?;
-        self.send_to_shard(entry.shard, input)
+        let shard = match &input {
+            GameInput::BlockBreak { position, .. } | GameInput::BlockPlace { position, .. } => {
+                self.shard_for_block(*position, entry.shard)
+            }
+            _ => entry.shard,
+        };
+        self.send_to_shard(shard, input)
+    }
+
+    /// Resolves the shard that should apply a block edit at `position`.
+    ///
+    /// The minimal multi-shard seam: a block edit belongs to the shard owning the
+    /// block's *chunk*, not to the acting player's bound shard — the two diverge
+    /// once view distance exceeds a shard's 8-chunk span and a player edits a
+    /// block another shard owns. When that owning shard is registered it wins;
+    /// otherwise the edit falls back to the player's bound shard (`fallback`). In
+    /// this single-shard milestone both resolve to the same shard, so routing is
+    /// unchanged — the seam only positions the router for real multi-shard later.
+    fn shard_for_block(&self, position: BlockPos, fallback: ShardPos) -> ShardPos {
+        let owner = position.to_chunk_pos().to_shard_pos();
+        if self.shards.contains_key(&owner) {
+            owner
+        } else {
+            fallback
+        }
     }
 
     /// Non-blocking send of `input` to `shard`'s input channel.
@@ -1061,10 +1146,13 @@ mod tests {
             .expect("viewer join");
 
         // A change in the viewer's chunk reaches them as a BlockUpdate (the lone
-        // player got no join-visibility packets, so this is the first one).
+        // player got no join-visibility packets, so this is the first one). A
+        // command cause has no actor, so no ack competes with the broadcast.
         let closed = router.route_output(&GameOutput::BlockChanged {
             position: BlockPos::new(8, 63, 8),
             state: BlockStateId::AIR,
+            sequence: 0,
+            cause: MutationCause::Command,
         });
         assert!(closed.is_empty());
         let ClientboundPlayPacket::BlockUpdate(update) =
@@ -1092,6 +1180,8 @@ mod tests {
         let closed = router.route_output(&GameOutput::BlockChanged {
             position: BlockPos::new(88, 63, 8),
             state: BlockStateId::AIR,
+            sequence: 0,
+            cause: MutationCause::Command,
         });
         assert!(closed.is_empty());
         assert!(viewer_handle.try_recv().is_none());
@@ -1111,8 +1201,110 @@ mod tests {
         let closed = router.route_output(&GameOutput::BlockChanged {
             position: BlockPos::new(8, 63, 8),
             state: BlockStateId::AIR,
+            sequence: 0,
+            cause: MutationCause::Command,
         });
         assert_eq!(closed, vec![viewer]);
+    }
+
+    #[test]
+    fn accepted_player_edit_acks_only_the_actor() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let actor = player("actor");
+        let viewer = player("viewer");
+        let mut actor_handle = router.join_player(actor, spawn_pos()).expect("actor join");
+        let mut viewer_handle = router
+            .join_player(viewer, spawn_pos())
+            .expect("viewer join");
+        // Drain the mutual join-visibility packets so only the edit remains.
+        let viewer_eid = router.player_entity_id(viewer).expect("viewer entity id");
+        let actor_eid = router.player_entity_id(actor).expect("actor entity id");
+        assert_player_info_add(&mut actor_handle, viewer);
+        assert_entity_spawn(&mut actor_handle, viewer, viewer_eid, spawn_pos());
+        assert_player_info_add(&mut viewer_handle, actor);
+        assert_entity_spawn(&mut viewer_handle, actor, actor_eid, spawn_pos());
+
+        let closed = router.route_output(&GameOutput::BlockChanged {
+            position: BlockPos::new(8, 63, 8),
+            state: BlockStateId::AIR,
+            sequence: 55,
+            cause: MutationCause::PlayerCreative { player: actor },
+        });
+        assert!(closed.is_empty());
+
+        // The actor sees the authoritative BlockUpdate (it is in range too) and
+        // then the AcknowledgeBlockChange echoing its sequence.
+        let ClientboundPlayPacket::BlockUpdate(_) =
+            actor_handle.try_recv().expect("actor block update")
+        else {
+            panic!("expected a BlockUpdate for the actor first");
+        };
+        let ClientboundPlayPacket::AcknowledgeBlockChange(ack) =
+            actor_handle.try_recv().expect("actor ack")
+        else {
+            panic!("expected an AcknowledgeBlockChange for the actor");
+        };
+        assert_eq!(ack.sequence(), 55);
+
+        // The viewer sees the broadcast BlockUpdate but never an ack.
+        let ClientboundPlayPacket::BlockUpdate(_) =
+            viewer_handle.try_recv().expect("viewer block update")
+        else {
+            panic!("expected a BlockUpdate for the viewer");
+        };
+        assert!(viewer_handle.try_recv().is_none());
+    }
+
+    #[test]
+    fn rejected_player_edit_resyncs_only_the_actor() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let actor = player("actor");
+        let viewer = player("viewer");
+        let mut actor_handle = router.join_player(actor, spawn_pos()).expect("actor join");
+        let mut viewer_handle = router
+            .join_player(viewer, spawn_pos())
+            .expect("viewer join");
+        // Drain the mutual join-visibility packets so only the resync remains.
+        let viewer_eid = router.player_entity_id(viewer).expect("viewer entity id");
+        let actor_eid = router.player_entity_id(actor).expect("actor entity id");
+        assert_player_info_add(&mut actor_handle, viewer);
+        assert_entity_spawn(&mut actor_handle, viewer, viewer_eid, spawn_pos());
+        assert_player_info_add(&mut viewer_handle, actor);
+        assert_entity_spawn(&mut viewer_handle, actor, actor_eid, spawn_pos());
+
+        // A rejected break: only the actor is healed — first the authoritative
+        // state, then the ack that ends its pending prediction (the ack is what
+        // actually reverts the ghost block on a real client).
+        let closed = router.route_output(&GameOutput::BlockChangeRejected {
+            player: actor,
+            position: BlockPos::new(8, 63, 8),
+            sequence: 77,
+            requested_state: BlockStateId::AIR,
+            authoritative_state: BlockStateId::new(1),
+        });
+        assert!(closed.is_empty());
+
+        let ClientboundPlayPacket::BlockUpdate(update) =
+            actor_handle.try_recv().expect("actor resync")
+        else {
+            panic!("expected a BlockUpdate resync for the actor");
+        };
+        let loc = update.location();
+        assert_eq!((loc.x(), loc.y(), loc.z()), (8, 63, 8));
+        assert_eq!(update.block_state(), 1);
+        // The ack follows the resync, echoing the rejected sequence so the client
+        // ends its prediction and displays the authoritative state.
+        let ClientboundPlayPacket::AcknowledgeBlockChange(ack) =
+            actor_handle.try_recv().expect("actor ack")
+        else {
+            panic!("expected an AcknowledgeBlockChange after the resync");
+        };
+        assert_eq!(ack.sequence(), 77);
+        assert!(actor_handle.try_recv().is_none());
+        // The viewer never saw the predicted change, so it gets nothing.
+        assert!(viewer_handle.try_recv().is_none());
     }
 
     #[test]

@@ -45,8 +45,9 @@ use ferrumc_proto::generated::login::{
     ClientboundLoginPacket, LoginSuccess, ServerboundLoginPacket, SetCompression,
 };
 use ferrumc_proto::generated::play::{
-    ClientboundKeepAlive, ClientboundPlayPacket, GameEvent, ServerboundPlayPacket, SetCenterChunk,
-    SetDefaultSpawnPosition, SetPlayerPosition, SynchronizePlayerPosition, UnloadChunk,
+    AcknowledgeBlockChange, ClientboundKeepAlive, ClientboundPlayPacket, GameEvent,
+    ServerboundPlayPacket, SetCenterChunk, SetDefaultSpawnPosition, SetPlayerPosition,
+    SynchronizePlayerPosition, UnloadChunk,
 };
 use ferrumc_proto::generated::status::{
     ClientboundStatusPacket, PongResponse, ServerboundStatusPacket, StatusResponse,
@@ -999,13 +1000,25 @@ async fn handle_play_body(
     }
 
     let event = NetEvent::play(player, packet);
-    if let Some(kind) = veto_kind(ctx, player, &event) {
+    if let Some((kind, sequence)) = veto_kind(ctx, player, &event) {
         // Spawn protection: drop the edit so the world is never modified and no
-        // BlockUpdate is broadcast. Count the rejected mutation. The actor's
-        // optimistic client-side change is left uncorrected this slice (no
-        // clientbound carrier to restore it).
+        // BlockUpdate is broadcast. Count the rejected mutation, then heal the
+        // actor's optimistic client-side prediction: an `AcknowledgeBlockChange`
+        // for the edit's sequence ends the client's pending prediction
+        // (endPredictionsUpTo) and reverts the ghost block. The veto changed
+        // nothing, so the client's pre-prediction state is already authoritative —
+        // the ack alone heals it, and the net layer has no world access to read a
+        // `BlockUpdate` anyway. Without the ack a real 1.21.8 client would keep the
+        // ghost block until some later sequence happened to be acked.
         ctx.metrics
             .record_block_mutation(kind, MutationResult::Rejected);
+        enqueue_traced_classified(
+            writer,
+            debug,
+            compression,
+            &ctx.clock,
+            ClientboundPlayPacket::AcknowledgeBlockChange(AcknowledgeBlockChange::new(sequence)),
+        );
         return Ok(());
     }
     ctx.commands
@@ -1176,16 +1189,22 @@ fn chebyshev_distance(a: ChunkPos, b: ChunkPos) -> i64 {
     dx.max(dz)
 }
 
-/// Returns the mutation kind if `event` is a break/place that spawn protection
-/// should veto (it targets a protected column and the actor lacks the bypass
-/// permission), or `None` if it is not a vetoed edit.
+/// Returns the mutation kind and block-action sequence if `event` is a
+/// break/place that spawn protection should veto (it targets a protected column
+/// and the actor lacks the bypass permission), or `None` if it is not a vetoed
+/// edit.
 ///
 /// Returning the [`MutationKind`] lets the caller record the rejected mutation
-/// against `ferrumc_block_mutation_total{kind,result=rejected}`.
-fn veto_kind(ctx: &ConnContext, player: PlayerId, event: &NetEvent) -> Option<MutationKind> {
-    let (position, kind) = match net_event_to_input(event) {
-        Some(GameInput::BlockBreak { position, .. }) => (position, MutationKind::Break),
-        Some(GameInput::BlockPlace { position, .. }) => (position, MutationKind::Place),
+/// against `ferrumc_block_mutation_total{kind,result=rejected}`; the `sequence`
+/// lets it acknowledge the vetoed action so the client's prediction heals.
+fn veto_kind(ctx: &ConnContext, player: PlayerId, event: &NetEvent) -> Option<(MutationKind, i32)> {
+    let (position, sequence, kind) = match net_event_to_input(event) {
+        Some(GameInput::BlockBreak {
+            position, sequence, ..
+        }) => (position, sequence, MutationKind::Break),
+        Some(GameInput::BlockPlace {
+            position, sequence, ..
+        }) => (position, sequence, MutationKind::Place),
         _ => return None,
     };
     if ctx
@@ -1193,7 +1212,7 @@ fn veto_kind(ctx: &ConnContext, player: PlayerId, event: &NetEvent) -> Option<Mu
         .guard()
         .vetoes(position, ctx.policy.permissions().has_bypass(player))
     {
-        Some(kind)
+        Some((kind, sequence))
     } else {
         None
     }

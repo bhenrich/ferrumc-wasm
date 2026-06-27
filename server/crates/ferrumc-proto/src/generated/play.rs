@@ -987,6 +987,40 @@ impl SpawnEntity {
     }
 }
 
+/// `AcknowledgeBlockChange`: the play clientbound packet (wire id `0x04`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcknowledgeBlockChange {
+    sequence: i32,
+}
+
+impl AcknowledgeBlockChange {
+    /// The wire packet id for `AcknowledgeBlockChange`.
+    pub const PACKET_ID: i32 = 0x04;
+
+    /// Creates a new `AcknowledgeBlockChange` from its wire fields.
+    pub fn new(sequence: i32) -> Self {
+        Self { sequence }
+    }
+
+    /// Returns the `sequence` field.
+    pub fn sequence(&self) -> i32 {
+        self.sequence
+    }
+
+    /// Decodes a `AcknowledgeBlockChange` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let sequence = reader.read_var_int()?;
+        Ok(Self { sequence })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        ferrumc_codec::write_var_int(buf, self.sequence);
+        Ok(())
+    }
+}
+
 /// `BlockUpdate`: the play clientbound packet (wire id `0x08`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockUpdate {
@@ -1906,6 +1940,8 @@ impl ServerboundPlayPacket {
 pub enum ClientboundPlayPacket {
     /// The `SpawnEntity` packet.
     SpawnEntity(SpawnEntity),
+    /// The `AcknowledgeBlockChange` packet.
+    AcknowledgeBlockChange(AcknowledgeBlockChange),
     /// The `BlockUpdate` packet.
     BlockUpdate(BlockUpdate),
     /// The `UnloadChunk` packet.
@@ -1933,6 +1969,9 @@ impl ClientboundPlayPacket {
     pub fn decode(id: i32, reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
         match id {
             SpawnEntity::PACKET_ID => Ok(Self::SpawnEntity(SpawnEntity::decode(reader)?)),
+            AcknowledgeBlockChange::PACKET_ID => Ok(Self::AcknowledgeBlockChange(
+                AcknowledgeBlockChange::decode(reader)?,
+            )),
             BlockUpdate::PACKET_ID => Ok(Self::BlockUpdate(BlockUpdate::decode(reader)?)),
             UnloadChunk::PACKET_ID => Ok(Self::UnloadChunk(UnloadChunk::decode(reader)?)),
             GameEvent::PACKET_ID => Ok(Self::GameEvent(GameEvent::decode(reader)?)),
@@ -1965,6 +2004,7 @@ impl ClientboundPlayPacket {
     pub fn packet_id(&self) -> i32 {
         match self {
             Self::SpawnEntity(_) => SpawnEntity::PACKET_ID,
+            Self::AcknowledgeBlockChange(_) => AcknowledgeBlockChange::PACKET_ID,
             Self::BlockUpdate(_) => BlockUpdate::PACKET_ID,
             Self::UnloadChunk(_) => UnloadChunk::PACKET_ID,
             Self::GameEvent(_) => GameEvent::PACKET_ID,
@@ -1982,6 +2022,7 @@ impl ClientboundPlayPacket {
     pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
         match self {
             Self::SpawnEntity(packet) => packet.encode(buf),
+            Self::AcknowledgeBlockChange(packet) => packet.encode(buf),
             Self::BlockUpdate(packet) => packet.encode(buf),
             Self::UnloadChunk(packet) => packet.encode(buf),
             Self::GameEvent(packet) => packet.encode(buf),

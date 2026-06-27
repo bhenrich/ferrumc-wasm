@@ -19,8 +19,8 @@
 use ferrumc_core::PlayerId;
 use ferrumc_math::{BlockPos, ChunkPos, Direction, ShardPos, Vec3};
 use ferrumc_proto::generated::play::{
-    BlockUpdate, ClientboundPlayPacket, EntityVelocity, PlayerAction, PlayerInfoUpdate,
-    ServerboundPlayPacket, SpawnEntity, SynchronizePlayerPosition, UseItemOn,
+    AcknowledgeBlockChange, BlockUpdate, ClientboundPlayPacket, EntityVelocity, PlayerAction,
+    PlayerInfoUpdate, ServerboundPlayPacket, SpawnEntity, SynchronizePlayerPosition, UseItemOn,
 };
 use ferrumc_proto::types::BlockPosition;
 use ferrumc_sim::{BlockStateId, GameInput, GameOutput};
@@ -122,6 +122,9 @@ fn block_break_input(player: PlayerId, packet: &PlayerAction) -> Option<GameInpu
     Some(GameInput::BlockBreak {
         player,
         position: block_pos(packet.location()),
+        // The client stamps each block action with a sequence; carry it so an
+        // accepted break can be acknowledged back to this player.
+        sequence: packet.sequence(),
     })
 }
 
@@ -138,6 +141,9 @@ fn block_place_input(player: PlayerId, packet: &UseItemOn) -> Option<GameInput> 
     Some(GameInput::BlockPlace {
         player,
         position: block_pos(packet.location()).offset(face),
+        // The client stamps each block action with a sequence; carry it so an
+        // accepted place can be acknowledged back to this player.
+        sequence: packet.sequence(),
     })
 }
 
@@ -175,8 +181,12 @@ pub fn output_to_clientbound(output: &GameOutput) -> Option<ClientboundPlayPacke
         )),
         GameOutput::PlayerMoved { position, .. }
         | GameOutput::PlayerPositionCorrected { position, .. } => Some(move_shell(*position)),
-        GameOutput::BlockChanged { position, state } => Some(block_update_shell(*position, *state)),
-        // PlayerDespawned (and any future variant) has no clientbound shell yet.
+        GameOutput::BlockChanged {
+            position, state, ..
+        } => Some(block_update_shell(*position, *state)),
+        // PlayerDespawned, BlockChangeRejected (a targeted resync the router
+        // addresses to the actor, not a standalone shell), and any future variant
+        // have no clientbound shell here yet.
         _ => None,
     }
 }
@@ -249,6 +259,16 @@ pub(crate) fn block_update_shell(position: BlockPos, state: BlockStateId) -> Cli
         BlockPosition::new(position.x(), position.y(), position.z()),
         block_state,
     ))
+}
+
+/// Builds the [`AcknowledgeBlockChange`] packet echoing `sequence`.
+///
+/// Sent to the acting player alone after an accepted break/place so its
+/// optimistic, client-side prediction for that block action is confirmed and the
+/// client stops waiting on it. A rejected edit is healed with a
+/// [`block_update_shell`] resync instead, never an ack.
+pub(crate) fn ack_shell(sequence: i32) -> ClientboundPlayPacket {
+    ClientboundPlayPacket::AcknowledgeBlockChange(AcknowledgeBlockChange::new(sequence))
 }
 
 /// Returns the [`ShardPos`] of the simulation shard that owns `position`.
@@ -352,14 +372,16 @@ mod tests {
                 START_DESTROY_BLOCK,
                 BlockPosition::new(8, 63, 8),
                 1,
-                0,
+                42,
             )),
         );
+        // The packet's sequence (42) must flow through to the BlockBreak input.
         assert_eq!(
             net_event_to_input(&event),
             Some(GameInput::BlockBreak {
                 player: player(),
                 position: BlockPos::new(8, 63, 8),
+                sequence: 42,
             })
         );
     }
@@ -394,14 +416,16 @@ mod tests {
                 0.5,
                 false,
                 false,
-                0,
+                99,
             )),
         );
+        // The packet's sequence (99) must flow through to the BlockPlace input.
         assert_eq!(
             net_event_to_input(&event),
             Some(GameInput::BlockPlace {
                 player: player(),
                 position: BlockPos::new(8, 64, 8),
+                sequence: 99,
             })
         );
     }
@@ -431,6 +455,8 @@ mod tests {
         let out = GameOutput::BlockChanged {
             position: BlockPos::new(8, 63, 8),
             state: BlockStateId::AIR,
+            sequence: 7,
+            cause: ferrumc_sim::MutationCause::PlayerCreative { player: player() },
         };
         let Some(ClientboundPlayPacket::BlockUpdate(update)) = output_to_clientbound(&out) else {
             panic!("expected a BlockUpdate shell");
@@ -438,6 +464,14 @@ mod tests {
         let loc = update.location();
         assert_eq!((loc.x(), loc.y(), loc.z()), (8, 63, 8));
         assert_eq!(update.block_state(), 0);
+    }
+
+    #[test]
+    fn ack_shell_carries_the_sequence() {
+        let ClientboundPlayPacket::AcknowledgeBlockChange(ack) = ack_shell(123) else {
+            panic!("expected an AcknowledgeBlockChange");
+        };
+        assert_eq!(ack.sequence(), 123);
     }
 
     #[test]

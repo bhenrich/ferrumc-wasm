@@ -7,9 +7,8 @@ repository.workspace = true
 
 [dependencies]
 # Mandated shared-types dependency (ferrumc-math depends on ferrumc-core per the
-# crate map). The coordinate/geometry types here are self-contained value types
-# and need none of core's types yet, so lib.rs binds the crate anonymously to
-# keep the link intentional rather than dead weight.
+# crate map). The coordinate/geometry types are self-contained, but `WorldIntent`
+# (intent.rs) uses core's `PlayerId` / `TextComponent`, so the dependency is live.
 ferrumc-core = { workspace = true }
 
 [dev-dependencies]

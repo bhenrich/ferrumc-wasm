@@ -259,9 +259,9 @@ async fn release_chunks(
 /// Drains queued inputs into the shard, advances one tick, and routes outputs.
 ///
 /// Also records the per-tick observability metrics: it times the tick
-/// (`ferrumc_tick_ms{shard}`), counts accepted block edits
-/// (`ferrumc_block_mutation_total{kind,result=accepted}`), advances and publishes
-/// the authoritative tick through `clock`, and emits a structured tick event.
+/// (`ferrumc_tick_ms{shard}`), counts accepted and sim-rejected block edits
+/// (`ferrumc_block_mutation_total{kind,result}`), advances and publishes the
+/// authoritative tick through `clock`, and emits a structured tick event.
 fn run_tick(
     router: &mut SessionRouter,
     shard: &mut SimShard,
@@ -289,16 +289,31 @@ fn run_tick(
     // closed are returned so we can schedule a clean despawn for each.
     let mut closed = Vec::new();
     for output in &outputs {
-        // An accepted block edit surfaces here as a BlockChanged: air means the
-        // edit was a break, any other state a place. Rejected edits emit no output
-        // and are counted at the app veto site instead.
-        if let GameOutput::BlockChanged { state, .. } = output {
-            let kind = if state.is_air() {
-                MutationKind::Break
-            } else {
-                MutationKind::Place
-            };
-            metrics.record_block_mutation(kind, MutationResult::Accepted);
+        // Classify the block-edit metric from the requested/new state: air means a
+        // break, any other state a place. An accepted edit surfaces as BlockChanged;
+        // a sim-side rejection (out of reach, etc.) now surfaces as
+        // BlockChangeRejected and is counted here too (spawn-protect vetoes are
+        // still counted at the connection veto site, before the sim ever sees them).
+        match output {
+            GameOutput::BlockChanged { state, .. } => {
+                let kind = if state.is_air() {
+                    MutationKind::Break
+                } else {
+                    MutationKind::Place
+                };
+                metrics.record_block_mutation(kind, MutationResult::Accepted);
+            }
+            GameOutput::BlockChangeRejected {
+                requested_state, ..
+            } => {
+                let kind = if requested_state.is_air() {
+                    MutationKind::Break
+                } else {
+                    MutationKind::Place
+                };
+                metrics.record_block_mutation(kind, MutationResult::Rejected);
+            }
+            _ => {}
         }
         closed.extend(router.route_output(output));
     }

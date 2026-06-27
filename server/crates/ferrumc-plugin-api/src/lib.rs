@@ -48,7 +48,12 @@ pub use event::{EventKind, EventRegistrar, PluginEvent};
 pub use metadata::PluginMetadata;
 pub use permission::PermissionApi;
 pub use plugin::Plugin;
-pub use sink::{CommandSink, WorldIntent};
+pub use sink::CommandSink;
+// `WorldIntent` lives in `ferrumc-math` (the lowest crate that owns its
+// coordinate fields and can see core's id/text types) so the simulation and
+// session layers can route intents without depending on this crate. Re-exported
+// here for backward compatibility: plugins keep importing it from the plugin API.
+pub use ferrumc_math::WorldIntent;
 pub use storage::{PluginStorageApi, MAX_KEY_LEN, MAX_VALUE_LEN};
 pub use world::WorldView;
 

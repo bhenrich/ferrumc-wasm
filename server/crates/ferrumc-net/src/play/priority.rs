@@ -111,6 +111,11 @@ impl OutboundPriority {
             | ClientboundPlayPacket::PlayerInfoUpdate(_)
             | ClientboundPlayPacket::GameEvent(_)
             | ClientboundPlayPacket::SetCenterChunk(_)
+            // The block-change ack confirms the client's optimistic prediction for
+            // a break/place; dropping it would leave that prediction stuck, so it
+            // rides the State class (not droppable World traffic) alongside the
+            // other client-reconciliation frames.
+            | ClientboundPlayPacket::AcknowledgeBlockChange(_)
             | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::State,
             ClientboundPlayPacket::SpawnEntity(_)
             | ClientboundPlayPacket::BlockUpdate(_)
