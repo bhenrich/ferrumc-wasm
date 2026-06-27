@@ -1,5 +1,10 @@
 //! Per-connection protocol driver: handshake -> login -> configuration -> play.
 //!
+//! A handshake with `next_state == 1` instead takes the status branch: the
+//! server replies with a server-list status response and a ping/pong echo, then
+//! closes — this is what makes the server visible (and "COMPATIBLE") in a real
+//! client's multiplayer list.
+//!
 //! Each accepted socket runs one [`handle_connection`] task. It drives the login
 //! handshake by hand over the `ferrumc-net` framing primitives (the crate's own
 //! `LoginServer` ends at a keepalive shell and exposes no post-play hook, so the
@@ -24,7 +29,7 @@ use ferrumc_core::PlayerId;
 use ferrumc_math::Vec3;
 use ferrumc_net::{
     offline_uuid, CompressionState, ConnectionLimits, ConnectionState, DisconnectReason,
-    InboundDecoder, InboundPacket, OutboundEncoder, OutboundPacket, PlayWriter,
+    InboundDecoder, InboundPacket, OutboundEncoder, OutboundPacket, PlayWriter, StatusInfo,
 };
 use ferrumc_proto::generated::configuration::{
     ClientboundConfigurationPacket, ClientboundKnownPacks, FinishConfiguration,
@@ -38,6 +43,9 @@ use ferrumc_proto::generated::play::{
     ClientboundKeepAlive, ClientboundPlayPacket, GameEvent, ServerboundPlayPacket, SetCenterChunk,
     SetDefaultSpawnPosition, SetPlayerPosition, SynchronizePlayerPosition,
 };
+use ferrumc_proto::generated::status::{
+    ClientboundStatusPacket, PongResponse, ServerboundStatusPacket, StatusResponse,
+};
 use ferrumc_session::{net_event_to_input, NetEvent, PlayerSessionHandle};
 use ferrumc_sim::GameInput;
 
@@ -47,8 +55,26 @@ use crate::plugins::PlayPolicy;
 use crate::registries::ConfigRegistries;
 use crate::world::JoinKit;
 
+/// The `next_state` value in a handshake that selects the status branch
+/// (server-list ping).
+const NEXT_STATE_STATUS: i32 = 1;
+
 /// The `next_state` value in a handshake that selects the login branch.
 const NEXT_STATE_LOGIN: i32 = 2;
+
+/// Human-readable version label shown in the client's multiplayer list.
+const STATUS_VERSION_NAME: &str = "FerrumC 1.21.8";
+
+/// Wire protocol number advertised in the status response. A client reporting
+/// the same number (772, Minecraft 1.21.8) renders the server as compatible.
+const STATUS_PROTOCOL_VERSION: i32 = 772;
+
+/// MOTD text rendered as the status `description`.
+const STATUS_MOTD: &str = "FerrumC";
+
+/// Upper bound on the status-response JSON, matching the wire `StatusResponse`
+/// string cap (chat-component max, 32767 chars).
+const STATUS_JSON_MAX_CHARS: usize = 32_767;
 
 /// Bytes read off the socket per `read` call before decoding.
 const READ_CHUNK: usize = 4096;
@@ -88,6 +114,10 @@ pub(crate) struct ConnContext {
     /// The shared play policy: spawn-protection veto, bypass permissions, and the
     /// command tree consulted for serverbound play packets.
     pub(crate) policy: Arc<PlayPolicy>,
+    /// The prebuilt server-list status response, rendered once at startup and
+    /// replayed for every status (`next_state == 1`) handshake. Behind an [`Arc`]
+    /// so cloning the context per connection is a pointer bump, not a re-render.
+    pub(crate) status_response: Arc<OutboundPacket>,
 }
 
 impl ConnContext {
@@ -98,12 +128,47 @@ impl ConnContext {
     }
 }
 
+/// Builds the server-list status response advertised to clients that handshake
+/// with `next_state == 1`.
+///
+/// The `{version, players, description}` JSON is rendered (and escaped) by
+/// `ferrumc-net`'s [`StatusInfo`] so the shape matches the crate's own status
+/// server: version `{"name": "FerrumC 1.21.8", "protocol": 772}` (772 marks the
+/// server COMPATIBLE for a 1.21.8 client), `players` advertising `max_players`
+/// with none online and an empty sample, and the MOTD as the description text.
+///
+/// Built once at startup and shared behind an [`Arc`]; each status request only
+/// re-sends it.
+///
+/// # Errors
+///
+/// Returns an error if the rendered JSON exceeds the wire string bound — only
+/// possible with an absurdly long MOTD or version label, neither of which the
+/// server sets.
+pub(crate) fn build_status_response(max_players: u32) -> anyhow::Result<OutboundPacket> {
+    let info = StatusInfo::new(
+        STATUS_VERSION_NAME,
+        STATUS_PROTOCOL_VERSION,
+        max_players,
+        0,
+        STATUS_MOTD,
+    );
+    let json = BoundedString::<STATUS_JSON_MAX_CHARS>::new(info.to_json())
+        .map_err(|err| anyhow::anyhow!("status response JSON exceeds the wire bound: {err}"))?;
+    Ok(OutboundPacket::Status(
+        ClientboundStatusPacket::StatusResponse(StatusResponse::new(json)),
+    ))
+}
+
 /// The login-handshake phase, one step finer than [`ConnectionState`] so an
 /// out-of-order-but-valid packet can be rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoginPhase {
     /// Awaiting the initial handshake.
     Handshaking,
+    /// Status branch (`next_state == 1`): awaiting the Status Request and Ping
+    /// Request that drive the server-list exchange.
+    Status,
     /// Awaiting Login Start.
     Login,
     /// Awaiting Login Acknowledged (Login Success already sent).
@@ -120,6 +185,7 @@ impl LoginPhase {
     fn connection_state(self) -> ConnectionState {
         match self {
             Self::Handshaking => ConnectionState::Handshaking,
+            Self::Status => ConnectionState::Status,
             Self::Login | Self::AwaitingLoginAck => ConnectionState::Login,
             Self::AwaitingKnownPacks | Self::AwaitingFinishAck => ConnectionState::Configuration,
         }
@@ -297,13 +363,33 @@ async fn advance(
             LoginPhase::Handshaking,
             InboundPacket::Handshake(ServerboundHandshakePacket::Handshake(handshake)),
         ) => {
-            if handshake.next_state() == NEXT_STATE_LOGIN {
-                *phase = LoginPhase::Login;
-                Ok(LoginProgress::Continue)
-            } else {
-                // Status / transfer: this slice serves only the login branch.
-                Ok(LoginProgress::Close)
+            match handshake.next_state() {
+                NEXT_STATE_LOGIN => {
+                    *phase = LoginPhase::Login;
+                    Ok(LoginProgress::Continue)
+                }
+                NEXT_STATE_STATUS => {
+                    *phase = LoginPhase::Status;
+                    Ok(LoginProgress::Continue)
+                }
+                // Transfer (3) or anything else is out of scope: close cleanly.
+                _ => Ok(LoginProgress::Close),
             }
+        }
+        (LoginPhase::Status, InboundPacket::Status(ServerboundStatusPacket::StatusRequest(_))) => {
+            // Copy the shared context reference out so the prebuilt response borrow
+            // does not collide with the `&mut self` `send` needs.
+            let ctx = conn.ctx;
+            conn.send(&ctx.status_response).await?;
+            Ok(LoginProgress::Continue)
+        }
+        (LoginPhase::Status, InboundPacket::Status(ServerboundStatusPacket::PingRequest(req))) => {
+            // Echo the client's payload, then close: the status exchange ends here.
+            let reply = OutboundPacket::Status(ClientboundStatusPacket::PongResponse(
+                PongResponse::new(req.payload()),
+            ));
+            conn.send(&reply).await?;
+            Ok(LoginProgress::Close)
         }
         (LoginPhase::Login, InboundPacket::Login(ServerboundLoginPacket::LoginStart(start))) => {
             let player_name = start.name().clone();

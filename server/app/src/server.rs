@@ -18,7 +18,7 @@ use ferrumc_net::ConnectionLimits;
 use ferrumc_session::{shard_for_position, SessionRouter};
 
 use crate::config::AppConfig;
-use crate::connection::{handle_connection, ConnContext};
+use crate::connection::{build_status_response, handle_connection, ConnContext};
 use crate::driver;
 use crate::plugins::{build_play_policy, load_plugins};
 use crate::registries::ConfigRegistries;
@@ -127,6 +127,12 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     let listener = TcpListener::bind(config.bind).await?;
     let local_addr = listener.local_addr()?;
 
+    // Render the server-list status response once; it advertises the connection
+    // ceiling as the player max and never changes for the server's lifetime. A
+    // ceiling above `u32::MAX` saturates rather than wrapping to a tiny max.
+    let max_players = u32::try_from(config.max_connections).unwrap_or(u32::MAX);
+    let status_response = Arc::new(build_status_response(max_players)?);
+
     let ctx = ConnContext {
         limits: ConnectionLimits::default(),
         io_timeout: config.io_timeout,
@@ -136,6 +142,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         keep_alive_interval: config.keep_alive_interval,
         commands: commands_tx,
         policy,
+        status_response,
     };
 
     let accept_task = tokio::spawn(accept_loop(

@@ -5,8 +5,8 @@
 //! Each of the ten MVP points is asserted against the closest observable the fake
 //! client (or the server's public API) can reach:
 //!
-//! 1. **status ping** — a `next_state = 1` handshake is closed cleanly by the
-//!    server (full Server List Ping JSON is not wired in this slice).
+//! 1. **status ping** — a `next_state = 1` handshake gets a `StatusResponse`
+//!    advertising protocol 772, then a `PongResponse` echoing the ping payload.
 //! 2. **offline login** — a client reaches play (`JoinGame`).
 //! 3. **flat world** — the client receives `ChunkDataAndLight` for the spawn area.
 //! 4. **movement updates sim** — one client moves and another sees the broadcast.
@@ -41,7 +41,7 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use ferrumc_app::{build_command_tree, load_plugins, AppConfig};
-use ferrumc_codec::BoundedString;
+use ferrumc_codec::{BoundedReader, BoundedString};
 use ferrumc_command::{CommandError, CommandSource};
 use ferrumc_core::PlayerId;
 use ferrumc_proto::generated::handshake::Handshake;
@@ -49,6 +49,7 @@ use ferrumc_proto::generated::play::{
     ChatCommand, ClientboundPlayPacket, PlayerAction, PlayerInfoUpdate, SetPlayerPosition,
     UseItemOn,
 };
+use ferrumc_proto::generated::status::{ClientboundStatusPacket, PingRequest, StatusRequest};
 use ferrumc_proto::types::BlockPosition;
 use ferrumc_session::PLAYER_INFO_ADD;
 
@@ -305,13 +306,17 @@ async fn send_command(client: &mut TestClient, command: &str) -> anyhow::Result<
 }
 
 // --------------------------------------------------------------------------
-// Point 1: status ping closes cleanly.
+// Point 1: status ping returns a server-list response and pong.
 // --------------------------------------------------------------------------
 
-/// Drives a `next_state = 1` (status) handshake and asserts the server closes the
-/// connection — the closest observable for status ping in this slice, which does
-/// not implement the full Server List Ping exchange.
-async fn status_ping_closes(addr: SocketAddr) -> anyhow::Result<()> {
+/// The ping payload the status exchange must echo back verbatim.
+const STATUS_PING_PAYLOAD: i64 = 0x5151_5151_5151_5151;
+
+/// Drives a `next_state = 1` (status) handshake plus Status Request and Ping
+/// Request, asserting the server answers with a `StatusResponse` advertising
+/// protocol 772 and a `PongResponse` echoing the ping payload — what a real
+/// client needs to render the server in its multiplayer list.
+async fn status_ping_responds(addr: SocketAddr) -> anyhow::Result<()> {
     let mut client = TestClient::connect(addr).await?;
     let address = BoundedString::<255>::new("127.0.0.1".to_string())?;
     client
@@ -319,11 +324,41 @@ async fn status_ping_closes(addr: SocketAddr) -> anyhow::Result<()> {
             Handshake::new(PROTOCOL_VERSION, address.clone(), addr.port(), 1).encode(buf)
         }))
         .await?;
-    // The server serves only the login branch, so a status handshake ends the
-    // connection: the next read sees EOF.
+
+    // Status Request -> Status Response advertising the 1.21.8 protocol.
+    client
+        .send_frame(&encode(|buf| StatusRequest.encode(buf)))
+        .await?;
+    let frame = client.next_frame().await?;
+    let mut reader = BoundedReader::new(&frame);
+    let id = reader.read_var_int()?;
+    let ClientboundStatusPacket::StatusResponse(response) =
+        ClientboundStatusPacket::decode(id, &mut reader)?
+    else {
+        anyhow::bail!("expected a StatusResponse");
+    };
     anyhow::ensure!(
-        client.next_frame().await.is_err(),
-        "server must close a status handshake cleanly"
+        response.json().as_str().contains("\"protocol\":772"),
+        "status JSON must advertise protocol 772"
+    );
+
+    // Ping Request -> Pong Response echoing the exact payload.
+    client
+        .send_frame(&encode(|buf| {
+            PingRequest::new(STATUS_PING_PAYLOAD).encode(buf)
+        }))
+        .await?;
+    let frame = client.next_frame().await?;
+    let mut reader = BoundedReader::new(&frame);
+    let id = reader.read_var_int()?;
+    let ClientboundStatusPacket::PongResponse(pong) =
+        ClientboundStatusPacket::decode(id, &mut reader)?
+    else {
+        anyhow::bail!("expected a PongResponse");
+    };
+    anyhow::ensure!(
+        pong.payload() == STATUS_PING_PAYLOAD,
+        "pong must echo the ping payload"
     );
     Ok(())
 }
@@ -418,11 +453,11 @@ async fn mvp_end_to_end() {
     let server = ferrumc_app::run(&config).await.expect("server starts");
     let addr = server.local_addr();
 
-    // Point 1: status ping closes cleanly.
-    timeout(GUARD, status_ping_closes(addr))
+    // Point 1: status ping returns a server-list response and pong.
+    timeout(GUARD, status_ping_responds(addr))
         .await
         .expect("status ping finished within the guard")
-        .expect("status ping closed cleanly");
+        .expect("status ping answered");
 
     // Points 2-9: the full play flow.
     timeout(GUARD, run_flow(addr))
