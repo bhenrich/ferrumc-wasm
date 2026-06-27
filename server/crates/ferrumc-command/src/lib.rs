@@ -3,6 +3,7 @@
 #![warn(missing_docs)]
 
 mod argument;
+mod brigadier;
 mod builder;
 mod context;
 mod error;
@@ -11,6 +12,7 @@ mod source;
 mod tree;
 
 pub use argument::{ArgumentType, ArgumentValue, ParsedArgs};
+pub use brigadier::{BrigadierExtra, BrigadierGraph, BrigadierNode, BrigadierProps};
 pub use builder::{argument, literal, CommandBuilder};
 pub use context::CommandContext;
 pub use error::CommandError;

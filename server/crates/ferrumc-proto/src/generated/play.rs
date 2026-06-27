@@ -88,6 +88,75 @@ impl ChunkBlockEntity {
     }
 }
 
+/// `CommandSuggestionMatch`: a composite payload used on the wire.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandSuggestionMatch {
+    suggestion: BoundedString<32_767>,
+    tooltip: Option<ferrumc_nbt::NbtTag>,
+}
+
+impl CommandSuggestionMatch {
+    /// Creates a new `CommandSuggestionMatch` from its wire fields.
+    pub fn new(suggestion: BoundedString<32_767>, tooltip: Option<ferrumc_nbt::NbtTag>) -> Self {
+        Self {
+            suggestion,
+            tooltip,
+        }
+    }
+
+    /// Returns the `suggestion` field.
+    pub fn suggestion(&self) -> &BoundedString<32_767> {
+        &self.suggestion
+    }
+
+    /// Returns the `tooltip` field.
+    pub fn tooltip(&self) -> Option<&ferrumc_nbt::NbtTag> {
+        self.tooltip.as_ref()
+    }
+
+    /// Decodes a `CommandSuggestionMatch` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let suggestion = BoundedString::<32_767>::read(reader)?;
+        let tooltip = if wire::read_bool(reader)? {
+            Some({
+                let available = reader.remaining();
+                let bytes = reader.read_bytes(available)?;
+                let (tag, consumed) = ferrumc_nbt::read_network_root_with_consumed(
+                    bytes,
+                    &ferrumc_nbt::NbtLimits::default(),
+                )?;
+                *reader = BoundedReader::new(bytes.get(consumed..).unwrap_or_default());
+                tag
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            suggestion,
+            tooltip,
+        })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        self.suggestion.write(buf);
+        match &self.tooltip {
+            Some(inner) => {
+                wire::write_bool(buf, true);
+                {
+                    let nbt_bytes =
+                        ferrumc_nbt::write_network_root(inner, &ferrumc_nbt::NbtLimits::default())?;
+                    wire::write_raw(buf, &nbt_bytes);
+                }
+            }
+            None => {
+                wire::write_bool(buf, false);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `DeathLocation`: a composite payload used on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeathLocation {
@@ -489,6 +558,54 @@ impl ChatMessage {
         ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
         self.message.write(buf);
         wire::write_raw(buf, &self.rest);
+        Ok(())
+    }
+}
+
+/// `TabCompleteRequest`: the play serverbound packet (wire id `0x0e`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabCompleteRequest {
+    transaction_id: i32,
+    text: BoundedString<32_767>,
+}
+
+impl TabCompleteRequest {
+    /// The wire packet id for `TabCompleteRequest`.
+    pub const PACKET_ID: i32 = 0x0e;
+
+    /// Creates a new `TabCompleteRequest` from its wire fields.
+    pub fn new(transaction_id: i32, text: BoundedString<32_767>) -> Self {
+        Self {
+            transaction_id,
+            text,
+        }
+    }
+
+    /// Returns the `transaction_id` field.
+    pub fn transaction_id(&self) -> i32 {
+        self.transaction_id
+    }
+
+    /// Returns the `text` field.
+    pub fn text(&self) -> &BoundedString<32_767> {
+        &self.text
+    }
+
+    /// Decodes a `TabCompleteRequest` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let transaction_id = reader.read_var_int()?;
+        let text = BoundedString::<32_767>::read(reader)?;
+        Ok(Self {
+            transaction_id,
+            text,
+        })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        ferrumc_codec::write_var_int(buf, self.transaction_id);
+        self.text.write(buf);
         Ok(())
     }
 }
@@ -1110,6 +1227,126 @@ impl BlockUpdate {
         ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
         self.location.write(buf);
         ferrumc_codec::write_var_int(buf, self.block_state);
+        Ok(())
+    }
+}
+
+/// `TabCompleteResponse`: the play clientbound packet (wire id `0x0f`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabCompleteResponse {
+    transaction_id: i32,
+    start: i32,
+    length: i32,
+    matches: Vec<CommandSuggestionMatch>,
+}
+
+impl TabCompleteResponse {
+    /// The wire packet id for `TabCompleteResponse`.
+    pub const PACKET_ID: i32 = 0x0f;
+
+    /// Creates a new `TabCompleteResponse` from its wire fields.
+    pub fn new(
+        transaction_id: i32,
+        start: i32,
+        length: i32,
+        matches: Vec<CommandSuggestionMatch>,
+    ) -> Self {
+        Self {
+            transaction_id,
+            start,
+            length,
+            matches,
+        }
+    }
+
+    /// Returns the `transaction_id` field.
+    pub fn transaction_id(&self) -> i32 {
+        self.transaction_id
+    }
+
+    /// Returns the `start` field.
+    pub fn start(&self) -> i32 {
+        self.start
+    }
+
+    /// Returns the `length` field.
+    pub fn length(&self) -> i32 {
+        self.length
+    }
+
+    /// Returns the `matches` field.
+    pub fn matches(&self) -> &[CommandSuggestionMatch] {
+        &self.matches
+    }
+
+    /// Decodes a `TabCompleteResponse` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let transaction_id = reader.read_var_int()?;
+        let start = reader.read_var_int()?;
+        let length = reader.read_var_int()?;
+        let matches = {
+            let count = wire::read_prefixed_len(reader)?;
+            let mut items = Vec::with_capacity(count.min(reader.remaining()));
+            for _ in 0..count {
+                items.push(CommandSuggestionMatch::decode(reader)?);
+            }
+            items
+        };
+        Ok(Self {
+            transaction_id,
+            start,
+            length,
+            matches,
+        })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        ferrumc_codec::write_var_int(buf, self.transaction_id);
+        ferrumc_codec::write_var_int(buf, self.start);
+        ferrumc_codec::write_var_int(buf, self.length);
+        wire::write_prefixed_len(buf, self.matches.len());
+        for elem in &self.matches {
+            elem.encode(buf)?;
+        }
+        Ok(())
+    }
+}
+
+/// `Commands`: the play clientbound packet (wire id `0x10`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commands {
+    payload: Vec<u8>,
+}
+
+impl Commands {
+    /// The wire packet id for `Commands`.
+    pub const PACKET_ID: i32 = 0x10;
+
+    /// Creates a new `Commands` from its wire fields.
+    pub fn new(payload: Vec<u8>) -> Self {
+        Self { payload }
+    }
+
+    /// Returns the `payload` field.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Decodes a `Commands` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let payload = {
+            let remaining = reader.remaining();
+            reader.read_bytes(remaining)?.to_vec()
+        };
+        Ok(Self { payload })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        wire::write_raw(buf, &self.payload);
         Ok(())
     }
 }
@@ -2502,6 +2739,8 @@ pub enum ServerboundPlayPacket {
     ChatCommand(ChatCommand),
     /// The `ChatMessage` packet.
     ChatMessage(ChatMessage),
+    /// The `TabCompleteRequest` packet.
+    TabCompleteRequest(TabCompleteRequest),
     /// The `ServerboundKeepAlive` packet.
     ServerboundKeepAlive(ServerboundKeepAlive),
     /// The `SetPlayerPosition` packet.
@@ -2523,6 +2762,9 @@ impl ServerboundPlayPacket {
             )),
             ChatCommand::PACKET_ID => Ok(Self::ChatCommand(ChatCommand::decode(reader)?)),
             ChatMessage::PACKET_ID => Ok(Self::ChatMessage(ChatMessage::decode(reader)?)),
+            TabCompleteRequest::PACKET_ID => Ok(Self::TabCompleteRequest(
+                TabCompleteRequest::decode(reader)?,
+            )),
             ServerboundKeepAlive::PACKET_ID => Ok(Self::ServerboundKeepAlive(
                 ServerboundKeepAlive::decode(reader)?,
             )),
@@ -2548,6 +2790,7 @@ impl ServerboundPlayPacket {
             Self::ConfirmTeleportation(_) => ConfirmTeleportation::PACKET_ID,
             Self::ChatCommand(_) => ChatCommand::PACKET_ID,
             Self::ChatMessage(_) => ChatMessage::PACKET_ID,
+            Self::TabCompleteRequest(_) => TabCompleteRequest::PACKET_ID,
             Self::ServerboundKeepAlive(_) => ServerboundKeepAlive::PACKET_ID,
             Self::SetPlayerPosition(_) => SetPlayerPosition::PACKET_ID,
             Self::SetPlayerPositionAndRotation(_) => SetPlayerPositionAndRotation::PACKET_ID,
@@ -2562,6 +2805,7 @@ impl ServerboundPlayPacket {
             Self::ConfirmTeleportation(packet) => packet.encode(buf),
             Self::ChatCommand(packet) => packet.encode(buf),
             Self::ChatMessage(packet) => packet.encode(buf),
+            Self::TabCompleteRequest(packet) => packet.encode(buf),
             Self::ServerboundKeepAlive(packet) => packet.encode(buf),
             Self::SetPlayerPosition(packet) => packet.encode(buf),
             Self::SetPlayerPositionAndRotation(packet) => packet.encode(buf),
@@ -2580,6 +2824,10 @@ pub enum ClientboundPlayPacket {
     AcknowledgeBlockChange(AcknowledgeBlockChange),
     /// The `BlockUpdate` packet.
     BlockUpdate(BlockUpdate),
+    /// The `TabCompleteResponse` packet.
+    TabCompleteResponse(TabCompleteResponse),
+    /// The `Commands` packet.
+    Commands(Commands),
     /// The `EntityTeleport` packet.
     EntityTeleport(EntityTeleport),
     /// The `UnloadChunk` packet.
@@ -2625,6 +2873,10 @@ impl ClientboundPlayPacket {
                 AcknowledgeBlockChange::decode(reader)?,
             )),
             BlockUpdate::PACKET_ID => Ok(Self::BlockUpdate(BlockUpdate::decode(reader)?)),
+            TabCompleteResponse::PACKET_ID => Ok(Self::TabCompleteResponse(
+                TabCompleteResponse::decode(reader)?,
+            )),
+            Commands::PACKET_ID => Ok(Self::Commands(Commands::decode(reader)?)),
             EntityTeleport::PACKET_ID => Ok(Self::EntityTeleport(EntityTeleport::decode(reader)?)),
             UnloadChunk::PACKET_ID => Ok(Self::UnloadChunk(UnloadChunk::decode(reader)?)),
             GameEvent::PACKET_ID => Ok(Self::GameEvent(GameEvent::decode(reader)?)),
@@ -2678,6 +2930,8 @@ impl ClientboundPlayPacket {
             Self::SpawnEntity(_) => SpawnEntity::PACKET_ID,
             Self::AcknowledgeBlockChange(_) => AcknowledgeBlockChange::PACKET_ID,
             Self::BlockUpdate(_) => BlockUpdate::PACKET_ID,
+            Self::TabCompleteResponse(_) => TabCompleteResponse::PACKET_ID,
+            Self::Commands(_) => Commands::PACKET_ID,
             Self::EntityTeleport(_) => EntityTeleport::PACKET_ID,
             Self::UnloadChunk(_) => UnloadChunk::PACKET_ID,
             Self::GameEvent(_) => GameEvent::PACKET_ID,
@@ -2704,6 +2958,8 @@ impl ClientboundPlayPacket {
             Self::SpawnEntity(packet) => packet.encode(buf),
             Self::AcknowledgeBlockChange(packet) => packet.encode(buf),
             Self::BlockUpdate(packet) => packet.encode(buf),
+            Self::TabCompleteResponse(packet) => packet.encode(buf),
+            Self::Commands(packet) => packet.encode(buf),
             Self::EntityTeleport(packet) => packet.encode(buf),
             Self::UnloadChunk(packet) => packet.encode(buf),
             Self::GameEvent(packet) => packet.encode(buf),

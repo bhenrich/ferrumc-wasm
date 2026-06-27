@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
 
 use ferrumc_codec::{BoundedReader, BoundedString};
-use ferrumc_command::CommandSource;
+use ferrumc_command::{CommandSource, CommandTree};
 use ferrumc_core::{PlayerId, TextColor, TextComponent};
 use ferrumc_math::{BlockPos, ChunkPos, Vec3};
 use ferrumc_net::{
@@ -45,9 +45,9 @@ use ferrumc_proto::generated::login::{
     ClientboundLoginPacket, LoginSuccess, ServerboundLoginPacket, SetCompression,
 };
 use ferrumc_proto::generated::play::{
-    AcknowledgeBlockChange, ClientboundKeepAlive, ClientboundPlayPacket, GameEvent,
-    ServerboundPlayPacket, SetCenterChunk, SetDefaultSpawnPosition, SetPlayerPosition,
-    SynchronizePlayerPosition, UnloadChunk,
+    AcknowledgeBlockChange, ClientboundKeepAlive, ClientboundPlayPacket, CommandSuggestionMatch,
+    Commands, GameEvent, ServerboundPlayPacket, SetCenterChunk, SetDefaultSpawnPosition,
+    SetPlayerPosition, SynchronizePlayerPosition, TabCompleteResponse, UnloadChunk,
 };
 use ferrumc_proto::generated::status::{
     ClientboundStatusPacket, PongResponse, ServerboundStatusPacket, StatusResponse,
@@ -747,7 +747,8 @@ async fn join_simulation(
 
 /// Sends the join kit in the order a real client needs to leave the loading
 /// screen: `JoinGame`, `GameEvent(13)`, `SetCenterChunk`, `SetDefaultSpawnPosition`,
-/// a non-zero `SynchronizePlayerPosition`, then the spawn-area chunks.
+/// the permission-filtered `Commands` graph, a non-zero `SynchronizePlayerPosition`,
+/// then the spawn-area chunks.
 ///
 /// The position sync goes out *before* the chunks so the client's spawn point is
 /// fixed first: the loading-screen gate releases on the chunk that contains the
@@ -822,6 +823,21 @@ async fn send_join_kit(
             kit.spawn_block(),
             0.0,
         )),
+    );
+    // Declare the command graph so the client renders `/spawn` and `/gamemode` as
+    // valid (not red) and offers autocomplete for them. The graph is filtered to
+    // this player's permission level, so a non-operator never receives the
+    // level-gated `/gamemode` subtree.
+    let command_body = ctx
+        .policy
+        .command_tree()
+        .encode_commands_body(ctx.policy.permission_level(player));
+    enqueue_traced_classified(
+        writer,
+        debug,
+        compression,
+        clock,
+        ClientboundPlayPacket::Commands(Commands::new(command_body)),
     );
     enqueue_traced_classified(
         writer,
@@ -1039,6 +1055,20 @@ async fn handle_play_body(
                 })
                 .await
                 .map_err(|_| anyhow::anyhow!("simulation driver is gone"));
+        }
+        // A tab-complete request is answered locally from the command tree; it
+        // never touches the simulation.
+        ServerboundPlayPacket::TabCompleteRequest(req) => {
+            handle_tab_complete(
+                ctx,
+                player,
+                writer,
+                req.transaction_id(),
+                req.text().as_str(),
+                debug,
+                compression,
+            );
+            return Ok(());
         }
         // The teleport confirmation (reply to the join position sync) and the
         // Keep Alive echo are accepted and need no action: the slice does not
@@ -1369,6 +1399,86 @@ async fn handle_command(
     Ok(())
 }
 
+/// Answers a serverbound tab-complete request, enqueuing a `TabCompleteResponse`
+/// built from the command tree's suggestion engine.
+///
+/// The request `text` is the full chat-box content including the leading `/`; the
+/// slash is stripped before suggesting, and `start`/`length` are computed so the
+/// client replaces exactly the in-progress token. Suggestions are filtered to the
+/// literals the player's permission level may use (matching the permission-filtered
+/// command graph the join kit declared), and argument *hints* such as
+/// `<mode: 0..3>` are dropped — only concrete literal completions are sent, never
+/// placeholder text the client would insert verbatim. The offsets are byte indices,
+/// which coincide with character indices for the ASCII command literals in scope.
+fn handle_tab_complete(
+    ctx: &ConnContext,
+    player: PlayerId,
+    writer: &mut PlayWriter,
+    transaction_id: i32,
+    text: &str,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+) {
+    let level = ctx.policy.permission_level(player);
+    let (start, length, suggestions) = tab_complete_reply(ctx.policy.command_tree(), level, text);
+
+    let matches: Vec<CommandSuggestionMatch> = suggestions
+        .into_iter()
+        .filter_map(|suggestion| {
+            BoundedString::<32_767>::new(suggestion)
+                .ok()
+                // MVP: no hover tooltip (a single absent-flag byte on the wire).
+                .map(|suggestion| CommandSuggestionMatch::new(suggestion, None))
+        })
+        .collect();
+
+    let response = TabCompleteResponse::new(
+        transaction_id,
+        i32::try_from(start).unwrap_or(i32::MAX),
+        i32::try_from(length).unwrap_or(i32::MAX),
+        matches,
+    );
+    enqueue_traced_classified(
+        writer,
+        debug,
+        compression,
+        &ctx.clock,
+        ClientboundPlayPacket::TabCompleteResponse(response),
+    );
+}
+
+/// Computes the tab-complete reply for `text` at permission `level` against
+/// `tree`: the `(start, length)` byte span of `text` the matches replace, and the
+/// filtered list of literal completions.
+///
+/// Pure (no I/O), so it is unit-tested directly. The leading `/` is stripped
+/// before suggesting; `start`/`length` delimit the in-progress token (from after
+/// the last whitespace to the end of `text`). Matches are filtered to the literals
+/// the player's `level` may use (the declared graph is filtered the same way), and
+/// argument *hints* (which begin with `<`) are dropped so the client is never sent
+/// placeholder text to insert verbatim.
+fn tab_complete_reply(tree: &CommandTree, level: u8, text: &str) -> (usize, usize, Vec<String>) {
+    let input = text.strip_prefix('/').unwrap_or(text);
+    let offset = text.len() - input.len();
+    let token_start = input.rfind(char::is_whitespace).map_or(0, |idx| idx + 1);
+    let start = offset + token_start;
+    let length = text.len().saturating_sub(start);
+
+    let graph = tree.to_brigadier(level);
+    let allowed: Vec<&str> = graph
+        .nodes()
+        .iter()
+        .filter_map(|node| node.name())
+        .collect();
+    let matches = tree
+        .suggest(input)
+        .into_iter()
+        .filter(|suggestion| !suggestion.starts_with('<'))
+        .filter(|suggestion| allowed.contains(&suggestion.as_str()))
+        .collect();
+    (start, length, matches)
+}
+
 /// Enqueues `packet` at its default priority, recording an outbound trace only
 /// when it is actually queued.
 ///
@@ -1482,4 +1592,51 @@ async fn write_all(
         .await
         .map_err(|_| anyhow::anyhow!("socket flush timed out"))??;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tab_complete_reply;
+    use crate::command::{build_command_tree, GAMEMODE_COMMAND, SPAWN_COMMAND};
+
+    const OP_LEVEL: u8 = 4;
+    const MEMBER_LEVEL: u8 = 0;
+
+    #[test]
+    fn tab_complete_offers_literal_completion_for_a_prefix() {
+        let tree = build_command_tree();
+        // "/sp" -> the in-progress token "sp" (byte 1..3) completes to "spawn".
+        let (start, length, matches) = tab_complete_reply(&tree, OP_LEVEL, "/sp");
+        assert_eq!((start, length), (1, 2));
+        assert_eq!(matches, vec![SPAWN_COMMAND.to_string()]);
+    }
+
+    #[test]
+    fn tab_complete_lists_all_commands_after_the_slash() {
+        let tree = build_command_tree();
+        let (start, length, matches) = tab_complete_reply(&tree, OP_LEVEL, "/");
+        assert_eq!((start, length), (1, 0));
+        assert!(matches.contains(&SPAWN_COMMAND.to_string()));
+        assert!(matches.contains(&GAMEMODE_COMMAND.to_string()));
+    }
+
+    #[test]
+    fn tab_complete_hides_gated_commands_from_low_level_players() {
+        let tree = build_command_tree();
+        // A level-0 player gets `/spawn` but never `/gamemode`.
+        let (_, _, op_matches) = tab_complete_reply(&tree, OP_LEVEL, "/ga");
+        assert_eq!(op_matches, vec![GAMEMODE_COMMAND.to_string()]);
+        let (_, _, member_matches) = tab_complete_reply(&tree, MEMBER_LEVEL, "/ga");
+        assert!(member_matches.is_empty());
+    }
+
+    #[test]
+    fn tab_complete_drops_argument_hints() {
+        let tree = build_command_tree();
+        // After "/gamemode " the only candidate is the `<mode: 0..3>` hint, which is
+        // display-only and must not be sent as an insertable match.
+        let (start, length, matches) = tab_complete_reply(&tree, OP_LEVEL, "/gamemode ");
+        assert_eq!((start, length), (10, 0));
+        assert!(matches.is_empty());
+    }
 }

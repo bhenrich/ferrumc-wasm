@@ -123,6 +123,12 @@ impl OutboundPriority {
             // client should reliably see it, so it rides the high-priority State
             // class (still non-fatal if the queue is ever saturated).
             | ClientboundPlayPacket::SystemChat(_)
+            // The command graph is part of the join handshake (the client renders
+            // commands valid and enables autocomplete from it); the tab-complete
+            // response answers a client request and must be reliably delivered.
+            // Both ride the State class.
+            | ClientboundPlayPacket::Commands(_)
+            | ClientboundPlayPacket::TabCompleteResponse(_)
             | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::State,
             ClientboundPlayPacket::SpawnEntity(_)
             | ClientboundPlayPacket::BlockUpdate(_)

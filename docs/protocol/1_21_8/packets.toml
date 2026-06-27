@@ -127,6 +127,18 @@ fields = [
     { name = "z", type = "i16" },
 ]
 
+# One tab-complete suggestion in a TabCompleteResponse: the completion text plus
+# an optional hover tooltip. `suggestion` is the wire `match` field, renamed to
+# dodge the Rust keyword (the on-wire bytes are identical). `tooltip` is an
+# optional network-form NBT text component, sent absent (a single 0x00 flag byte)
+# for the MVP.
+[[struct]]
+name = "CommandSuggestionMatch"
+fields = [
+    { name = "suggestion", type = "string(32767)" },
+    { name = "tooltip", type = "optional<nbt>" },
+]
+
 # --- Handshaking ---------------------------------------------------------------
 
 [[packet]]
@@ -692,4 +704,58 @@ id = 0x4C
 fields = [
     { name = "entity_id", type = "varint" },
     { name = "head_yaw", type = "i8" },
+]
+
+# --- Command tree / tab-completion (client autocomplete) ------------------------
+#
+# These three packets hand the vanilla client its command graph (so `/spawn` and
+# `/gamemode` render as valid, not red) and drive tab-completion. Ids verified
+# against fixtures/protocol/1_21_8/protocol.json (protocol 772): clientbound
+# declare_commands 0x10, serverbound tab_complete 0x0E, clientbound tab_complete
+# 0x0F (all free in the play id set).
+
+# minecraft-data: play.toClient.declare_commands ("Commands"). The Brigadier node
+# graph is a flags-driven, self-referential structure — a bitfield byte, a redirect
+# switch on that bitfield, and a per-node-type switch whose argument branch nests a
+# parser mapper plus a parser-keyed properties switch — that the closed packets.toml
+# type grammar (no bitfield / switch / mapper) cannot express. It is therefore
+# carried as ONE opaque `remaining_bytes` payload, hand-encoded by
+# `ferrumc_command::CommandTree::encode_commands_body` (covered by a byte-level
+# test). That payload is the WHOLE body: the varint node count, then every node's
+# bytes, then the trailing varint rootIndex. rootIndex lives INSIDE the blob after
+# the node array (NOT a separate trailing field) precisely because `remaining_bytes`
+# must be the packet's final field. Commands is clientbound-only, so the generated
+# `decode` for `remaining_bytes` is never exercised at runtime.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "Commands"
+id = 0x10
+fields = [{ name = "payload", type = "remaining_bytes" }]
+
+# minecraft-data: play.toServer.tab_complete ("Command Suggestions Request"). The
+# client sends the in-progress command text and a transaction id the server echoes.
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "TabCompleteRequest"
+id = 0x0E
+fields = [
+    { name = "transaction_id", type = "varint" },
+    { name = "text", type = "string(32767)" },
+]
+
+# minecraft-data: play.toClient.tab_complete ("Command Suggestions Response").
+# `start`/`length` delimit the substring of the client's input the `matches`
+# replace; each match is a completion string plus an optional NBT tooltip.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "TabCompleteResponse"
+id = 0x0F
+fields = [
+    { name = "transaction_id", type = "varint" },
+    { name = "start", type = "varint" },
+    { name = "length", type = "varint" },
+    { name = "matches", type = "prefixed_array<CommandSuggestionMatch>" },
 ]

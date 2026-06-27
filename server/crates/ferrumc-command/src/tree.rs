@@ -1,6 +1,7 @@
 //! The command tree: registration, dispatch, and suggestions.
 
 use crate::argument::{ArgumentType, ArgumentValue, ParsedArgs};
+use crate::brigadier::{self, BrigadierGraph};
 use crate::builder::{CommandBuilder, CommandNode, NodeKind};
 use crate::context::CommandContext;
 use crate::error::CommandError;
@@ -150,6 +151,31 @@ impl CommandTree {
             }
         }
         suggestions
+    }
+
+    /// Lowers this tree into the Brigadier command-node graph the clientbound
+    /// `Commands` packet carries, filtered to the commands a player at
+    /// `player_level` may use.
+    ///
+    /// A node whose required permission *level* exceeds `player_level` is dropped
+    /// along with its whole subtree, and the surviving child indices are
+    /// renumbered. Permission *node strings* are not consulted here: the level is
+    /// the only gate the client graph can express. The synthetic root is always
+    /// present at index 0. See [`crate::BrigadierGraph`] for the resulting shape
+    /// and [`CommandTree::encode_commands_body`] for the wire bytes.
+    pub fn to_brigadier(&self, player_level: u8) -> BrigadierGraph {
+        brigadier::lower(&self.root, player_level)
+    }
+
+    /// Encodes the `Commands` packet body for a player at `player_level`: the
+    /// `VarInt` node count, each Brigadier node's bytes, then the trailing
+    /// `VarInt` root index.
+    ///
+    /// This is the opaque payload the generated `Commands` packet wraps (the
+    /// Brigadier node graph is not expressible in the declarative packet grammar).
+    /// Equivalent to `self.to_brigadier(player_level).encode()`.
+    pub fn encode_commands_body(&self, player_level: u8) -> Vec<u8> {
+        self.to_brigadier(player_level).encode()
     }
 }
 

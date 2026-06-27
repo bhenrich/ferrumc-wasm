@@ -196,6 +196,7 @@ dependencies = [
 name = "ferrumc-command"
 version = "0.2.0-dev"
 dependencies = [
+ "ferrumc-codec",
  "ferrumc-core",
  "thiserror",
 ]

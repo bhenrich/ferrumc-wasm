@@ -9,6 +9,10 @@ repository.workspace = true
 # Shared value types: `PlayerId` for command sources, `TextComponent` for
 # command feedback, and `ServerError` for error conversion.
 ferrumc-core = { workspace = true }
+# VarInt (LEB128) and string wire encoding for lowering the command tree to the
+# Brigadier command-graph body of the clientbound Commands packet. Reusing the
+# codec's `write_var_int` avoids a hand-rolled, untested LEB128 reimplementation.
+ferrumc-codec = { workspace = true }
 # Classifying command error enum (`CommandError`).
 thiserror = { workspace = true }
 

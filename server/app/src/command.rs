@@ -133,4 +133,37 @@ mod tests {
             .expect_err("member lacks level 2");
         assert!(matches!(err, CommandError::PermissionDenied(_)));
     }
+
+    #[test]
+    fn command_graph_is_permission_filtered() {
+        use ferrumc_command::BrigadierExtra;
+
+        let tree = build_command_tree();
+
+        // An operator sees both commands and the typed `mode` argument.
+        let op = tree.to_brigadier(4);
+        let op_names: Vec<&str> = op.nodes().iter().filter_map(|n| n.name()).collect();
+        assert!(op_names.contains(&SPAWN_COMMAND));
+        assert!(op_names.contains(&GAMEMODE_COMMAND));
+        assert!(op_names.contains(&"mode"));
+        let mode = op
+            .nodes()
+            .iter()
+            .find(|n| n.name() == Some("mode"))
+            .expect("mode node");
+        assert!(matches!(
+            mode.extra(),
+            BrigadierExtra::Argument { parser_id: 3, .. }
+        ));
+
+        // A level-0 player sees only `/spawn`; the gated `/gamemode` subtree is gone.
+        let member = tree.to_brigadier(0);
+        let member_names: Vec<&str> = member.nodes().iter().filter_map(|n| n.name()).collect();
+        assert!(member_names.contains(&SPAWN_COMMAND));
+        assert!(!member_names.contains(&GAMEMODE_COMMAND));
+        assert!(!member_names.contains(&"mode"));
+
+        // The encoded body the join kit sends therefore differs by level.
+        assert!(tree.encode_commands_body(4).len() > tree.encode_commands_body(0).len());
+    }
 }
