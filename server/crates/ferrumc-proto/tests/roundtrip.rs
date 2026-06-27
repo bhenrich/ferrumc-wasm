@@ -21,7 +21,8 @@ use ferrumc_proto::generated::play::{
     ClientboundPlayPacket, ConfirmTeleportation, DeathLocation, EntityVelocity, GameEvent,
     Heightmap, JoinGame, PlayerAction, PlayerInfoUpdate, ServerboundKeepAlive,
     ServerboundPlayPacket, SetCenterChunk, SetDefaultSpawnPosition, SetPlayerPosition,
-    SetPlayerPositionAndRotation, SpawnEntity, SpawnInfo, SynchronizePlayerPosition, UseItemOn,
+    SetPlayerPositionAndRotation, SpawnEntity, SpawnInfo, SynchronizePlayerPosition, UnloadChunk,
+    UseItemOn,
 };
 use ferrumc_proto::generated::status::{
     PingRequest, PongResponse, ServerboundStatusPacket, StatusRequest, StatusResponse,
@@ -420,6 +421,14 @@ fn play_clientbound_simple_packets_round_trip() {
         SetDefaultSpawnPosition::encode,
         SetDefaultSpawnPosition::decode,
         SetDefaultSpawnPosition::PACKET_ID,
+    );
+    // Unload Chunk: note the wire order is Z then X (a protocol quirk), so the
+    // constructor arguments here are (chunk_z, chunk_x).
+    roundtrip(
+        &UnloadChunk::new(-7, 3),
+        UnloadChunk::encode,
+        UnloadChunk::decode,
+        UnloadChunk::PACKET_ID,
     );
 }
 

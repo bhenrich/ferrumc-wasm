@@ -1035,6 +1035,48 @@ impl BlockUpdate {
     }
 }
 
+/// `UnloadChunk`: the play clientbound packet (wire id `0x21`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnloadChunk {
+    chunk_z: i32,
+    chunk_x: i32,
+}
+
+impl UnloadChunk {
+    /// The wire packet id for `UnloadChunk`.
+    pub const PACKET_ID: i32 = 0x21;
+
+    /// Creates a new `UnloadChunk` from its wire fields.
+    pub fn new(chunk_z: i32, chunk_x: i32) -> Self {
+        Self { chunk_z, chunk_x }
+    }
+
+    /// Returns the `chunk_z` field.
+    pub fn chunk_z(&self) -> i32 {
+        self.chunk_z
+    }
+
+    /// Returns the `chunk_x` field.
+    pub fn chunk_x(&self) -> i32 {
+        self.chunk_x
+    }
+
+    /// Decodes a `UnloadChunk` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let chunk_z = reader.read_i32()?;
+        let chunk_x = reader.read_i32()?;
+        Ok(Self { chunk_z, chunk_x })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        wire::write_i32(buf, self.chunk_z);
+        wire::write_i32(buf, self.chunk_x);
+        Ok(())
+    }
+}
+
 /// `GameEvent`: the play clientbound packet (wire id `0x22`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GameEvent {
@@ -1866,6 +1908,8 @@ pub enum ClientboundPlayPacket {
     SpawnEntity(SpawnEntity),
     /// The `BlockUpdate` packet.
     BlockUpdate(BlockUpdate),
+    /// The `UnloadChunk` packet.
+    UnloadChunk(UnloadChunk),
     /// The `GameEvent` packet.
     GameEvent(GameEvent),
     /// The `ClientboundKeepAlive` packet.
@@ -1890,6 +1934,7 @@ impl ClientboundPlayPacket {
         match id {
             SpawnEntity::PACKET_ID => Ok(Self::SpawnEntity(SpawnEntity::decode(reader)?)),
             BlockUpdate::PACKET_ID => Ok(Self::BlockUpdate(BlockUpdate::decode(reader)?)),
+            UnloadChunk::PACKET_ID => Ok(Self::UnloadChunk(UnloadChunk::decode(reader)?)),
             GameEvent::PACKET_ID => Ok(Self::GameEvent(GameEvent::decode(reader)?)),
             ClientboundKeepAlive::PACKET_ID => Ok(Self::ClientboundKeepAlive(
                 ClientboundKeepAlive::decode(reader)?,
@@ -1921,6 +1966,7 @@ impl ClientboundPlayPacket {
         match self {
             Self::SpawnEntity(_) => SpawnEntity::PACKET_ID,
             Self::BlockUpdate(_) => BlockUpdate::PACKET_ID,
+            Self::UnloadChunk(_) => UnloadChunk::PACKET_ID,
             Self::GameEvent(_) => GameEvent::PACKET_ID,
             Self::ClientboundKeepAlive(_) => ClientboundKeepAlive::PACKET_ID,
             Self::ChunkDataAndLight(_) => ChunkDataAndLight::PACKET_ID,
@@ -1937,6 +1983,7 @@ impl ClientboundPlayPacket {
         match self {
             Self::SpawnEntity(packet) => packet.encode(buf),
             Self::BlockUpdate(packet) => packet.encode(buf),
+            Self::UnloadChunk(packet) => packet.encode(buf),
             Self::GameEvent(packet) => packet.encode(buf),
             Self::ClientboundKeepAlive(packet) => packet.encode(buf),
             Self::ChunkDataAndLight(packet) => packet.encode(buf),
