@@ -102,9 +102,16 @@ impl OutboundPriority {
     pub fn for_packet(packet: &ClientboundPlayPacket) -> Self {
         match packet {
             ClientboundPlayPacket::ClientboundKeepAlive(_) => Self::Critical,
+            // The login/join handshake packets are all connection state the client
+            // needs to enter the world consistently: `GameEvent` (the
+            // chunks-load-start cue), `SetCenterChunk`, and the default-spawn and
+            // position syncs frame the bulk chunk stream that follows.
             ClientboundPlayPacket::JoinGame(_)
             | ClientboundPlayPacket::SynchronizePlayerPosition(_)
-            | ClientboundPlayPacket::PlayerInfoUpdate(_) => Self::State,
+            | ClientboundPlayPacket::PlayerInfoUpdate(_)
+            | ClientboundPlayPacket::GameEvent(_)
+            | ClientboundPlayPacket::SetCenterChunk(_)
+            | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::State,
             ClientboundPlayPacket::SpawnEntity(_)
             | ClientboundPlayPacket::BlockUpdate(_)
             | ClientboundPlayPacket::ChunkDataAndLight(_) => Self::World,

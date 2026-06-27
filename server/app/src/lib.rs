@@ -19,6 +19,7 @@ mod config;
 mod connection;
 mod driver;
 mod plugins;
+mod registries;
 mod server;
 mod world;
 

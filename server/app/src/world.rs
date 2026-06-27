@@ -13,11 +13,15 @@
 
 use ferrumc_codec::{BoundedBytes, BoundedString};
 use ferrumc_math::{BlockPos, ChunkPos};
-use ferrumc_proto::generated::play::{ChunkDataAndLight, JoinGame, SpawnInfo};
+use ferrumc_proto::generated::play::{ChunkDataAndLight, Heightmap, JoinGame, SpawnInfo};
+use ferrumc_proto::types::BlockPosition;
 use ferrumc_registry::dimension;
 use ferrumc_sim::{SimShard, SpawnChunkTickets};
 use ferrumc_storage::InMemoryStore;
-use ferrumc_world::{Chunk, FlatWorldGenerator, HeightmapKind};
+use ferrumc_world::{
+    encode_chunk_section_data, pack_motion_blocking_heightmap, Chunk, ChunkLightData,
+    FlatWorldGenerator,
+};
 
 use crate::config::AppConfig;
 
@@ -41,6 +45,12 @@ const GAMEMODE_CREATIVE: u8 = 1;
 /// "No previous game mode" sentinel (`-1` as an unsigned byte).
 const NO_PREVIOUS_GAMEMODE: u8 = u8::MAX;
 
+/// `MOTION_BLOCKING` heightmap type id, the one heightmap the slice transmits.
+///
+/// The 1.21.5+ array-form heightmap is keyed by numeric type; `4` selects
+/// `MOTION_BLOCKING` (the highest block that blocks motion or contains a fluid).
+const MOTION_BLOCKING_HEIGHTMAP: i32 = 4;
+
 /// The clientbound packets replayed to every player the instant they reach play.
 ///
 /// Built once at startup from the resident spawn chunks and shared behind an
@@ -53,6 +63,11 @@ pub(crate) struct JoinKit {
     join_game: JoinGame,
     /// The world-spawn position the player is placed at.
     spawn_position: ferrumc_math::Vec3,
+    /// The chunk the spawn point falls in, sent as `Set Center Chunk` so the
+    /// client centres its view square on the spawn area before the chunks arrive.
+    spawn_chunk: ChunkPos,
+    /// The block-aligned world spawn, sent as `Set Default Spawn Position`.
+    spawn_block: BlockPosition,
     /// One `ChunkDataAndLight` packet per resident spawn chunk.
     chunks: Vec<ChunkDataAndLight>,
 }
@@ -66,6 +81,16 @@ impl JoinKit {
     /// The absolute world-spawn position to synchronize the client to.
     pub(crate) fn spawn_position(&self) -> ferrumc_math::Vec3 {
         self.spawn_position
+    }
+
+    /// The chunk the spawn point falls in (the `Set Center Chunk` target).
+    pub(crate) fn spawn_chunk(&self) -> ChunkPos {
+        self.spawn_chunk
+    }
+
+    /// The block-aligned world spawn (the `Set Default Spawn Position` target).
+    pub(crate) fn spawn_block(&self) -> BlockPosition {
+        self.spawn_block
     }
 
     /// The spawn-area chunk packets, in deterministic order.
@@ -134,9 +159,16 @@ fn build_join_kit(
         })?;
         chunks.push(chunk_packet(pos, chunk)?);
     }
+    let spawn_block = BlockPosition::new(
+        config.spawn.x.floor() as i32,
+        config.spawn.y.floor() as i32,
+        config.spawn.z.floor() as i32,
+    );
     Ok(JoinKit {
         join_game: build_join_game(config)?,
         spawn_position: config.spawn,
+        spawn_chunk: spawn_center_chunk(config),
+        spawn_block,
         chunks,
     })
 }
@@ -173,41 +205,49 @@ fn build_join_game(config: &AppConfig) -> anyhow::Result<JoinGame> {
 }
 
 /// Builds the `ChunkDataAndLight` packet for one resident chunk.
+///
+/// The payload is the real 1.21.8 wire form: the paletted section blob from
+/// [`encode_chunk_section_data`], the `MOTION_BLOCKING` heightmap packed by
+/// [`pack_motion_blocking_heightmap`], and the full-bright sky light from
+/// [`ChunkLightData::full_bright`] (no block light). Block entities are empty.
+///
+/// # Errors
+///
+/// Returns an error if the section blob or a packed heightmap cannot be produced
+/// (only for out-of-range block data, which the flat generator never emits), or
+/// if an encoded buffer exceeds its protocol length bound.
 fn chunk_packet(pos: ChunkPos, chunk: &Chunk) -> anyhow::Result<ChunkDataAndLight> {
-    let blob = BoundedBytes::<2_097_152>::new(chunk_data_blob(chunk))
+    let blob = BoundedBytes::<2_097_152>::new(encode_chunk_section_data(chunk)?)
         .map_err(|err| anyhow::anyhow!("chunk blob exceeds protocol bound: {err}"))?;
+
+    let heightmaps = vec![Heightmap::new(
+        MOTION_BLOCKING_HEIGHTMAP,
+        pack_motion_blocking_heightmap(chunk)?,
+    )];
+
+    // Lighting is not computed yet: flood the column with full sky light and no
+    // block light, which is exactly how a flat overworld renders.
+    let light = ChunkLightData::full_bright();
+    let sky_light = light
+        .sky_light()
+        .iter()
+        .map(|section| BoundedBytes::<2048>::new(section.clone()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| anyhow::anyhow!("sky-light section exceeds protocol bound: {err}"))?;
+
     Ok(ChunkDataAndLight::new(
         pos.x(),
         pos.z(),
-        Vec::new(),
+        heightmaps,
         blob,
         Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        light.sky_light_mask().to_vec(),
+        light.block_light_mask().to_vec(),
+        light.empty_sky_light_mask().to_vec(),
+        light.empty_block_light_mask().to_vec(),
+        sky_light,
         Vec::new(),
     ))
-}
-
-/// Produces the opaque chunk-data blob carried in `ChunkDataAndLight`.
-///
-/// The vanilla paletted section + biome network format is a later milestone; the
-/// slice ships the documented opaque-blob form. The blob is deterministic and
-/// genuinely chunk-derived — the world-surface height of every column — so it
-/// proves the flat terrain was generated, without claiming the wire layout a
-/// vanilla client would render.
-fn chunk_data_blob(chunk: &Chunk) -> Vec<u8> {
-    let surface = chunk.heightmap(HeightmapKind::WorldSurface);
-    let mut blob = Vec::with_capacity(16 * 16 * 4);
-    for z in 0..16u8 {
-        for x in 0..16u8 {
-            let height = surface.height(x, z).unwrap_or(i32::MIN);
-            blob.extend_from_slice(&height.to_be_bytes());
-        }
-    }
-    blob
 }
 
 #[cfg(test)]
@@ -233,9 +273,33 @@ mod tests {
             setup.join_kit.join_game().view_distance(),
             config.view_distance
         );
-        // Every chunk blob is the per-column surface height grid (16x16 i32).
+        // The spawn point (8, 64, 8) falls in chunk (0, 0) and block (8, 64, 8).
+        assert_eq!(
+            setup.join_kit.spawn_chunk(),
+            ferrumc_math::ChunkPos::new(0, 0)
+        );
+        let block = setup.join_kit.spawn_block();
+        assert_eq!((block.x(), block.y(), block.z()), (8, 64, 8));
+
+        // Every chunk packet carries the real wire payload: a non-empty paletted
+        // section blob, the 37-long MOTION_BLOCKING heightmap, and full-bright sky
+        // light over all 26 light sections.
         for chunk in setup.join_kit.chunks() {
-            assert_eq!(chunk.chunk_data().as_slice().len(), 16 * 16 * 4);
+            assert!(!chunk.chunk_data().as_slice().is_empty());
+
+            let heightmaps = chunk.heightmaps();
+            assert_eq!(heightmaps.len(), 1);
+            assert_eq!(heightmaps[0].kind(), 4);
+            assert_eq!(heightmaps[0].data().len(), 37);
+
+            assert_eq!(chunk.sky_light_mask(), &[0x03FF_FFFF]);
+            assert_eq!(chunk.empty_block_light_mask(), &[0x03FF_FFFF]);
+            assert!(chunk.block_light_mask().is_empty());
+            assert_eq!(chunk.sky_light().len(), 26);
+            assert!(chunk.block_light().is_empty());
+            for section in chunk.sky_light() {
+                assert_eq!(section.as_slice().len(), 2048);
+            }
         }
     }
 }

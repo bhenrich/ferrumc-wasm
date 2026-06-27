@@ -43,6 +43,13 @@ const DEFAULT_TICKS_PER_SECOND: u32 = 20;
 /// entirely, which is the default so an unconfigured server protects nothing.
 const DEFAULT_SPAWN_PROTECT_RADIUS: i32 = 0;
 
+/// Default play-phase keep-alive interval, in milliseconds.
+///
+/// A vanilla client disconnects if it hears no Keep Alive for 20 s, so the server
+/// pings every 10 s. Configurable (in ms) so tests can drive a short interval
+/// without a wall-clock wait.
+const DEFAULT_KEEP_ALIVE_INTERVAL_MS: u64 = 10_000;
+
 /// Validated, runtime-ready server configuration.
 ///
 /// Construct one with [`AppConfig::default`] for the documented defaults, or
@@ -77,6 +84,8 @@ pub struct AppConfig {
     pub spawn_protect_radius: i32,
     /// Names of players granted the spawn-protection bypass permission.
     pub spawn_protect_bypass: Vec<String>,
+    /// Interval between clientbound play-phase Keep Alive pings.
+    pub keep_alive_interval: Duration,
 }
 
 impl AppConfig {
@@ -120,6 +129,7 @@ impl Default for AppConfig {
             plugins_dir: None,
             spawn_protect_radius: DEFAULT_SPAWN_PROTECT_RADIUS,
             spawn_protect_bypass: Vec::new(),
+            keep_alive_interval: Duration::from_millis(DEFAULT_KEEP_ALIVE_INTERVAL_MS),
         }
     }
 }
@@ -155,6 +165,8 @@ struct RawConfig {
     spawn_protect_radius: Option<i32>,
     /// Override for [`AppConfig::spawn_protect_bypass`].
     spawn_protect_bypass: Option<Vec<String>>,
+    /// Override for [`AppConfig::keep_alive_interval`], expressed in milliseconds.
+    keep_alive_interval_ms: Option<u64>,
 }
 
 impl RawConfig {
@@ -204,6 +216,9 @@ impl RawConfig {
             spawn_protect_bypass: self
                 .spawn_protect_bypass
                 .unwrap_or(defaults.spawn_protect_bypass),
+            keep_alive_interval: self
+                .keep_alive_interval_ms
+                .map_or(defaults.keep_alive_interval, Duration::from_millis),
         })
     }
 }
@@ -233,6 +248,7 @@ mod tests {
             plugins_dir = "/srv/plugins"
             spawn_protect_radius = 12
             spawn_protect_bypass = ["Admin", "Mod"]
+            keep_alive_interval_ms = 250
         "#;
         let parsed = AppConfig::from_toml_str(toml).expect("valid config");
         assert_eq!(parsed.bind, "0.0.0.0:0".parse().unwrap());
@@ -247,6 +263,7 @@ mod tests {
         assert_eq!(parsed.plugins_dir, Some(PathBuf::from("/srv/plugins")));
         assert_eq!(parsed.spawn_protect_radius, 12);
         assert_eq!(parsed.spawn_protect_bypass, vec!["Admin", "Mod"]);
+        assert_eq!(parsed.keep_alive_interval, Duration::from_millis(250));
     }
 
     #[test]

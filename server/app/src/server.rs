@@ -21,6 +21,7 @@ use crate::config::AppConfig;
 use crate::connection::{handle_connection, ConnContext};
 use crate::driver;
 use crate::plugins::{build_play_policy, load_plugins};
+use crate::registries::ConfigRegistries;
 use crate::world::build_world;
 
 /// Capacity of the bounded command channel from connections to the driver.
@@ -85,6 +86,10 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     let shard_pos = shard_for_position(config.spawn);
     let setup = build_world(config, shard_pos).await?;
 
+    // The configuration-phase registry payloads are identical for every
+    // connection; build them once and share behind an `Arc`.
+    let config_registries = Arc::new(ConfigRegistries::build()?);
+
     // Build the play policy (spawn-protection veto, bypass permissions, command
     // tree) by driving the in-process plugin's config round-trip through storage.
     let policy = Arc::new(build_play_policy(config)?);
@@ -127,6 +132,8 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         io_timeout: config.io_timeout,
         compression_threshold: config.compression_threshold,
         join_kit: setup.join_kit,
+        config: config_registries,
+        keep_alive_interval: config.keep_alive_interval,
         commands: commands_tx,
         policy,
     };

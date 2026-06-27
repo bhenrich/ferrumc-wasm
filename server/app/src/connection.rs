@@ -16,7 +16,7 @@ use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::timeout;
+use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
 
 use ferrumc_codec::{BoundedReader, BoundedString};
 use ferrumc_command::CommandSource;
@@ -35,7 +35,8 @@ use ferrumc_proto::generated::login::{
     ClientboundLoginPacket, LoginSuccess, ServerboundLoginPacket, SetCompression,
 };
 use ferrumc_proto::generated::play::{
-    ClientboundPlayPacket, ServerboundPlayPacket, SetPlayerPosition, SynchronizePlayerPosition,
+    ClientboundKeepAlive, ClientboundPlayPacket, GameEvent, ServerboundPlayPacket, SetCenterChunk,
+    SetDefaultSpawnPosition, SetPlayerPosition, SynchronizePlayerPosition,
 };
 use ferrumc_session::{net_event_to_input, NetEvent, PlayerSessionHandle};
 use ferrumc_sim::GameInput;
@@ -43,6 +44,7 @@ use ferrumc_sim::GameInput;
 use crate::command::SPAWN_COMMAND;
 use crate::driver::SimCommand;
 use crate::plugins::PlayPolicy;
+use crate::registries::ConfigRegistries;
 use crate::world::JoinKit;
 
 /// The `next_state` value in a handshake that selects the login branch.
@@ -50,6 +52,17 @@ const NEXT_STATE_LOGIN: i32 = 2;
 
 /// Bytes read off the socket per `read` call before decoding.
 const READ_CHUNK: usize = 4096;
+
+/// `Game Event` reason `13`: "level chunks load start". Sent right after
+/// `JoinGame` to tell the client the spawn chunks are on their way; without it
+/// the client never leaves the "Loading terrain" screen.
+const GAME_EVENT_LEVEL_CHUNKS_LOAD_START: u8 = 13;
+
+/// Teleport id carried by the join `SynchronizePlayerPosition`.
+///
+/// Must be non-zero: a real client replies with a `ConfirmTeleportation` echoing
+/// it, which the server decodes and ignores.
+const JOIN_TELEPORT_ID: i32 = 1;
 
 /// Immutable context shared by every connection task.
 ///
@@ -65,6 +78,11 @@ pub(crate) struct ConnContext {
     pub(crate) compression_threshold: Option<i32>,
     /// The clientbound payload replayed when a client reaches play.
     pub(crate) join_kit: Arc<JoinKit>,
+    /// The Known Packs advertisement and the registry packets sent during the
+    /// configuration phase.
+    pub(crate) config: Arc<ConfigRegistries>,
+    /// Interval between clientbound play-phase Keep Alive pings.
+    pub(crate) keep_alive_interval: Duration,
     /// Bounded channel to the simulation/session driver.
     pub(crate) commands: mpsc::Sender<SimCommand>,
     /// The shared play policy: spawn-protection veto, bypass permissions, and the
@@ -90,6 +108,9 @@ enum LoginPhase {
     Login,
     /// Awaiting Login Acknowledged (Login Success already sent).
     AwaitingLoginAck,
+    /// Awaiting the client's Known Packs echo (Clientbound Known Packs already
+    /// sent); the registry data is not sent until it arrives.
+    AwaitingKnownPacks,
     /// Awaiting Ack Finish Configuration.
     AwaitingFinishAck,
 }
@@ -100,7 +121,7 @@ impl LoginPhase {
         match self {
             Self::Handshaking => ConnectionState::Handshaking,
             Self::Login | Self::AwaitingLoginAck => ConnectionState::Login,
-            Self::AwaitingFinishAck => ConnectionState::Configuration,
+            Self::AwaitingKnownPacks | Self::AwaitingFinishAck => ConnectionState::Configuration,
         }
     }
 }
@@ -167,14 +188,31 @@ impl<'a> Connection<'a> {
         .await
     }
 
-    /// Advertises the (empty) known packs and finishes configuration.
-    async fn send_enter_configuration(&mut self) -> anyhow::Result<()> {
+    /// Advertises the built-in `minecraft:core` data pack so the client will
+    /// accept NBT-omitted registry entries. The server then waits for the
+    /// client's Known Packs echo before sending any registry data.
+    async fn send_known_packs(&mut self) -> anyhow::Result<()> {
+        let packs = self.ctx.config.known_packs().to_vec();
         self.send(&OutboundPacket::Configuration(
             ClientboundConfigurationPacket::ClientboundKnownPacks(ClientboundKnownPacks::new(
-                Vec::new(),
+                packs,
             )),
         ))
-        .await?;
+        .await
+    }
+
+    /// Sends every enumerated registry (NBT omitted) in id-assignment order, then
+    /// Finish Configuration to hand the client off to play.
+    async fn send_registries_and_finish(&mut self) -> anyhow::Result<()> {
+        // Detach the shared context reference so the registry borrow does not tie
+        // up the `&mut self` each `send` needs.
+        let ctx = self.ctx;
+        for registry in ctx.config.registries() {
+            self.send(&OutboundPacket::Configuration(
+                ClientboundConfigurationPacket::RegistryData(registry.clone()),
+            ))
+            .await?;
+        }
         self.send(&OutboundPacket::Configuration(
             ClientboundConfigurationPacket::FinishConfiguration(FinishConfiguration),
         ))
@@ -278,13 +316,23 @@ async fn advance(
             LoginPhase::AwaitingLoginAck,
             InboundPacket::Login(ServerboundLoginPacket::LoginAcknowledged(_)),
         ) => {
-            conn.send_enter_configuration().await?;
-            *phase = LoginPhase::AwaitingFinishAck;
+            conn.send_known_packs().await?;
+            *phase = LoginPhase::AwaitingKnownPacks;
             Ok(LoginProgress::Continue)
         }
+        (LoginPhase::AwaitingKnownPacks, InboundPacket::Configuration(config)) => match config {
+            // The client's Known Packs echo is the cue to send the registries.
+            ServerboundConfigurationPacket::ServerboundKnownPacks(_) => {
+                conn.send_registries_and_finish().await?;
+                *phase = LoginPhase::AwaitingFinishAck;
+                Ok(LoginProgress::Continue)
+            }
+            // Client Information (and anything else) is accepted without a reply.
+            _ => Ok(LoginProgress::Continue),
+        },
         (LoginPhase::AwaitingFinishAck, InboundPacket::Configuration(config)) => match config {
             ServerboundConfigurationPacket::AckFinishConfiguration(_) => Ok(LoginProgress::Play),
-            // Client settings / known packs are accepted but need no reply.
+            // Late client settings / known packs are accepted but need no reply.
             _ => Ok(LoginProgress::Continue),
         },
         _ => anyhow::bail!("unexpected {:?} packet during {:?}", packet.state(), *phase),
@@ -311,8 +359,7 @@ async fn enter_play(
 
     // Replay the keystone payload, then drain any already-buffered play frames.
     let mut writer = PlayWriter::with_defaults(ctx.limits);
-    enqueue_join_kit(&mut writer, ctx, position);
-    flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await?;
+    send_join_kit(&mut writer, &mut stream, &compression, ctx, position).await?;
     pump_serverbound(
         &mut decoder,
         &compression,
@@ -324,11 +371,30 @@ async fn enter_play(
     .await?;
     flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await?;
 
+    // Keep Alive: a real client disconnects if it hears nothing for 20 s. Ping on
+    // an interval; the client echoes with a serverbound Keep Alive the play pump
+    // decodes and ignores. The first tick fires one interval in, not immediately.
+    let mut keep_alive = interval_at(
+        Instant::now() + ctx.keep_alive_interval,
+        ctx.keep_alive_interval,
+    );
+    keep_alive.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut keep_alive_id: i64 = 0;
+
     let mut read_buf = [0u8; READ_CHUNK];
     let result = loop {
         tokio::select! {
             biased;
             _ = shutdown.changed() => break Ok(()),
+            _ = keep_alive.tick() => {
+                keep_alive_id = keep_alive_id.wrapping_add(1);
+                writer.enqueue_classified(ClientboundPlayPacket::ClientboundKeepAlive(
+                    ClientboundKeepAlive::new(keep_alive_id),
+                ));
+                if let Err(err) = flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
+                    break Err(err);
+                }
+            }
             outbound = handle.recv() => match outbound {
                 // Clientbound simulation output: queue and flush to the socket.
                 Some(packet) => {
@@ -395,24 +461,69 @@ async fn join_simulation(
         .map_err(|err| anyhow::anyhow!("join rejected: {err}"))
 }
 
-/// Queues the join kit: `JoinGame`, the spawn position sync, then the chunks.
-fn enqueue_join_kit(writer: &mut PlayWriter, ctx: &ConnContext, position: Vec3) {
-    writer.enqueue_classified(ClientboundPlayPacket::JoinGame(
-        ctx.join_kit.join_game().clone(),
-    ));
-    writer.enqueue_classified(ClientboundPlayPacket::SynchronizePlayerPosition(
-        spawn_sync(position),
-    ));
-    for chunk in ctx.join_kit.chunks() {
+/// Sends the join kit in the order a real client needs to leave the loading
+/// screen: `JoinGame`, `GameEvent(13)`, `SetCenterChunk`, the spawn-area chunks,
+/// `SetDefaultSpawnPosition`, then a non-zero `SynchronizePlayerPosition`.
+///
+/// The sequence is flushed in three stages because the [`PlayWriter`] drains by
+/// priority (State before World): flushing the framing packets, then the chunks,
+/// then the spawn/position sync guarantees the chunks land *between* `SetCenterChunk`
+/// and the position sync rather than being reordered after them.
+///
+/// # Errors
+///
+/// Returns an error if any stage fails to encode or write to the socket.
+async fn send_join_kit(
+    writer: &mut PlayWriter,
+    stream: &mut TcpStream,
+    compression: &CompressionState,
+    ctx: &ConnContext,
+    position: Vec3,
+) -> anyhow::Result<()> {
+    let kit = &ctx.join_kit;
+
+    // Stage 1: enter play and cue the client to expect spawn chunks.
+    writer.enqueue_classified(ClientboundPlayPacket::JoinGame(kit.join_game().clone()));
+    writer.enqueue_classified(ClientboundPlayPacket::GameEvent(GameEvent::new(
+        GAME_EVENT_LEVEL_CHUNKS_LOAD_START,
+        0.0,
+    )));
+    writer.enqueue_classified(ClientboundPlayPacket::SetCenterChunk(SetCenterChunk::new(
+        kit.spawn_chunk().x(),
+        kit.spawn_chunk().z(),
+    )));
+    flush_writer(writer, stream, compression, ctx.io_timeout).await?;
+
+    // Stage 2: the spawn-area chunk column packets (includes the player's chunk).
+    for chunk in kit.chunks() {
         writer.enqueue_classified(ClientboundPlayPacket::ChunkDataAndLight(chunk.clone()));
     }
+    flush_writer(writer, stream, compression, ctx.io_timeout).await?;
+
+    // Stage 3: fix the world spawn, then teleport the player into it.
+    writer.enqueue_classified(ClientboundPlayPacket::SetDefaultSpawnPosition(
+        SetDefaultSpawnPosition::new(kit.spawn_block(), 0.0),
+    ));
+    writer.enqueue_classified(ClientboundPlayPacket::SynchronizePlayerPosition(
+        spawn_sync(JOIN_TELEPORT_ID, position),
+    ));
+    flush_writer(writer, stream, compression, ctx.io_timeout).await
 }
 
-/// Builds the absolute spawn-position sync packet.
-fn spawn_sync(position: Vec3) -> SynchronizePlayerPosition {
-    // Teleport id 0; absolute position with zero deltas, orientation, and flags.
+/// Builds an absolute position sync with the given teleport id (zero deltas,
+/// orientation, and flags).
+fn spawn_sync(teleport_id: i32, position: Vec3) -> SynchronizePlayerPosition {
     SynchronizePlayerPosition::new(
-        0, position.x, position.y, position.z, 0.0, 0.0, 0.0, 0.0, 0.0, 0,
+        teleport_id,
+        position.x,
+        position.y,
+        position.z,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0,
     )
 }
 
@@ -458,8 +569,9 @@ async fn pump_serverbound(
 /// Handles one decoded serverbound play-frame body.
 ///
 /// Unknown or malformed play packets are ignored (the slice models only a
-/// subset). A `ChatCommand` is dispatched locally; every other packet is
-/// forwarded to the simulation unless spawn protection vetoes it.
+/// subset), as are the teleport confirmation and the Keep Alive echo. A
+/// `ChatCommand` is dispatched locally; every other modelled packet is forwarded
+/// to the simulation unless spawn protection vetoes it.
 async fn handle_play_body(
     ctx: &ConnContext,
     player: PlayerId,
@@ -475,9 +587,17 @@ async fn handle_play_body(
         return Ok(());
     };
 
-    if let ServerboundPlayPacket::ChatCommand(command) = &packet {
-        let command = command.command().as_str().to_owned();
-        return handle_command(ctx, player, name, writer, &command).await;
+    match &packet {
+        ServerboundPlayPacket::ChatCommand(command) => {
+            let command = command.command().as_str().to_owned();
+            return handle_command(ctx, player, name, writer, &command).await;
+        }
+        // The teleport confirmation (reply to the join position sync) and the
+        // Keep Alive echo are accepted and need no action: the slice does not
+        // validate teleport ids and the keep-alive timer is fire-and-forget.
+        ServerboundPlayPacket::ConfirmTeleportation(_)
+        | ServerboundPlayPacket::ServerboundKeepAlive(_) => return Ok(()),
+        _ => {}
     }
 
     let event = NetEvent::play(player, packet);
@@ -539,7 +659,7 @@ async fn handle_command(
     if command.split_whitespace().next() == Some(SPAWN_COMMAND) {
         let spawn = policy.spawn();
         writer.enqueue_classified(ClientboundPlayPacket::SynchronizePlayerPosition(
-            spawn_sync(spawn),
+            spawn_sync(JOIN_TELEPORT_ID, spawn),
         ));
         let move_event = NetEvent::play(
             player,

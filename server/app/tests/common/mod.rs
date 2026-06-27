@@ -5,16 +5,26 @@
 //! exposes frame-level read/write so a test can assert on the clientbound play
 //! packets the server sends. There are no wall-clock sleeps; every read awaits the
 //! next frame and the caller wraps the flow in a timeout guard.
+//!
+//! The socket is split: a background task continuously drains the read half into
+//! a bounded frame channel, while the writer half stays on the [`TestClient`].
+//! Continuous draining is what a real client does, and it matters here because a
+//! single `ChunkDataAndLight` packet carries ~70 KiB of section + light data — a
+//! spawn area is hundreds of KiB, more than a socket buffer holds. Without a
+//! background drainer, an idle client's socket fills and the server's join-kit
+//! `write_all` blocks before it ever reaches its serverbound read loop.
 
 use std::net::SocketAddr;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 
 use ferrumc_codec::{write_var_int, BoundedReader, BoundedString, CodecError, FrameLengthReader};
 use ferrumc_proto::generated::configuration::{
-    AckFinishConfiguration, ClientboundConfigurationPacket,
+    AckFinishConfiguration, ClientboundConfigurationPacket, ServerboundKnownPacks,
 };
 use ferrumc_proto::generated::handshake::Handshake;
 use ferrumc_proto::generated::login::{ClientboundLoginPacket, LoginAcknowledged, LoginStart};
@@ -26,21 +36,32 @@ const PROTOCOL_VERSION: i32 = 772;
 /// `next_state` selecting the login branch in the handshake.
 const NEXT_STATE_LOGIN: i32 = 2;
 
+/// Capacity (in frames) of the channel the background drainer feeds.
+///
+/// Comfortably above the join kit plus the appearance/broadcast frames a test
+/// reads before it next drains; tests consume promptly so it never fills.
+const FRAME_CHANNEL_CAPACITY: usize = 1024;
+
+/// The largest clientbound frame the drainer will accept, matching the server's
+/// play frame cap with headroom.
+const MAX_FRAME: usize = 4 * 1024 * 1024;
+
 /// A length-delimited frame pipe over a real client socket.
 pub struct TestClient {
-    /// The connected client socket.
-    stream: TcpStream,
-    /// Accumulated clientbound bytes not yet consumed by a full frame.
-    buf: Vec<u8>,
+    /// The write half of the socket, used to send serverbound frames.
+    writer: OwnedWriteHalf,
+    /// Complete clientbound frame bodies, fed by the background drainer.
+    frames: mpsc::Receiver<Vec<u8>>,
 }
 
 impl TestClient {
-    /// Connects to `addr` and wraps the socket.
+    /// Connects to `addr`, splits the socket, and spawns the background drainer.
     pub async fn connect(addr: SocketAddr) -> anyhow::Result<Self> {
-        Ok(Self {
-            stream: TcpStream::connect(addr).await?,
-            buf: Vec::new(),
-        })
+        let stream = TcpStream::connect(addr).await?;
+        let (reader, writer) = stream.into_split();
+        let (tx, frames) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+        tokio::spawn(drain_frames(reader, tx));
+        Ok(Self { writer, frames })
     }
 
     /// Writes one frame: a `VarInt` length prefix followed by `body` (id + fields).
@@ -48,25 +69,16 @@ impl TestClient {
         let mut framed: Vec<u8> = Vec::new();
         write_var_int(&mut framed, i32::try_from(body.len())?);
         framed.extend_from_slice(body);
-        self.stream.write_all(&framed).await?;
-        self.stream.flush().await?;
+        self.writer.write_all(&framed).await?;
+        self.writer.flush().await?;
         Ok(())
     }
 
-    /// Reads the next complete frame body (id + fields), reading from the socket
-    /// as needed.
+    /// Awaits the next complete frame body (id + fields) from the drainer.
     pub async fn next_frame(&mut self) -> anyhow::Result<Vec<u8>> {
-        loop {
-            if let Some(body) = self.take_buffered_frame()? {
-                return Ok(body);
-            }
-            let mut chunk = [0u8; 4096];
-            let n = self.stream.read(&mut chunk).await?;
-            if n == 0 {
-                anyhow::bail!("server closed the connection before the expected frame");
-            }
-            self.buf.extend_from_slice(&chunk[..n]);
-        }
+        self.frames.recv().await.ok_or_else(|| {
+            anyhow::anyhow!("server closed the connection before the expected frame")
+        })
     }
 
     /// Reads and decodes the next clientbound play packet.
@@ -76,25 +88,53 @@ impl TestClient {
         let id = reader.read_var_int()?;
         Ok(ClientboundPlayPacket::decode(id, &mut reader)?)
     }
+}
 
-    /// Extracts one complete frame from the buffer, or `None` if more bytes are
-    /// needed.
-    fn take_buffered_frame(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
-        const MAX_FRAME: usize = 4 * 1024 * 1024;
-        let mut reader = BoundedReader::new(&self.buf);
-        let len = match FrameLengthReader::new(MAX_FRAME).read_length(&mut reader) {
-            Ok(len) => len,
-            Err(CodecError::UnexpectedEof { .. }) => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-        let prefix = reader.position();
-        if self.buf.len() < prefix + len {
-            return Ok(None);
+/// Continuously reads `reader`, splitting the byte stream into length-delimited
+/// frames and forwarding each body over `tx` until EOF, a framing error, or the
+/// receiver is dropped.
+async fn drain_frames<R>(mut reader: R, tx: mpsc::Sender<Vec<u8>>)
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    loop {
+        // Forward every complete frame currently buffered.
+        loop {
+            match take_frame(&buf) {
+                Ok(Some((prefix, len))) => {
+                    let body = buf[prefix..prefix + len].to_vec();
+                    buf.drain(..prefix + len);
+                    if tx.send(body).await.is_err() {
+                        return; // The test dropped the client.
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => return, // Malformed length prefix: stop draining.
+            }
         }
-        let body = self.buf[prefix..prefix + len].to_vec();
-        self.buf.drain(..prefix + len);
-        Ok(Some(body))
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => return, // EOF or socket error: close the channel.
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
     }
+}
+
+/// Locates the next complete frame in `buf`, returning `(prefix_len, body_len)`
+/// when one is fully present, or `None` if more bytes are needed.
+fn take_frame(buf: &[u8]) -> Result<Option<(usize, usize)>, CodecError> {
+    let mut reader = BoundedReader::new(buf);
+    let len = match FrameLengthReader::new(MAX_FRAME).read_length(&mut reader) {
+        Ok(len) => len,
+        Err(CodecError::UnexpectedEof { .. }) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let prefix = reader.position();
+    if buf.len() < prefix + len {
+        return Ok(None);
+    }
+    Ok(Some((prefix, len)))
 }
 
 /// Encodes a serverbound packet body (id + fields) via its `encode` method.
@@ -146,7 +186,9 @@ pub async fn login_to_play(addr: SocketAddr, name: &str) -> anyhow::Result<TestC
         }
     }
 
-    // Login Acknowledged, then wait for the configuration to finish.
+    // Login Acknowledged, then drive the Known Packs handshake: echo the server's
+    // advertised packs so it sends the registries, and read through to Finish
+    // Configuration (the registry data packets pass by).
     client
         .send_frame(&encode(|buf| LoginAcknowledged.encode(buf)))
         .await?;
@@ -154,11 +196,13 @@ pub async fn login_to_play(addr: SocketAddr, name: &str) -> anyhow::Result<TestC
         let frame = client.next_frame().await?;
         let mut reader = BoundedReader::new(&frame);
         let id = reader.read_var_int()?;
-        if matches!(
-            ClientboundConfigurationPacket::decode(id, &mut reader)?,
-            ClientboundConfigurationPacket::FinishConfiguration(_)
-        ) {
-            break;
+        match ClientboundConfigurationPacket::decode(id, &mut reader)? {
+            ClientboundConfigurationPacket::ClientboundKnownPacks(packs) => {
+                let echo = ServerboundKnownPacks::new(packs.known_packs().to_vec());
+                client.send_frame(&encode(|buf| echo.encode(buf))).await?;
+            }
+            ClientboundConfigurationPacket::FinishConfiguration(_) => break,
+            ClientboundConfigurationPacket::RegistryData(_) => {}
         }
     }
 

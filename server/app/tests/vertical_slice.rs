@@ -1,15 +1,25 @@
-//! End-to-end vertical-slice test.
+//! End-to-end real-client-join acceptance test.
 //!
 //! Starts the real server on an ephemeral port, connects a real
-//! [`tokio::net::TcpStream`] acting as the client, and drives the protocol by
-//! hand with the `ferrumc-proto` encoders: handshake(next=2) -> login ->
-//! configuration -> play. It asserts the server transitions the client into play
-//! and sends the keystone payload — a `JoinGame`, a `SynchronizePlayerPosition`,
-//! and at least one `ChunkDataAndLight` — then asserts a clean shutdown.
+//! [`tokio::net::TcpStream`] acting as a 1.21.8 client, and drives the protocol
+//! by hand with the `ferrumc-proto` encoders: handshake(next=2) -> login ->
+//! configuration -> play.
 //!
-//! There are no wall-clock sleeps: every step awaits the next frame, and the
-//! whole exchange (and the shutdown) is wrapped in a timeout guard so a hang
-//! fails loudly instead of stalling the suite.
+//! It asserts the full real-join flow:
+//! - **configuration** — the server advertises Known Packs, the client echoes
+//!   them, and the server then sends at least the 11 enumerated `RegistryData`
+//!   packets followed by Finish Configuration.
+//! - **play join sequence** — the keystone packets arrive in the order a real
+//!   client needs to leave the loading screen: `JoinGame`, `GameEvent(13)`,
+//!   `SetCenterChunk`, at least one `ChunkDataAndLight`, then a
+//!   `SynchronizePlayerPosition`.
+//! - **keep alive** — a clientbound `KeepAlive` arrives within the (short,
+//!   test-configured) timer window.
+//!
+//! There are no wall-clock sleeps: every step awaits the next frame, the
+//! keep-alive interval is driven short via config (not a sleep), and the whole
+//! exchange (and the shutdown) is wrapped in a timeout guard so a hang fails
+//! loudly instead of stalling the suite.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -21,7 +31,7 @@ use tokio::time::timeout;
 
 use ferrumc_codec::{write_var_int, BoundedReader, BoundedString, CodecError, FrameLengthReader};
 use ferrumc_proto::generated::configuration::{
-    AckFinishConfiguration, ClientboundConfigurationPacket,
+    AckFinishConfiguration, ClientboundConfigurationPacket, ServerboundKnownPacks,
 };
 use ferrumc_proto::generated::handshake::Handshake;
 use ferrumc_proto::generated::login::{ClientboundLoginPacket, LoginAcknowledged, LoginStart};
@@ -132,18 +142,26 @@ fn decode_play(body: &[u8]) -> ClientboundPlayPacket {
     ClientboundPlayPacket::decode(id, &mut reader).expect("play packet decodes")
 }
 
-/// What the client observed once it reached and read the play phase.
-struct PlayObservations {
-    /// Whether a `JoinGame` packet arrived.
-    join_game: bool,
-    /// Whether a `SynchronizePlayerPosition` packet arrived.
-    position: bool,
-    /// Whether at least one `ChunkDataAndLight` packet arrived.
-    chunk: bool,
+/// `Game Event` reason `13` (level chunks load start), the cue that releases the
+/// loading screen once the player is in a loaded chunk.
+const LEVEL_CHUNKS_LOAD_START: u8 = 13;
+
+/// The minimum number of `RegistryData` packets a real client needs to leave
+/// configuration (one per enumerated registry).
+const MIN_REGISTRIES: usize = 11;
+
+/// What the client observed across the real-join flow.
+struct JoinObservations {
+    /// The number of `RegistryData` packets received in configuration.
+    registry_count: usize,
+    /// The order the keystone play packets arrived in, as short tags.
+    play_order: Vec<&'static str>,
+    /// Whether a clientbound `KeepAlive` arrived within the timer window.
+    keep_alive: bool,
 }
 
-/// Drives the full client flow and returns what it saw in play.
-async fn drive_client(addr: SocketAddr) -> anyhow::Result<PlayObservations> {
+/// Drives the full real-client-join flow and returns what it saw.
+async fn drive_client(addr: SocketAddr) -> anyhow::Result<JoinObservations> {
     let mut client = FrameStream::connect(addr).await?;
 
     // Handshake -> Login.
@@ -177,46 +195,81 @@ async fn drive_client(addr: SocketAddr) -> anyhow::Result<PlayObservations> {
         }
     }
 
-    // Login Acknowledged, then wait for the configuration to finish.
+    // Login Acknowledged, then drive the Known Packs handshake: echo the server's
+    // advertised packs so it sends the registries, counting the RegistryData
+    // packets up to Finish Configuration.
     client
         .send_frame(&encode(|buf| LoginAcknowledged.encode(buf)))
         .await?;
+    let mut registry_count = 0;
     loop {
         let frame = client.next_frame().await?;
+        match decode_configuration(&frame) {
+            ClientboundConfigurationPacket::ClientboundKnownPacks(packs) => {
+                let echo = ServerboundKnownPacks::new(packs.known_packs().to_vec());
+                client.send_frame(&encode(|buf| echo.encode(buf))).await?;
+            }
+            ClientboundConfigurationPacket::RegistryData(_) => registry_count += 1,
+            ClientboundConfigurationPacket::FinishConfiguration(_) => break,
+        }
+    }
+
+    // Acknowledge configuration to enter play, then record the keystone play
+    // packets in arrival order, up to and including the position sync.
+    client
+        .send_frame(&encode(|buf| AckFinishConfiguration.encode(buf)))
+        .await?;
+    let mut play_order: Vec<&'static str> = Vec::new();
+    loop {
+        match decode_play(&client.next_frame().await?) {
+            ClientboundPlayPacket::JoinGame(_) => play_order.push("join"),
+            ClientboundPlayPacket::GameEvent(event)
+                if event.reason() == LEVEL_CHUNKS_LOAD_START =>
+            {
+                play_order.push("game_event");
+            }
+            ClientboundPlayPacket::SetCenterChunk(_) => play_order.push("center"),
+            ClientboundPlayPacket::ChunkDataAndLight(_) => {
+                // Record the first chunk only, to capture its position in the order.
+                if !play_order.contains(&"chunk") {
+                    play_order.push("chunk");
+                }
+            }
+            ClientboundPlayPacket::SynchronizePlayerPosition(_) => {
+                play_order.push("sync");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // The keep-alive timer is configured short; one must arrive promptly.
+    let mut keep_alive = false;
+    for _ in 0..64 {
         if matches!(
-            decode_configuration(&frame),
-            ClientboundConfigurationPacket::FinishConfiguration(_)
+            decode_play(&client.next_frame().await?),
+            ClientboundPlayPacket::ClientboundKeepAlive(_)
         ) {
+            keep_alive = true;
             break;
         }
     }
 
-    // Acknowledge configuration to enter play, then collect the keystone payload.
-    client
-        .send_frame(&encode(|buf| AckFinishConfiguration.encode(buf)))
-        .await?;
-    let mut seen = PlayObservations {
-        join_game: false,
-        position: false,
-        chunk: false,
-    };
-    while !(seen.join_game && seen.position && seen.chunk) {
-        let frame = client.next_frame().await?;
-        match decode_play(&frame) {
-            ClientboundPlayPacket::JoinGame(_) => seen.join_game = true,
-            ClientboundPlayPacket::SynchronizePlayerPosition(_) => seen.position = true,
-            ClientboundPlayPacket::ChunkDataAndLight(_) => seen.chunk = true,
-            _ => {}
-        }
-    }
-    Ok(seen)
+    Ok(JoinObservations {
+        registry_count,
+        play_order,
+        keep_alive,
+    })
 }
 
 #[tokio::test]
 async fn client_reaches_play_and_receives_the_flat_world() {
-    // Bind to an ephemeral port; a radius-1 spawn keeps the chunk payload small.
-    let config = AppConfig::from_toml_str("bind = \"127.0.0.1:0\"\nspawn_chunk_radius = 1")
-        .expect("config parses");
+    // Ephemeral port; a radius-1 spawn keeps the chunk payload small, and a short
+    // keep-alive interval lets the test observe a ping without a wall-clock sleep.
+    let config = AppConfig::from_toml_str(
+        "bind = \"127.0.0.1:0\"\nspawn_chunk_radius = 1\nkeep_alive_interval_ms = 100",
+    )
+    .expect("config parses");
     let server = ferrumc_app::run(&config).await.expect("server starts");
     let addr = server.local_addr();
 
@@ -225,14 +278,24 @@ async fn client_reaches_play_and_receives_the_flat_world() {
         .expect("client flow finished within the timeout guard")
         .expect("client flow succeeded");
 
-    assert!(observed.join_game, "server must send JoinGame");
+    // Configuration enumerated every registry the client needs.
     assert!(
-        observed.position,
-        "server must send a SynchronizePlayerPosition"
+        observed.registry_count >= MIN_REGISTRIES,
+        "server must send at least {MIN_REGISTRIES} RegistryData packets, saw {}",
+        observed.registry_count,
     );
+
+    // The keystone play packets arrived in the loading-screen-releasing order.
+    assert_eq!(
+        observed.play_order,
+        vec!["join", "game_event", "center", "chunk", "sync"],
+        "join sequence out of order",
+    );
+
+    // A keep-alive landed within the timer window.
     assert!(
-        observed.chunk,
-        "server must send at least one ChunkDataAndLight"
+        observed.keep_alive,
+        "server must send a clientbound KeepAlive"
     );
 
     // Clean shutdown: the signal must wind the server down within the guard.
