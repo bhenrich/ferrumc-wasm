@@ -1,0 +1,18 @@
+{
+  "name": "ferrumc-blackbox-smoke",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Independent black-box protocol smoke test for the FerrumC v2 Minecraft server (Java 1.21.8 / protocol 772). Uses PrismarineJS node-minecraft-protocol as a TRULY independent client so our own packet code is never both the server-under-test and the test oracle.",
+  "scripts": {
+    "smoke": "node smoke.mjs",
+    "check": "node --check smoke.mjs"
+  },
+  "dependencies": {
+    "node-minecraft-protocol": "1.66.2",
+    "minecraft-data": "3.111.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
