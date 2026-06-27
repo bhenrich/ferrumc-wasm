@@ -324,6 +324,32 @@ impl InboundDecoder {
         self.buffer.advance(span.body_end);
         Ok(Some(packet))
     }
+
+    /// Skips the next complete frame for `state`, consuming its on-wire bytes
+    /// without decoding the body.
+    ///
+    /// This is the recovery counterpart to
+    /// [`next_packet_compressed`](Self::next_packet_compressed): that method
+    /// leaves the buffer intact when a frame decodes to an unknown packet id, so
+    /// a caller that chooses to *ignore* such a well-framed-but-unmodelled packet
+    /// (rather than tear the connection down) uses this to advance past it. Only
+    /// the length-delimited on-wire span is consumed — the (possibly compressed)
+    /// body is never inflated, so skipping is independent of compression.
+    ///
+    /// Returns `Ok(true)` when a complete frame was located and skipped,
+    /// `Ok(false)` when the buffer does not yet hold a full frame (nothing is
+    /// consumed), or a [`DecodeError`] if the frame's length prefix is itself
+    /// malformed or oversized.
+    pub fn skip_frame(&mut self, state: ConnectionState) -> Result<bool, DecodeError> {
+        let max = self.limits.max_frame_size(state);
+        match locate_frame(&self.buffer, state, max)? {
+            Some(span) => {
+                self.buffer.advance(span.body_end);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -541,6 +567,57 @@ mod tests {
             }
         );
         assert_eq!(err.disconnect_class(), DisconnectClass::ProtocolViolation);
+    }
+
+    #[test]
+    fn skip_frame_recovers_after_an_unknown_packet_id() {
+        // A serverbound configuration Plugin Message (0x02, not modelled) followed
+        // by a modelled Ack Finish Configuration (0x03). The unknown frame errors
+        // but leaves the buffer intact; skip_frame consumes exactly it so the next
+        // frame decodes cleanly — the recovery the connection layer relies on to
+        // tolerate config packets the vanilla client sends but the slice ignores.
+        let mut decoder = InboundDecoder::new(ConnectionLimits::default());
+        let compression = CompressionState::disabled();
+
+        let mut unknown = Vec::new();
+        write_var_int(&mut unknown, 0x02); // custom_payload / brand: not modelled
+        unknown.extend_from_slice(b"hello"); // arbitrary payload
+        let mut ack = Vec::new();
+        write_var_int(&mut ack, 0x03); // AckFinishConfiguration, empty body
+
+        let mut wire = frame(&unknown);
+        wire.extend_from_slice(&frame(&ack));
+        decoder.push(&wire).unwrap();
+
+        let err = decoder
+            .next_packet_compressed(ConnectionState::Configuration, &compression)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            FrameDecodeError::Decode(DecodeError::UnknownPacket {
+                state: ConnectionState::Configuration,
+                id: 0x02,
+            })
+        ));
+
+        // The unknown frame is still buffered; skipping consumes exactly it.
+        assert!(decoder.skip_frame(ConnectionState::Configuration).unwrap());
+
+        let next = decoder
+            .next_packet_compressed(ConnectionState::Configuration, &compression)
+            .unwrap();
+        assert!(matches!(next, Some(InboundPacket::Configuration(_))));
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn skip_frame_on_an_incomplete_buffer_consumes_nothing() {
+        // Only a partial frame is present: skip_frame reports false and leaves the
+        // buffer untouched, never advancing past bytes that have not arrived.
+        let mut decoder = InboundDecoder::new(ConnectionLimits::default());
+        decoder.push(&[0x05u8, 0x00]).unwrap(); // claims 5 body bytes, only 1 present
+        assert!(!decoder.skip_frame(ConnectionState::Configuration).unwrap());
+        assert_eq!(decoder.buffered_len(), 2);
     }
 
     #[test]

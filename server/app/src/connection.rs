@@ -28,8 +28,9 @@ use ferrumc_command::CommandSource;
 use ferrumc_core::PlayerId;
 use ferrumc_math::Vec3;
 use ferrumc_net::{
-    offline_uuid, CompressionState, ConnectionLimits, ConnectionState, DisconnectReason,
-    InboundDecoder, InboundPacket, OutboundEncoder, OutboundPacket, PlayWriter, StatusInfo,
+    offline_uuid, CompressionState, ConnectionLimits, ConnectionState, DecodeError,
+    DisconnectReason, FrameDecodeError, InboundDecoder, InboundPacket, OutboundEncoder,
+    OutboundPacket, PlayWriter, StatusInfo,
 };
 use ferrumc_proto::generated::configuration::{
     ClientboundConfigurationPacket, ClientboundKnownPacks, FinishConfiguration,
@@ -319,11 +320,11 @@ async fn run_login(
         let state = phase.connection_state();
         // Drain everything buffered before blocking on another read so pipelined
         // frames progress without an extra round trip.
-        if let Some(packet) = conn
+        match conn
             .decoder
-            .next_packet_compressed(state, &conn.compression)?
+            .next_packet_compressed(state, &conn.compression)
         {
-            match advance(conn, &mut phase, &mut name, &packet).await? {
+            Ok(Some(packet)) => match advance(conn, &mut phase, &mut name, &packet).await? {
                 LoginProgress::Continue => continue,
                 LoginProgress::Close => return Ok(None),
                 LoginProgress::Play => {
@@ -332,7 +333,25 @@ async fn run_login(
                         .map(Some)
                         .ok_or_else(|| anyhow::anyhow!("reached play without a login name"));
                 }
+            },
+            // Buffer holds no complete frame yet: fall through and read more.
+            Ok(None) => {}
+            // A well-framed frame carrying an unmodelled packet id in login or
+            // configuration is ignored, not fatal: the vanilla client sends
+            // several configuration packets the slice does not react to (cookie
+            // response 0x01, plugin message / brand 0x02, keep alive 0x04, pong
+            // 0x05, resource pack response 0x06), and the spec requires a server
+            // to skip unhandled configuration packets rather than disconnect. The
+            // frame is length-delimited but `next_packet_compressed` leaves it
+            // buffered on error, so it is explicitly skipped before continuing.
+            // Only an unknown id is tolerated; a malformed *known* packet still
+            // follows the disconnect policy below.
+            Err(err) if is_ignorable_unknown_packet(state, &err) => {
+                tracing::debug!(?state, %err, "ignoring unmodelled serverbound packet");
+                conn.decoder.skip_frame(state)?;
+                continue;
             }
+            Err(err) => return Err(err.into()),
         }
 
         let io_timeout = conn.ctx.io_timeout;
@@ -349,6 +368,25 @@ async fn run_login(
             ReadOutcome::Eof | ReadOutcome::Shutdown => return Ok(None),
         }
     }
+}
+
+/// Whether `err` is a well-framed frame carrying an unknown (unmodelled) packet
+/// id in a state where the server should ignore it rather than disconnect.
+///
+/// Tolerance is scoped to the login and configuration states: the vanilla client
+/// legitimately sends configuration packets the slice does not model (e.g. the
+/// `minecraft:brand` plugin message), and the protocol requires the server to
+/// skip them. Handshaking and status remain strict — an unknown id in those
+/// single-exchange states is a genuine protocol violation. A *malformed* known
+/// packet ([`DecodeError::MalformedBody`] and friends) is never ignored here.
+fn is_ignorable_unknown_packet(state: ConnectionState, err: &FrameDecodeError) -> bool {
+    matches!(
+        state,
+        ConnectionState::Login | ConnectionState::Configuration
+    ) && matches!(
+        err,
+        FrameDecodeError::Decode(DecodeError::UnknownPacket { .. })
+    )
 }
 
 /// Feeds one decoded packet to the login state machine, sending replies.
