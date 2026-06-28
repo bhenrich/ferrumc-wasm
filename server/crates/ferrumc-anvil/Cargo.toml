@@ -6,9 +6,32 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Classified, structured error types for a crate that parses untrusted files.
+thiserror = { workspace = true }
+# zlib (Anvil compression type 2) and gzip (type 1) decoders. Pure-Rust facade
+# over miniz_oxide; already a workspace dependency (used by ferrumc-net for
+# protocol compression), so no new third-party surface is introduced.
+flate2 = { workspace = true }
+
+# Internal crates this importer bridges between.
+# Hardened NBT decoder for chunk payloads (used instead of a hand-rolled parser).
+# Internally bounds every read of the untrusted payload via its BoundedReader.
+ferrumc-nbt = { workspace = true }
+# Typed coordinates (RegionPos/ChunkPos/BlockPos) — no raw (i32, i32) tuples.
+ferrumc-math = { workspace = true }
+# Vanilla block name + properties -> numeric block-state id (compute_state_id).
+ferrumc-registry = { workspace = true }
+# The import target: Chunk / ChunkSection / BlockStateId world model.
+ferrumc-world = { workspace = true }
 
 [dev-dependencies]
+# Integration tests build synthetic regions in-memory: NBT (write_named_root)
+# + zlib (flate2) to assemble chunk payloads, then assert against the world
+# model (BlockStateId) at typed coordinates (BlockPos/ChunkPos/RegionPos).
+ferrumc-nbt = { workspace = true }
+flate2 = { workspace = true }
+ferrumc-world = { workspace = true }
+ferrumc-math = { workspace = true }
 
 [lints]
 workspace = true
