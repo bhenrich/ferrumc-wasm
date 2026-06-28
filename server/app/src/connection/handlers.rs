@@ -805,10 +805,10 @@ async fn handle_use_item_on(
 
     // Consult the plugins at the interaction intent boundary FIRST: a right-click on
     // a block is an interaction regardless of what (if anything) it would place. A
-    // Deny stops the interaction here — ack the sequence so the client's prediction
-    // ends, show the reason, and do not place — before the block-place decision even
-    // runs. (The current protocol slice only carries use-item-on-block, so the
-    // target is always a `Block`; air/entity interactions are a future wiring.)
+    // Deny stops the interaction here — heal the client's prediction, show the
+    // reason, and do not place — before the block-place decision even runs. (The
+    // current protocol slice only carries use-item-on-block, so the target is always
+    // a `Block`; air/entity interactions are a future wiring.)
     let (interact_decision, interact_intents) = ctx.block_events.before_interact(
         &InteractAttempt::new(
             player,
@@ -822,7 +822,23 @@ async fn handle_use_item_on(
         &perms,
     );
     if let PluginEventDecision::Deny { message } = interact_decision {
-        ack_sequence(writer, debug, compression, &ctx.clock, sequence)?;
+        // The interaction is refused. If the held item would have placed a block,
+        // the client already predicted that placement at `position`; an ack alone
+        // heals to the predicted state and leaves a ghost block (see
+        // `reject_block_edit`), so route the same heal a refused place uses. A
+        // non-placeable interaction predicts no block, so a plain ack ends it.
+        if let Some(held_state) = inventory.held().placeable_block() {
+            reject_block_edit(
+                ctx,
+                player,
+                position,
+                sequence,
+                BlockStateId::new(held_state),
+            )
+            .await?;
+        } else {
+            ack_sequence(writer, debug, compression, &ctx.clock, sequence)?;
+        }
         deliver_deny_message(ctx, writer, debug, compression, message);
         return route_emitted_intents(
             ctx,
