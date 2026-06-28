@@ -334,6 +334,7 @@ dependencies = [
  "ferrumc-permission",
  "ferrumc-plugin-api",
  "ferrumc-plugin-block-rules",
+ "ferrumc-plugin-greeter",
  "ferrumc-plugin-host",
  "ferrumc-plugin-spawn-protect",
  "ferrumc-proto",
@@ -522,6 +523,17 @@ name = "ferrumc-plugin-fixture"
 version = "0.2.0-dev"
 dependencies = [
  "ferrumc-plugin-api",
+]
+
+[[package]]
+name = "ferrumc-plugin-greeter"
+version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-core",
+ "ferrumc-math",
+ "ferrumc-permission",
+ "ferrumc-plugin-api",
+ "tracing",
 ]
 
 [[package]]

@@ -1,0 +1,35 @@
+[package]
+name = "ferrumc-plugin-greeter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# An rlib only: this sample exercises the in-process event surface (join greet,
+# move/interact observation, chat veto), none of which crosses the C ABI, so it
+# needs no `cdylib` export — and can therefore keep the workspace's blanket
+# `#![forbid(unsafe_code)]` (unlike the dual cdylib/rlib samples, which must
+# downgrade to `deny` to export a C symbol).
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# Text components for the greeting / chat-filter feedback, and the player id.
+ferrumc-core = { workspace = true }
+# The stable plugin SDK: the in-process `Plugin` trait, the new event-decision
+# surface (before_chat / before_interact + `PluginEventDecision`), the PlayerMove
+# notification, the capability manifest, events, and mutation intents.
+ferrumc-plugin-api = { workspace = true }
+# Structured logging for the observe-only Interact / PlayerMove demonstrations.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Typed coordinates the unit tests use to build move / interact attempts and the
+# WorldView stub.
+ferrumc-math = { workspace = true }
+# Permission node/resolution types for the permission-facade stub.
+ferrumc-permission = { workspace = true }
+
+[lints]
+workspace = true
