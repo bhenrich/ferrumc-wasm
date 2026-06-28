@@ -68,7 +68,8 @@ cd ../tests/blackbox && pnpm install && node smoke.mjs 127.0.0.1 25565   # indep
 ```
 
 ## Dev method (for future agents — READ THIS)
-- **Identity:** commit as `Sweattypalms <stranger8722@gmail.com>` (repo-local git config is set). NEVER add a Co-Authored-By trailer or mention Claude/Codex/AI in commits or PRs (the business identity `git@saadm.com` must never appear). See memory `no-ai-attribution`.
+- **Identity:** commit as `Sweattypalms <stranger8722@gmail.com>` (repo-local git config is set). NEVER add a Co-Authored-By trailer or mention Claude/Codex/AI in commits or PRs (the business identity `git@saadm.com` must never appear).
+- **Pushing is gated:** commit locally freely, but NEVER `git push` / publish without Saad's EXPLICIT confirmation each time — the repo is public and he tests locally before anything goes public.
 - **Workflow:** per-commit pipeline scout → implement → adversarial-review → fix-to-green; subagents on 1M-context Opus; **Codex (gpt-5.5) independently audits every protocol-touching commit** (it has caught ~a dozen real bugs the Claude review missed). Keep workflow structured-output schemas LEAN (a complex schema once hit the retry cap).
 - **Parallelism:** one code-editing workflow per checkout; for true parallel lanes use a git **worktree per workstream** with its own `CARGO_TARGET_DIR`, then merge serially (placement ‖ dashboard proved this). Reserve new crates in one tiny serial commit first to avoid root-Cargo.toml/lock collisions.
 - **Protocol ground truth:** `fixtures/protocol/1_21_8/protocol.json` (+ `blocks.json`). Human-readable: `../wiki/protocol/`. v1 reference impl: `../ref/`. NEVER hand-edit `crates/ferrumc-proto/src/generated/`; edit `docs/protocol/1_21_8/packets.toml` + `cargo xtask generate`. Complex tagged-union packets are modeled as opaque bytes + hand-encoded.
