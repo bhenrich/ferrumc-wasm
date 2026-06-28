@@ -17,7 +17,8 @@ use crate::outbound::OutboundMessage;
 use crate::translate::{
     ack_shell, block_update_shell, chunk_for_position, entity_spawn_shell, entity_teleport_shell,
     move_shell, play_packet_to_input, player_info_add, player_info_remove, remove_entities_shell,
-    shard_for_position, update_entity_position_shell,
+    set_equipment_shell, set_head_rotation_shell, shard_for_position,
+    update_entity_position_and_rotation_shell, update_entity_rotation_shell,
 };
 
 /// Default capacity of each shard's input channel.
@@ -67,6 +68,17 @@ struct SessionEntry {
     name: String,
     entity_id: i32,
     position: Vec3,
+    /// The player's last-known body yaw in degrees (seeded at join, refreshed from
+    /// every movement output). Carried on the spawn sent to a viewer entering view
+    /// so the remote player appears facing the right way.
+    yaw: f32,
+    /// The player's last-known pitch in degrees (seeded at join, refreshed from
+    /// every movement output).
+    pitch: f32,
+    /// The pre-encoded `SetEquipment` body (main-hand slot + trusted Slot) for this
+    /// player, cached at join and refreshed on a hotbar change, sent to viewers as
+    /// they enter view. Empty means "no equipment to show" (the send is skipped).
+    equipment: Vec<u8>,
     /// The last position of each *subject* (keyed by the subject's network
     /// `entity_id`) actually **delivered** to this viewer.
     ///
@@ -78,6 +90,21 @@ struct SessionEntry {
     /// naturally promotes to an absolute teleport that re-syncs), and pruned when
     /// the subject despawns. Bounded by the number of connected players.
     delivered: BTreeMap<i32, Vec3>,
+}
+
+/// A snapshot of an in-range peer captured for a join-visibility exchange.
+///
+/// Copied out of the player map before the mutable per-recipient sends so the map
+/// can be borrowed mutably inside the loop (mirrors the name/equipment clones the
+/// move broadcast makes). Carries everything a spawn + equipment send needs.
+struct PeerSnapshot {
+    player: PlayerId,
+    entity_id: i32,
+    name: String,
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+    equipment: Vec<u8>,
 }
 
 /// A handle to one player's session, returned by
@@ -342,6 +369,25 @@ impl SessionRouter {
         name: &str,
         position: Vec3,
     ) -> Result<PlayerSessionHandle, SessionError> {
+        self.join_player_with_equipment(player, name, position, Vec::new())
+    }
+
+    /// Joins `player` exactly like [`join_player`](Self::join_player), but also
+    /// caches their pre-encoded `equipment` (main-hand `SetEquipment` body) so it is
+    /// sent to every viewer the join makes the player visible to.
+    ///
+    /// Caching the equipment *at join* (rather than via a follow-up call) closes the
+    /// enter-view race: viewers that become visible to the joiner during this call
+    /// receive the held item immediately with the spawn, not only after the next
+    /// hotbar change. An empty `equipment` skips the cosmetic send. All the error and
+    /// backpressure behaviour of [`join_player`](Self::join_player) applies here.
+    pub fn join_player_with_equipment(
+        &mut self,
+        player: PlayerId,
+        name: &str,
+        position: Vec3,
+        equipment: Vec<u8>,
+    ) -> Result<PlayerSessionHandle, SessionError> {
         let shard = shard_for_position(position);
         if !self.shards.contains_key(&shard) {
             return Err(SessionError::UnknownShard { shard });
@@ -388,6 +434,9 @@ impl SessionRouter {
                 name: name.to_owned(),
                 entity_id,
                 position,
+                yaw: 0.0,
+                pitch: 0.0,
+                equipment,
                 delivered: BTreeMap::new(),
             },
         );
@@ -432,6 +481,12 @@ impl SessionRouter {
     /// the very next movement delta is measured against the position they actually
     /// received. The joiner's own visibility cannot overflow here: [`join_player`](Self::join_player)
     /// stages it against guaranteed channel capacity before calling this.
+    ///
+    /// After each mandatory spawn, a **droppable** [`SetEquipment`](set_equipment_shell)
+    /// for the spawned subject is sent to the recipient (both directions) from the
+    /// subject's cached equipment, so the joiner and existing players immediately see
+    /// what each other is holding. The equipment send is skipped when the cached body
+    /// is empty (nothing to show); being droppable, it never forces a disconnect.
     fn broadcast_join_visibility(
         &mut self,
         joiner: PlayerId,
@@ -443,10 +498,13 @@ impl SessionRouter {
         };
         let joiner_eid = joiner_entry.entity_id;
         let joiner_name = joiner_entry.name.clone();
+        let joiner_yaw = joiner_entry.yaw;
+        let joiner_pitch = joiner_entry.pitch;
+        let joiner_equipment = joiner_entry.equipment.clone();
         let joiner_chunk = chunk_for_position(joiner_position);
         // Snapshot the in-range existing players first so the player map can be
         // mutated (seeding delivered baselines) while iterating.
-        let others: Vec<(PlayerId, i32, String, Vec3)> = self
+        let others: Vec<PeerSnapshot> = self
             .players
             .iter()
             .filter(|(&other, entry)| {
@@ -457,43 +515,79 @@ impl SessionRouter {
                         self.view_distance,
                     )
             })
-            .map(|(&other, entry)| (other, entry.entity_id, entry.name.clone(), entry.position))
+            .map(|(&other, entry)| PeerSnapshot {
+                player: other,
+                entity_id: entry.entity_id,
+                name: entry.name.clone(),
+                position: entry.position,
+                yaw: entry.yaw,
+                pitch: entry.pitch,
+                equipment: entry.equipment.clone(),
+            })
             .collect();
-        for (other, other_eid, other_name, other_pos) in others {
+        for other in others {
             // Show the joiner to the existing player: both the tab-list add and the
             // entity spawn are mandatory (a dropped spawn leaves an invisible body).
-            if let Some(entry) = self.players.get_mut(&other) {
+            if let Some(entry) = self.players.get_mut(&other.player) {
                 Self::send_mandatory(
                     entry,
                     player_info_add(joiner, &joiner_name),
-                    other,
+                    other.player,
                     to_disconnect,
                 );
                 Self::send_mandatory_spawn(
                     entry,
-                    entity_spawn_shell(joiner_eid, joiner, joiner_position),
+                    entity_spawn_shell(
+                        joiner_eid,
+                        joiner,
+                        joiner_position,
+                        joiner_yaw,
+                        joiner_pitch,
+                    ),
                     joiner_eid,
                     joiner_position,
-                    other,
+                    other.player,
                     to_disconnect,
                 );
+                if !joiner_equipment.is_empty() {
+                    Self::send_droppable(
+                        entry,
+                        set_equipment_shell(joiner_eid, joiner_equipment.clone()),
+                        other.player,
+                        to_disconnect,
+                    );
+                }
             }
             // Show the existing player to the joiner.
             if let Some(entry) = self.players.get_mut(&joiner) {
                 Self::send_mandatory(
                     entry,
-                    player_info_add(other, &other_name),
+                    player_info_add(other.player, &other.name),
                     joiner,
                     to_disconnect,
                 );
                 Self::send_mandatory_spawn(
                     entry,
-                    entity_spawn_shell(other_eid, other, other_pos),
-                    other_eid,
-                    other_pos,
+                    entity_spawn_shell(
+                        other.entity_id,
+                        other.player,
+                        other.position,
+                        other.yaw,
+                        other.pitch,
+                    ),
+                    other.entity_id,
+                    other.position,
                     joiner,
                     to_disconnect,
                 );
+                if !other.equipment.is_empty() {
+                    Self::send_droppable(
+                        entry,
+                        set_equipment_shell(other.entity_id, other.equipment),
+                        joiner,
+                        to_disconnect,
+                    );
+                }
             }
         }
     }
@@ -546,11 +640,13 @@ impl SessionRouter {
     /// - [`GameOutput::PlayerSpawned`] refreshes the player's cached position;
     ///   the spawn itself was already broadcast to viewers at
     ///   [`join_player`](Self::join_player) time, so nothing else is sent.
-    /// - [`GameOutput::PlayerMoved`] broadcasts the move (droppable) to every
-    ///   *other* in-range player — a relative `UpdateEntityPosition` when every
-    ///   axis fits the i16 fixed-point range, an absolute `EntityTeleport`
-    ///   otherwise — measured per viewer against its delivered baseline, then
-    ///   refreshes the cached position used for visibility scoping.
+    /// - [`GameOutput::PlayerMoved`] broadcasts the move/rotation (droppable) to
+    ///   every *other* in-range player — a relative
+    ///   `UpdateEntityPositionAndRotation` when every axis fits the i16 fixed-point
+    ///   range (else an absolute `EntityTeleport`) plus a `SetHeadRotation` for a
+    ///   position change, or an `UpdateEntityRotation` + `SetHeadRotation` for a
+    ///   rotation-only turn — measured per viewer against its delivered baseline,
+    ///   then refreshes the cached position/rotation used for visibility scoping.
     /// - [`GameOutput::PlayerPositionCorrected`] snaps the player itself back to
     ///   the authoritative position; it is **mandatory** (not a broadcast).
     /// - [`GameOutput::BlockChanged`] broadcasts a `BlockUpdate` (droppable) to
@@ -583,12 +679,25 @@ impl SessionRouter {
             GameOutput::PlayerSpawned { player, position } => {
                 self.update_position(*player, *position);
             }
-            GameOutput::PlayerMoved { player, position } => {
+            GameOutput::PlayerMoved {
+                player,
+                position,
+                yaw,
+                pitch,
+                position_changed,
+            } => {
                 // Broadcast BEFORE refreshing the cached position: visibility is
                 // scoped against the new position, but each viewer's delta is
                 // measured against its own delivered baseline, not this cache.
-                self.broadcast_move(*player, *position, &mut to_disconnect);
-                self.update_position(*player, *position);
+                self.broadcast_move(
+                    *player,
+                    *position,
+                    *yaw,
+                    *pitch,
+                    *position_changed,
+                    &mut to_disconnect,
+                );
+                self.update_position_and_rotation(*player, *position, *yaw, *pitch);
             }
             GameOutput::PlayerPositionCorrected { player, position } => {
                 // A correction snaps a desynced client back to its authoritative
@@ -737,49 +846,79 @@ impl SessionRouter {
         }
     }
 
-    /// Refreshes the cached position the router routes visibility against.
+    /// Refreshes only the cached position the router routes visibility against
+    /// (used on spawn, where rotation stays at its join seed).
     fn update_position(&mut self, player: PlayerId, position: Vec3) {
         if let Some(entry) = self.players.get_mut(&player) {
             entry.position = position;
         }
     }
 
-    /// Broadcasts `mover`'s new `position` to every other player within view
-    /// distance, recording any closed recipients in `to_disconnect`.
+    /// Refreshes the cached position and rotation the router routes visibility
+    /// against and carries on the next spawn a viewer entering view receives.
+    fn update_position_and_rotation(
+        &mut self,
+        player: PlayerId,
+        position: Vec3,
+        yaw: f32,
+        pitch: f32,
+    ) {
+        if let Some(entry) = self.players.get_mut(&player) {
+            entry.position = position;
+            entry.yaw = yaw;
+            entry.pitch = pitch;
+        }
+    }
+
+    /// Broadcasts `mover`'s new `position` and rotation (`yaw`/`pitch`, degrees) to
+    /// every other player within view distance, recording any closed recipients in
+    /// `to_disconnect`. `position_changed` distinguishes a real move from a
+    /// rotation-only turn in place.
     ///
     /// A viewer that *already* has a [`delivered`](SessionEntry::delivered)
-    /// baseline for the mover gets a **droppable** movement carrier chosen against
-    /// that baseline: a relative [`update_entity_position_shell`] when every axis
-    /// fits the i16 fixed-point range, otherwise an absolute
-    /// [`entity_teleport_shell`]. The baseline advances **only** on a successful
-    /// enqueue, so a move dropped under backpressure self-corrects: its next delta
-    /// is measured from the stale baseline, grows, and promotes to a teleport —
-    /// the viewer never drifts. Movement is droppable, so a *full* channel simply
-    /// skips this update; a *closed* channel is recorded for disconnect.
+    /// baseline for the mover gets **droppable** cosmetic carriers:
+    /// - **position changed**: a relative
+    ///   [`update_entity_position_and_rotation_shell`] when every axis fits the i16
+    ///   fixed-point range, otherwise an absolute [`entity_teleport_shell`], plus a
+    ///   [`set_head_rotation_shell`] so the head turns. The baseline advances
+    ///   **only** on a successful move enqueue, so a move dropped under backpressure
+    ///   self-corrects: its next delta is measured from the stale baseline, grows,
+    ///   and promotes to a teleport — the viewer never drifts.
+    /// - **rotation only**: an [`update_entity_rotation_shell`] plus a
+    ///   [`set_head_rotation_shell`]; the baseline is left unchanged (no move).
+    ///
+    /// All of these are droppable, so a *full* channel simply skips the update; a
+    /// *closed* channel is recorded for disconnect.
     ///
     /// A viewer with **no** baseline is one the mover is *entering view of* (it
     /// joined out of range, or its earlier spawn was lost). Such a viewer must
-    /// never receive a bare teleport for an entity it never spawned — a real client
-    /// ignores movement for an unknown entity id, leaving an invisible body. So the
-    /// mover is *spawned* into view instead: a **mandatory** [`player_info_add`]
-    /// then a **mandatory** [`entity_spawn_shell`] (which seeds the baseline at this
-    /// position), and no movement packet this tick — the spawn already carries the
-    /// position. A viewer that cannot accept either mandatory packet is pushed to
+    /// never receive a bare movement packet for an entity it never spawned — a real
+    /// client ignores it, leaving an invisible body. So the mover is *spawned* into
+    /// view instead: a **mandatory** [`player_info_add`] then a **mandatory**
+    /// [`entity_spawn_shell`] carrying the facing (which seeds the baseline at this
+    /// position), then a **droppable** [`set_equipment_shell`] (skipped when empty)
+    /// so the held item shows immediately — and no movement packet this tick. A
+    /// viewer that cannot accept either mandatory packet is pushed to
     /// `to_disconnect` (the slow-client policy).
+    #[allow(clippy::too_many_arguments)] // one broadcast: mover identity + pose + delivery sink
     fn broadcast_move(
         &mut self,
         mover: PlayerId,
         position: Vec3,
+        yaw: f32,
+        pitch: f32,
+        position_changed: bool,
         to_disconnect: &mut Vec<PlayerId>,
     ) {
         let Some(mover_entry) = self.players.get(&mover) else {
             return;
         };
         let mover_eid = mover_entry.entity_id;
-        // Clone the mover's name before the loop: the per-viewer entries are
-        // mutably borrowed inside it, so the immutable borrow of the mover entry
+        // Clone the mover's name + equipment before the loop: the per-viewer entries
+        // are mutably borrowed inside it, so the immutable borrow of the mover entry
         // cannot survive (mirrors `broadcast_join_visibility`).
         let mover_name = mover_entry.name.clone();
+        let mover_equipment = mover_entry.equipment.clone();
         let mover_chunk = chunk_for_position(position);
         let view_distance = self.view_distance;
         // Snapshot the in-range viewers so each entry can be mutated (advancing its
@@ -802,20 +941,46 @@ impl SessionRouter {
                 continue;
             };
             if let Some(last) = entry.delivered.get(&mover_eid).copied() {
-                // Already in view: ordinary droppable movement.
-                let packet = relative_or_teleport(mover_eid, last, position);
-                match entry.outbound.try_send(OutboundMessage::droppable(packet)) {
-                    // Advance the delivered baseline only on success (the
-                    // self-correcting invariant; see the method and field docs).
-                    Ok(()) => {
-                        entry.delivered.insert(mover_eid, position);
+                if position_changed {
+                    // Already in view, position changed: a relative/absolute move
+                    // carrier plus a head turn, all droppable.
+                    let packet =
+                        relative_or_teleport_with_rotation(mover_eid, last, position, yaw, pitch);
+                    match entry.outbound.try_send(OutboundMessage::droppable(packet)) {
+                        // Advance the delivered baseline only on success (the
+                        // self-correcting invariant; see the method and field docs).
+                        Ok(()) => {
+                            entry.delivered.insert(mover_eid, position);
+                            Self::send_droppable(
+                                entry,
+                                set_head_rotation_shell(mover_eid, yaw),
+                                viewer,
+                                to_disconnect,
+                            );
+                        }
+                        Err(TrySendError::Full(_)) => {}
+                        Err(TrySendError::Closed(_)) => to_disconnect.push(viewer),
                     }
-                    Err(TrySendError::Full(_)) => {}
-                    Err(TrySendError::Closed(_)) => to_disconnect.push(viewer),
+                } else {
+                    // Rotation only: turn the body and head in place, baseline
+                    // unchanged (no position moved).
+                    Self::send_droppable(
+                        entry,
+                        update_entity_rotation_shell(mover_eid, yaw, pitch),
+                        viewer,
+                        to_disconnect,
+                    );
+                    Self::send_droppable(
+                        entry,
+                        set_head_rotation_shell(mover_eid, yaw),
+                        viewer,
+                        to_disconnect,
+                    );
                 }
             } else {
-                // Entering view: spawn the mover (mandatory add + spawn) and seed
-                // the baseline; never a bare teleport for an unspawned entity.
+                // Entering view: spawn the mover (mandatory add + spawn) carrying the
+                // facing, seed the baseline, then a droppable equipment send; never a
+                // bare movement packet for an unspawned entity.
                 Self::send_mandatory(
                     entry,
                     player_info_add(mover, &mover_name),
@@ -824,12 +989,53 @@ impl SessionRouter {
                 );
                 Self::send_mandatory_spawn(
                     entry,
-                    entity_spawn_shell(mover_eid, mover, position),
+                    entity_spawn_shell(mover_eid, mover, position, yaw, pitch),
                     mover_eid,
                     position,
                     viewer,
                     to_disconnect,
                 );
+                if !mover_equipment.is_empty() {
+                    Self::send_droppable(
+                        entry,
+                        set_equipment_shell(mover_eid, mover_equipment.clone()),
+                        viewer,
+                        to_disconnect,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Broadcasts `player`'s changed held item (the pre-encoded `equipment`
+    /// [`SetEquipment`](set_equipment_shell) body) to every viewer that currently
+    /// has `player` spawned, and refreshes the cached body so later viewers entering
+    /// view receive it too.
+    ///
+    /// The body is built app-side (it owns the trusted Slot encoder) and passed
+    /// opaque. Only viewers holding a [`delivered`](SessionEntry::delivered) baseline
+    /// for the subject are sent the update — exactly those that have the entity
+    /// spawned. The send is **droppable** and best-effort (cosmetic): a *full* or
+    /// *closed* recipient simply misses it, matching the chat broadcasts; a closed
+    /// channel is cleaned up when that connection's own loop ends. An unknown player
+    /// is a silent no-op.
+    pub fn set_equipment(&mut self, player: PlayerId, equipment: Vec<u8>) {
+        let subject_eid = match self.players.get_mut(&player) {
+            Some(entry) => {
+                entry.equipment.clone_from(&equipment);
+                entry.entity_id
+            }
+            None => return,
+        };
+        let packet = set_equipment_shell(subject_eid, equipment);
+        for (&viewer, entry) in &self.players {
+            if viewer == player {
+                continue;
+            }
+            if entry.delivered.contains_key(&subject_eid) {
+                let _ = entry
+                    .outbound
+                    .try_send(OutboundMessage::droppable(packet.clone()));
             }
         }
     }
@@ -1054,7 +1260,15 @@ impl SessionRouter {
         }
         // Update authoritative position and let in-range viewers see the move via
         // the simulation at the next tick.
-        let routed = self.route_game_input(player, GameInput::PlayerMove { player, position });
+        let routed = self.route_game_input(
+            player,
+            GameInput::PlayerMove {
+                player,
+                position: Some(position),
+                yaw: None,
+                pitch: None,
+            },
+        );
         // A target that overflowed the mandatory position-sync is torn down.
         for victim in to_disconnect {
             let _ = self.disconnect_player(victim);
@@ -1114,22 +1328,33 @@ impl SessionRouter {
     }
 }
 
-/// Builds the movement carrier for a move from `last` to `position`: a relative
-/// [`update_entity_position_shell`] when every axis fits the i16 fixed-point
-/// range, otherwise an absolute [`entity_teleport_shell`].
+/// Builds the movement carrier for a move from `last` to `position` facing
+/// `yaw`/`pitch` (degrees): a relative
+/// [`update_entity_position_and_rotation_shell`] when every axis fits the i16
+/// fixed-point range, otherwise an absolute [`entity_teleport_shell`].
 ///
 /// Selecting per-axis (rather than by a single squared-distance threshold) makes
 /// the choice exactly match the wire encoding's limit, so a delta that would
-/// overflow `i16` always teleports instead of silently saturating.
-fn relative_or_teleport(entity_id: i32, last: Vec3, position: Vec3) -> ClientboundPlayPacket {
-    match update_entity_position_shell(
+/// overflow `i16` always teleports instead of silently saturating. Both carriers
+/// convey the rotation: the relative one as angle bytes, the teleport as f32
+/// degrees (its native form).
+fn relative_or_teleport_with_rotation(
+    entity_id: i32,
+    last: Vec3,
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+) -> ClientboundPlayPacket {
+    match update_entity_position_and_rotation_shell(
         entity_id,
         position.x - last.x,
         position.y - last.y,
         position.z - last.z,
+        yaw,
+        pitch,
     ) {
         Some(relative) => relative,
-        None => entity_teleport_shell(entity_id, position),
+        None => entity_teleport_shell(entity_id, position, yaw, pitch),
     }
 }
 
@@ -1253,7 +1478,9 @@ mod tests {
             inbox.try_recv(),
             Ok(GameInput::PlayerMove {
                 player: p,
-                position: Vec3::new(20.0, 64.0, 20.0),
+                position: Some(Vec3::new(20.0, 64.0, 20.0)),
+                yaw: None,
+                pitch: None,
             })
         );
     }
@@ -1311,6 +1538,9 @@ mod tests {
             .route_output(&GameOutput::PlayerMoved {
                 player: p,
                 position: Vec3::new(4.0, 5.0, 6.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                position_changed: true,
             })
             .is_empty());
         assert!(handle.try_recv().is_none());
@@ -1356,6 +1586,9 @@ mod tests {
         let closed = router.route_output(&GameOutput::PlayerMoved {
             player: player("nobody"),
             position: Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         });
         assert!(closed.is_empty());
     }
@@ -1460,6 +1693,9 @@ mod tests {
         let closed = router.route_output(&GameOutput::PlayerMoved {
             player: mover,
             position: Vec3::new(9.0, 64.0, 9.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         });
         // The viewer is full, not closed: nothing to disconnect.
         assert!(closed.is_empty());
@@ -1484,6 +1720,9 @@ mod tests {
         let closed = router.route_output(&GameOutput::PlayerMoved {
             player: mover,
             position: Vec3::new(9.0, 64.0, 9.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         });
         assert_eq!(closed, vec![viewer]);
     }
@@ -1667,7 +1906,9 @@ mod tests {
             inbox.try_recv(),
             Ok(GameInput::PlayerMove {
                 player: p,
-                position: dest,
+                position: Some(dest),
+                yaw: None,
+                pitch: None,
             })
         );
     }
@@ -1704,14 +1945,17 @@ mod tests {
         let closed = router.route_output(&GameOutput::PlayerMoved {
             player: mover,
             position: Vec3::new(10.0, 64.0, 9.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         });
         assert!(closed.is_empty());
-        let ClientboundPlayPacket::UpdateEntityPosition(rel) = viewer_handle
+        let ClientboundPlayPacket::UpdateEntityPositionAndRotation(rel) = viewer_handle
             .try_recv()
             .expect("a relative move")
             .into_packet()
         else {
-            panic!("expected an UpdateEntityPosition for a small move");
+            panic!("expected an UpdateEntityPositionAndRotation for a small move");
         };
         assert_eq!(rel.entity_id(), mover_eid);
         // Deltas are `(new - last) * 4096`: dx = 2, dy = 0, dz = 1.
@@ -1743,6 +1987,9 @@ mod tests {
         let closed = router.route_output(&GameOutput::PlayerMoved {
             player: mover,
             position: new_pos,
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         });
         assert!(closed.is_empty());
         let ClientboundPlayPacket::EntityTeleport(tp) =
@@ -1777,6 +2024,9 @@ mod tests {
         let closed = router.route_output(&GameOutput::PlayerMoved {
             player: far,
             position: Vec3::new(81.0, 64.0, 81.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         });
         assert!(closed.is_empty());
         assert!(near_handle.try_recv().is_none());
@@ -2238,6 +2488,9 @@ mod tests {
         let closed = router.route_output(&GameOutput::PlayerMoved {
             player: mover,
             position: near_pos,
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         });
         assert!(closed.is_empty());
         assert_player_info_add(&mut viewer_handle, mover);
@@ -2251,14 +2504,17 @@ mod tests {
         let closed = router.route_output(&GameOutput::PlayerMoved {
             player: mover,
             position: step,
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         });
         assert!(closed.is_empty());
-        let ClientboundPlayPacket::UpdateEntityPosition(rel) = viewer_handle
+        let ClientboundPlayPacket::UpdateEntityPositionAndRotation(rel) = viewer_handle
             .try_recv()
             .expect("a relative move after the spawn seeded the baseline")
             .into_packet()
         else {
-            panic!("expected an UpdateEntityPosition once a baseline exists");
+            panic!("expected an UpdateEntityPositionAndRotation once a baseline exists");
         };
         assert_eq!(rel.entity_id(), mover_eid);
         // dx = (11 - 10) * 4096 = 4096.
@@ -2343,6 +2599,9 @@ mod tests {
         let closed = router.route_output(&GameOutput::PlayerMoved {
             player: mover,
             position: new_pos,
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         });
         assert!(closed.is_empty());
         let ClientboundPlayPacket::EntityTeleport(tp) =
@@ -2378,6 +2637,9 @@ mod tests {
         let closed = router.route_output(&GameOutput::PlayerMoved {
             player: mover,
             position: Vec3::new(10.0, 64.0, 8.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         });
         assert!(closed.is_empty());
 
@@ -2391,17 +2653,210 @@ mod tests {
         let closed = router.route_output(&GameOutput::PlayerMoved {
             player: mover,
             position: Vec3::new(11.0, 64.0, 8.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         });
         assert!(closed.is_empty());
-        let ClientboundPlayPacket::UpdateEntityPosition(rel) = viewer_handle
+        let ClientboundPlayPacket::UpdateEntityPositionAndRotation(rel) = viewer_handle
             .try_recv()
             .expect("a relative move")
             .into_packet()
         else {
-            panic!("expected an UpdateEntityPosition");
+            panic!("expected an UpdateEntityPositionAndRotation");
         };
         assert_eq!(rel.entity_id(), mover_eid);
         assert_eq!((rel.delta_x(), rel.delta_y(), rel.delta_z()), (12288, 0, 0));
+    }
+
+    /// A non-empty pre-encoded main-hand equipment body (slot 0 + a fake Slot).
+    /// The router treats it opaquely; only its non-emptiness and round-trip matter.
+    fn equipment_body() -> Vec<u8> {
+        vec![0x00, 0x01, 0x01]
+    }
+
+    /// Reads the next `SetEquipment` packet off `handle`, asserting its entity id
+    /// and opaque body.
+    fn assert_set_equipment(handle: &mut PlayerSessionHandle, eid: i32, body: &[u8]) {
+        let ClientboundPlayPacket::SetEquipment(equip) = handle
+            .try_recv()
+            .expect("a set-equipment packet")
+            .into_packet()
+        else {
+            panic!("expected a SetEquipment packet");
+        };
+        assert_eq!(equip.entity_id(), eid);
+        assert_eq!(equip.equipments(), body);
+    }
+
+    #[test]
+    fn viewer_receives_equipment_on_enter_view_at_join() {
+        // A player joining in view of an existing viewer is shown — beyond the
+        // mandatory add + spawn — a droppable SetEquipment carrying their held item.
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let viewer = player("viewer");
+        let held = player("held");
+        let mut viewer_handle = router
+            .join_player(viewer, "viewer", spawn_pos())
+            .expect("viewer join");
+        // The held-item player joins with a non-empty cached equipment body.
+        let _held_handle = router
+            .join_player_with_equipment(held, "held", spawn_pos(), equipment_body())
+            .expect("held join");
+        let held_eid = router.player_entity_id(held).expect("held entity id");
+
+        // The viewer learns of the new player: add, spawn, then the equipment.
+        assert_player_info_add(&mut viewer_handle, held);
+        assert_entity_spawn(&mut viewer_handle, held, held_eid, spawn_pos());
+        assert_set_equipment(&mut viewer_handle, held_eid, &equipment_body());
+    }
+
+    #[test]
+    fn hotbar_change_broadcasts_equipment_to_in_view_viewer() {
+        // Both players already in view of each other; the subject switches its held
+        // item, and the viewer (which has the subject spawned) gets a SetEquipment.
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let viewer = player("viewer");
+        let subject = player("subject");
+        let mut viewer_handle = router
+            .join_player(viewer, "viewer", spawn_pos())
+            .expect("viewer join");
+        let _subject_handle = router
+            .join_player(subject, "subject", spawn_pos())
+            .expect("subject join");
+        let subject_eid = router.player_entity_id(subject).expect("subject entity id");
+        // Drain the join visibility (both joined with empty equipment -> no
+        // equipment packets at join).
+        assert_player_info_add(&mut viewer_handle, subject);
+        assert_entity_spawn(&mut viewer_handle, subject, subject_eid, spawn_pos());
+
+        router.set_equipment(subject, equipment_body());
+        assert_set_equipment(&mut viewer_handle, subject_eid, &equipment_body());
+    }
+
+    #[test]
+    fn set_equipment_skips_a_viewer_that_never_saw_the_subject() {
+        // A far viewer that never had the subject spawned (no delivered baseline)
+        // is not sent the hotbar-change equipment.
+        let mut router = SessionRouter::new();
+        router.set_view_distance(1);
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let far = player("far");
+        let subject = player("subject");
+        let mut far_handle = router
+            .join_player(far, "far", Vec3::new(80.0, 64.0, 80.0))
+            .expect("far join");
+        let _subject_handle = router
+            .join_player(subject, "subject", spawn_pos())
+            .expect("subject join");
+        // Out of range: no visibility exchanged.
+        assert!(far_handle.try_recv().is_none());
+
+        router.set_equipment(subject, equipment_body());
+        // The far viewer never saw the subject, so it gets nothing.
+        assert!(far_handle.try_recv().is_none());
+    }
+
+    #[test]
+    fn moving_and_rotating_broadcasts_position_and_rotation_with_nonzero_yaw() {
+        // A position+rotation move to an in-view viewer yields an
+        // UpdateEntityPositionAndRotation carrying the quantized yaw (90 deg -> 64)
+        // followed by a SetHeadRotation.
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let viewer = player("viewer");
+        let mover = player("mover");
+        let mut viewer_handle = router
+            .join_player(viewer, "viewer", spawn_pos())
+            .expect("viewer join");
+        let _mover_handle = router
+            .join_player(mover, "mover", spawn_pos())
+            .expect("mover join");
+        let mover_eid = router.player_entity_id(mover).expect("mover entity id");
+        assert_player_info_add(&mut viewer_handle, mover);
+        assert_entity_spawn(&mut viewer_handle, mover, mover_eid, spawn_pos());
+
+        let closed = router.route_output(&GameOutput::PlayerMoved {
+            player: mover,
+            position: Vec3::new(10.0, 64.0, 9.0),
+            yaw: 90.0,
+            pitch: 0.0,
+            position_changed: true,
+        });
+        assert!(closed.is_empty());
+
+        let ClientboundPlayPacket::UpdateEntityPositionAndRotation(rel) = viewer_handle
+            .try_recv()
+            .expect("a position+rotation move")
+            .into_packet()
+        else {
+            panic!("expected an UpdateEntityPositionAndRotation");
+        };
+        assert_eq!(rel.entity_id(), mover_eid);
+        // yaw 90 deg quantizes to angle byte 64 (non-zero: the player no longer
+        // faces north).
+        assert_eq!(rel.yaw(), 64);
+        assert_ne!(rel.yaw(), 0);
+        // The head rotation follows.
+        let ClientboundPlayPacket::SetHeadRotation(head) = viewer_handle
+            .try_recv()
+            .expect("a head rotation")
+            .into_packet()
+        else {
+            panic!("expected a SetHeadRotation after the move");
+        };
+        assert_eq!(head.entity_id(), mover_eid);
+        assert_eq!(head.head_yaw(), 64);
+    }
+
+    #[test]
+    fn rotation_only_move_broadcasts_rotation_and_head_rotation() {
+        // A rotation-only move (position unchanged) to an in-view viewer yields an
+        // UpdateEntityRotation + SetHeadRotation and no position carrier.
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let viewer = player("viewer");
+        let mover = player("mover");
+        let mut viewer_handle = router
+            .join_player(viewer, "viewer", spawn_pos())
+            .expect("viewer join");
+        let _mover_handle = router
+            .join_player(mover, "mover", spawn_pos())
+            .expect("mover join");
+        let mover_eid = router.player_entity_id(mover).expect("mover entity id");
+        assert_player_info_add(&mut viewer_handle, mover);
+        assert_entity_spawn(&mut viewer_handle, mover, mover_eid, spawn_pos());
+
+        let closed = router.route_output(&GameOutput::PlayerMoved {
+            player: mover,
+            position: spawn_pos(),
+            yaw: 90.0,
+            pitch: 45.0,
+            position_changed: false,
+        });
+        assert!(closed.is_empty());
+
+        let ClientboundPlayPacket::UpdateEntityRotation(rot) = viewer_handle
+            .try_recv()
+            .expect("a rotation-only update")
+            .into_packet()
+        else {
+            panic!("expected an UpdateEntityRotation for a rotation-only move");
+        };
+        assert_eq!(rot.entity_id(), mover_eid);
+        // yaw 90 -> 64, pitch 45 -> 32; both non-zero (no longer facing north/level).
+        assert_eq!((rot.yaw(), rot.pitch()), (64, 32));
+        let ClientboundPlayPacket::SetHeadRotation(head) = viewer_handle
+            .try_recv()
+            .expect("a head rotation")
+            .into_packet()
+        else {
+            panic!("expected a SetHeadRotation after the rotation");
+        };
+        assert_eq!(head.entity_id(), mover_eid);
+        assert_eq!(head.head_yaw(), 64);
     }
 
     /// Asserts the next packet on `handle` is a player-list add for `expected`.

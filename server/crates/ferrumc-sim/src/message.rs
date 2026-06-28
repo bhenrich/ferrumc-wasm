@@ -30,12 +30,23 @@ pub enum GameInput {
         /// World-space position the player joins at.
         position: Vec3,
     },
-    /// A player moved.
+    /// A player moved, rotated, or both.
+    ///
+    /// Carries each component independently so one variant covers all three
+    /// serverbound move packets: a position-only `SetPlayerPosition`
+    /// (`position` set, `yaw`/`pitch` `None`), a `SetPlayerPositionAndRotation`
+    /// (all set), and a rotation-only `SetPlayerRotation` (`position` `None`,
+    /// `yaw`/`pitch` set). A `None` field leaves that component unchanged; an
+    /// input with no component set has no effect. `yaw`/`pitch` are degrees.
     PlayerMove {
         /// Identity of the moving player.
         player: PlayerId,
-        /// New world-space position.
-        position: Vec3,
+        /// New world-space position, if this move changed it.
+        position: Option<Vec3>,
+        /// New body yaw in degrees, if this move changed it.
+        yaw: Option<f32>,
+        /// New pitch in degrees, if this move changed it.
+        pitch: Option<f32>,
     },
     /// A player left the shard.
     PlayerLeave {
@@ -149,12 +160,26 @@ pub enum GameOutput {
         /// World-space position the player spawned at.
         position: Vec3,
     },
-    /// A player's position changed.
+    /// A player's position and/or rotation changed.
+    ///
+    /// Always carries the player's current absolute `position`, `yaw`, and
+    /// `pitch` (degrees) as of this tick, plus `position_changed`: `true` when
+    /// this output applied a new position (the session layer broadcasts a
+    /// relative/absolute move carrier), `false` for a rotation-only change (the
+    /// session layer broadcasts a rotation-only carrier). The head yaw is sent
+    /// alongside either way so a viewer's head turns.
     PlayerMoved {
         /// Identity of the moved player.
         player: PlayerId,
-        /// New world-space position.
+        /// Current absolute world-space position.
         position: Vec3,
+        /// Current body yaw in degrees.
+        yaw: f32,
+        /// Current pitch in degrees.
+        pitch: f32,
+        /// `true` if this tick applied a new position; `false` if it was a
+        /// rotation-only change.
+        position_changed: bool,
     },
     /// A player's movement was rejected; the client should snap back to this
     /// authoritative position.
@@ -240,7 +265,9 @@ mod tests {
             a,
             GameInput::PlayerMove {
                 player: p,
-                position: Vec3::new(1.0, 2.0, 3.0),
+                position: Some(Vec3::new(1.0, 2.0, 3.0)),
+                yaw: None,
+                pitch: None,
             }
         );
     }

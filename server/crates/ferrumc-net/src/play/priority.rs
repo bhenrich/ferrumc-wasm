@@ -164,7 +164,10 @@ impl OutboundPriority {
             | ClientboundPlayPacket::UpdateEntityPosition(_)
             | ClientboundPlayPacket::UpdateEntityPositionAndRotation(_)
             | ClientboundPlayPacket::UpdateEntityRotation(_)
-            | ClientboundPlayPacket::SetHeadRotation(_) => Self::World,
+            | ClientboundPlayPacket::SetHeadRotation(_)
+            // Equipment (held item) is cosmetic viewer state: a later update or the
+            // next spawn supersedes a dropped one, so it rides droppable World.
+            | ClientboundPlayPacket::SetEquipment(_) => Self::World,
         }
     }
 }
@@ -254,6 +257,9 @@ impl Criticality {
             | ClientboundPlayPacket::UpdateEntityPositionAndRotation(_)
             | ClientboundPlayPacket::UpdateEntityRotation(_)
             | ClientboundPlayPacket::SetHeadRotation(_)
+            // Equipment is cosmetic: a dropped held-item update is superseded by the
+            // next one (or re-sent with the spawn on re-enter), so it is droppable.
+            | ClientboundPlayPacket::SetEquipment(_)
             | ClientboundPlayPacket::SystemChat(_)
             | ClientboundPlayPacket::Commands(_)
             | ClientboundPlayPacket::TabCompleteResponse(_) => Self::Droppable,

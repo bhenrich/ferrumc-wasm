@@ -21,7 +21,8 @@ use ferrumc_math::{BlockPos, ChunkPos, Direction, ShardPos, Vec3};
 use ferrumc_proto::generated::play::{
     AcknowledgeBlockChange, BlockUpdate, ClientboundPlayPacket, EntityTeleport, EntityVelocity,
     PlayerAction, PlayerInfoUpdate, RemoveEntities, RemovePlayerInfo, ServerboundPlayPacket,
-    SpawnEntity, SynchronizePlayerPosition, UpdateEntityPosition, UseItemOn,
+    SetEquipment, SetHeadRotation, SpawnEntity, SynchronizePlayerPosition,
+    UpdateEntityPositionAndRotation, UpdateEntityRotation, UseItemOn,
 };
 use ferrumc_proto::types::BlockPosition;
 use ferrumc_sim::{BlockStateId, GameInput, GameOutput};
@@ -96,10 +97,12 @@ pub fn net_event_to_input(event: &NetEvent) -> Option<GameInput> {
 
 /// Maps a serverbound play `packet` from `player` to a [`GameInput`], if any.
 ///
-/// Both absolute-position packets collapse to a [`GameInput::PlayerMove`] (the
-/// rotation is dropped because the simulation only tracks position this
-/// milestone). A dig-start `PlayerAction` becomes a [`GameInput::BlockBreak`]
-/// carrying a typed target [`BlockPos`].
+/// The three serverbound move packets all collapse to a [`GameInput::PlayerMove`]
+/// with each component set independently: `SetPlayerPosition` carries only the
+/// position, `SetPlayerPositionAndRotation` carries position + yaw/pitch, and
+/// `SetPlayerRotation` carries only yaw/pitch (a turn in place). A dig-start
+/// `PlayerAction` becomes a [`GameInput::BlockBreak`] carrying a typed target
+/// [`BlockPos`].
 ///
 /// A `UseItemOn` (block place) is deliberately *not* mapped here: a place needs
 /// the held item's resolved block-state, which the session layer cannot see (the
@@ -113,17 +116,53 @@ pub(crate) fn play_packet_to_input(
     match packet {
         ServerboundPlayPacket::SetPlayerPosition(p) => Some(GameInput::PlayerMove {
             player,
-            position: Vec3::new(p.x(), p.y(), p.z()),
+            position: Some(Vec3::new(p.x(), p.y(), p.z())),
+            yaw: None,
+            pitch: None,
         }),
         ServerboundPlayPacket::SetPlayerPositionAndRotation(p) => Some(GameInput::PlayerMove {
             player,
-            position: Vec3::new(p.x(), p.y(), p.z()),
+            position: Some(Vec3::new(p.x(), p.y(), p.z())),
+            yaw: Some(p.yaw()),
+            pitch: Some(p.pitch()),
+        }),
+        ServerboundPlayPacket::SetPlayerRotation(p) => Some(GameInput::PlayerMove {
+            player,
+            position: None,
+            yaw: Some(p.yaw()),
+            pitch: Some(p.pitch()),
         }),
         ServerboundPlayPacket::PlayerAction(p) => block_break_input(player, p),
         // UseItemOn / KeepAlive / ChatCommand have no simulation input here: a
         // place is resolved by the app (see `use_item_on_target`).
         _ => None,
     }
+}
+
+/// Converts an angle in degrees to the protocol's single-byte angle form
+/// (`256` units = `360` degrees), wrapping into the `i8` range.
+///
+/// The mapping is `degrees * 256 / 360` rounded to the nearest unit, reduced
+/// modulo `256`, then reinterpreted as a signed byte — so `0 -> 0`, `90 -> 64`,
+/// `180 -> -128`, `270 -> 64` (i.e. `-64`), and `-90 -> -64`. A plain `as i8`
+/// cast would *saturate* (clamping any yaw `>= 180` to `127`) instead of
+/// wrapping, which is wrong for the full `0..360` yaw range; the `rem_euclid`
+/// keeps every angle on the wire faithful and panic-free for non-finite inputs.
+// The final `as i8` wrap of a `0..256` value is the whole point of this helper
+// (reinterpret the angle byte's high bit as the sign), so the wrap is intended.
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "reinterpreting the 0..256 angle unit as a signed byte is intentional"
+)]
+fn angle_to_byte(degrees: f32) -> i8 {
+    let units = (f64::from(degrees) / 360.0 * 256.0).round();
+    // `rem_euclid` yields a value in `[0, 256)`; non-finite inputs collapse to 0.
+    let wrapped = if units.is_finite() {
+        units.rem_euclid(256.0) as u8
+    } else {
+        0
+    };
+    wrapped as i8
 }
 
 /// Maps a serverbound `PlayerAction` to a [`GameInput::BlockBreak`], if it is a
@@ -211,6 +250,8 @@ pub fn output_to_clientbound(output: &GameOutput) -> Option<ClientboundPlayPacke
             PLACEHOLDER_ENTITY_ID,
             *player,
             *position,
+            0.0,
+            0.0,
         )),
         GameOutput::PlayerMoved { position, .. }
         | GameOutput::PlayerPositionCorrected { position, .. } => Some(move_shell(*position)),
@@ -225,17 +266,23 @@ pub fn output_to_clientbound(output: &GameOutput) -> Option<ClientboundPlayPacke
 }
 
 /// Builds the [`SpawnEntity`] shell that makes `player` visible to a viewer at
-/// `position`, tagged with the server-allocated network `entity_id`.
+/// `position`, facing `yaw`/`pitch` (degrees), tagged with the server-allocated
+/// network `entity_id`.
 ///
 /// The player's UUID is carried through; the type is [`PLAYER_ENTITY_TYPE`] (so
-/// the client renders a player model and skin) and orientation/velocity are
-/// zeroed. This is sent on the player's first appearance to a viewer; subsequent
-/// moves are conveyed with the relative/teleport movement shells below, never a
-/// re-sent spawn (which a real client ignores for an already-known entity).
+/// the client renders a player model and skin). The `pitch`/`yaw`/`head_pitch`
+/// fields are filled with the angle-byte form of the player's facing (head yaw
+/// matches body yaw on spawn) so a remote player appears facing the right way
+/// rather than always north; velocity is zeroed. This is sent on the player's
+/// first appearance to a viewer; subsequent moves are conveyed with the
+/// relative/teleport/rotation movement shells below, never a re-sent spawn (which
+/// a real client ignores for an already-known entity).
 pub(crate) fn entity_spawn_shell(
     entity_id: i32,
     player: PlayerId,
     position: Vec3,
+    yaw: f32,
+    pitch: f32,
 ) -> ClientboundPlayPacket {
     ClientboundPlayPacket::SpawnEntity(SpawnEntity::new(
         entity_id,
@@ -244,9 +291,9 @@ pub(crate) fn entity_spawn_shell(
         position.x,
         position.y,
         position.z,
-        0,
-        0,
-        0,
+        angle_to_byte(pitch),
+        angle_to_byte(yaw),
+        angle_to_byte(yaw),
         0,
         EntityVelocity::new(0, 0, 0),
     ))
@@ -324,40 +371,108 @@ fn delta_to_fixed_point_checked(delta: f64) -> Option<i16> {
 }
 
 /// Builds an [`EntityTeleport`] shell repositioning `entity_id` absolutely to
-/// `position`.
+/// `position`, facing `yaw`/`pitch` (degrees).
 ///
-/// Used for jumps larger than a relative move can encode (>8 blocks). Velocity
-/// and orientation are zeroed: rotation is not threaded through the simulation
-/// this milestone, so remote players face north and carry no head turn.
-pub(crate) fn entity_teleport_shell(entity_id: i32, position: Vec3) -> ClientboundPlayPacket {
+/// Used for jumps larger than a relative move can encode (>8 blocks). Velocity is
+/// zeroed. NOTE: `EntityTeleport` (wire `0x1F`, `sync_entity_position`, 1.21.2+)
+/// carries yaw/pitch as f32 **degrees**, not angle bytes — so the degrees are
+/// passed straight through here, unlike the relative/rotation/spawn shells which
+/// quantize to angle bytes.
+pub(crate) fn entity_teleport_shell(
+    entity_id: i32,
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+) -> ClientboundPlayPacket {
     ClientboundPlayPacket::EntityTeleport(EntityTeleport::new(
-        entity_id, position.x, position.y, position.z, 0.0, 0.0, 0.0, 0.0, 0.0, true,
+        entity_id, position.x, position.y, position.z, 0.0, 0.0, 0.0, yaw, pitch, true,
     ))
 }
 
-/// Builds an [`UpdateEntityPosition`] shell moving `entity_id` by the relative
-/// delta `(dx, dy, dz)` blocks, or `None` when any axis does not fit the
-/// 1/4096-block `i16` fixed-point range.
+/// Converts a relative `(dx, dy, dz)` block delta into the three i16 fixed-point
+/// axes a relative-move packet carries, or `None` when any axis does not fit the
+/// 1/4096-block `i16` range.
 ///
-/// The deltas are encoded in the 1/4096-block fixed-point wire format, which
-/// tops out near +/-8 blocks per axis. Returning `None` (rather than saturating)
-/// signals the caller — the router's `broadcast_move` — to fall back to an
-/// absolute [`entity_teleport_shell`] so the move is conveyed exactly instead of
-/// drifting by the clamped remainder.
-pub(crate) fn update_entity_position_shell(
+/// Shared by [`update_entity_position_and_rotation_shell`]; returning `None`
+/// (rather than saturating) signals the caller to fall back to an absolute
+/// [`entity_teleport_shell`] so the move is conveyed exactly instead of drifting
+/// by the clamped remainder. A relative move tops out near +/-8 blocks per axis.
+fn position_deltas(dx: f64, dy: f64, dz: f64) -> Option<(i16, i16, i16)> {
+    Some((
+        delta_to_fixed_point_checked(dx)?,
+        delta_to_fixed_point_checked(dy)?,
+        delta_to_fixed_point_checked(dz)?,
+    ))
+}
+
+/// Builds an [`UpdateEntityPositionAndRotation`] shell moving `entity_id` by the
+/// relative delta `(dx, dy, dz)` blocks and facing `yaw`/`pitch` (degrees), or
+/// `None` when any axis does not fit the 1/4096-block `i16` fixed-point range.
+///
+/// Yaw/pitch are quantized to angle bytes (256 units = 360 degrees). Returning
+/// `None` (rather than saturating a delta) signals the caller — the router's
+/// `broadcast_move` — to fall back to an absolute [`entity_teleport_shell`].
+pub(crate) fn update_entity_position_and_rotation_shell(
     entity_id: i32,
     dx: f64,
     dy: f64,
     dz: f64,
+    yaw: f32,
+    pitch: f32,
 ) -> Option<ClientboundPlayPacket> {
     // Build only when all three axes fit; a single overflowing axis forces a
     // teleport for the whole move.
-    let dx = delta_to_fixed_point_checked(dx)?;
-    let dy = delta_to_fixed_point_checked(dy)?;
-    let dz = delta_to_fixed_point_checked(dz)?;
-    Some(ClientboundPlayPacket::UpdateEntityPosition(
-        UpdateEntityPosition::new(entity_id, dx, dy, dz, true),
+    let (dx, dy, dz) = position_deltas(dx, dy, dz)?;
+    Some(ClientboundPlayPacket::UpdateEntityPositionAndRotation(
+        UpdateEntityPositionAndRotation::new(
+            entity_id,
+            dx,
+            dy,
+            dz,
+            angle_to_byte(yaw),
+            angle_to_byte(pitch),
+            true,
+        ),
     ))
+}
+
+/// Builds an [`UpdateEntityRotation`] shell turning `entity_id` to face
+/// `yaw`/`pitch` (degrees) without moving it.
+///
+/// Sent for a rotation-only move (the player turned in place). Yaw/pitch are
+/// quantized to angle bytes (256 units = 360 degrees).
+pub(crate) fn update_entity_rotation_shell(
+    entity_id: i32,
+    yaw: f32,
+    pitch: f32,
+) -> ClientboundPlayPacket {
+    ClientboundPlayPacket::UpdateEntityRotation(UpdateEntityRotation::new(
+        entity_id,
+        angle_to_byte(yaw),
+        angle_to_byte(pitch),
+        true,
+    ))
+}
+
+/// Builds a [`SetHeadRotation`] shell turning `entity_id`'s head to `yaw`
+/// (degrees), quantized to an angle byte.
+///
+/// The head yaw is separate from the body yaw a movement packet carries; sending
+/// it alongside every move/rotation keeps a remote player's head facing the right
+/// way instead of snapping to the body yaw only.
+pub(crate) fn set_head_rotation_shell(entity_id: i32, yaw: f32) -> ClientboundPlayPacket {
+    ClientboundPlayPacket::SetHeadRotation(SetHeadRotation::new(entity_id, angle_to_byte(yaw)))
+}
+
+/// Builds a [`SetEquipment`] shell announcing `entity_id`'s equipment from the
+/// pre-encoded `equipments` body.
+///
+/// The router owns only the typed `entity_id`; the `equipments` body (the
+/// continuation-bit-terminated slot+Slot entries) is hand-encoded upstream by the
+/// app, which owns the trusted `ferrumc-items` Slot encoder, and passed through
+/// opaque — so the session crate never needs a `ferrumc-items` dependency.
+pub(crate) fn set_equipment_shell(entity_id: i32, equipments: Vec<u8>) -> ClientboundPlayPacket {
+    ClientboundPlayPacket::SetEquipment(SetEquipment::new(entity_id, equipments))
 }
 
 /// Builds a [`RemoveEntities`] shell despawning every id in `entity_ids` on the
@@ -444,7 +559,7 @@ mod tests {
 
     use ferrumc_net::DisconnectReason;
     use ferrumc_proto::generated::play::{
-        ServerboundKeepAlive, SetPlayerPosition, SetPlayerPositionAndRotation,
+        ServerboundKeepAlive, SetPlayerPosition, SetPlayerPositionAndRotation, SetPlayerRotation,
     };
 
     use super::*;
@@ -463,7 +578,9 @@ mod tests {
             net_event_to_input(&event),
             Some(GameInput::PlayerMove {
                 player: player(),
-                position: Vec3::new(1.0, 64.0, -2.0),
+                position: Some(Vec3::new(1.0, 64.0, -2.0)),
+                yaw: None,
+                pitch: None,
             })
         );
     }
@@ -480,7 +597,27 @@ mod tests {
             net_event_to_input(&event),
             Some(GameInput::PlayerMove {
                 player: player(),
-                position: Vec3::new(3.5, 70.0, 8.5),
+                position: Some(Vec3::new(3.5, 70.0, 8.5)),
+                yaw: Some(90.0),
+                pitch: Some(0.0),
+            })
+        );
+    }
+
+    #[test]
+    fn rotation_packet_becomes_rotation_only_player_move() {
+        // A turn in place (SetPlayerRotation) carries yaw/pitch but no position.
+        let event = NetEvent::play(
+            player(),
+            ServerboundPlayPacket::SetPlayerRotation(SetPlayerRotation::new(45.0, -10.0, 1)),
+        );
+        assert_eq!(
+            net_event_to_input(&event),
+            Some(GameInput::PlayerMove {
+                player: player(),
+                position: None,
+                yaw: Some(45.0),
+                pitch: Some(-10.0),
             })
         );
     }
@@ -685,6 +822,9 @@ mod tests {
         let out = GameOutput::PlayerMoved {
             player: player(),
             position: Vec3::new(-1.0, 64.0, 1.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         };
         let Some(ClientboundPlayPacket::SynchronizePlayerPosition(sync)) =
             output_to_clientbound(&out)
@@ -716,10 +856,11 @@ mod tests {
     }
 
     #[test]
-    fn entity_spawn_shell_carries_id_uuid_and_position() {
+    fn entity_spawn_shell_carries_id_uuid_position_and_facing() {
         let p = player();
+        // Yaw 90 deg -> angle byte 64; pitch 0 -> 0. Head yaw matches body yaw.
         let ClientboundPlayPacket::SpawnEntity(spawn) =
-            entity_spawn_shell(7, p, Vec3::new(2.0, 3.0, 4.0))
+            entity_spawn_shell(7, p, Vec3::new(2.0, 3.0, 4.0), 90.0, 0.0)
         else {
             panic!("expected a SpawnEntity");
         };
@@ -728,6 +869,10 @@ mod tests {
         assert_eq!((spawn.x(), spawn.y(), spawn.z()), (2.0, 3.0, 4.0));
         // The spawned entity type is minecraft:player (149) for 1.21.8 / proto 772.
         assert_eq!(spawn.entity_type(), 149);
+        // Facing is quantized to angle bytes, not left at zero (north).
+        assert_eq!(spawn.yaw(), 64);
+        assert_eq!(spawn.head_pitch(), 64);
+        assert_eq!(spawn.pitch(), 0);
     }
 
     #[test]
@@ -780,17 +925,34 @@ mod tests {
     }
 
     #[test]
-    fn update_entity_position_encodes_fixed_point_deltas() {
-        let Some(ClientboundPlayPacket::UpdateEntityPosition(rel)) =
-            update_entity_position_shell(7, 1.0, -0.5, 2.0)
+    fn angle_to_byte_wraps_instead_of_saturating() {
+        // 0 -> 0, 90 -> 64, 180 -> -128, 270 -> -64, -90 -> -64. A plain `as i8`
+        // would saturate yaw >= 180 to 127; rem_euclid wraps it faithfully.
+        assert_eq!(angle_to_byte(0.0), 0);
+        assert_eq!(angle_to_byte(90.0), 64);
+        assert_eq!(angle_to_byte(180.0), -128);
+        assert_eq!(angle_to_byte(270.0), -64);
+        assert_eq!(angle_to_byte(-90.0), -64);
+        // A full turn wraps back to 0, and a non-finite input is panic-free.
+        assert_eq!(angle_to_byte(360.0), 0);
+        assert_eq!(angle_to_byte(f32::NAN), 0);
+    }
+
+    #[test]
+    fn update_entity_position_and_rotation_encodes_deltas_and_angles() {
+        let Some(ClientboundPlayPacket::UpdateEntityPositionAndRotation(rel)) =
+            update_entity_position_and_rotation_shell(7, 1.0, -0.5, 2.0, 90.0, 0.0)
         else {
-            panic!("expected an UpdateEntityPosition");
+            panic!("expected an UpdateEntityPositionAndRotation");
         };
         assert_eq!(rel.entity_id(), 7);
         // delta * 4096: 1.0 -> 4096, -0.5 -> -2048, 2.0 -> 8192.
         assert_eq!(rel.delta_x(), 4096);
         assert_eq!(rel.delta_y(), -2048);
         assert_eq!(rel.delta_z(), 8192);
+        // yaw 90 deg -> angle byte 64; pitch 0 -> 0.
+        assert_eq!(rel.yaw(), 64);
+        assert_eq!(rel.pitch(), 0);
     }
 
     #[test]
@@ -799,23 +961,23 @@ mod tests {
         // 8-block step (8 * 4096 = 32768) is one past i16::MAX, so it yields no
         // relative shell (the router teleports) instead of saturating to 32767 and
         // drifting 1/4096 block.
-        assert!(update_entity_position_shell(1, 8.0, 0.0, 0.0).is_none());
-        assert!(update_entity_position_shell(1, 0.0, 0.0, 9.5).is_none());
+        assert!(update_entity_position_and_rotation_shell(1, 8.0, 0.0, 0.0, 0.0, 0.0).is_none());
+        assert!(update_entity_position_and_rotation_shell(1, 0.0, 0.0, 9.5, 0.0, 0.0).is_none());
         // A negative 9-block step underflows i16::MIN, so it teleports too.
-        assert!(update_entity_position_shell(1, 0.0, -9.0, 0.0).is_none());
+        assert!(update_entity_position_and_rotation_shell(1, 0.0, -9.0, 0.0, 0.0, 0.0).is_none());
         // A step comfortably within range still encodes as a relative move.
-        assert!(update_entity_position_shell(1, 7.0, 0.0, 0.0).is_some());
+        assert!(update_entity_position_and_rotation_shell(1, 7.0, 0.0, 0.0, 0.0, 0.0).is_some());
         // An exact -8-block step lands on i16::MIN (-32768), which still fits.
-        let Some(ClientboundPlayPacket::UpdateEntityPosition(min)) =
-            update_entity_position_shell(1, 0.0, -8.0, 0.0)
+        let Some(ClientboundPlayPacket::UpdateEntityPositionAndRotation(min)) =
+            update_entity_position_and_rotation_shell(1, 0.0, -8.0, 0.0, 0.0, 0.0)
         else {
             panic!("the i16::MIN boundary delta must still encode as a relative move");
         };
         assert_eq!(min.delta_y(), i16::MIN);
         // The exact i16::MAX boundary value (just under +8 blocks) still fits.
         let max_blocks = f64::from(i16::MAX) / 4096.0;
-        let Some(ClientboundPlayPacket::UpdateEntityPosition(max)) =
-            update_entity_position_shell(1, max_blocks, 0.0, 0.0)
+        let Some(ClientboundPlayPacket::UpdateEntityPositionAndRotation(max)) =
+            update_entity_position_and_rotation_shell(1, max_blocks, 0.0, 0.0, 0.0, 0.0)
         else {
             panic!("the i16::MAX boundary delta must still encode as a relative move");
         };
@@ -823,14 +985,49 @@ mod tests {
     }
 
     #[test]
-    fn entity_teleport_carries_absolute_position() {
+    fn update_entity_rotation_and_head_rotation_carry_angle_bytes() {
+        let ClientboundPlayPacket::UpdateEntityRotation(rot) =
+            update_entity_rotation_shell(5, 90.0, 45.0)
+        else {
+            panic!("expected an UpdateEntityRotation");
+        };
+        assert_eq!(rot.entity_id(), 5);
+        // yaw 90 -> 64; pitch 45 -> 32.
+        assert_eq!(rot.yaw(), 64);
+        assert_eq!(rot.pitch(), 32);
+
+        let ClientboundPlayPacket::SetHeadRotation(head) = set_head_rotation_shell(5, 90.0) else {
+            panic!("expected a SetHeadRotation");
+        };
+        assert_eq!(head.entity_id(), 5);
+        assert_eq!(head.head_yaw(), 64);
+    }
+
+    #[test]
+    fn set_equipment_shell_carries_entity_id_and_body() {
+        // The router prepends only the typed entity_id; the opaque body is the
+        // app's hand-encoded main-hand entry (slot byte 0x00 + a trusted Slot).
+        let body = vec![0x00, 0x01, 0x01]; // slot 0, then a (fake) 1-count Slot
+        let ClientboundPlayPacket::SetEquipment(equip) = set_equipment_shell(7, body.clone())
+        else {
+            panic!("expected a SetEquipment");
+        };
+        assert_eq!(equip.entity_id(), 7);
+        assert_eq!(equip.equipments(), &body[..]);
+    }
+
+    #[test]
+    fn entity_teleport_carries_absolute_position_and_degree_angles() {
+        // EntityTeleport (sync_entity_position) carries yaw/pitch as f32 DEGREES,
+        // not angle bytes, so the degrees pass straight through.
         let ClientboundPlayPacket::EntityTeleport(tp) =
-            entity_teleport_shell(9, Vec3::new(-1.0, 64.0, 20.0))
+            entity_teleport_shell(9, Vec3::new(-1.0, 64.0, 20.0), 90.0, -10.0)
         else {
             panic!("expected an EntityTeleport");
         };
         assert_eq!(tp.entity_id(), 9);
         assert_eq!((tp.x(), tp.y(), tp.z()), (-1.0, 64.0, 20.0));
+        assert_eq!((tp.yaw(), tp.pitch()), (90.0, -10.0));
     }
 
     #[test]

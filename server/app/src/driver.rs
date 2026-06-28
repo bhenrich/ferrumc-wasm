@@ -141,6 +141,10 @@ pub(crate) enum SimCommand {
         name: String,
         /// The world-space position to join at.
         position: Vec3,
+        /// The pre-encoded main-hand `SetEquipment` body (slot byte + trusted Slot)
+        /// for the joiner's initial held item, cached by the router at join so
+        /// viewers entering view see it without a follow-up (which would race).
+        equipment: Vec<u8>,
         /// One-shot channel the driver replies on with the new session handle (or
         /// a classified routing error).
         reply: oneshot::Sender<Result<PlayerSessionHandle, SessionError>>,
@@ -271,6 +275,18 @@ pub(crate) enum SimCommand {
         content: TextComponent,
         /// Whether to render above the hotbar (action bar) rather than the chat box.
         overlay: bool,
+    },
+    /// Update `player`'s broadcast equipment (held item) after a hotbar change.
+    ///
+    /// The inventory is connection-local, so the connection encodes the new
+    /// main-hand `SetEquipment` body and routes it here; the driver-owned
+    /// [`SessionRouter`] caches it and broadcasts it (droppable) to the viewers that
+    /// currently have `player` spawned. A gone player is a no-op.
+    SetEquipment {
+        /// The player whose held item changed.
+        player: PlayerId,
+        /// The pre-encoded main-hand `SetEquipment` body (slot byte + trusted Slot).
+        equipment: Vec<u8>,
     },
 }
 
@@ -465,6 +481,7 @@ fn try_flush_persist_dirty(
 
 /// Applies one command against the router and/or the shard's chunk map.
 #[allow(clippy::too_many_arguments)] // threads the storage flush channel + tick context through
+#[allow(clippy::too_many_lines)] // one dispatch over every SimCommand variant
 async fn handle_command(
     router: &mut SessionRouter,
     shard: &mut SimShard,
@@ -481,9 +498,10 @@ async fn handle_command(
             player,
             name,
             position,
+            equipment,
             reply,
         } => {
-            let result = router.join_player(player, &name, position);
+            let result = router.join_player_with_equipment(player, &name, position, equipment);
             // Record the joiner in the driver-owned roster for the dashboard
             // snapshot only once the router accepted the join; a rejected join must
             // not leave a phantom roster entry. The roster is pruned each tick
@@ -592,6 +610,11 @@ async fn handle_command(
             overlay,
         } => {
             router.send_system_chat_to(player, &content, overlay);
+        }
+        SimCommand::SetEquipment { player, equipment } => {
+            // Best-effort cosmetic broadcast to in-view viewers; a gone player is a
+            // no-op inside the router.
+            router.set_equipment(player, equipment);
         }
     }
 }

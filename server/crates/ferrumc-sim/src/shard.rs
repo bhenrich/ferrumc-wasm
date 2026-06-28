@@ -112,10 +112,32 @@ const MUTATION_LOG_CAP: usize = 4096;
 #[derive(Debug, Clone, Copy)]
 struct PlayerState {
     position: Vec3,
+    /// Body yaw in degrees, seeded to `0.0` on join and updated by a
+    /// [`GameInput::PlayerMove`] carrying rotation. Broadcast to viewers so a
+    /// remote player faces the right way instead of always facing north.
+    yaw: f32,
+    /// Pitch in degrees, seeded to `0.0` on join and updated by a
+    /// [`GameInput::PlayerMove`] carrying rotation.
+    pitch: f32,
     /// The authoritative server-side game mode. Seeded to [`GameMode::default`] on
     /// join and mutated by [`GameInput::SetGameMode`]; later milestones read it to
     /// enforce mode-specific rules (creative no-decrement, break speed, flight).
     game_mode: GameMode,
+}
+
+/// A movement coalesced within one tick: the latest valid position and/or
+/// rotation a player's [`GameInput::PlayerMove`]s carried this tick.
+///
+/// Each field merges independently — a later input's `Some` component overwrites
+/// an earlier one, while a `None` leaves the earlier value — so a position-only
+/// move followed by a rotation-only move in the same tick applies both. A
+/// `position` of `None` means no (valid) position arrived this tick, so the apply
+/// pass emits a rotation-only [`GameOutput::PlayerMoved`].
+#[derive(Debug, Clone, Copy, Default)]
+struct PendingMove {
+    position: Option<Vec3>,
+    yaw: Option<f32>,
+    pitch: Option<f32>,
 }
 
 /// One simulation shard.
@@ -341,8 +363,9 @@ impl SimShard {
     #[allow(clippy::too_many_lines)] // one tick drain: join/leave/move + every block-edit input arm
     pub fn run_tick(&mut self) -> Vec<GameOutput> {
         let mut outputs = Vec::new();
-        // Coalesce movement: keep only the latest *valid* position per player.
-        let mut pending_moves: BTreeMap<PlayerId, Vec3> = BTreeMap::new();
+        // Coalesce movement: keep only the latest *valid* position and rotation
+        // per player (each component merged independently).
+        let mut pending_moves: BTreeMap<PlayerId, PendingMove> = BTreeMap::new();
         // Players whose move was rejected this tick and still need a snap-back
         // correction (a later valid move removes them again).
         let mut corrections: BTreeSet<PlayerId> = BTreeSet::new();
@@ -356,6 +379,8 @@ impl SimShard {
                     if let Entry::Vacant(slot) = self.players.entry(player) {
                         slot.insert(PlayerState {
                             position,
+                            yaw: 0.0,
+                            pitch: 0.0,
                             game_mode: GameMode::default(),
                         });
                         outputs.push(GameOutput::PlayerSpawned { player, position });
@@ -368,23 +393,47 @@ impl SimShard {
                         state.game_mode = mode;
                     }
                 }
-                GameInput::PlayerMove { player, position } => {
+                GameInput::PlayerMove {
+                    player,
+                    position,
+                    yaw,
+                    pitch,
+                } => {
                     // Movement for an unknown player is ignored rather than
                     // implicitly spawning one; there is also nothing to correct.
                     if !self.players.contains_key(&player) {
                         continue;
                     }
-                    if is_valid_position(position) {
-                        // Coalesce: overwrite any earlier move this tick. A valid
-                        // move also clears a pending correction — it supersedes
-                        // the rejected one.
-                        pending_moves.insert(player, position);
-                        corrections.remove(&player);
-                    } else if !pending_moves.contains_key(&player) {
+                    // A position is accepted only if finite and in range.
+                    let valid_position = position.filter(|p| is_valid_position(*p));
+                    if position.is_some() && valid_position.is_none() {
                         // Reject out-of-range / non-finite coords. Request a
-                        // correction only if no valid move is queued to override
-                        // the client's bad position.
-                        corrections.insert(player);
+                        // correction only if no valid position is queued to
+                        // override the client's bad one.
+                        let valid_pending = pending_moves
+                            .get(&player)
+                            .is_some_and(|m| m.position.is_some());
+                        if !valid_pending {
+                            corrections.insert(player);
+                        }
+                    }
+                    // Coalesce each component independently: a later input's
+                    // `Some` overwrites, a `None` leaves the earlier value. Only
+                    // touch the entry when there is something to record so a
+                    // purely-invalid move leaves no empty entry to apply.
+                    if valid_position.is_some() || yaw.is_some() || pitch.is_some() {
+                        let merged = pending_moves.entry(player).or_default();
+                        if valid_position.is_some() {
+                            merged.position = valid_position;
+                            // A valid move supersedes a queued correction.
+                            corrections.remove(&player);
+                        }
+                        if yaw.is_some() {
+                            merged.yaw = yaw;
+                        }
+                        if pitch.is_some() {
+                            merged.pitch = pitch;
+                        }
                     }
                 }
                 GameInput::PlayerLeave { player } => {
@@ -486,11 +535,27 @@ impl SimShard {
 
         // Apply the coalesced moves at the boundary, in deterministic player
         // order. Every player here was present at coalesce time and cannot have
-        // left (a leave clears the entry), so the lookup always succeeds.
-        for (player, position) in pending_moves {
+        // left (a leave clears the entry), so the lookup always succeeds. Every
+        // entry carries at least one component, so each yields a PlayerMoved.
+        for (player, merged) in pending_moves {
             if let Some(state) = self.players.get_mut(&player) {
-                state.position = position;
-                outputs.push(GameOutput::PlayerMoved { player, position });
+                let position_changed = merged.position.is_some();
+                if let Some(position) = merged.position {
+                    state.position = position;
+                }
+                if let Some(yaw) = merged.yaw {
+                    state.yaw = yaw;
+                }
+                if let Some(pitch) = merged.pitch {
+                    state.pitch = pitch;
+                }
+                outputs.push(GameOutput::PlayerMoved {
+                    player,
+                    position: state.position,
+                    yaw: state.yaw,
+                    pitch: state.pitch,
+                    position_changed,
+                });
             }
         }
 
@@ -877,12 +942,16 @@ mod tests {
         .expect("room");
         s.enqueue(GameInput::PlayerMove {
             player: p,
-            position: Vec3::new(5.0, 0.0, 0.0),
+            position: Some(Vec3::new(5.0, 0.0, 0.0)),
+            yaw: None,
+            pitch: None,
         })
         .expect("room");
         s.enqueue(GameInput::PlayerMove {
             player: p,
-            position: Vec3::new(9.0, 0.0, 0.0),
+            position: Some(Vec3::new(9.0, 0.0, 0.0)),
+            yaw: None,
+            pitch: None,
         })
         .expect("room");
 
@@ -898,11 +967,124 @@ mod tests {
                 },
                 GameOutput::PlayerMoved {
                     player: p,
-                    position: Vec3::new(9.0, 0.0, 0.0)
+                    position: Vec3::new(9.0, 0.0, 0.0),
+                    yaw: 0.0,
+                    pitch: 0.0,
+                    position_changed: true,
                 },
             ]
         );
         assert_eq!(s.player_position(p), Some(Vec3::new(9.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn move_with_rotation_stores_and_emits_yaw_pitch() {
+        let mut s = shard();
+        let p = player("turner");
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: Vec3::ZERO,
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
+        // A position+rotation move stores both and emits a position-changed
+        // PlayerMoved carrying the new yaw/pitch.
+        s.enqueue(GameInput::PlayerMove {
+            player: p,
+            position: Some(Vec3::new(3.0, 0.0, 0.0)),
+            yaw: Some(90.0),
+            pitch: Some(-30.0),
+        })
+        .expect("room");
+        let outputs = s.run_tick();
+        assert_eq!(
+            outputs,
+            vec![GameOutput::PlayerMoved {
+                player: p,
+                position: Vec3::new(3.0, 0.0, 0.0),
+                yaw: 90.0,
+                pitch: -30.0,
+                position_changed: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn rotation_only_move_keeps_position_and_flags_no_position_change() {
+        let mut s = shard();
+        let p = player("looker");
+        let spawn = Vec3::new(8.0, 64.0, 8.0);
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: spawn,
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
+        // A rotation-only move (no position) updates yaw/pitch but leaves the
+        // position untouched and reports position_changed = false.
+        s.enqueue(GameInput::PlayerMove {
+            player: p,
+            position: None,
+            yaw: Some(45.0),
+            pitch: Some(10.0),
+        })
+        .expect("room");
+        let outputs = s.run_tick();
+        assert_eq!(
+            outputs,
+            vec![GameOutput::PlayerMoved {
+                player: p,
+                position: spawn,
+                yaw: 45.0,
+                pitch: 10.0,
+                position_changed: false,
+            }]
+        );
+        // The stored position is unchanged by a rotation-only move.
+        assert_eq!(s.player_position(p), Some(spawn));
+    }
+
+    #[test]
+    fn position_only_move_leaves_rotation_unchanged() {
+        let mut s = shard();
+        let p = player("strafer");
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: Vec3::ZERO,
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
+        // First turn in place, then move position-only: the second move must keep
+        // the yaw the first one set (a None component leaves the stored value).
+        s.enqueue(GameInput::PlayerMove {
+            player: p,
+            position: None,
+            yaw: Some(120.0),
+            pitch: Some(5.0),
+        })
+        .expect("room");
+        let _ = s.run_tick();
+        s.enqueue(GameInput::PlayerMove {
+            player: p,
+            position: Some(Vec3::new(1.0, 0.0, 0.0)),
+            yaw: None,
+            pitch: None,
+        })
+        .expect("room");
+        let outputs = s.run_tick();
+        assert_eq!(
+            outputs,
+            vec![GameOutput::PlayerMoved {
+                player: p,
+                position: Vec3::new(1.0, 0.0, 0.0),
+                yaw: 120.0,
+                pitch: 5.0,
+                position_changed: true,
+            }]
+        );
     }
 
     #[test]
@@ -927,7 +1109,9 @@ mod tests {
         ] {
             s.enqueue(GameInput::PlayerMove {
                 player: p,
-                position: bad,
+                position: Some(bad),
+                yaw: None,
+                pitch: None,
             })
             .expect("room");
             let outputs = s.run_tick();
@@ -959,12 +1143,16 @@ mod tests {
         // correction is emitted (the PlayerMoved is the authoritative update).
         s.enqueue(GameInput::PlayerMove {
             player: p,
-            position: Vec3::new(f64::NAN, 0.0, 0.0),
+            position: Some(Vec3::new(f64::NAN, 0.0, 0.0)),
+            yaw: None,
+            pitch: None,
         })
         .expect("room");
         s.enqueue(GameInput::PlayerMove {
             player: p,
-            position: Vec3::new(3.0, 4.0, 5.0),
+            position: Some(Vec3::new(3.0, 4.0, 5.0)),
+            yaw: None,
+            pitch: None,
         })
         .expect("room");
         let outputs = s.run_tick();
@@ -973,6 +1161,9 @@ mod tests {
             vec![GameOutput::PlayerMoved {
                 player: p,
                 position: Vec3::new(3.0, 4.0, 5.0),
+                yaw: 0.0,
+                pitch: 0.0,
+                position_changed: true,
             }]
         );
         assert_eq!(s.player_position(p), Some(Vec3::new(3.0, 4.0, 5.0)));
@@ -993,7 +1184,9 @@ mod tests {
         let edge = Vec3::new(3.0e7, -3.0e7, 0.0);
         s.enqueue(GameInput::PlayerMove {
             player: p,
-            position: edge,
+            position: Some(edge),
+            yaw: None,
+            pitch: None,
         })
         .expect("room");
         let outputs = s.run_tick();
@@ -1002,6 +1195,9 @@ mod tests {
             vec![GameOutput::PlayerMoved {
                 player: p,
                 position: edge,
+                yaw: 0.0,
+                pitch: 0.0,
+                position_changed: true,
             }]
         );
         assert_eq!(s.player_position(p), Some(edge));
@@ -1020,7 +1216,9 @@ mod tests {
 
         s.enqueue(GameInput::PlayerMove {
             player: p,
-            position: Vec3::new(2.0, 0.0, 0.0),
+            position: Some(Vec3::new(2.0, 0.0, 0.0)),
+            yaw: None,
+            pitch: None,
         })
         .expect("room");
         s.enqueue(GameInput::PlayerLeave { player: p })
@@ -1037,7 +1235,9 @@ mod tests {
         let ghost = player("ghost");
         s.enqueue(GameInput::PlayerMove {
             player: ghost,
-            position: Vec3::new(f64::NAN, 0.0, 0.0),
+            position: Some(Vec3::new(f64::NAN, 0.0, 0.0)),
+            yaw: None,
+            pitch: None,
         })
         .expect("room");
         // No player present: no correction, no output at all.
@@ -1079,7 +1279,9 @@ mod tests {
         let ghost = player("ghost");
         s.enqueue(GameInput::PlayerMove {
             player: ghost,
-            position: Vec3::new(1.0, 1.0, 1.0),
+            position: Some(Vec3::new(1.0, 1.0, 1.0)),
+            yaw: None,
+            pitch: None,
         })
         .expect("room");
         s.enqueue(GameInput::PlayerLeave { player: ghost })
@@ -1122,7 +1324,9 @@ mod tests {
         .expect("first");
         s.enqueue(GameInput::PlayerMove {
             player: p,
-            position: Vec3::new(1.0, 0.0, 0.0),
+            position: Some(Vec3::new(1.0, 0.0, 0.0)),
+            yaw: None,
+            pitch: None,
         })
         .expect("second");
         assert!(s.is_inbox_full());
@@ -1131,7 +1335,9 @@ mod tests {
         let err = s
             .enqueue(GameInput::PlayerMove {
                 player: p,
-                position: Vec3::new(2.0, 0.0, 0.0),
+                position: Some(Vec3::new(2.0, 0.0, 0.0)),
+                yaw: None,
+                pitch: None,
             })
             .expect_err("inbox is full");
         assert_eq!(err, SimError::InboxFull { capacity: 2 });

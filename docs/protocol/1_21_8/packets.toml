@@ -336,6 +336,25 @@ fields = [
     { name = "flags", type = "u8" },
 ]
 
+# minecraft-data: play.toServer.look ("Set Player Rotation"). The rotation-only
+# serverbound move: a client turning in place (no position change) sends this, so
+# without it an in-place look would never be decoded and the rotation-only viewer
+# broadcast (Update Entity Rotation + Set Head Rotation) would be unreachable.
+# `yaw`/`pitch` are f32 degrees; `flags` is the same MovementFlags bit mask as
+# SetPlayerPosition (bit 0 = on ground, bit 1 = horizontal collision), modeled u8.
+# No id clash with the clientbound EntityTeleport (also wire 0x1F): ids are
+# per-direction.
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "SetPlayerRotation"
+id = 0x1F
+fields = [
+    { name = "yaw", type = "f32" },
+    { name = "pitch", type = "f32" },
+    { name = "flags", type = "u8" },
+]
+
 # minecraft-data: play.toServer.block_dig ("Player Action").
 [[packet]]
 state = "play"
@@ -704,6 +723,30 @@ id = 0x4C
 fields = [
     { name = "entity_id", type = "varint" },
     { name = "head_yaw", type = "i8" },
+]
+
+# minecraft-data: play.toClient.entity_equipment ("Set Equipment"). Shows other
+# players what a remote player is holding/wearing. protocol.json models the body
+# as `entityId: varint` then `equipments: topBitSetTerminatedArray<{ slot: i8,
+# item: Slot }>` — a continuation-bit-terminated array (each slot byte's high bit
+# 0x80 flags "another entry follows"; the last entry has it clear) whose `item` is
+# the count-first 1.21.8 Slot. The closed packets.toml grammar has no
+# topBitSetTerminatedArray and no Slot type, so — exactly like Commands /
+# PlayerInfoUpdate / SetContainerContent — the variable tail is carried as one
+# opaque `remaining_bytes` payload, hand-encoded by the app (which owns the
+# ferrumc-items Slot encoder) and passed through the router, which only prepends
+# the router-owned `entity_id`. For the main-hand-only v0 the body is a single
+# terminal slot byte `0x00` (slot 0 = main hand) followed by the trusted Slot;
+# armor/offhand are a later addition. `remaining_bytes` must be the final field,
+# which it is.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SetEquipment"
+id = 0x5F
+fields = [
+    { name = "entity_id", type = "varint" },
+    { name = "equipments", type = "remaining_bytes" },
 ]
 
 # --- Command tree / tab-completion (client autocomplete) ------------------------

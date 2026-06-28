@@ -53,7 +53,22 @@ pub(super) async fn enter_play(
     debug.set_session(name.as_str());
     let player = PlayerId::offline(name.as_str());
     let position = ctx.join_kit.spawn_position();
-    let mut handle = join_simulation(ctx, player, name.as_str(), position).await?;
+
+    // The authoritative server-side inventory for this connection, created BEFORE
+    // the join so the joiner's initial held item is cached in the router as part of
+    // the join — viewers entering view then see it on the spawn rather than only
+    // after the next hotbar change (closing the enter-view race). Seeded with the
+    // creative starter kit and a creative game-mode mirror; the connection is the
+    // sole writer of both, so the mirror cannot drift from the sim's mode.
+    let mut inventory = PlayerInventory::with_creative_kit(GameMode::Creative);
+    // The opaque main-hand equipment body threaded into the join. The default kit
+    // never fails to encode; on the off chance it does, fall back to empty (no
+    // equipment shown) rather than aborting the join.
+    let equipment = inventory.main_hand_equipment_body().unwrap_or_else(|err| {
+        tracing::warn!(%err, "failed to encode initial equipment; joining without it");
+        Vec::new()
+    });
+    let mut handle = join_simulation(ctx, player, name.as_str(), position, equipment).await?;
 
     // The client already holds the spawn batch after the join kit; stream tracks
     // it from there so it never re-sends a spawn chunk and knows what to unload.
@@ -63,12 +78,6 @@ pub(super) async fn enter_play(
     // here (the connection task may use a non-deterministic time source) and is
     // never touched by the sim/session deterministic tick path.
     let mut chat_limiter = ChatRateLimiter::new(ctx.clock.now());
-
-    // The authoritative server-side inventory for this connection. Seeded with the
-    // creative starter kit and a creative game-mode mirror; the connection is the
-    // sole writer of both, so the mirror cannot drift from the sim's mode. The
-    // matching `SetGameMode` below makes the sim's authoritative mode agree.
-    let mut inventory = PlayerInventory::with_creative_kit(GameMode::Creative);
 
     // The player's last-reported yaw, mirrored from look packets so a place can
     // derive block facing. Defaults to 0.0 (south-ish) until the first look packet;
@@ -271,11 +280,15 @@ pub(super) async fn enter_play(
 }
 
 /// Sends a join request to the driver and awaits the session handle.
+///
+/// `equipment` is the joiner's pre-encoded main-hand `SetEquipment` body, cached
+/// by the router at join so viewers entering view see the held item immediately.
 async fn join_simulation(
     ctx: &ConnContext,
     player: PlayerId,
     name: &str,
     position: Vec3,
+    equipment: Vec<u8>,
 ) -> anyhow::Result<PlayerSessionHandle> {
     let (reply_tx, reply_rx) = oneshot::channel();
     ctx.commands
@@ -283,6 +296,7 @@ async fn join_simulation(
             player,
             name: name.to_owned(),
             position,
+            equipment,
             reply: reply_tx,
         })
         .await

@@ -163,6 +163,25 @@ impl PlayerInventory {
     pub(crate) fn container_content_payload(&self) -> Result<Vec<u8>, ItemValidationError> {
         encode_container_content_payload(&self.slots, &ItemStack::empty())
     }
+
+    /// Builds the opaque `SetEquipment` body for the player's main hand: the slot
+    /// byte `0x00` (slot 0 = main hand, high bit clear = the terminal entry)
+    /// followed by the trusted [`ItemStack::encode_slot`] of the currently held
+    /// item. Armor/offhand are out of scope for the v0 main-hand target.
+    ///
+    /// The session/router layer carries this opaque (it has no `ferrumc-items`
+    /// dependency) and only prepends the router-owned entity id.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an [`ItemValidationError`] from encoding the held [`ItemStack`]
+    /// (e.g. an NBT component failure); the default creative-kit items never error.
+    pub(crate) fn main_hand_equipment_body(&self) -> Result<Vec<u8>, ItemValidationError> {
+        // Slot 0 (main hand), high bit clear so it is the single terminal entry.
+        let mut body = vec![0x00u8];
+        self.held().encode_slot(&mut body)?;
+        Ok(body)
+    }
 }
 
 #[cfg(test)]

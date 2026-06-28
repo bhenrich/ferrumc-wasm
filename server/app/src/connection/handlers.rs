@@ -191,10 +191,10 @@ pub(super) async fn handle_play_body(
         ServerboundPlayPacket::SetCreativeSlot(p) => {
             return handle_set_creative_slot(ctx, name, writer, inventory, p, debug, compression);
         }
-        // Set Held Item (serverbound): update the selected hotbar index.
+        // Set Held Item (serverbound): update the selected hotbar index and, on a
+        // real change, broadcast the new held item to viewers.
         ServerboundPlayPacket::ServerboundSetHeldItem(p) => {
-            handle_set_held_item(inventory, p);
-            return Ok(());
+            return handle_set_held_item(ctx, player, inventory, p).await;
         }
         // Click Container: the slice models no click logic, so any click on window
         // 0 triggers a safe resync of the authoritative inventory.
@@ -252,12 +252,14 @@ fn reported_position(packet: &ServerboundPlayPacket) -> Option<Vec3> {
 
 /// The yaw (degrees) a serverbound play packet reports, if any.
 ///
-/// `SetPlayerPositionAndRotation` is the only modelled serverbound look-carrying
-/// packet; position-only and other packets do not rotate the player and so report
-/// nothing.
+/// Both look-carrying packets report a yaw: `SetPlayerPositionAndRotation` (move +
+/// look) and `SetPlayerRotation` (a turn in place). Position-only and other
+/// packets do not rotate the player and so report nothing. Mirroring the yaw from
+/// a turn-in-place too lets a place right after one use the correct facing.
 fn reported_yaw(packet: &ServerboundPlayPacket) -> Option<f32> {
     match packet {
         ServerboundPlayPacket::SetPlayerPositionAndRotation(p) => Some(p.yaw()),
+        ServerboundPlayPacket::SetPlayerRotation(p) => Some(p.yaw()),
         _ => None,
     }
 }
@@ -786,14 +788,41 @@ fn handle_set_creative_slot(
     )
 }
 
-/// Handles a serverbound Set Held Item: update the selected hotbar index.
+/// Handles a serverbound Set Held Item: update the selected hotbar index and, on a
+/// real change, broadcast the new main-hand item to viewers.
 ///
-/// The wire slot is an `i16`; values outside `0..=8` are ignored (no clientbound
-/// reply is needed — the client already moved its own selector).
-fn handle_set_held_item(inventory: &mut PlayerInventory, packet: &ServerboundSetHeldItem) {
-    if let Ok(slot) = u8::try_from(packet.slot()) {
-        inventory.set_selected(slot);
+/// The wire slot is an `i16`; values outside `0..=8` are ignored (the client
+/// already moved its own selector, so no clientbound reply is needed and nothing
+/// is broadcast). On a valid change the new main-hand equipment body is encoded
+/// from the connection-local inventory and routed as a [`SimCommand::SetEquipment`]
+/// so the driver-owned router relays it (droppable) to the viewers that have this
+/// player spawned — the inventory stays connection-local; only the opaque body
+/// crosses to the router. A failed encode is logged and skipped (never fatal).
+async fn handle_set_held_item(
+    ctx: &ConnContext,
+    player: PlayerId,
+    inventory: &mut PlayerInventory,
+    packet: &ServerboundSetHeldItem,
+) -> anyhow::Result<()> {
+    let Ok(slot) = u8::try_from(packet.slot()) else {
+        return Ok(());
+    };
+    // Only broadcast when the selection actually changed (an out-of-range slot
+    // leaves `selected` untouched and returns false).
+    if !inventory.set_selected(slot) {
+        return Ok(());
     }
+    let equipment = match inventory.main_hand_equipment_body() {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(%err, "failed to encode held-item equipment; skipping broadcast");
+            return Ok(());
+        }
+    };
+    ctx.commands
+        .send(SimCommand::SetEquipment { player, equipment })
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
 }
 
 /// Handles a serverbound Click Container on window 0 with a conservative resync.

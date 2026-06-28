@@ -211,9 +211,11 @@ fn delta_fp(delta: f64) -> i16 {
 }
 
 /// Reads until `client` sees `entity_id` move from `from` to `to`, matching the
-/// distance-based carrier the server picks: a relative `UpdateEntityPosition`
-/// (deltas in 1/4096-block units) for a step of at most 8 blocks, or an absolute
-/// `EntityTeleport` for a larger jump.
+/// distance-based carrier the server picks: a relative
+/// `UpdateEntityPositionAndRotation` (deltas in 1/4096-block units, plus yaw/pitch
+/// angle bytes) for a step of at most 8 blocks, or an absolute `EntityTeleport`
+/// for a larger jump. A position-only `SetPlayerPosition` from the client carries
+/// no rotation, so the broadcast yaw/pitch stay at the default angle byte 0.
 async fn observe_move(
     client: &mut TestClient,
     entity_id: i32,
@@ -224,7 +226,7 @@ async fn observe_move(
     if dx * dx + dy * dy + dz * dz <= 64.0 {
         let expected = (delta_fp(dx), delta_fp(dy), delta_fp(dz));
         read_until(client, |packet| {
-            matches!(packet, ClientboundPlayPacket::UpdateEntityPosition(u)
+            matches!(packet, ClientboundPlayPacket::UpdateEntityPositionAndRotation(u)
                 if u.entity_id() == entity_id
                     && (u.delta_x(), u.delta_y(), u.delta_z()) == expected)
         })

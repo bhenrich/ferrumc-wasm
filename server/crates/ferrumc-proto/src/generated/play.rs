@@ -851,6 +851,56 @@ impl SetPlayerPositionAndRotation {
     }
 }
 
+/// `SetPlayerRotation`: the play serverbound packet (wire id `0x1f`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetPlayerRotation {
+    yaw: f32,
+    pitch: f32,
+    flags: u8,
+}
+
+impl SetPlayerRotation {
+    /// The wire packet id for `SetPlayerRotation`.
+    pub const PACKET_ID: i32 = 0x1f;
+
+    /// Creates a new `SetPlayerRotation` from its wire fields.
+    pub fn new(yaw: f32, pitch: f32, flags: u8) -> Self {
+        Self { yaw, pitch, flags }
+    }
+
+    /// Returns the `yaw` field.
+    pub fn yaw(&self) -> f32 {
+        self.yaw
+    }
+
+    /// Returns the `pitch` field.
+    pub fn pitch(&self) -> f32 {
+        self.pitch
+    }
+
+    /// Returns the `flags` field.
+    pub fn flags(&self) -> u8 {
+        self.flags
+    }
+
+    /// Decodes a `SetPlayerRotation` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let yaw = reader.read_f32()?;
+        let pitch = reader.read_f32()?;
+        let flags = reader.read_u8()?;
+        Ok(Self { yaw, pitch, flags })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        wire::write_f32(buf, self.yaw);
+        wire::write_f32(buf, self.pitch);
+        wire::write_u8(buf, self.flags);
+        Ok(())
+    }
+}
+
 /// `PlayerAction`: the play serverbound packet (wire id `0x28`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerAction {
@@ -3005,6 +3055,57 @@ impl SetDefaultSpawnPosition {
     }
 }
 
+/// `SetEquipment`: the play clientbound packet (wire id `0x5f`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetEquipment {
+    entity_id: i32,
+    equipments: Vec<u8>,
+}
+
+impl SetEquipment {
+    /// The wire packet id for `SetEquipment`.
+    pub const PACKET_ID: i32 = 0x5f;
+
+    /// Creates a new `SetEquipment` from its wire fields.
+    pub fn new(entity_id: i32, equipments: Vec<u8>) -> Self {
+        Self {
+            entity_id,
+            equipments,
+        }
+    }
+
+    /// Returns the `entity_id` field.
+    pub fn entity_id(&self) -> i32 {
+        self.entity_id
+    }
+
+    /// Returns the `equipments` field.
+    pub fn equipments(&self) -> &[u8] {
+        &self.equipments
+    }
+
+    /// Decodes a `SetEquipment` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let entity_id = reader.read_var_int()?;
+        let equipments = {
+            let remaining = reader.remaining();
+            reader.read_bytes(remaining)?.to_vec()
+        };
+        Ok(Self {
+            entity_id,
+            equipments,
+        })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        ferrumc_codec::write_var_int(buf, self.entity_id);
+        wire::write_raw(buf, &self.equipments);
+        Ok(())
+    }
+}
+
 /// `ClientboundSetHeldItem`: the play clientbound packet (wire id `0x62`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientboundSetHeldItem {
@@ -3113,6 +3214,8 @@ pub enum ServerboundPlayPacket {
     SetPlayerPosition(SetPlayerPosition),
     /// The `SetPlayerPositionAndRotation` packet.
     SetPlayerPositionAndRotation(SetPlayerPositionAndRotation),
+    /// The `SetPlayerRotation` packet.
+    SetPlayerRotation(SetPlayerRotation),
     /// The `PlayerAction` packet.
     PlayerAction(PlayerAction),
     /// The `ServerboundSetHeldItem` packet.
@@ -3145,6 +3248,9 @@ impl ServerboundPlayPacket {
             SetPlayerPositionAndRotation::PACKET_ID => Ok(Self::SetPlayerPositionAndRotation(
                 SetPlayerPositionAndRotation::decode(reader)?,
             )),
+            SetPlayerRotation::PACKET_ID => {
+                Ok(Self::SetPlayerRotation(SetPlayerRotation::decode(reader)?))
+            }
             PlayerAction::PACKET_ID => Ok(Self::PlayerAction(PlayerAction::decode(reader)?)),
             ServerboundSetHeldItem::PACKET_ID => Ok(Self::ServerboundSetHeldItem(
                 ServerboundSetHeldItem::decode(reader)?,
@@ -3172,6 +3278,7 @@ impl ServerboundPlayPacket {
             Self::ServerboundKeepAlive(_) => ServerboundKeepAlive::PACKET_ID,
             Self::SetPlayerPosition(_) => SetPlayerPosition::PACKET_ID,
             Self::SetPlayerPositionAndRotation(_) => SetPlayerPositionAndRotation::PACKET_ID,
+            Self::SetPlayerRotation(_) => SetPlayerRotation::PACKET_ID,
             Self::PlayerAction(_) => PlayerAction::PACKET_ID,
             Self::ServerboundSetHeldItem(_) => ServerboundSetHeldItem::PACKET_ID,
             Self::SetCreativeSlot(_) => SetCreativeSlot::PACKET_ID,
@@ -3190,6 +3297,7 @@ impl ServerboundPlayPacket {
             Self::ServerboundKeepAlive(packet) => packet.encode(buf),
             Self::SetPlayerPosition(packet) => packet.encode(buf),
             Self::SetPlayerPositionAndRotation(packet) => packet.encode(buf),
+            Self::SetPlayerRotation(packet) => packet.encode(buf),
             Self::PlayerAction(packet) => packet.encode(buf),
             Self::ServerboundSetHeldItem(packet) => packet.encode(buf),
             Self::SetCreativeSlot(packet) => packet.encode(buf),
@@ -3249,6 +3357,8 @@ pub enum ClientboundPlayPacket {
     SetCenterChunk(SetCenterChunk),
     /// The `SetDefaultSpawnPosition` packet.
     SetDefaultSpawnPosition(SetDefaultSpawnPosition),
+    /// The `SetEquipment` packet.
+    SetEquipment(SetEquipment),
     /// The `ClientboundSetHeldItem` packet.
     ClientboundSetHeldItem(ClientboundSetHeldItem),
     /// The `SystemChat` packet.
@@ -3315,6 +3425,7 @@ impl ClientboundPlayPacket {
             SetDefaultSpawnPosition::PACKET_ID => Ok(Self::SetDefaultSpawnPosition(
                 SetDefaultSpawnPosition::decode(reader)?,
             )),
+            SetEquipment::PACKET_ID => Ok(Self::SetEquipment(SetEquipment::decode(reader)?)),
             ClientboundSetHeldItem::PACKET_ID => Ok(Self::ClientboundSetHeldItem(
                 ClientboundSetHeldItem::decode(reader)?,
             )),
@@ -3354,6 +3465,7 @@ impl ClientboundPlayPacket {
             Self::SetHeadRotation(_) => SetHeadRotation::PACKET_ID,
             Self::SetCenterChunk(_) => SetCenterChunk::PACKET_ID,
             Self::SetDefaultSpawnPosition(_) => SetDefaultSpawnPosition::PACKET_ID,
+            Self::SetEquipment(_) => SetEquipment::PACKET_ID,
             Self::ClientboundSetHeldItem(_) => ClientboundSetHeldItem::PACKET_ID,
             Self::SystemChat(_) => SystemChat::PACKET_ID,
         }
@@ -3386,6 +3498,7 @@ impl ClientboundPlayPacket {
             Self::SetHeadRotation(packet) => packet.encode(buf),
             Self::SetCenterChunk(packet) => packet.encode(buf),
             Self::SetDefaultSpawnPosition(packet) => packet.encode(buf),
+            Self::SetEquipment(packet) => packet.encode(buf),
             Self::ClientboundSetHeldItem(packet) => packet.encode(buf),
             Self::SystemChat(packet) => packet.encode(buf),
         }

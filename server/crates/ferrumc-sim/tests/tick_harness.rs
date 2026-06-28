@@ -47,14 +47,18 @@ fn sample_scenario() -> Vec<Vec<GameInput>> {
         vec![
             GameInput::PlayerMove {
                 player: alice,
-                position: Vec3::new(1.0, 64.0, 0.0),
+                position: Some(Vec3::new(1.0, 64.0, 0.0)),
+                yaw: None,
+                pitch: None,
             },
             GameInput::PlayerLeave { player: bob },
         ],
         // bob already left: this move is ignored, producing no output.
         vec![GameInput::PlayerMove {
             player: bob,
-            position: Vec3::new(99.0, 64.0, 99.0),
+            position: Some(Vec3::new(99.0, 64.0, 99.0)),
+            yaw: None,
+            pitch: None,
         }],
         // An empty tick still advances the counter and yields no outputs.
         vec![],
@@ -100,7 +104,9 @@ fn inputs_apply_at_next_tick_boundary_not_mid_tick() {
     harness
         .submit(GameInput::PlayerMove {
             player: alice,
-            position: Vec3::new(5.0, 64.0, 2.0),
+            position: Some(Vec3::new(5.0, 64.0, 2.0)),
+            yaw: None,
+            pitch: None,
         })
         .expect("inbox has room");
     assert_eq!(
@@ -133,7 +139,9 @@ fn multiple_moves_in_one_tick_coalesce_to_the_latest_position() {
         harness
             .submit(GameInput::PlayerMove {
                 player: p,
-                position: Vec3::new(x, 64.0, 0.0),
+                position: Some(Vec3::new(x, 64.0, 0.0)),
+                yaw: None,
+                pitch: None,
             })
             .expect("room");
     }
@@ -142,7 +150,10 @@ fn multiple_moves_in_one_tick_coalesce_to_the_latest_position() {
         outcome.outputs(),
         &[GameOutput::PlayerMoved {
             player: p,
-            position: Vec3::new(3.0, 64.0, 0.0)
+            position: Vec3::new(3.0, 64.0, 0.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            position_changed: true,
         }]
     );
     assert_eq!(
@@ -167,7 +178,9 @@ fn invalid_coordinates_are_rejected_at_the_boundary() {
     harness
         .submit(GameInput::PlayerMove {
             player: p,
-            position: Vec3::new(f64::INFINITY, 64.0, 8.0),
+            position: Some(Vec3::new(f64::INFINITY, 64.0, 8.0)),
+            yaw: None,
+            pitch: None,
         })
         .expect("room");
     let outcome = harness.tick().expect("tick");
@@ -214,7 +227,9 @@ fn inbox_full_rejects_without_dropping_or_blocking() {
     shard
         .enqueue(GameInput::PlayerMove {
             player: p,
-            position: Vec3::new(1.0, 0.0, 0.0),
+            position: Some(Vec3::new(1.0, 0.0, 0.0)),
+            yaw: None,
+            pitch: None,
         })
         .expect("second input fits");
     assert!(shard.is_inbox_full());
@@ -223,7 +238,9 @@ fn inbox_full_rejects_without_dropping_or_blocking() {
     let err = shard
         .enqueue(GameInput::PlayerMove {
             player: p,
-            position: Vec3::new(2.0, 0.0, 0.0),
+            position: Some(Vec3::new(2.0, 0.0, 0.0)),
+            yaw: None,
+            pitch: None,
         })
         .expect_err("inbox is full");
     assert_eq!(err, SimError::InboxFull { capacity: 2 });
