@@ -821,11 +821,20 @@ impl PluginHost {
                 }
             }
 
-            // A Deny is absorbing and recorded; Allow (and, since the enum is
-            // `#[non_exhaustive]`, any unknown future variant) leaves the fold
-            // unchanged.
-            if let PluginEventDecision::Deny { message } = plugin_decision {
-                decision = PluginEventDecision::Deny { message };
+            // Tally this plugin's own contribution (mirroring the per-plugin
+            // attribution in `fold_before`), then fold it: a Deny is absorbing
+            // and recorded; Allow (and, since the enum is `#[non_exhaustive]`,
+            // any unknown future variant) leaves the fold unchanged.
+            match plugin_decision {
+                PluginEventDecision::Deny { message } => {
+                    slot.stats.deny = slot.stats.deny.saturating_add(1);
+                    decision = PluginEventDecision::Deny { message };
+                }
+                // `PluginEventDecision::Allow` (no-op) and any future no-veto
+                // variant count as an allow (the event was not vetoed).
+                _ => {
+                    slot.stats.allow = slot.stats.allow.saturating_add(1);
+                }
             }
         }
 
@@ -1636,6 +1645,46 @@ mod tests {
         );
         assert_eq!(resolved.decision(), &PluginEventDecision::Allow);
         assert_eq!(resolved.report().delivered(), 1, "the hook ran");
+    }
+
+    #[test]
+    fn event_decisions_are_tallied_per_plugin() {
+        let mut host = PluginHost::in_memory();
+        // Registration order: allower first, then denier. Only a Deny is
+        // absorbing, so the allower runs and tallies an allow before the
+        // denier runs, tallies a deny, and short-circuits the rest. This proves
+        // each plugin's OWN contribution is recorded, not just the folded result.
+        let allower = host
+            .register(EventDecisionPlugin::boxed(
+                "allower",
+                PluginEventDecision::Allow,
+            ))
+            .expect("registers allower");
+        let denier = host
+            .register(EventDecisionPlugin::boxed(
+                "denier",
+                PluginEventDecision::Deny {
+                    message: Some(TextComponent::text("nope")),
+                },
+            ))
+            .expect("registers denier");
+        enable_all(&mut host, &[&allower, &denier]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_chat_decision(
+            &chat_attempt("hi"),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert!(resolved.is_deny(), "the denier vetoes the message");
+
+        let allower_stats = host.stats(&allower).expect("allower registered");
+        assert_eq!(allower_stats.allow(), 1, "the allower tallied an allow");
+        assert_eq!(allower_stats.deny(), 0);
+        let denier_stats = host.stats(&denier).expect("denier registered");
+        assert_eq!(denier_stats.deny(), 1, "the denier tallied a deny");
+        assert_eq!(denier_stats.allow(), 0);
     }
 
     #[test]
