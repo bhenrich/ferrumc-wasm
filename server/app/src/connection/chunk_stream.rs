@@ -238,8 +238,8 @@ pub(super) async fn pump_chunk_stream(
 
     // Only the chunks the driver actually built come back; record exactly those so
     // a skipped chunk is retried on a later update rather than treated as sent.
-    for packet in packets {
-        let pos = ChunkPos::new(packet.x(), packet.z());
+    for streamed in packets {
+        let pos = ChunkPos::new(streamed.chunk.x(), streamed.chunk.z());
         // Track the column unconditionally: the driver already took a player ticket
         // for it, and `loaded` is what the disconnect/unload path uses to release
         // that ticket. Gating this on the enqueue would leak the ticket on a
@@ -251,10 +251,22 @@ pub(super) async fn pump_chunk_stream(
             compression,
             clock,
             OutboundPriority::World,
-            ClientboundPlayPacket::ChunkDataAndLight(packet),
+            ClientboundPlayPacket::ChunkDataAndLight(streamed.chunk),
         );
         if outcome.is_enqueued() {
             ctx.metrics.incr_chunk_sent(1);
+        }
+        // Render any signs in the column right after it (chunk-enter half of the
+        // sign loop), at the same World priority.
+        for block_entity in streamed.block_entities {
+            enqueue_traced(
+                writer,
+                debug,
+                compression,
+                clock,
+                OutboundPriority::World,
+                block_entity,
+            );
         }
     }
     Ok(())

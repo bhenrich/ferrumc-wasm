@@ -31,8 +31,10 @@ use ferrumc_observability::{
     PlayerSnapshot, ServerClock, ServerSnapshotParts, SnapshotPublisher, TickMetrics, Vec3Snapshot,
     DEFAULT_TOP_N,
 };
-use ferrumc_proto::generated::play::ChunkDataAndLight;
-use ferrumc_session::{NetEvent, PlayerSessionHandle, SessionError, SessionRouter};
+use ferrumc_proto::generated::play::{ChunkDataAndLight, ClientboundPlayPacket};
+use ferrumc_session::{
+    sign_block_entity_data, NetEvent, PlayerSessionHandle, SessionError, SessionRouter,
+};
 use ferrumc_sim::{
     BlockStateId, ChunkTicket, GameInput, GameOutput, MutationCause, PendingMutation, RegionOp,
     SimShard, TicketReason,
@@ -40,7 +42,7 @@ use ferrumc_sim::{
 use ferrumc_storage::{
     BlockMutationLogRecord, MutationActor, MutationLogCause, SchemaVersion, WorldStore,
 };
-use ferrumc_world::FlatWorldGenerator;
+use ferrumc_world::{BlockEntity, Chunk, FlatWorldGenerator};
 
 use crate::plugins::BlockEventDispatcher;
 use crate::storage_worker::StorageFlushRequest;
@@ -182,7 +184,10 @@ pub(crate) enum SimCommand {
         /// One-shot channel the driver replies on with the built chunk packets for
         /// the subset of `load` that resolved (a store/encode failure skips just
         /// that chunk, so the connection only records what it actually received).
-        reply: oneshot::Sender<Vec<ChunkDataAndLight>>,
+        /// Each [`StreamedChunk`] carries the column packet plus any block-entity
+        /// (sign) render packets for that chunk, so a (re)joining or streaming
+        /// player sees existing signs render as the chunk enters view.
+        reply: oneshot::Sender<Vec<StreamedChunk>>,
     },
     /// Release the player tickets on every chunk in `positions` without sending
     /// anything back. Used when a connection ends so the player's streamed chunks
@@ -357,6 +362,53 @@ pub(crate) enum SimCommand {
         /// The pre-encoded main-hand `SetEquipment` body (slot byte + trusted Slot).
         equipment: Vec<u8>,
     },
+    /// Apply a player's edit to a sign's text after a serverbound `UpdateSign`.
+    ///
+    /// Routed to the block's owning shard as a [`GameInput::UpdateSign`]. The
+    /// simulation validates it (actor present, chunk resident, in reach, a
+    /// non-waxed sign present) at the tick boundary and, on acceptance, stores the
+    /// new lines and emits a `SignUpdated` the router broadcasts as
+    /// `BlockEntityData`. Net never writes the world directly — this is the only
+    /// path a sign edit reaches the simulation.
+    UpdateSign {
+        /// The editing player.
+        player: PlayerId,
+        /// Absolute position of the sign being edited.
+        position: BlockPos,
+        /// `true` to edit the front face, `false` the back.
+        is_front: bool,
+        /// The four new text lines, top to bottom.
+        lines: [String; ferrumc_world::SIGN_LINES],
+    },
+}
+
+/// One chunk built for a [`SimCommand::StreamChunks`] request: the column
+/// data+light packet plus any block-entity render packets for that chunk.
+///
+/// The block-entity packets (sign `BlockEntityData`) are sent right after the
+/// column so the client renders existing signs as the chunk enters view — the
+/// chunk-enter half of the sign loop, covering both a (re)joining player's spawn
+/// columns and a moving player streaming new columns.
+pub(crate) struct StreamedChunk {
+    /// The chunk column data + light packet.
+    pub(crate) chunk: ChunkDataAndLight,
+    /// Block-entity render packets for this chunk, in deterministic position
+    /// order; empty when the chunk holds no block entities.
+    pub(crate) block_entities: Vec<ClientboundPlayPacket>,
+}
+
+/// Builds the block-entity render packets for `chunk`: one `BlockEntityData` per
+/// sign block-entity, in ascending [`BlockPos`] order.
+fn chunk_block_entity_packets(chunk: &Chunk) -> Vec<ClientboundPlayPacket> {
+    chunk
+        .block_entities()
+        .filter_map(|(pos, entity)| {
+            let BlockEntity::Sign(sign) = entity else {
+                return None;
+            };
+            Some(sign_block_entity_data(pos, sign))
+        })
+        .collect()
 }
 
 /// Runs the driver loop until `shutdown` flips or every command sender drops.
@@ -737,6 +789,27 @@ async fn handle_command(
             // no-op inside the router.
             router.set_equipment(player, equipment);
         }
+        SimCommand::UpdateSign {
+            player,
+            position,
+            is_front,
+            lines,
+        } => {
+            // Route the sign edit to the block's owning shard. A gone player has no
+            // shard to route to; a full inbox drops it (the client's next edit
+            // retries), exactly like any other block-edit input under load.
+            if let Err(err) = router.route_game_input(
+                player,
+                GameInput::UpdateSign {
+                    player,
+                    position,
+                    is_front,
+                    lines,
+                },
+            ) {
+                tracing::trace!(%err, "dropping sign update");
+            }
+        }
     }
 }
 
@@ -751,7 +824,7 @@ async fn load_chunks(
     store: &dyn WorldStore,
     generator: &FlatWorldGenerator,
     positions: &[ChunkPos],
-) -> Vec<ChunkDataAndLight> {
+) -> Vec<StreamedChunk> {
     let ticket = ChunkTicket::of(TicketReason::Player);
     let mut packets = Vec::with_capacity(positions.len());
     for &pos in positions {
@@ -764,13 +837,14 @@ async fn load_chunks(
             continue;
         }
         // `acquire` just made the chunk resident, so the lookup cannot miss; the
-        // built packet is owned, so the immutable borrow ends before the arms.
-        match shard
-            .loaded_chunks()
-            .get(pos)
-            .map(|chunk| chunk_packet(pos, chunk))
-        {
-            Some(Ok(packet)) => packets.push(packet),
+        // built packets are owned, so the immutable borrow ends before the arms.
+        match shard.loaded_chunks().get(pos).map(|chunk| {
+            chunk_packet(pos, chunk).map(|chunk_packet| StreamedChunk {
+                chunk: chunk_packet,
+                block_entities: chunk_block_entity_packets(chunk),
+            })
+        }) {
+            Some(Ok(streamed)) => packets.push(streamed),
             other => {
                 if let Some(Err(err)) = other {
                     tracing::warn!(%err, x = pos.x(), z = pos.z(), "failed to encode streamed chunk");

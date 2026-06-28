@@ -14,7 +14,7 @@ use ferrumc_plugin_host::ResolvedDecision;
 use ferrumc_proto::generated::play::{
     ClientboundPlayPacket, CommandSuggestionMatch, GameEvent, ServerboundPlayPacket,
     ServerboundSetHeldItem, SetContainerContent, SetContainerSlot, SetCreativeSlot,
-    SetPlayerPosition, TabCompleteResponse, UseItemOn, WindowClick,
+    SetPlayerPosition, TabCompleteResponse, UpdateSign, UseItemOn, WindowClick,
 };
 use ferrumc_session::{net_event_to_input, use_item_on_face, use_item_on_target, NetEvent};
 use ferrumc_sim::{BlockStateId, GameInput};
@@ -192,6 +192,12 @@ pub(super) async fn handle_play_body(
                 compression,
             )
             .await;
+        }
+        // Update Sign: the player confirmed text in the sign editor. Route it to
+        // the block's owning shard, which validates and stores it (net never writes
+        // the world directly) and broadcasts the rendered sign to viewers.
+        ServerboundPlayPacket::UpdateSign(p) => {
+            return handle_update_sign(ctx, player, p).await;
         }
         // Set Creative Slot (untrusted): validate the hostile item bytes, store the
         // slot, and echo it back so the client view matches the server.
@@ -853,6 +859,38 @@ async fn handle_use_item_on(
     }
 }
 
+/// Handles a serverbound Update Sign: route the player's new sign text to the
+/// block's owning shard as a [`SimCommand::UpdateSign`].
+///
+/// All validation — the editor is within reach and a non-waxed sign block-entity
+/// exists at the target — happens in the simulation at the tick boundary, since
+/// net never reads or writes the world directly. This only converts the wire
+/// fields (the packed location and the four bounded line strings) and forwards
+/// them; an edit the sim refuses is a silent no-op.
+async fn handle_update_sign(
+    ctx: &ConnContext,
+    player: PlayerId,
+    packet: &UpdateSign,
+) -> anyhow::Result<()> {
+    let loc = packet.location();
+    let position = BlockPos::new(loc.x(), loc.y(), loc.z());
+    let lines = [
+        packet.line_1().as_str().to_owned(),
+        packet.line_2().as_str().to_owned(),
+        packet.line_3().as_str().to_owned(),
+        packet.line_4().as_str().to_owned(),
+    ];
+    ctx.commands
+        .send(SimCommand::UpdateSign {
+            player,
+            position,
+            is_front: packet.is_front_text(),
+            lines,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
+}
+
 /// Handles a serverbound Set Creative Slot: validate the untrusted item bytes,
 /// store the slot, and echo it.
 ///
@@ -1103,8 +1141,9 @@ fn tab_complete_reply(
 
 #[cfg(test)]
 mod tests {
+    use ferrumc_codec::{write_var_int, BoundedReader};
     use ferrumc_proto::generated::play::{
-        ServerboundPlayPacket, SetPlayerPosition, SetPlayerRotation,
+        ServerboundPlayPacket, SetPlayerPosition, SetPlayerRotation, UpdateSign,
     };
 
     use super::{reported_yaw, tab_complete_reply};
@@ -1174,5 +1213,60 @@ mod tests {
         // The old byte computation would report length 3, mis-indexing the client.
         let (start, length, _) = tab_complete_reply(&tree, OP_LEVEL, &|_| true, "/\u{e9}a");
         assert_eq!((start, length), (1, 2));
+    }
+
+    /// Decodes a serverbound play body the same way `handle_play_body` does:
+    /// read the `VarInt` id, then dispatch to the typed packet.
+    fn decode_play(body: &[u8]) -> Result<ServerboundPlayPacket, ()> {
+        let mut reader = BoundedReader::new(body);
+        let id = reader.read_var_int().map_err(|_| ())?;
+        ServerboundPlayPacket::decode(id, &mut reader).map_err(|_| ())
+    }
+
+    #[test]
+    fn update_sign_decodes_a_well_formed_body() {
+        // id + 8-byte packed location (all zero -> (0,0,0)) + is_front(1) + four
+        // zero-length line strings.
+        let mut body = Vec::new();
+        write_var_int(&mut body, UpdateSign::PACKET_ID);
+        body.extend_from_slice(&[0u8; 8]); // packed BlockPosition (0,0,0)
+        body.push(0x01); // is_front_text = true
+        body.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // four empty VarInt-prefixed strings
+
+        let ServerboundPlayPacket::UpdateSign(packet) = decode_play(&body).expect("valid body")
+        else {
+            panic!("expected an UpdateSign");
+        };
+        let loc = packet.location();
+        assert_eq!((loc.x(), loc.y(), loc.z()), (0, 0, 0));
+        assert!(packet.is_front_text());
+        assert!(packet.line_1().as_str().is_empty());
+        assert!(packet.line_4().as_str().is_empty());
+    }
+
+    #[test]
+    fn update_sign_rejects_a_truncated_body() {
+        // Only the location is present: the decoder needs the is_front bool and four
+        // line strings next, so a body that stops here is malformed and rejected
+        // rather than silently accepted with garbage.
+        let mut truncated = Vec::new();
+        write_var_int(&mut truncated, UpdateSign::PACKET_ID);
+        truncated.extend_from_slice(&[0u8; 8]); // location only, nothing after
+        assert!(decode_play(&truncated).is_err());
+
+        // Even shorter: the location itself is incomplete (4 of 8 bytes).
+        let mut shorter = Vec::new();
+        write_var_int(&mut shorter, UpdateSign::PACKET_ID);
+        shorter.extend_from_slice(&[0u8; 4]);
+        assert!(decode_play(&shorter).is_err());
+
+        // A line string claims a length far past the remaining bytes.
+        let mut bad_string = Vec::new();
+        write_var_int(&mut bad_string, UpdateSign::PACKET_ID);
+        bad_string.extend_from_slice(&[0u8; 8]); // location
+        bad_string.push(0x00); // is_front = false
+        write_var_int(&mut bad_string, 4096); // line_1 claims 4096 bytes...
+        bad_string.extend_from_slice(b"hi"); // ...but only 2 follow
+        assert!(decode_play(&bad_string).is_err());
     }
 }

@@ -237,18 +237,23 @@ pub(super) async fn send_join_kit(
     let chunks = reply_rx
         .await
         .map_err(|_| anyhow::anyhow!("simulation driver dropped the spawn chunk reply"))?;
-    for chunk in chunks {
+    for streamed in chunks {
         let outcome = enqueue_traced_classified(
             writer,
             debug,
             compression,
             clock,
-            ClientboundPlayPacket::ChunkDataAndLight(chunk),
+            ClientboundPlayPacket::ChunkDataAndLight(streamed.chunk),
         );
         // Count only chunks that actually entered the queue; a tail-dropped chunk
         // never reaches the wire and must not inflate the counter.
         if outcome.is_enqueued() {
             ctx.metrics.incr_chunk_sent(1);
+        }
+        // Render any signs in the column right after it, so a (re)joining player
+        // sees text a previous session left on spawn-area signs.
+        for block_entity in streamed.block_entities {
+            enqueue_traced_classified(writer, debug, compression, clock, block_entity);
         }
     }
     flush_writer(writer, stream, compression, ctx.io_timeout).await
