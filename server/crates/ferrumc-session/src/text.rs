@@ -31,7 +31,11 @@ use ferrumc_proto::generated::play::{ClientboundPlayPacket, SystemChat};
 ///
 /// The compound root is mandatory: [`ferrumc_nbt::write_network_root`] requires a
 /// `TAG_Compound` root, and `{ text: "..." }` is the canonical component form.
-fn text_component_to_nbt(component: &TextComponent) -> NbtTag {
+///
+/// Visible to the rest of the crate so the [`crate::presentation`] title and
+/// action-bar builders encode their text the exact same way `SystemChat` does —
+/// the single source of truth for the `TextComponent` -> network-NBT path.
+pub(crate) fn text_component_to_nbt(component: &TextComponent) -> NbtTag {
     let mut root = NbtCompound::new();
     root.push("text", NbtTag::String(component.content().to_owned()));
     if let Some(color) = component.color() {

@@ -44,6 +44,7 @@
 mod error;
 mod event;
 mod outbound;
+mod presentation;
 mod router;
 mod text;
 mod translate;
@@ -51,6 +52,14 @@ mod translate;
 pub use error::SessionError;
 pub use event::NetEvent;
 pub use outbound::OutboundMessage;
+pub use presentation::{
+    action_bar, encode_dust_data, encode_sound_effect_payload, play_sound, spawn_dust,
+    spawn_particle, spawn_simple_particle, subtitle, title, title_animation_times, SoundCategory,
+    SoundId, PARTICLE_CLOUD, PARTICLE_CRIT, PARTICLE_DUST, PARTICLE_EXPLOSION, PARTICLE_FLAME,
+    PARTICLE_HAPPY_VILLAGER, PARTICLE_HEART, PARTICLE_SMOKE, SOUND_ANVIL_LAND,
+    SOUND_EXPERIENCE_ORB_PICKUP, SOUND_NOTE_BLOCK_HARP, SOUND_PLAYER_LEVELUP,
+    SOUND_UI_BUTTON_CLICK,
+};
 pub use router::{
     PlayerSessionHandle, SessionRouter, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_SHARD_INPUT_CAPACITY,
     DEFAULT_VIEW_DISTANCE,

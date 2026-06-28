@@ -591,6 +591,7 @@ dependencies = [
  "ferrumc-net",
  "ferrumc-proto",
  "ferrumc-sim",
+ "ferrumc-testkit",
  "thiserror",
  "tokio",
 ]

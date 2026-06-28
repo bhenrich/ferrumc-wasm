@@ -42,6 +42,11 @@ thiserror = { workspace = true }
 # Drive the one async `recv` test on a minimal current-thread runtime; all other
 # tests are runtime-free (bounded-channel `try_send`/`try_recv` need no runtime).
 tokio = { workspace = true }
+# The strict golden-byte frame oracle (`assert_wire_frame`) pins the hand-encoded
+# `SoundEffect` and `Particle` payloads byte-for-byte and proves they round-trip
+# through the generated codecs. Test-only; `ferrumc-testkit` does not depend on
+# this crate, so the dev edge stays acyclic.
+ferrumc-testkit = { workspace = true }
 
 [lints]
 workspace = true
