@@ -32,6 +32,9 @@ flamegraph.svg
 # Benchmark results (committed selectively)
 target/criterion/
 
+# Generated runtime config (the committed template is config.template.toml)
+/server/app/config.toml
+
 # World data (for testing only — don't commit actual worlds)
 world/
 world.ferrumdb

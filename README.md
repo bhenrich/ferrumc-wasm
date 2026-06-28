@@ -4,6 +4,14 @@ A high-performance Minecraft Java Edition server implementation written in Rust.
 
 > ⚠️ **This branch (`rework/ferrumc-v2`) is an active rewrite.** For the current working version, see `master`.
 
+## Status: v2 rework (creative/minigame core)
+
+FerrumC v2 is a **deterministic, Rust-native, observable creative/minigame server core** for vanilla **Minecraft: Java Edition 1.21.8** clients. It is a clean-room core meant for creative and minigame servers — not a drop-in vanilla replacement.
+
+It is **not** vanilla parity, **not** survival, and **not** a Paper/Spigot replacement. Scope today: **flat-world only**, **offline/local alpha**. The only supported client is Minecraft: Java Edition 1.21.8 (protocol 772) — see [`SUPPORTED_VERSION.md`](SUPPORTED_VERSION.md).
+
+> **NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.**
+
 ## FerrumC v2 (rework branch) — current status
 
 A playable vertical slice targeting **Minecraft Java 1.21.8 (protocol 772)**, **offline mode only**. This is honest about what is and isn't done — see [`docs/FEATURES.md`](docs/FEATURES.md) for the full, test-by-test breakdown.
