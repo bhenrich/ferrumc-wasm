@@ -9,7 +9,7 @@
     "check": "node --check smoke.mjs"
   },
   "dependencies": {
-    "node-minecraft-protocol": "1.66.2",
+    "minecraft-protocol": "1.66.2",
     "minecraft-data": "3.111.0"
   },
   "engines": {

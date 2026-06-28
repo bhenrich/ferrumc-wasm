@@ -40,3 +40,6 @@ world.ferrumdb
 plugins/*.so
 plugins/*.dll
 plugins/*.dylib
+
+# Node black-box smoke harness deps
+tests/blackbox/node_modules/
