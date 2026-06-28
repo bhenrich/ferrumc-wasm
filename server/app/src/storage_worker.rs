@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 
 use ferrumc_observability::CounterRegistry;
@@ -37,6 +37,18 @@ pub(crate) struct StorageFlushRequest {
     pub(crate) overlays: Vec<(ChunkKey, ChunkOverlayRecord)>,
     /// Journal entries to append.
     pub(crate) mutations: Vec<BlockMutationLogRecord>,
+    /// Optional single-shot acknowledgement, signalled after this request *and*
+    /// all previously buffered work have been committed (`save_chunk_overlays` +
+    /// redb `txn.commit`).
+    ///
+    /// `Some` only on the disconnect/release barrier (see
+    /// [`release_chunks_acked`](crate::driver)), where the driver must not drop a
+    /// chunk's tickets until the placed-block overlay is durable — otherwise a
+    /// fast rejoin could read a stale baseline before the write lands. `None` for
+    /// the fire-and-forget per-tick and shutdown flushes, which never block on a
+    /// commit. The receiver may be gone (the connection disconnected); the send is
+    /// best-effort and a dropped receiver is ignored.
+    pub(crate) ack: Option<oneshot::Sender<()>>,
 }
 
 /// Flush pending work at least this often (measured in driver ticks) even when
@@ -70,9 +82,21 @@ pub(crate) async fn run_storage_worker(
         tokio::select! {
             maybe_req = rx.recv() => {
                 if let Some(req) = maybe_req {
-                    pending_overlays.extend(req.overlays);
-                    pending_mutations.extend(req.mutations);
-                    if pending_overlays.len() >= FLUSH_CHUNK_THRESHOLD
+                    let StorageFlushRequest {
+                        overlays,
+                        mutations,
+                        ack,
+                    } = req;
+                    pending_overlays.extend(overlays);
+                    pending_mutations.extend(mutations);
+                    // An acked request forces a full-buffer drain regardless of the
+                    // count thresholds: the placed-block overlay it is meant to make
+                    // durable has usually already been moved into this buffer by an
+                    // earlier per-tick `try_flush_persist_dirty`, so the only way to
+                    // guarantee it is committed before the ack fires is to commit
+                    // everything still pending here.
+                    if ack.is_some()
+                        || pending_overlays.len() >= FLUSH_CHUNK_THRESHOLD
                         || pending_mutations.len() >= FLUSH_CHUNK_THRESHOLD
                     {
                         flush(
@@ -82,6 +106,12 @@ pub(crate) async fn run_storage_worker(
                             &mut pending_mutations,
                         )
                         .await;
+                    }
+                    // Signal the barrier (if any) only after the commit above, so the
+                    // releaser awaiting it observes a durable write. A gone receiver
+                    // (the connection already dropped) is ignored.
+                    if let Some(ack) = ack {
+                        let _ = ack.send(());
                     }
                 } else {
                     // The driver dropped its sender on shutdown: drain everything

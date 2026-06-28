@@ -924,6 +924,12 @@ async fn join_simulation(
 /// the permission-filtered `Commands` graph, a non-zero `SynchronizePlayerPosition`,
 /// then the spawn-area chunks.
 ///
+/// The spawn-area chunks are fetched LIVE from the resident shard chunks at join
+/// time (a [`SimCommand::StreamChunks`] round-trip), not replayed from a cached
+/// snapshot, so an edit a previous session placed in a spawn chunk is reflected on
+/// this (re)join. The round-trip also gives this connection a player ticket on each
+/// spawn column, released on disconnect via the normal `ReleaseChunks` path.
+///
 /// The position sync goes out *before* the chunks so the client's spawn point is
 /// fixed first: the loading-screen gate releases on the chunk that contains the
 /// player's position, and sending the sync first guarantees that chunk is among
@@ -1056,14 +1062,33 @@ async fn send_join_kit(
     )?;
     flush_writer(writer, stream, compression, ctx.io_timeout).await?;
 
-    // Stage 2: the spawn-area chunk column packets (includes the player's chunk).
-    for chunk in kit.chunks() {
+    // Stage 2: the spawn-area chunk column packets (includes the player's chunk),
+    // fetched LIVE from the resident shard chunks rather than replayed from a
+    // cached snapshot. A `StreamChunks` round-trip acquires a player ticket on each
+    // spawn column and builds its packet from the current chunk state, so a block a
+    // previous session placed in a spawn chunk is present on this (re)join. The
+    // whole batch is still sent up-front here (not re-paced through the streaming
+    // pump) so the loading screen releases as before.
+    let spawn_positions: Vec<ChunkPos> = kit.chunk_positions().collect();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    ctx.commands
+        .send(SimCommand::StreamChunks {
+            load: spawn_positions,
+            unload: Vec::new(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+    let chunks = reply_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver dropped the spawn chunk reply"))?;
+    for chunk in chunks {
         let outcome = enqueue_traced_classified(
             writer,
             debug,
             compression,
             clock,
-            ClientboundPlayPacket::ChunkDataAndLight(chunk.clone()),
+            ClientboundPlayPacket::ChunkDataAndLight(chunk),
         );
         // Count only chunks that actually entered the queue; a tail-dropped chunk
         // never reaches the wire and must not inflate the counter.

@@ -5,11 +5,16 @@
 //! The spawn chunks are loaded once at startup into the single shard's
 //! [`LoadedChunkMap`](ferrumc_sim::LoadedChunkMap) via
 //! [`acquire_spawn`](ferrumc_sim::LoadedChunkMap::acquire_spawn) (try the
-//! [`WorldStore`], else generate flat terrain). From the resident chunks we build
-//! a shared [`JoinKit`]: the `JoinGame` packet, the spawn position, and one
-//! `ChunkDataAndLight` per spawn chunk. Connection tasks clone the `Arc<JoinKit>`
-//! and replay it the moment a client reaches play, so no per-connection work
-//! touches the simulation shard.
+//! [`WorldStore`], else generate flat terrain) and kept resident by a `Spawn`
+//! ticket. From them we build a shared [`JoinKit`]: the `JoinGame` packet, the
+//! spawn position, and the *list of spawn chunk positions*. Connection tasks clone
+//! the `Arc<JoinKit>` and replay the framing the moment a client reaches play.
+//!
+//! The spawn-area chunk blobs themselves are **not** cached in the kit: they are
+//! fetched live from the resident shard chunks at join time (via a
+//! [`StreamChunks`](crate::driver::SimCommand::StreamChunks) round-trip), so a
+//! block another player placed in a spawn chunk is reflected on every (re)join —
+//! a cached snapshot would replay the stale pre-edit terrain instead.
 
 use ferrumc_codec::{BoundedBytes, BoundedString};
 use ferrumc_math::{BlockPos, ChunkPos};
@@ -53,12 +58,18 @@ const NO_PREVIOUS_GAMEMODE: u8 = u8::MAX;
 /// `MOTION_BLOCKING` (the highest block that blocks motion or contains a fluid).
 const MOTION_BLOCKING_HEIGHTMAP: i32 = 4;
 
-/// The clientbound packets replayed to every player the instant they reach play.
+/// The shared join payload replayed to every player the instant they reach play.
 ///
-/// Built once at startup from the resident spawn chunks and shared behind an
-/// [`Arc`](std::sync::Arc). It is exactly the keystone payload of the vertical
-/// slice: the `JoinGame` that puts the client in play, the absolute spawn
-/// position to synchronize to, and the spawn-area chunk column packets.
+/// Built once at startup and shared behind an [`Arc`](std::sync::Arc). It is the
+/// keystone framing of the vertical slice: the `JoinGame` that puts the client in
+/// play, the absolute spawn position to synchronize to, and the *positions* of the
+/// spawn-area chunk columns.
+///
+/// The chunk blobs are deliberately **not** stored here. A joining connection
+/// fetches them live from the resident shard chunks at join time (see
+/// [`send_join_kit`](crate::connection)), so an edit placed in a spawn chunk by a
+/// previous session is reflected on the next join; a cached snapshot would replay
+/// the stale pre-edit terrain.
 #[derive(Debug, Clone)]
 pub(crate) struct JoinKit {
     /// The `JoinGame` packet announcing the (flat) overworld.
@@ -70,8 +81,9 @@ pub(crate) struct JoinKit {
     spawn_chunk: ChunkPos,
     /// The block-aligned world spawn, sent as `Set Default Spawn Position`.
     spawn_block: BlockPosition,
-    /// One `ChunkDataAndLight` packet per resident spawn chunk.
-    chunks: Vec<ChunkDataAndLight>,
+    /// The positions of the spawn-area chunk columns, in deterministic order. The
+    /// connection fetches each column's live blob from the shard at join time.
+    spawn_positions: Vec<ChunkPos>,
 }
 
 impl JoinKit {
@@ -95,19 +107,13 @@ impl JoinKit {
         self.spawn_block
     }
 
-    /// The spawn-area chunk packets, in deterministic order.
-    pub(crate) fn chunks(&self) -> &[ChunkDataAndLight] {
-        &self.chunks
-    }
-
     /// The chunk positions covered by the spawn batch sent at join.
     ///
-    /// A connection seeds its per-player loaded-chunk set with these so chunk
+    /// A connection both fetches the live blob for each of these from the shard at
+    /// join time and seeds its per-player loaded-chunk set with them, so chunk
     /// streaming never re-sends a chunk the client already received at join.
     pub(crate) fn chunk_positions(&self) -> impl Iterator<Item = ChunkPos> + '_ {
-        self.chunks
-            .iter()
-            .map(|chunk| ChunkPos::new(chunk.x(), chunk.z()))
+        self.spawn_positions.iter().copied()
     }
 }
 
@@ -163,7 +169,7 @@ pub(crate) async fn build_world(
         .acquire_spawn(&*store, &generator, &spawn)
         .await?;
 
-    let join_kit = std::sync::Arc::new(build_join_kit(config, &shard, &spawn)?);
+    let join_kit = std::sync::Arc::new(build_join_kit(config, &spawn)?);
     Ok(WorldSetup {
         shard,
         join_kit,
@@ -200,19 +206,12 @@ fn open_store(config: &AppConfig) -> anyhow::Result<Arc<dyn WorldStore>> {
     }
 }
 
-/// Assembles the [`JoinKit`] from the shard's resident spawn chunks.
-fn build_join_kit(
-    config: &AppConfig,
-    shard: &SimShard,
-    spawn: &SpawnChunkTickets,
-) -> anyhow::Result<JoinKit> {
-    let mut chunks = Vec::with_capacity(spawn.chunk_count());
-    for pos in spawn.positions() {
-        let chunk = shard.loaded_chunks().get(pos).ok_or_else(|| {
-            anyhow::anyhow!("spawn chunk ({}, {}) not resident", pos.x(), pos.z())
-        })?;
-        chunks.push(chunk_packet(pos, chunk)?);
-    }
+/// Assembles the shared [`JoinKit`] framing.
+///
+/// Records only the spawn chunk *positions*; the connection fetches each column's
+/// live blob from the resident shard chunks at join time, so the kit never holds a
+/// stale snapshot of a spawn chunk.
+fn build_join_kit(config: &AppConfig, spawn: &SpawnChunkTickets) -> anyhow::Result<JoinKit> {
     let spawn_block = BlockPosition::new(
         config.spawn.x.floor() as i32,
         config.spawn.y.floor() as i32,
@@ -223,7 +222,7 @@ fn build_join_kit(
         spawn_position: config.spawn,
         spawn_chunk: spawn_center_chunk(config),
         spawn_block,
-        chunks,
+        spawn_positions: spawn.positions().collect(),
     })
 }
 
@@ -322,10 +321,11 @@ mod tests {
             .await
             .expect("world builds");
 
-        // Radius 2 -> a 5x5 spawn square, all resident, all with a chunk packet.
+        // Radius 2 -> a 5x5 spawn square, all resident, all covered by the kit's
+        // position list.
         let expected = (2 * usize::from(config.spawn_chunk_radius) + 1).pow(2);
         assert_eq!(setup.shard.loaded_chunks().loaded_count(), expected);
-        assert_eq!(setup.join_kit.chunks().len(), expected);
+        assert_eq!(setup.join_kit.chunk_positions().count(), expected);
         assert_eq!(setup.join_kit.spawn_position(), config.spawn);
         assert_eq!(
             setup.join_kit.join_game().view_distance(),
@@ -339,10 +339,17 @@ mod tests {
         let block = setup.join_kit.spawn_block();
         assert_eq!((block.x(), block.y(), block.z()), (8, 64, 8));
 
-        // Every chunk packet carries the real wire payload: a non-empty paletted
-        // section blob, the 37-long MOTION_BLOCKING heightmap, and full-bright sky
-        // light over all 26 light sections.
-        for chunk in setup.join_kit.chunks() {
+        // Every spawn column builds the real wire payload from its live resident
+        // chunk (the same `chunk_packet` the join-time fetch uses): a non-empty
+        // paletted section blob, the 37-long MOTION_BLOCKING heightmap, and
+        // full-bright sky light over all 26 light sections.
+        for pos in setup.join_kit.chunk_positions() {
+            let resident = setup
+                .shard
+                .loaded_chunks()
+                .get(pos)
+                .expect("spawn chunk resident");
+            let chunk = chunk_packet(pos, resident).expect("chunk packet builds");
             assert!(!chunk.chunk_data().as_slice().is_empty());
 
             let heightmaps = chunk.heightmaps();

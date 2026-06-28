@@ -253,6 +253,9 @@ fn build_flush_request(
     Some(StorageFlushRequest {
         overlays,
         mutations,
+        // Per-tick/shutdown flushes are fire-and-forget; only the disconnect
+        // barrier (`release_chunks_acked`) attaches an ack.
+        ack: None,
     })
 }
 
@@ -353,7 +356,9 @@ async fn handle_command(
             let _ = reply.send(packets);
         }
         SimCommand::ReleaseChunks { positions } => {
-            release_chunks(shard, storage_tx, tick, next_mutation_id, &positions).await;
+            // Disconnect path: await the worker's commit before releasing tickets so
+            // a fast rejoin cannot read a stale baseline (Bug A barrier).
+            release_chunks_acked(shard, storage_tx, tick, next_mutation_id, &positions).await;
         }
         SimCommand::BroadcastSystemChat { content, overlay } => {
             router.broadcast_system_chat(&content, overlay);
@@ -456,6 +461,53 @@ async fn release_chunks(
         if let Err(err) = storage_tx.send(request).await {
             tracing::warn!(%err, "failed to flush edits before releasing chunks");
         }
+    }
+
+    let ticket = ChunkTicket::of(TicketReason::Player);
+    for &pos in positions {
+        let _ = shard.loaded_chunks_mut().release(pos, ticket);
+    }
+}
+
+/// Releases the player ticket on each chunk in `positions`, but **only after** the
+/// storage worker confirms every buffered edit is committed (the Bug A barrier).
+///
+/// Used exclusively on the disconnect path ([`SimCommand::ReleaseChunks`]). Unlike
+/// the per-movement [`release_chunks`], this always sends a flush request carrying
+/// a single-shot ack — even when [`build_flush_request`] returns `None`. That is
+/// deliberate: a prior per-tick [`try_flush_persist_dirty`] has usually already
+/// drained the placed-block overlay into the worker's *uncommitted* buffer, so
+/// there may be nothing fresh to capture here yet the write is still not durable.
+/// The worker force-commits its entire pending buffer before acking, and only then
+/// are the tickets dropped — so the next player's `acquire`/`load_or_generate`
+/// reads the freshly persisted baseline instead of the stale one.
+///
+/// This `await`s a redb commit, which is allowed because it runs off the tick (from
+/// [`handle_command`], never `run_tick`); the per-movement unload deliberately does
+/// **not** route through here, so a chunk-boundary crossing never forces a commit.
+async fn release_chunks_acked(
+    shard: &mut SimShard,
+    storage_tx: &mpsc::Sender<StorageFlushRequest>,
+    tick: Tick,
+    next_mutation_id: &mut u64,
+    positions: &[ChunkPos],
+) {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    // Always send an acked request, even with nothing fresh to flush: the overlay
+    // may already be buffered uncommitted in the worker.
+    let mut request =
+        build_flush_request(shard, tick, next_mutation_id).unwrap_or(StorageFlushRequest {
+            overlays: Vec::new(),
+            mutations: Vec::new(),
+            ack: None,
+        });
+    request.ack = Some(ack_tx);
+
+    if storage_tx.send(request).await.is_ok() {
+        // Block this command (not the tick) until the commit lands.
+        let _ = ack_rx.await;
+    } else {
+        tracing::warn!("failed to send acked flush before releasing chunks; releasing best-effort");
     }
 
     let ticket = ChunkTicket::of(TicketReason::Player);
