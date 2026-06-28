@@ -18,9 +18,13 @@
 //! - A [`CounterRegistry`] of atomic-backed counters/gauges named after the
 //!   locked-in metric set, a per-tick [`TickMetrics`] record, a shared
 //!   [`ServerClock`], and a [`MetricsSnapshot`] for a future exporter.
+//! - A read-only [`ServerSnapshot`] (folded from the registry plus app-supplied
+//!   [`ServerSnapshotParts`]) published lock-light through a [`SnapshotPublisher`]
+//!   for the localhost dashboard to render.
 
 mod metrics;
 mod ring;
+mod snapshot;
 mod trace;
 
 pub use metrics::{
@@ -29,4 +33,9 @@ pub use metrics::{
     StorageFlushStats, TickMetrics, TickMsEntry,
 };
 pub use ring::RingBuffer;
+pub use snapshot::{
+    ChunkPosSnapshot, DecodeErrorSnapshot, MutationCountSnapshot, NetworkMetricsSnapshot,
+    PacketFrequency, PacketTraceSummary, PlayerSnapshot, PluginDecisionSnapshot, PluginDecisions,
+    ServerSnapshot, ServerSnapshotParts, SnapshotPublisher, Vec3Snapshot,
+};
 pub use trace::{Direction, PacketState, PacketTrace, SessionDebug, SessionDebugSnapshot};

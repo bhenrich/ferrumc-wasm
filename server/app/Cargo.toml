@@ -55,6 +55,9 @@ ferrumc-plugin-block-rules = { workspace = true }
 # Packet tracing + the metric registry / server clock wired into the connection
 # and driver hot paths; the app is the only crate that can fire those hooks.
 ferrumc-observability = { workspace = true }
+# The read-only localhost dashboard task `main` spawns; it reads the snapshot the
+# driver publishes through `ferrumc-observability::SnapshotPublisher`.
+ferrumc-dashboard = { workspace = true }
 
 # Single multi-thread Tokio runtime: listener, per-connection tasks, bounded
 # channels, intervals, timeouts, and graceful shutdown.
