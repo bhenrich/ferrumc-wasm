@@ -30,12 +30,7 @@ use super::chunk_stream::ChunkStream;
 use super::context::ConnContext;
 use super::outbound::{ack_sequence, enqueue_traced_classified, send_mandatory};
 use super::rate_limiter::ChatRateLimiter;
-use super::{spawn_sync, JOIN_TELEPORT_ID};
-
-/// `Game Event` reason `3`: "change game mode". The event `value` is the game-mode
-/// id as a float; sending it switches the issuing client's mode (the carrier
-/// `/gamemode` uses, since there is no dedicated set-game-mode packet).
-const GAME_EVENT_CHANGE_GAMEMODE: u8 = 3;
+use super::{spawn_sync, GAME_EVENT_CHANGE_GAMEMODE, JOIN_TELEPORT_ID};
 
 /// Handles one decoded serverbound play-frame body.
 ///
@@ -56,6 +51,7 @@ pub(super) async fn handle_play_body(
     chat_limiter: &mut ChatRateLimiter,
     inventory: &mut PlayerInventory,
     player_yaw: &mut f32,
+    player_pitch: &mut f32,
     body: &[u8],
     debug: &mut SessionDebug,
     compression: &CompressionState,
@@ -103,6 +99,13 @@ pub(super) async fn handle_play_body(
     // to 0.0 (south-ish) until the first look packet.
     if let Some(yaw) = reported_yaw(&packet) {
         *player_yaw = yaw;
+    }
+
+    // Mirror the client's reported pitch alongside the yaw. Pitch carries no
+    // simulation input either; it is tracked here solely so it can be persisted and
+    // restored on rejoin, and defaults to 0.0 (level) until the first look packet.
+    if let Some(pitch) = reported_pitch(&packet) {
+        *player_pitch = pitch;
     }
 
     match &packet {
@@ -261,6 +264,20 @@ fn reported_yaw(packet: &ServerboundPlayPacket) -> Option<f32> {
     match packet {
         ServerboundPlayPacket::SetPlayerPositionAndRotation(p) => Some(p.yaw()),
         ServerboundPlayPacket::SetPlayerRotation(p) => Some(p.yaw()),
+        _ => None,
+    }
+}
+
+/// The pitch (degrees) a serverbound play packet reports, if any.
+///
+/// The same two look-carrying packets that report a yaw also report a pitch:
+/// `SetPlayerPositionAndRotation` (move + look) and `SetPlayerRotation` (a turn in
+/// place). Other packets do not rotate the player and report nothing. The mirrored
+/// pitch is persisted so a rejoining player keeps looking where they left off.
+fn reported_pitch(packet: &ServerboundPlayPacket) -> Option<f32> {
+    match packet {
+        ServerboundPlayPacket::SetPlayerPositionAndRotation(p) => Some(p.pitch()),
+        ServerboundPlayPacket::SetPlayerRotation(p) => Some(p.pitch()),
         _ => None,
     }
 }
@@ -588,7 +605,12 @@ async fn handle_command(
             debug,
             compression,
             &ctx.clock,
-            ClientboundPlayPacket::SynchronizePlayerPosition(spawn_sync(JOIN_TELEPORT_ID, spawn)),
+            ClientboundPlayPacket::SynchronizePlayerPosition(spawn_sync(
+                JOIN_TELEPORT_ID,
+                spawn,
+                0.0,
+                0.0,
+            )),
         );
         let move_event = NetEvent::play(
             player,

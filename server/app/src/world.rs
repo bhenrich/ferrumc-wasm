@@ -24,7 +24,7 @@ use ferrumc_registry::dimension;
 use std::sync::Arc;
 
 use ferrumc_sim::{SimShard, SpawnChunkTickets};
-use ferrumc_storage::{InMemoryStore, RedbStore, WorldStore};
+use ferrumc_storage::{InMemoryStore, PlayerStore, RedbStore, WorldStore};
 use ferrumc_world::{
     encode_chunk_section_data, pack_motion_blocking_heightmap, Chunk, ChunkLightData,
     FlatWorldGenerator,
@@ -133,6 +133,10 @@ pub(crate) struct WorldSetup {
     /// [`WorldStore`] trait so the backend (durable redb or in-memory) is chosen
     /// once at startup and the rest of the app stays backend-agnostic.
     pub(crate) store: Arc<dyn WorldStore>,
+    /// The per-player record store, the *same* backend object as [`store`] viewed
+    /// through the [`PlayerStore`] trait. Connection tasks load a player's saved
+    /// state on join and save it on leave/shutdown through this handle.
+    pub(crate) player_store: Arc<dyn PlayerStore>,
     /// The terrain generator the driver uses on a store miss.
     pub(crate) generator: FlatWorldGenerator,
 }
@@ -159,7 +163,10 @@ pub(crate) async fn build_world(
     config: &AppConfig,
     shard_pos: ferrumc_math::ShardPos,
 ) -> anyhow::Result<WorldSetup> {
-    let store = open_store(config)?;
+    let OpenedStore {
+        store,
+        player_store,
+    } = open_store(config)?;
     let generator = FlatWorldGenerator::new();
     let spawn = SpawnChunkTickets::new(spawn_center_chunk(config), config.spawn_chunk_radius);
 
@@ -174,8 +181,20 @@ pub(crate) async fn build_world(
         shard,
         join_kit,
         store,
+        player_store,
         generator,
     })
+}
+
+/// The two trait-object views of the one store backend opened at startup.
+///
+/// Both `Arc`s point at the *same* concrete backend object, so chunk and player
+/// records share one redb file (or one in-memory map). They are separate handles
+/// only because the driver/storage-worker reach the backend through [`WorldStore`]
+/// while connection tasks reach it through [`PlayerStore`].
+struct OpenedStore {
+    store: Arc<dyn WorldStore>,
+    player_store: Arc<dyn PlayerStore>,
 }
 
 /// Opens the world store the runtime will use, selected by
@@ -184,25 +203,33 @@ pub(crate) async fn build_world(
 /// `Some(dir)` opens the durable redb-backed [`RedbStore`] at `dir/world.redb`
 /// (creating the directory if needed) — the runtime default. `None` constructs an
 /// [`InMemoryStore`], used by tests and any ephemeral run. Either way the concrete
-/// backend is erased to `Arc<dyn WorldStore>` so the driver and storage worker are
-/// backend-agnostic.
+/// backend is erased to the [`WorldStore`] and [`PlayerStore`] trait objects so
+/// the driver, storage worker, and connection tasks stay backend-agnostic; the two
+/// handles share the single backend object (one redb file / one in-memory map).
 ///
 /// # Errors
 ///
 /// Returns an error if the world directory cannot be created or the redb file
 /// cannot be opened.
-fn open_store(config: &AppConfig) -> anyhow::Result<Arc<dyn WorldStore>> {
-    match &config.world_dir {
-        Some(dir) => {
-            std::fs::create_dir_all(dir).map_err(|err| {
-                anyhow::anyhow!("creating world directory {}: {err}", dir.display())
-            })?;
-            let path = dir.join("world.redb");
-            let store = RedbStore::open(&path)
-                .map_err(|err| anyhow::anyhow!("opening world store {}: {err}", path.display()))?;
-            Ok(Arc::new(store))
-        }
-        None => Ok(Arc::new(InMemoryStore::new())),
+fn open_store(config: &AppConfig) -> anyhow::Result<OpenedStore> {
+    if let Some(dir) = &config.world_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|err| anyhow::anyhow!("creating world directory {}: {err}", dir.display()))?;
+        let path = dir.join("world.redb");
+        let store = RedbStore::open(&path)
+            .map_err(|err| anyhow::anyhow!("opening world store {}: {err}", path.display()))?;
+        Ok(opened_store(Arc::new(store)))
+    } else {
+        Ok(opened_store(Arc::new(InMemoryStore::new())))
+    }
+}
+
+/// Erases one concrete backend `Arc` into the [`WorldStore`] and [`PlayerStore`]
+/// trait-object handles, both sharing the single backend object.
+fn opened_store<T: WorldStore + PlayerStore + 'static>(store: Arc<T>) -> OpenedStore {
+    OpenedStore {
+        store: Arc::clone(&store) as Arc<dyn WorldStore>,
+        player_store: store as Arc<dyn PlayerStore>,
     }
 }
 

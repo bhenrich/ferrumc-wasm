@@ -57,6 +57,10 @@ pub(super) struct ChunkStream {
     /// `None` if nothing new — coalescing many move packets in one read into a
     /// single streaming pass.
     pending_position: Option<Vec3>,
+    /// The most recent position the client ever reported (never cleared), used to
+    /// persist where the player was standing when they leave. `None` until the
+    /// first move packet, in which case the join position is persisted instead.
+    last_position: Option<Vec3>,
 }
 
 impl ChunkStream {
@@ -68,12 +72,20 @@ impl ChunkStream {
             view_distance: ctx.view_distance.clamp(0, STREAM_VIEW_DISTANCE_MAX),
             loaded: ctx.join_kit.chunk_positions().collect(),
             pending_position: None,
+            last_position: None,
         }
     }
 
     /// Records the client's latest reported position for the next evaluation.
     pub(super) fn observe(&mut self, position: Vec3) {
         self.pending_position = Some(position);
+        self.last_position = Some(position);
+    }
+
+    /// The most recent position the client reported, or `None` if it never moved
+    /// (in which case the caller persists the join position).
+    pub(super) fn last_position(&self) -> Option<Vec3> {
+        self.last_position
     }
 }
 

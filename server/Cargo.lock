@@ -343,6 +343,7 @@ dependencies = [
  "ferrumc-storage",
  "ferrumc-world",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",

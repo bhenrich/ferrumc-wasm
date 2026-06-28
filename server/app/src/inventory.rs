@@ -92,9 +92,34 @@ impl PlayerInventory {
         }
     }
 
+    /// Builds an inventory restored from persisted state: the given slots verbatim,
+    /// the (range-checked) selected hotbar index, and the game-mode mirror, stamped
+    /// with the initial window state id.
+    ///
+    /// An out-of-range `selected` (not `0..=8`) clamps to `0` rather than producing
+    /// an invalid selection, so a corrupt persisted value can never desync the held
+    /// slot.
+    pub(crate) fn from_persisted(
+        game_mode: GameMode,
+        selected: u8,
+        slots: [ItemStack; SLOT_COUNT],
+    ) -> Self {
+        Self {
+            slots,
+            state_id: INITIAL_STATE_ID,
+            selected: if selected < HOTBAR_LEN { selected } else { 0 },
+            game_mode,
+        }
+    }
+
     /// The current window state id.
     pub(crate) fn state_id(&self) -> i32 {
         self.state_id
+    }
+
+    /// The selected hotbar index (always `0..=8`).
+    pub(crate) fn selected(&self) -> u8 {
+        self.selected
     }
 
     /// The connection-local mirror of the player's game mode.
@@ -260,12 +285,5 @@ mod tests {
         assert_eq!(inv.game_mode(), GameMode::Creative);
         inv.set_game_mode(GameMode::Survival);
         assert_eq!(inv.game_mode(), GameMode::Survival);
-    }
-
-    impl PlayerInventory {
-        /// Test-only accessor for the selected hotbar index.
-        fn selected(&self) -> u8 {
-            self.selected
-        }
     }
 }

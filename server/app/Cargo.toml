@@ -73,8 +73,12 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 # Subscriber installed once in `main` to render the logs.
 tracing-subscriber = { workspace = true }
-# Minimal TOML config parsing.
+# Minimal TOML config parsing, plus JSON for the versioned persisted-player blob
+# encoded into the opaque `PlayerRecord` payload (the workspace has no binary serde
+# format; the per-player record is tiny, so JSON's overhead is irrelevant and its
+# decode is robust — a corrupt blob is a clean error, never a panic).
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 # CLI arg parsing (--config/--port/--bind/--version/--help) for the ferrumc
 # binary, replacing the old argv[1]-as-config-path footgun.

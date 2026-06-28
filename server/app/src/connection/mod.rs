@@ -72,6 +72,12 @@ const READ_CHUNK: usize = 4096;
 /// it, which the server decodes and ignores.
 const JOIN_TELEPORT_ID: i32 = 1;
 
+/// `Game Event` reason `3`: "change game mode". The event `value` is the game-mode
+/// id as a float; sending it switches the issuing client's mode (the carrier
+/// `/gamemode` and the rejoin restore use, since there is no dedicated
+/// set-game-mode packet). Shared by the join restore and the `/gamemode` handler.
+pub(super) const GAME_EVENT_CHANGE_GAMEMODE: u8 = 3;
+
 /// The login-handshake phase, one step finer than [`ConnectionState`] so an
 /// out-of-order-but-valid packet can be rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,9 +417,10 @@ async fn advance(
     }
 }
 
-/// Builds an absolute position sync with the given teleport id (zero deltas,
-/// orientation, and flags).
-fn spawn_sync(teleport_id: i32, position: Vec3) -> SynchronizePlayerPosition {
+/// Builds an absolute position sync with the given teleport id, `yaw`, and `pitch`
+/// (zero velocity deltas and flags), used both to spawn a joiner in at their
+/// restored look and to snap a `/spawn`'d player back.
+fn spawn_sync(teleport_id: i32, position: Vec3, yaw: f32, pitch: f32) -> SynchronizePlayerPosition {
     SynchronizePlayerPosition::new(
         teleport_id,
         position.x,
@@ -422,8 +429,8 @@ fn spawn_sync(teleport_id: i32, position: Vec3) -> SynchronizePlayerPosition {
         0.0,
         0.0,
         0.0,
-        0.0,
-        0.0,
+        yaw,
+        pitch,
         0,
     )
 }

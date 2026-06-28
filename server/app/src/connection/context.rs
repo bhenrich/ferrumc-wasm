@@ -11,6 +11,7 @@ use ferrumc_net::{offline_uuid, ConnectionLimits, OutboundPacket, StatusInfo};
 use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock};
 use ferrumc_proto::generated::login::{ClientboundLoginPacket, LoginDisconnect};
 use ferrumc_proto::generated::status::{ClientboundStatusPacket, StatusResponse};
+use ferrumc_storage::PlayerStore;
 
 use crate::driver::SimCommand;
 use crate::plugins::{BlockEventDispatcher, PlayPolicy};
@@ -56,6 +57,12 @@ pub(crate) struct ConnContext {
     pub(crate) chunk_stream_interval: Duration,
     /// Bounded channel to the simulation/session driver.
     pub(crate) commands: mpsc::Sender<SimCommand>,
+    /// The per-player record store. A connection loads the joiner's saved state
+    /// (position, look, inventory, held slot) on join and saves it on leave or
+    /// shutdown. Shared (behind an [`Arc`]) with the same backend the world store
+    /// wraps; player records are byte-oriented to storage (see
+    /// [`crate::player_data`]).
+    pub(crate) player_store: Arc<dyn PlayerStore>,
     /// The shared play policy: bypass permissions, the spawn position, and the
     /// command tree consulted for serverbound play packets.
     pub(crate) policy: Arc<PlayPolicy>,

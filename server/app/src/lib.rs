@@ -21,6 +21,7 @@ mod connection;
 mod driver;
 mod inventory;
 mod observe;
+mod player_data;
 mod plugins;
 mod registries;
 mod server;

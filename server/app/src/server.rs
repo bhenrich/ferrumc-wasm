@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use ferrumc_config::ResolvedAccess;
 use ferrumc_net::{ConnectionLimits, PerIpConnections};
@@ -122,6 +122,12 @@ impl RunningServer {
     pub async fn shutdown(self) -> anyhow::Result<()> {
         // A send error means every receiver is already gone — also a clean stop.
         let _ = self.shutdown.send(true);
+        // The accept loop owns every connection task in a `JoinSet` and drains it on
+        // shutdown, so awaiting it blocks until the last connection has finished its
+        // leave-save cleanup AND its task future (holding a `player_store` handle) is
+        // fully dropped. Connection tasks would otherwise be detached, so this is
+        // what makes a connected player's state durable across a graceful shutdown —
+        // and what releases the redb file before anything reopens it.
         self.accept_task.await?;
         // The driver performs its final flush and then drops its storage sender;
         // await it first so that send completes, then await the worker so it
@@ -143,7 +149,7 @@ impl RunningServer {
 ///
 /// Returns an error if the spawn area fails to load, the join payload cannot be
 /// built, or the listener cannot bind the configured address.
-#[allow(clippy::too_many_lines)] // wires every layer together once at startup
+#[allow(clippy::too_many_lines)] // one cohesive bring-up: build world+stores, wire channels, spawn tasks, bind
 pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     let shard_pos = shard_for_position(config.spawn);
     let setup = build_world(config, shard_pos).await?;
@@ -200,6 +206,9 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     // worker owns the world store and commits it off the tick. The store is shared
     // (the driver also reads it on the chunk load-or-generate path).
     let store = setup.store;
+    // The per-player record store (same backend as `store`), handed to every
+    // connection task so it can load a joiner's saved state and save it on leave.
+    let player_store = setup.player_store;
     let (storage_tx, storage_rx) =
         mpsc::channel::<StorageFlushRequest>(STORAGE_FLUSH_CHANNEL_CAPACITY);
     let storage_worker_task = tokio::spawn(run_storage_worker(
@@ -262,6 +271,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         keep_alive_interval: config.keep_alive_interval,
         chunk_stream_interval: config.chunk_stream_interval,
         commands: commands_tx,
+        player_store,
         policy,
         block_events,
         status_response,
@@ -315,9 +325,18 @@ fn build_access(
 /// Accepts connections until shutdown, spawning one bounded task per socket.
 ///
 /// Three gates bound a new connection, in order: a banned source IP is rejected
-/// before any slot is reserved; the global [`Semaphore`] caps total concurrency;
-/// and `per_ip` caps concurrent connections from a single source IP. Login-time
-/// name/UUID bans and the whitelist are enforced later, in the login handler.
+/// before any slot is reserved; the global [`Semaphore`] caps total concurrency
+/// (one permit per connection); and `per_ip` caps concurrent connections from a
+/// single source IP. Login-time name/UUID bans and the whitelist are enforced
+/// later, in the login handler.
+///
+/// A [`JoinSet`] owns the connection tasks: finished tasks are reaped during the
+/// loop so the set stays bounded, and on shutdown the set is *drained* (every task
+/// awaited) before returning. Awaiting a task guarantees its future — and the
+/// `player_store` handle it captured — is fully dropped, which is what makes a
+/// connected player's leave-save durable across a graceful shutdown and releases
+/// the world store before anything reopens it. The driver/storage worker observe
+/// the same shutdown signal and wind down independently.
 async fn accept_loop(
     listener: TcpListener,
     ctx: ConnContext,
@@ -326,10 +345,14 @@ async fn accept_loop(
     mut shutdown: watch::Receiver<bool>,
 ) {
     let limiter = Arc::new(Semaphore::new(max_connections.max(1)));
+    let mut connections = JoinSet::new();
     loop {
         tokio::select! {
             biased;
             _ = shutdown.changed() => break,
+            // Reap a finished connection (only when the set is non-empty, so this
+            // branch never busy-loops on an empty set) to bound the JoinSet.
+            Some(_joined) = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
                 let (stream, addr) = match accepted {
                     Ok(pair) => pair,
@@ -362,7 +385,10 @@ async fn accept_loop(
 
                 let ctx = ctx.clone();
                 let conn_shutdown = shutdown.clone();
-                tokio::spawn(async move {
+                // Own the task in the `JoinSet` so shutdown can drain it (the
+                // connection's leave-save must complete and its `player_store`
+                // handle drop before the server returns).
+                connections.spawn(async move {
                     // Both guards live for the connection's lifetime and free their
                     // slots (global + per-IP) when the task ends.
                     let _permit = permit;
@@ -374,4 +400,8 @@ async fn accept_loop(
             }
         }
     }
+
+    // Drain in-flight connections so each runs its leave-save and fully drops before
+    // shutdown proceeds. The connections already observed the shutdown signal above.
+    while connections.join_next().await.is_some() {}
 }

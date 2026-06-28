@@ -10,8 +10,8 @@ use ferrumc_math::{ChunkPos, Vec3};
 use ferrumc_net::{CompressionState, PlayWriter};
 use ferrumc_observability::SessionDebug;
 use ferrumc_proto::generated::play::{
-    ClientboundPlayPacket, Commands, GameEvent, PlayerAbilities, SetCenterChunk,
-    SetContainerContent, SetDefaultSpawnPosition,
+    ClientboundPlayPacket, ClientboundSetHeldItem, Commands, GameEvent, PlayerAbilities,
+    SetCenterChunk, SetContainerContent, SetDefaultSpawnPosition,
 };
 
 use crate::driver::SimCommand;
@@ -19,7 +19,7 @@ use crate::inventory::{PlayerInventory, WINDOW_ID};
 
 use super::context::ConnContext;
 use super::outbound::{enqueue_traced_classified, flush_writer, send_mandatory};
-use super::{spawn_sync, JOIN_TELEPORT_ID};
+use super::{spawn_sync, GAME_EVENT_CHANGE_GAMEMODE, JOIN_TELEPORT_ID};
 
 /// `Game Event` reason `13`: "level chunks load start". Sent right after
 /// `JoinGame` to tell the client the spawn chunks are on their way; without it
@@ -72,6 +72,9 @@ pub(super) async fn send_join_kit(
     player: PlayerId,
     name: &str,
     position: Vec3,
+    yaw: f32,
+    pitch: f32,
+    is_returning: bool,
     inventory: &PlayerInventory,
 ) -> anyhow::Result<()> {
     let kit = &ctx.join_kit;
@@ -146,7 +149,12 @@ pub(super) async fn send_join_kit(
         debug,
         compression,
         clock,
-        ClientboundPlayPacket::SynchronizePlayerPosition(spawn_sync(JOIN_TELEPORT_ID, position)),
+        ClientboundPlayPacket::SynchronizePlayerPosition(spawn_sync(
+            JOIN_TELEPORT_ID,
+            position,
+            yaw,
+            pitch,
+        )),
     );
     // Player Abilities: tell a creative client it may fly and instabuild, so the
     // flight + creative-reach UX matches the creative mode JoinGame advertised.
@@ -178,6 +186,35 @@ pub(super) async fn send_join_kit(
             container_payload,
         )),
     )?;
+
+    // For a RETURNING player, restore the saved game mode and held hotbar slot. The
+    // JoinGame above always advertises creative and the client defaults to hotbar
+    // slot 0, so a fresh joiner needs neither packet; a returning one is corrected
+    // here. The GameEvent (reason 3 = change game mode) switches the client's mode to
+    // the inventory's authoritative mirror, and `ClientboundSetHeldItem` moves the
+    // selector to the restored slot so the held item matches the broadcast equipment.
+    if is_returning {
+        enqueue_traced_classified(
+            writer,
+            debug,
+            compression,
+            clock,
+            ClientboundPlayPacket::GameEvent(GameEvent::new(
+                GAME_EVENT_CHANGE_GAMEMODE,
+                f32::from(inventory.game_mode().as_id()),
+            )),
+        );
+        enqueue_traced_classified(
+            writer,
+            debug,
+            compression,
+            clock,
+            ClientboundPlayPacket::ClientboundSetHeldItem(ClientboundSetHeldItem::new(i32::from(
+                inventory.selected(),
+            ))),
+        );
+    }
+
     flush_writer(writer, stream, compression, ctx.io_timeout).await?;
 
     // Stage 2: the spawn-area chunk column packets (includes the player's chunk),

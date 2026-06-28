@@ -20,6 +20,7 @@ use ferrumc_session::{NetEvent, PlayerSessionHandle};
 use crate::driver::SimCommand;
 use crate::inventory::PlayerInventory;
 use crate::observe;
+use crate::player_data::PlayerData;
 
 use super::chunk_stream::{apply_chunk_stream, pump_chunk_stream, ChunkStream};
 use super::context::ConnContext;
@@ -52,50 +53,82 @@ pub(super) async fn enter_play(
     // login has completed.
     debug.set_session(name.as_str());
     let player = PlayerId::offline(name.as_str());
-    let position = ctx.join_kit.spawn_position();
 
-    // The authoritative server-side inventory for this connection, created BEFORE
-    // the join so the joiner's initial held item is cached in the router as part of
-    // the join — viewers entering view then see it on the spawn rather than only
-    // after the next hotbar change (closing the enter-view race). Seeded with the
-    // creative starter kit and a creative game-mode mirror; the connection is the
-    // sole writer of both, so the mirror cannot drift from the sim's mode.
-    let mut inventory = PlayerInventory::with_creative_kit(GameMode::Creative);
-    // The opaque main-hand equipment body threaded into the join. The default kit
-    // never fails to encode; on the off chance it does, fall back to empty (no
-    // equipment shown) rather than aborting the join.
+    // Restore this player's persisted state if they have a saved record; a fresh
+    // player — or one whose record is corrupt, written under an incompatible schema,
+    // or whose load failed — starts from the spawn defaults. A storage hiccup must
+    // never block login, so any load error is logged and treated as a fresh join.
+    let restored = match ctx.player_store.load_player(player).await {
+        Ok(Some(record)) => {
+            let game_mode = record.game_mode();
+            PlayerData::from_record(&record).map(|data| (data, game_mode))
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(%err, player = name.as_str(), "failed to load player state; joining fresh");
+            None
+        }
+    };
+    let is_returning = restored.is_some();
+
+    // Resolve the join state from the restored record or the spawn defaults. The
+    // authoritative server-side inventory is built here, BEFORE the join, so the
+    // joiner's (restored) held item is cached in the router as part of the join —
+    // viewers entering view then see it on the spawn rather than only after the next
+    // hotbar change. The inventory mirrors the (restored or default-creative) game
+    // mode; the connection is the sole writer of both, so the mirror cannot drift.
+    let (position, mut player_yaw, mut player_pitch, game_mode, mut inventory) = match restored {
+        Some((data, game_mode)) => (
+            data.position(),
+            data.yaw(),
+            data.pitch(),
+            game_mode,
+            data.restore_inventory(game_mode),
+        ),
+        None => (
+            ctx.join_kit.spawn_position(),
+            0.0_f32,
+            0.0_f32,
+            GameMode::Creative,
+            PlayerInventory::with_creative_kit(GameMode::Creative),
+        ),
+    };
+
+    // The opaque main-hand equipment body threaded into the join, reflecting the
+    // restored held slot. The kit never fails to encode; on the off chance it does,
+    // fall back to empty (no equipment shown) rather than aborting the join.
     let equipment = inventory.main_hand_equipment_body().unwrap_or_else(|err| {
         tracing::warn!(%err, "failed to encode initial equipment; joining without it");
         Vec::new()
     });
     let mut handle = join_simulation(ctx, player, name.as_str(), position, equipment).await?;
 
-    // The client already holds the spawn batch after the join kit; stream tracks
-    // it from there so it never re-sends a spawn chunk and knows what to unload.
+    // The client holds the spawn batch after the join kit; the stream tracks it from
+    // there so it never re-sends a spawn chunk and knows what to unload. Seed it with
+    // the player's actual (restored) position so the first streaming pass centres on
+    // where they rejoin: if they left far from spawn, their chunk is then streamed in
+    // (centre-first) and the loading screen releases without waiting for a move.
     let mut chunk_stream = ChunkStream::new(ctx);
+    chunk_stream.observe(position);
 
     // Per-connection chat rate limiter, seeded at the current server tick. Lives
     // here (the connection task may use a non-deterministic time source) and is
     // never touched by the sim/session deterministic tick path.
     let mut chat_limiter = ChatRateLimiter::new(ctx.clock.now());
 
-    // The player's last-reported yaw, mirrored from look packets so a place can
-    // derive block facing. Defaults to 0.0 (south-ish) until the first look packet;
-    // UseItemOn itself carries no yaw.
-    let mut player_yaw: f32 = 0.0;
-
-    // The shard seeds every joiner's mode to the default (survival), but JoinGame
-    // told the client creative — make the sim's authoritative mode creative too so
-    // the creative-slot gate accepts this player and later enforcement is correct.
+    // Make the sim's authoritative mode match the restored (or default-creative)
+    // mode so the creative-slot gate accepts this player and later enforcement
+    // (creative no-decrement, break speed, flight) reads the right mode.
     ctx.commands
         .send(SimCommand::SetGameMode {
             player,
-            mode: GameMode::Creative,
+            mode: game_mode,
         })
         .await
         .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
 
-    // Replay the keystone payload, then drain any already-buffered play frames.
+    // Replay the keystone payload, restoring the look and — for a returning player —
+    // the game mode and held slot, then drain any already-buffered play frames.
     let mut writer = PlayWriter::with_defaults(ctx.limits);
     send_join_kit(
         &mut writer,
@@ -106,6 +139,9 @@ pub(super) async fn enter_play(
         player,
         name.as_str(),
         position,
+        player_yaw,
+        player_pitch,
+        is_returning,
         &inventory,
     )
     .await?;
@@ -120,6 +156,7 @@ pub(super) async fn enter_play(
         &mut chat_limiter,
         &mut inventory,
         &mut player_yaw,
+        &mut player_pitch,
         &mut debug,
     )
     .await?;
@@ -240,6 +277,7 @@ pub(super) async fn enter_play(
                         &mut chat_limiter,
                         &mut inventory,
                         &mut player_yaw,
+                        &mut player_pitch,
                         &mut debug,
                         &read_buf[..n],
                     ).await,
@@ -256,6 +294,27 @@ pub(super) async fn enter_play(
     // disconnect).
     observe_queue_len(&mut debug, ctx, &writer);
     debug.dump("disconnect");
+
+    // Persist this player's state BEFORE releasing their chunk tickets, mirroring
+    // the chunk-edit flush-before-release discipline (`release_chunks_acked` in the
+    // driver): the save is durable on the shared store the instant it returns (the
+    // in-memory backend inserts inline; a redb backend commits), so a fast rejoin —
+    // and the post-shutdown drain that waits on this connection's concurrency permit
+    // — reads the just-saved state rather than a stale one. The saved position is the
+    // last one the client reported, or the join position if it never moved. Failures
+    // are logged, never fatal: a connection ending must always run its teardown.
+    let save_position = chunk_stream.last_position().unwrap_or(position);
+    let player_data = PlayerData::capture(save_position, player_yaw, player_pitch, &inventory);
+    match player_data.to_record(inventory.game_mode()) {
+        Ok(record) => {
+            if let Err(err) = ctx.player_store.save_player(player, record).await {
+                tracing::warn!(%err, player = name.as_str(), "failed to save player state on leave");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(%err, player = name.as_str(), "failed to encode player state on leave");
+        }
+    }
 
     // Release every chunk this connection had the client holding so its player
     // tickets stop pinning chunks resident after it leaves. Best-effort: a gone
@@ -322,6 +381,7 @@ async fn read_and_pump(
     chat_limiter: &mut ChatRateLimiter,
     inventory: &mut PlayerInventory,
     player_yaw: &mut f32,
+    player_pitch: &mut f32,
     debug: &mut SessionDebug,
     bytes: &[u8],
 ) -> anyhow::Result<()> {
@@ -337,6 +397,7 @@ async fn read_and_pump(
         chat_limiter,
         inventory,
         player_yaw,
+        player_pitch,
         debug,
     )
     .await?;
@@ -363,6 +424,7 @@ async fn pump_serverbound(
     chat_limiter: &mut ChatRateLimiter,
     inventory: &mut PlayerInventory,
     player_yaw: &mut f32,
+    player_pitch: &mut f32,
     debug: &mut SessionDebug,
 ) -> anyhow::Result<()> {
     loop {
@@ -395,6 +457,7 @@ async fn pump_serverbound(
             chat_limiter,
             inventory,
             player_yaw,
+            player_pitch,
             &body,
             debug,
             compression,
