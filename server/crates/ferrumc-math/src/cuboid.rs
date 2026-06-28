@@ -89,6 +89,42 @@ impl Cuboid {
                 .flat_map(move |z| (min.x()..=max.x()).map(move |x| BlockPos::new(x, y, z)))
         })
     }
+
+    /// Returns the block position at linear `index` into the cuboid's iteration
+    /// order — the same order [`iter`](Self::iter) yields (ascending `y`, then
+    /// `z`, then `x`) — or `None` if `index` is at or past
+    /// [`volume`](Self::volume).
+    ///
+    /// Lets a caller resume a partial walk of a cuboid from a saved cursor (for
+    /// example a region edit applied across several ticks under a budget) without
+    /// materializing the whole position list.
+    #[must_use]
+    pub fn block_at_index(self, index: u64) -> Option<BlockPos> {
+        if index >= self.volume() {
+            return None;
+        }
+        let span = |lo: i32, hi: i32| -> u64 { (i64::from(hi) - i64::from(lo) + 1) as u64 };
+        let dx = span(self.min.x(), self.max.x());
+        let dz = span(self.min.z(), self.max.z());
+        // Split the index without ever forming `dx * dz` (which could overflow for
+        // an extreme cuboid): the x offset is `index % dx`, and the remaining row
+        // count splits into z and y by `dz`.
+        let x_off = index % dx;
+        let rows = index / dx;
+        let z_off = rows % dz;
+        let y_off = rows / dz;
+        // Each offset is within its span, so `min + offset` is `<= max` and fits
+        // back in `i32`; compute in `i64` and convert with `try_from` (the bound
+        // above guarantees success) rather than a wrapping `as` cast.
+        let coord = |base: i32, off: u64| -> Option<i32> {
+            i32::try_from(i64::from(base) + i64::try_from(off).ok()?).ok()
+        };
+        Some(BlockPos::new(
+            coord(self.min.x(), x_off)?,
+            coord(self.min.y(), y_off)?,
+            coord(self.min.z(), z_off)?,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -178,5 +214,19 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), visited.len(), "no block is visited twice");
+    }
+
+    #[test]
+    fn block_at_index_matches_iteration_order() {
+        // A non-cubic, negatively-offset cuboid to exercise all three axes.
+        let cuboid = Cuboid::new(BlockPos::new(-2, 5, 7), BlockPos::new(0, 6, 10));
+        let by_iter: Vec<BlockPos> = cuboid.iter().collect();
+        // Index 0..volume reproduces the iteration order exactly.
+        for (i, &expected) in by_iter.iter().enumerate() {
+            assert_eq!(cuboid.block_at_index(i as u64), Some(expected), "index {i}");
+        }
+        // The first index past the end (== volume) and beyond yield None.
+        assert_eq!(cuboid.block_at_index(cuboid.volume()), None);
+        assert_eq!(cuboid.block_at_index(cuboid.volume() + 100), None);
     }
 }
