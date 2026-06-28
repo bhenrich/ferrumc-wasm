@@ -17,6 +17,14 @@ ferrumc-math = { workspace = true }
 # The world model the simulation owns: `Chunk` is the resident chunk data and
 # `FlatWorldGenerator` is the miss path of the load-or-generate flow.
 ferrumc-world = { workspace = true }
+# Pure placement rules: the authoritative place path turns the held item's default
+# block-state into the correct rotated/faced/halved state via `compute_placement`.
+# Depends only on core/math/registry, so this introduces no dependency cycle.
+ferrumc-placement = { workspace = true }
+# The block-state catalog: the shard's neighbour query resolves a neighbour's
+# state id back to a block name (and solid-cube flag) for fence connectivity.
+# `ferrumc-world` already depends on registry, so this edge adds no cycle.
+ferrumc-registry = { workspace = true }
 # The storage boundary. The sim talks to persistence through the `WorldStore`
 # trait (passed in by reference per call — the sim owns chunk data, never a DB
 # handle) and reuses storage's `ChunkKey`/`ChunkRecord`/`SchemaVersion` value

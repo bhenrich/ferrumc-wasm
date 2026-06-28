@@ -466,6 +466,8 @@ version = "0.2.0-dev"
 dependencies = [
  "ferrumc-core",
  "ferrumc-math",
+ "ferrumc-placement",
+ "ferrumc-registry",
  "ferrumc-storage",
  "ferrumc-world",
  "thiserror",

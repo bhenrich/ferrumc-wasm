@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
 use ferrumc_core::{GameMode, PlayerId, TextComponent, Tick};
-use ferrumc_math::{BlockPos, ChunkPos, Vec3};
+use ferrumc_math::{BlockPos, ChunkPos, Direction, Vec3};
 use ferrumc_observability::{
     CounterRegistry, MutationKind, MutationResult, ServerClock, TickMetrics,
 };
@@ -134,8 +134,15 @@ pub(crate) enum SimCommand {
         position: BlockPos,
         /// The block-action sequence to acknowledge on accept/reject.
         sequence: i32,
-        /// The block-state the held item places.
+        /// The held item's default block-state (the placement input the sim
+        /// refines into the final rotated/faced/halved state).
         state: BlockStateId,
+        /// The face of the targeted block the player clicked.
+        clicked_face: Direction,
+        /// The cursor hit point inside the targeted block (`0.0..=1.0` per axis).
+        cursor_position: Vec3,
+        /// The player's yaw in degrees at place time.
+        player_yaw: f32,
     },
     /// Resync + acknowledge a block edit refused at the connection (a plugin
     /// `Deny` / spawn-protection veto) without mutating the world.
@@ -426,6 +433,9 @@ async fn handle_command(
             position,
             sequence,
             state,
+            clicked_face,
+            cursor_position,
+            player_yaw,
         } => {
             // Route the place to the block's owning shard (the same routing as any
             // other block edit). A gone player has no shard to route to.
@@ -436,6 +446,9 @@ async fn handle_command(
                     position,
                     sequence,
                     state,
+                    clicked_face,
+                    cursor_position,
+                    player_yaw,
                 },
             ) {
                 tracing::trace!(%err, "dropping block place");

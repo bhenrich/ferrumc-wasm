@@ -6,7 +6,7 @@ use ferrumc_codec::{BoundedReader, BoundedString};
 use ferrumc_command::{CommandSource, CommandTree};
 use ferrumc_core::{GameMode, PlayerId, TextColor, TextComponent};
 use ferrumc_items::UntrustedItemStack;
-use ferrumc_math::{BlockPos, Vec3, WorldIntent};
+use ferrumc_math::{BlockPos, Direction, Vec3, WorldIntent};
 use ferrumc_net::{CompressionState, PlayWriter};
 use ferrumc_observability::{PacketState, SessionDebug};
 use ferrumc_plugin_api::{BlockBreakAttempt, BlockPlaceAttempt};
@@ -16,7 +16,7 @@ use ferrumc_proto::generated::play::{
     ServerboundSetHeldItem, SetContainerContent, SetContainerSlot, SetCreativeSlot,
     SetPlayerPosition, TabCompleteResponse, UseItemOn, WindowClick,
 };
-use ferrumc_session::{net_event_to_input, use_item_on_target, NetEvent};
+use ferrumc_session::{net_event_to_input, use_item_on_face, use_item_on_target, NetEvent};
 use ferrumc_sim::{BlockStateId, GameInput};
 
 use crate::command::{parse_gamemode, GAMEMODE_COMMAND, SPAWN_COMMAND};
@@ -54,6 +54,7 @@ pub(super) async fn handle_play_body(
     chunk_stream: &mut ChunkStream,
     chat_limiter: &mut ChatRateLimiter,
     inventory: &mut PlayerInventory,
+    player_yaw: &mut f32,
     body: &[u8],
     debug: &mut SessionDebug,
     compression: &CompressionState,
@@ -94,6 +95,13 @@ pub(super) async fn handle_play_body(
     // stream centres on; the simulation stays authoritative.
     if let Some(position) = reported_position(&packet) {
         chunk_stream.observe(position);
+    }
+
+    // Mirror the client's reported yaw so a later place can derive facing. Yaw is
+    // not otherwise tracked; it carries no simulation input on its own and defaults
+    // to 0.0 (south-ish) until the first look packet.
+    if let Some(yaw) = reported_yaw(&packet) {
+        *player_yaw = yaw;
     }
 
     match &packet {
@@ -166,7 +174,17 @@ pub(super) async fn handle_play_body(
         // veto). Handled here, not via the generic NetEvent path, because the place
         // needs the inventory the session layer cannot see.
         ServerboundPlayPacket::UseItemOn(p) => {
-            return handle_use_item_on(ctx, player, writer, inventory, p, debug, compression).await;
+            return handle_use_item_on(
+                ctx,
+                player,
+                writer,
+                inventory,
+                p,
+                *player_yaw,
+                debug,
+                compression,
+            )
+            .await;
         }
         // Set Creative Slot (untrusted): validate the hostile item bytes, store the
         // slot, and echo it back so the client view matches the server.
@@ -232,6 +250,18 @@ fn reported_position(packet: &ServerboundPlayPacket) -> Option<Vec3> {
     }
 }
 
+/// The yaw (degrees) a serverbound play packet reports, if any.
+///
+/// `SetPlayerPositionAndRotation` is the only modelled serverbound look-carrying
+/// packet; position-only and other packets do not rotate the player and so report
+/// nothing.
+fn reported_yaw(packet: &ServerboundPlayPacket) -> Option<f32> {
+    match packet {
+        ServerboundPlayPacket::SetPlayerPositionAndRotation(p) => Some(p.yaw()),
+        _ => None,
+    }
+}
+
 /// Handles a block break at the plugin intent boundary.
 ///
 /// Consults the loaded plugins' `before_block_break` hooks (off the tick, under
@@ -286,12 +316,18 @@ async fn handle_block_break(
         }
         ResolvedDecision::Replace { block_state_id } => {
             // Replace the broken block with the replacement state instead of air.
+            // The plugin supplies an exact state; pass neutral placement inputs
+            // (top face, centre cursor, yaw 0) so a simple-cube replacement is
+            // written unchanged through the same funnel.
             ctx.commands
                 .send(SimCommand::PlaceBlock {
                     player,
                     position,
                     sequence,
                     state: BlockStateId::new(block_state_id),
+                    clicked_face: Direction::Up,
+                    cursor_position: Vec3::new(0.5, 0.0, 0.5),
+                    player_yaw: 0.0,
                 })
                 .await
                 .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
@@ -396,12 +432,17 @@ async fn route_emitted_intents(
                 pos,
                 block_state_id,
             } => {
+                // A plugin set-block supplies an exact state; neutral placement
+                // inputs keep a simple-cube state unchanged through the funnel.
                 ctx.commands
                     .send(SimCommand::PlaceBlock {
                         player: actor,
                         position: pos,
                         sequence,
                         state: BlockStateId::new(block_state_id),
+                        clicked_face: Direction::Up,
+                        cursor_position: Vec3::new(0.5, 0.0, 0.5),
+                        player_yaw: 0.0,
                     })
                     .await
                     .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
@@ -584,12 +625,14 @@ async fn handle_command(
 ///
 /// On a non-denied placement any emitted intents are routed and the
 /// `after_block_place` notification fires.
+#[allow(clippy::too_many_arguments)] // one place step: inventory + plugin policy + placement context + I/O
 async fn handle_use_item_on(
     ctx: &ConnContext,
     player: PlayerId,
     writer: &mut PlayWriter,
     inventory: &PlayerInventory,
     packet: &UseItemOn,
+    player_yaw: f32,
     debug: &mut SessionDebug,
     compression: &CompressionState,
 ) -> anyhow::Result<()> {
@@ -599,6 +642,16 @@ async fn handle_use_item_on(
         ack_sequence(writer, debug, compression, &ctx.clock, sequence)?;
         return Ok(());
     };
+    // The clicked face shares `use_item_on_target`'s face decoding, so a `Some`
+    // target guarantees a `Some` face; the fallback is unreachable but fails safe.
+    let clicked_face = use_item_on_face(packet).unwrap_or(Direction::Up);
+    // The cursor hit point inside the clicked block (`0.0..=1.0`), widened to the
+    // f64 the placement context uses.
+    let cursor_position = Vec3::new(
+        f64::from(packet.cursor_x()),
+        f64::from(packet.cursor_y()),
+        f64::from(packet.cursor_z()),
+    );
 
     // Empty hand or non-placeable item: nothing to place, just ack. The plugins are
     // not consulted for a no-op placement.
@@ -638,13 +691,18 @@ async fn handle_use_item_on(
         _ => held_state,
     };
 
-    // Creative: place the (possibly replaced) block; never touch the stack.
+    // Creative: place the (possibly replaced) block; never touch the stack. The
+    // clicked face, cursor hit point, and player yaw ride along so the sim can
+    // compute the correct rotated/faced/halved state.
     ctx.commands
         .send(SimCommand::PlaceBlock {
             player,
             position,
             sequence,
             state: BlockStateId::new(placed_state),
+            clicked_face,
+            cursor_position,
+            player_yaw,
         })
         .await
         .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;

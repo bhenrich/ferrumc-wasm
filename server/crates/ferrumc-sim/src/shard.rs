@@ -6,7 +6,12 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 
 use ferrumc_core::{DimensionId, GameMode, PlayerId, WorldId};
-use ferrumc_math::{BlockPos, ShardPos, Vec3};
+use ferrumc_math::{BlockPos, Direction, ShardPos, Vec3};
+use ferrumc_placement::{
+    compute_fence_connection_state, compute_placement, NeighborQuery, PlacementContext,
+    PlacementRule,
+};
+use ferrumc_registry::block_state::{block_metadata, state_id_to_block_name};
 use ferrumc_world::BlockStateId;
 
 use crate::error::SimError;
@@ -333,6 +338,7 @@ impl SimShard {
     /// type-level docs. Spawn/despawn outputs are emitted in inbox order;
     /// move/correction outputs follow, ordered by [`PlayerId`] so the result is
     /// fully deterministic for a given inbox.
+    #[allow(clippy::too_many_lines)] // one tick drain: join/leave/move + every block-edit input arm
     pub fn run_tick(&mut self) -> Vec<GameOutput> {
         let mut outputs = Vec::new();
         // Coalesce movement: keep only the latest *valid* position per player.
@@ -410,15 +416,49 @@ impl SimShard {
                     position,
                     sequence,
                     state,
+                    clicked_face,
+                    cursor_position,
+                    player_yaw,
                 } => {
-                    // Place -> the held item's resolved block-state, threaded in on
-                    // the input (the app resolves it from the player's hotbar).
+                    // Refine the held item's default state into the correct placed
+                    // state (rotation/facing/half/fence connectivity) against an
+                    // immutable view of the resident chunks. The borrow ends before
+                    // the mutable write below.
+                    let computed = {
+                        let query = ShardNeighborQuery {
+                            chunks: &self.chunks,
+                        };
+                        let ctx = PlacementContext {
+                            item_block_state: state.as_u32(),
+                            clicked_face,
+                            cursor_position,
+                            player_yaw,
+                            position,
+                        };
+                        compute_placement(&ctx, &query)
+                    };
+                    // Unsupported/unrecognised -> safe default (the held state).
+                    let placed = computed.map_or(state, |r| BlockStateId::new(r.state_id));
+                    let is_fence = computed.is_some_and(|r| r.rule == PlacementRule::FenceLike);
+
                     let cause = MutationCause::PlayerCreative { player };
-                    let result = self.apply_block_edit(cause, position, state);
+                    let result = self.apply_block_edit(cause, position, placed);
                     if let Some(output) =
-                        block_change_output(cause, sequence, position, state, result)
+                        block_change_output(cause, sequence, position, placed, result)
                     {
                         outputs.push(output);
+                    }
+                    // A placed fence updates its same-fence cardinal neighbours so
+                    // they connect back to it (broadcast-only, no extra ack).
+                    if is_fence {
+                        if let MutationResult::Applied { .. } = result {
+                            // The reverse lookup yields a `'static` name, so it does
+                            // not borrow `self` and is free to pass into the mutable
+                            // neighbour-update pass below.
+                            if let Some(fence_name) = state_id_to_block_name(placed.as_u32()) {
+                                self.update_fence_neighbors(&mut outputs, position, fence_name);
+                            }
+                        }
                     }
                 }
                 GameInput::RejectBlockEdit {
@@ -587,6 +627,93 @@ impl SimShard {
             .get(position.to_chunk_pos())
             .and_then(|chunk| chunk.get_block(position))
             .unwrap_or(BlockStateId::AIR)
+    }
+
+    /// After a fence is placed at `center`, recomputes each cardinal neighbour that
+    /// is the *same* fence so it connects back to the new block, and broadcasts any
+    /// that changed.
+    ///
+    /// Neighbour writes go through the same [`apply_block_edit`](Self::apply_block_edit)
+    /// funnel under [`MutationCause::Command`]: they persist and broadcast a viewer
+    /// `BlockUpdate` (via [`block_change_output`]) but carry no player, so the router
+    /// never acks them (only [`MutationCause::PlayerCreative`] is acked). Cross-shard
+    /// neighbours are out of scope this milestone; a neighbour in a non-resident
+    /// chunk is simply skipped (stale connectivity at the shard edge).
+    fn update_fence_neighbors(
+        &mut self,
+        outputs: &mut Vec<GameOutput>,
+        center: BlockPos,
+        fence_name: &str,
+    ) {
+        for dir in [
+            Direction::North,
+            Direction::South,
+            Direction::East,
+            Direction::West,
+        ] {
+            let npos = center.offset(dir);
+            // Only update a neighbour that is the very same fence.
+            let Some(neighbor_state) = self
+                .chunks
+                .get(npos.to_chunk_pos())
+                .and_then(|chunk| chunk.get_block(npos))
+            else {
+                continue;
+            };
+            if state_id_to_block_name(neighbor_state.as_u32()) != Some(fence_name) {
+                continue;
+            }
+            // Recompute its connectivity now that the placed fence is visible.
+            let recomputed = {
+                let query = ShardNeighborQuery {
+                    chunks: &self.chunks,
+                };
+                compute_fence_connection_state(fence_name, npos, &query)
+            };
+            let Some(new_state) = recomputed else {
+                continue;
+            };
+            if new_state == neighbor_state.as_u32() {
+                continue; // already connected; no write, no broadcast
+            }
+            let cause = MutationCause::Command;
+            let result = self.apply_block_edit(cause, npos, BlockStateId::new(new_state));
+            // Sequence 0: a Command edit is never acked, so the value is unused.
+            if let Some(output) =
+                block_change_output(cause, 0, npos, BlockStateId::new(new_state), result)
+            {
+                outputs.push(output);
+            }
+        }
+    }
+}
+
+/// A [`NeighborQuery`] backed by a shard's resident chunks.
+///
+/// Resolves a neighbour's block-state id to a name via the registry and reports it
+/// as fence-connectable when it is the same fence or a solid full cube. Air,
+/// unknown, and non-resident neighbours are not connectable.
+struct ShardNeighborQuery<'a> {
+    chunks: &'a LoadedChunkMap,
+}
+
+impl NeighborQuery for ShardNeighborQuery<'_> {
+    fn is_fence_connectable(&self, position: BlockPos, fence_block_name: &str) -> bool {
+        let Some(state) = self
+            .chunks
+            .get(position.to_chunk_pos())
+            .and_then(|chunk| chunk.get_block(position))
+        else {
+            return false;
+        };
+        if state.is_air() {
+            return false;
+        }
+        let Some(name) = state_id_to_block_name(state.as_u32()) else {
+            return false;
+        };
+        // A fence connects to the same fence or to any solid full cube.
+        name == fence_block_name || block_metadata(name).is_some_and(|m| m.is_solid_cube)
     }
 }
 
@@ -1094,6 +1221,9 @@ mod tests {
             position: target,
             sequence: 1,
             state: DEFAULT_PLACED_STATE,
+            clicked_face: Direction::Up,
+            cursor_position: Vec3::new(0.5, 0.0, 0.5),
+            player_yaw: 0.0,
         })
         .expect("room");
         let _ = s.run_tick();
@@ -1132,6 +1262,9 @@ mod tests {
             position: target,
             sequence: 12,
             state: DEFAULT_PLACED_STATE,
+            clicked_face: Direction::Up,
+            cursor_position: Vec3::new(0.5, 0.0, 0.5),
+            player_yaw: 0.0,
         })
         .expect("room");
         let outputs = s.run_tick();
@@ -1169,6 +1302,9 @@ mod tests {
             position: target,
             sequence: 8,
             state: glass,
+            clicked_face: Direction::Up,
+            cursor_position: Vec3::new(0.5, 0.0, 0.5),
+            player_yaw: 0.0,
         })
         .expect("room");
         let outputs = s.run_tick();
@@ -1387,6 +1523,9 @@ mod tests {
             position: BlockPos::new(8, 65, 8),
             sequence: 2,
             state: DEFAULT_PLACED_STATE,
+            clicked_face: Direction::Up,
+            cursor_position: Vec3::new(0.5, 0.0, 0.5),
+            player_yaw: 0.0,
         })
         .expect("room");
         // An absent actor has no session to ack or resync, so nothing is emitted.
@@ -1416,5 +1555,153 @@ mod tests {
         assert_ne!(block_at(&s, target), Some(BlockStateId::AIR));
         let _ = s.run_tick();
         assert_eq!(block_at(&s, target), Some(BlockStateId::AIR));
+    }
+
+    // --- placement integration (compute_placement in the place funnel) ---
+
+    /// `oak_log` default (axis=y); the integration tests derive axis/half/facing
+    /// from the placement inputs threaded on the place.
+    const OAK_LOG: u32 = 137;
+    /// `oak_slab` default (type=bottom).
+    const OAK_SLAB: u32 = 12054;
+    /// `oak_stairs` default (facing=north, half=bottom).
+    const OAK_STAIRS: u32 = 2949;
+    /// `torch` (single floor state).
+    const TORCH: u32 = 2401;
+    /// `oak_fence` default (all sides disconnected).
+    const OAK_FENCE: u32 = 6027;
+
+    /// Builds a shard with chunk (0,0) resident and `p` joined at spawn.
+    async fn shard_with_player(p: PlayerId) -> SimShard {
+        let mut s = shard_with_loaded_chunk(ChunkPos::new(0, 0)).await;
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: spawn(),
+        })
+        .expect("room");
+        let _ = s.run_tick();
+        s
+    }
+
+    /// Enqueues one place of `held` at `target` with the given placement inputs and
+    /// returns the tick's outputs.
+    #[allow(clippy::too_many_arguments)] // a test helper mirroring the place input's fields
+    fn place_block(
+        s: &mut SimShard,
+        p: PlayerId,
+        target: BlockPos,
+        held: u32,
+        face: Direction,
+        cursor_y: f64,
+        yaw: f32,
+        sequence: i32,
+    ) -> Vec<GameOutput> {
+        s.enqueue(GameInput::BlockPlace {
+            player: p,
+            position: target,
+            sequence,
+            state: BlockStateId::new(held),
+            clicked_face: face,
+            cursor_position: Vec3::new(0.5, cursor_y, 0.5),
+            player_yaw: yaw,
+        })
+        .expect("room");
+        s.run_tick()
+    }
+
+    #[tokio::test]
+    async fn place_log_on_side_face_sets_axis() {
+        let p = player("logger");
+        let mut s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+        // Clicking an east/west face lays the log along the x axis (136), not the
+        // default vertical y (137).
+        let _ = place_block(&mut s, p, target, OAK_LOG, Direction::East, 0.5, 0.0, 1);
+        assert_eq!(block_at(&s, target), Some(BlockStateId::new(136)));
+    }
+
+    #[tokio::test]
+    async fn place_slab_bottom_or_top_from_cursor() {
+        let p = player("slabber");
+        let mut s = shard_with_player(p).await;
+        // Top-face click -> bottom slab (default 12054).
+        let bottom = BlockPos::new(8, 65, 8);
+        let _ = place_block(&mut s, p, bottom, OAK_SLAB, Direction::Up, 0.0, 0.0, 1);
+        assert_eq!(block_at(&s, bottom), Some(BlockStateId::new(12054)));
+        // Side click in the upper half -> top slab (12052).
+        let top = BlockPos::new(9, 65, 8);
+        let _ = place_block(&mut s, p, top, OAK_SLAB, Direction::North, 0.8, 0.0, 2);
+        assert_eq!(block_at(&s, top), Some(BlockStateId::new(12052)));
+    }
+
+    #[tokio::test]
+    async fn place_stairs_facing_from_yaw_and_half_from_cursor() {
+        let p = player("stairer");
+        let mut s = shard_with_player(p).await;
+        // yaw 180 -> facing north, top-face click -> bottom half: the default 2949.
+        let a = BlockPos::new(8, 65, 8);
+        let _ = place_block(&mut s, p, a, OAK_STAIRS, Direction::Up, 0.0, 180.0, 1);
+        assert_eq!(block_at(&s, a), Some(BlockStateId::new(2949)));
+        // yaw 90 -> facing west, bottom-face click -> top half: 2979.
+        let b = BlockPos::new(9, 65, 8);
+        let _ = place_block(&mut s, p, b, OAK_STAIRS, Direction::Down, 0.0, 90.0, 2);
+        assert_eq!(block_at(&s, b), Some(BlockStateId::new(2979)));
+    }
+
+    #[tokio::test]
+    async fn place_torch_floor_vs_wall() {
+        let p = player("torcher");
+        let mut s = shard_with_player(p).await;
+        // Top-face click keeps the floor torch (2401).
+        let floor = BlockPos::new(8, 65, 8);
+        let _ = place_block(&mut s, p, floor, TORCH, Direction::Up, 0.5, 0.0, 1);
+        assert_eq!(block_at(&s, floor), Some(BlockStateId::new(2401)));
+        // North-face click becomes a wall torch facing north (2402).
+        let wall = BlockPos::new(9, 65, 8);
+        let _ = place_block(&mut s, p, wall, TORCH, Direction::North, 0.5, 0.0, 2);
+        assert_eq!(block_at(&s, wall), Some(BlockStateId::new(2402)));
+    }
+
+    #[tokio::test]
+    async fn place_simple_cube_is_unchanged() {
+        let p = player("mason");
+        let mut s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+        // Stone (1) is a simple cube: the placement inputs never alter it.
+        let _ = place_block(&mut s, p, target, 1, Direction::North, 0.9, 200.0, 1);
+        assert_eq!(block_at(&s, target), Some(BlockStateId::new(1)));
+    }
+
+    #[tokio::test]
+    async fn place_fence_connects_to_neighbor_and_broadcasts_the_update() {
+        let p = player("fencer");
+        let mut s = shard_with_player(p).await;
+
+        // Place an isolated fence at A: all sides disconnected (6027).
+        let a = BlockPos::new(8, 65, 8);
+        let _ = place_block(&mut s, p, a, OAK_FENCE, Direction::Up, 0.5, 0.0, 1);
+        assert_eq!(block_at(&s, a), Some(BlockStateId::new(6027)));
+
+        // Place a second fence at B, one east of A. B connects west to A (6026),
+        // and A is recomputed to connect east to B (6011).
+        let b = BlockPos::new(9, 65, 8);
+        let outputs = place_block(&mut s, p, b, OAK_FENCE, Direction::Up, 0.5, 0.0, 2);
+        assert_eq!(block_at(&s, b), Some(BlockStateId::new(6026)));
+        assert_eq!(block_at(&s, a), Some(BlockStateId::new(6011)));
+
+        // The actor's own place is acked (PlayerCreative); the neighbour update at A
+        // is broadcast under a non-acking Command cause.
+        assert!(outputs.contains(&GameOutput::BlockChanged {
+            position: b,
+            state: BlockStateId::new(6026),
+            sequence: 2,
+            cause: MutationCause::PlayerCreative { player: p },
+        }));
+        assert!(outputs.contains(&GameOutput::BlockChanged {
+            position: a,
+            state: BlockStateId::new(6011),
+            sequence: 0,
+            cause: MutationCause::Command,
+        }));
     }
 }

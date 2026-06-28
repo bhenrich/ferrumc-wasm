@@ -7,7 +7,7 @@
 //! these typed messages.
 
 use ferrumc_core::{GameMode, PlayerId};
-use ferrumc_math::{BlockPos, Vec3};
+use ferrumc_math::{BlockPos, Direction, Vec3};
 use ferrumc_world::BlockStateId;
 
 use crate::mutation::MutationCause;
@@ -63,10 +63,13 @@ pub enum GameInput {
     /// Decoded upstream from a serverbound `UseItemOn`; `position` is the block
     /// adjacent to the clicked face. The simulation validates the edit at the
     /// tick boundary (the same checks as [`BlockBreak`](GameInput::BlockBreak))
-    /// and, on acceptance, writes `state` — the block-state the held item places,
-    /// resolved by the app from the player's held hotbar stack before the input is
-    /// produced (so the simulation stays inventory-free and just applies the
-    /// already-resolved state).
+    /// and, on acceptance, computes the *correct* placed block-state from
+    /// `state` (the held item's default), `clicked_face`, `cursor_position`, and
+    /// `player_yaw` via `ferrumc_placement::compute_placement` (rotation/facing/
+    /// half/fence connectivity) before writing it through the single block-edit
+    /// funnel. An unsupported or unrecognised block falls back to writing `state`
+    /// unchanged. `state` itself is resolved by the app from the player's held
+    /// hotbar stack, so the simulation stays inventory-free.
     BlockPlace {
         /// Identity of the player placing the block.
         player: PlayerId,
@@ -75,9 +78,18 @@ pub enum GameInput {
         /// The block-action sequence the client stamped on the originating
         /// `UseItemOn`, echoed back in an `AcknowledgeBlockChange` on accept.
         sequence: i32,
-        /// The block-state to write on acceptance: the block the held item places,
-        /// resolved upstream from the player's selected hotbar slot.
+        /// The held item's default block-state (the placement input); the
+        /// simulation refines it into the final placed state.
         state: BlockStateId,
+        /// The face of the targeted block the player clicked, used to derive axis
+        /// (logs), half (slabs/stairs), and wall-torch facing.
+        clicked_face: Direction,
+        /// The cursor hit point inside the targeted block (`0.0..=1.0` per axis);
+        /// its `y` selects a slab/stair half.
+        cursor_position: Vec3,
+        /// The player's yaw in degrees at place time, used to derive horizontal
+        /// facing (stairs face the player; furnaces face away).
+        player_yaw: f32,
     },
     /// Request a resync + acknowledgement for a block edit that was refused
     /// *upstream* of the simulation (a plugin `Deny`, spawn-protection veto, etc.)

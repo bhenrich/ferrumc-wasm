@@ -161,6 +161,18 @@ pub fn use_item_on_target(packet: &UseItemOn) -> Option<BlockPos> {
     Some(block_pos(packet.location()).offset(face))
 }
 
+/// Resolves the face a serverbound `UseItemOn` clicked, as a typed [`Direction`].
+///
+/// Reuses the same protocol face-index decoding as [`use_item_on_target`], so the
+/// face logic lives in one place. Returns `None` for a malformed face index
+/// outside the canonical `0..6` range (the app then acks the sequence without
+/// placing, as today). The simulation builds a placement context from this face
+/// to derive rotation/facing/half.
+#[must_use]
+pub fn use_item_on_face(packet: &UseItemOn) -> Option<Direction> {
+    face_from_index(packet.direction())
+}
+
 /// Converts a wire [`BlockPosition`] into a typed [`BlockPos`].
 fn block_pos(pos: BlockPosition) -> BlockPos {
     BlockPos::new(pos.x(), pos.y(), pos.z())
@@ -573,6 +585,49 @@ mod tests {
             0,
         );
         assert_eq!(use_item_on_target(&packet), None);
+    }
+
+    #[test]
+    fn use_item_on_face_decodes_the_clicked_face() {
+        // Face index 1 = Up (Minecraft canonical face order == Direction::ALL).
+        let up = UseItemOn::new(
+            0,
+            BlockPosition::new(8, 63, 8),
+            1,
+            0.5,
+            1.0,
+            0.5,
+            false,
+            false,
+            1,
+        );
+        assert_eq!(use_item_on_face(&up), Some(Direction::Up));
+        // Face index 5 = East.
+        let east = UseItemOn::new(
+            0,
+            BlockPosition::new(8, 63, 8),
+            5,
+            0.0,
+            0.5,
+            0.5,
+            false,
+            false,
+            1,
+        );
+        assert_eq!(use_item_on_face(&east), Some(Direction::East));
+        // Out-of-range face index is malformed -> None (the app acks without placing).
+        let bad = UseItemOn::new(
+            0,
+            BlockPosition::new(8, 63, 8),
+            6,
+            0.5,
+            0.5,
+            0.5,
+            false,
+            false,
+            1,
+        );
+        assert_eq!(use_item_on_face(&bad), None);
     }
 
     #[test]

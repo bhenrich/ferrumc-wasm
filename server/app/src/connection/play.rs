@@ -70,6 +70,11 @@ pub(super) async fn enter_play(
     // matching `SetGameMode` below makes the sim's authoritative mode agree.
     let mut inventory = PlayerInventory::with_creative_kit(GameMode::Creative);
 
+    // The player's last-reported yaw, mirrored from look packets so a place can
+    // derive block facing. Defaults to 0.0 (south-ish) until the first look packet;
+    // UseItemOn itself carries no yaw.
+    let mut player_yaw: f32 = 0.0;
+
     // The shard seeds every joiner's mode to the default (survival), but JoinGame
     // told the client creative — make the sim's authoritative mode creative too so
     // the creative-slot gate accepts this player and later enforcement is correct.
@@ -105,6 +110,7 @@ pub(super) async fn enter_play(
         &mut chunk_stream,
         &mut chat_limiter,
         &mut inventory,
+        &mut player_yaw,
         &mut debug,
     )
     .await?;
@@ -224,6 +230,7 @@ pub(super) async fn enter_play(
                         &mut chunk_stream,
                         &mut chat_limiter,
                         &mut inventory,
+                        &mut player_yaw,
                         &mut debug,
                         &read_buf[..n],
                     ).await,
@@ -300,6 +307,7 @@ async fn read_and_pump(
     chunk_stream: &mut ChunkStream,
     chat_limiter: &mut ChatRateLimiter,
     inventory: &mut PlayerInventory,
+    player_yaw: &mut f32,
     debug: &mut SessionDebug,
     bytes: &[u8],
 ) -> anyhow::Result<()> {
@@ -314,6 +322,7 @@ async fn read_and_pump(
         chunk_stream,
         chat_limiter,
         inventory,
+        player_yaw,
         debug,
     )
     .await?;
@@ -339,6 +348,7 @@ async fn pump_serverbound(
     chunk_stream: &mut ChunkStream,
     chat_limiter: &mut ChatRateLimiter,
     inventory: &mut PlayerInventory,
+    player_yaw: &mut f32,
     debug: &mut SessionDebug,
 ) -> anyhow::Result<()> {
     loop {
@@ -370,6 +380,7 @@ async fn pump_serverbound(
             chunk_stream,
             chat_limiter,
             inventory,
+            player_yaw,
             &body,
             debug,
             compression,
