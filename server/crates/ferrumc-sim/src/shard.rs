@@ -851,6 +851,19 @@ impl NeighborQuery for ShardNeighborQuery<'_> {
         // A fence connects to the same fence or to any solid full cube.
         name == fence_block_name || block_metadata(name).is_some_and(|m| m.is_solid_cube)
     }
+
+    fn block_state_at(&self, position: BlockPos) -> Option<u32> {
+        // Resolve the resident neighbour's state for the placement rules that read
+        // it (stair auto-corner `shape`, fence-gate `in_wall`). Air and
+        // non-resident cells report `None`, matching the trait contract; a
+        // neighbour in another shard's chunk is simply unseen (stale corner at the
+        // shard edge, healed when that column streams in).
+        self.chunks
+            .get(position.to_chunk_pos())
+            .and_then(|chunk| chunk.get_block(position))
+            .filter(|state| !state.is_air())
+            .map(BlockStateId::as_u32)
+    }
 }
 
 /// Maps an [`apply_block_edit`](SimShard::apply_block_edit) result into the
