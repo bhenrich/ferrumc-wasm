@@ -260,6 +260,10 @@ pub(crate) struct ConnContext {
     pub(crate) config: Arc<ConfigRegistries>,
     /// Interval between clientbound play-phase Keep Alive pings.
     pub(crate) keep_alive_interval: Duration,
+    /// How often a standing player's chunk view is pumped toward the full
+    /// advertised view distance, independent of movement packets (see
+    /// [`AppConfig::chunk_stream_interval`](crate::config::AppConfig::chunk_stream_interval)).
+    pub(crate) chunk_stream_interval: Duration,
     /// Bounded channel to the simulation/session driver.
     pub(crate) commands: mpsc::Sender<SimCommand>,
     /// The shared play policy: bypass permissions, the spawn position, and the
@@ -750,6 +754,17 @@ async fn enter_play(
     keep_alive.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut keep_alive_id: i64 = 0;
 
+    // Chunk-stream pump: advance a standing player's view toward the full
+    // advertised view distance without waiting for a movement packet. The initial
+    // fill already ran in the first `pump_serverbound` above; this drains the
+    // remaining backlog one bounded batch per interval. `Delay` skips missed ticks
+    // under load rather than bursting to catch up.
+    let mut chunk_pump = interval_at(
+        Instant::now() + ctx.chunk_stream_interval,
+        ctx.chunk_stream_interval,
+    );
+    chunk_pump.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
     let mut read_buf = [0u8; READ_CHUNK];
     let result = loop {
         tokio::select! {
@@ -770,6 +785,20 @@ async fn enter_play(
                     break Err(anyhow::anyhow!(
                         "outbound overflow: a mandatory keep-alive was dropped at the connection writer"
                     ));
+                }
+                if let Err(err) = flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
+                    break Err(err);
+                }
+                observe_queue_len(&mut debug, ctx, &writer);
+            }
+            _ = chunk_pump.tick() => {
+                // Advance the view one bounded batch toward full view distance from
+                // the current center, even if the player never moved. Bounded per
+                // pump, so this paces the backlog out without flooding the socket.
+                if let Err(err) =
+                    pump_chunk_stream(ctx, &mut writer, &mut chunk_stream, &mut debug, &compression).await
+                {
+                    break Err(err);
                 }
                 if let Err(err) = flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
                     break Err(err);
@@ -973,12 +1002,14 @@ async fn send_join_kit(
     );
     // Declare the command graph so the client renders `/spawn` and `/gamemode` as
     // valid (not red) and offers autocomplete for them. The graph is filtered to
-    // this player's permission level, so a non-operator never receives the
-    // level-gated `/gamemode` subtree.
+    // this player's permission level AND their granted permission nodes, so a
+    // non-operator never receives the level-gated `/gamemode` subtree and a player
+    // without a permission-gated command's node never receives that command.
+    let allowed = |node: &str| ctx.policy.permissions().is_allowed(player, node);
     let command_body = ctx
         .policy
         .command_tree()
-        .encode_commands_body(ctx.policy.permission_level(player));
+        .encode_commands_body(ctx.policy.permission_level(player), &allowed);
     enqueue_traced_classified(
         writer,
         debug,
@@ -1349,16 +1380,14 @@ fn reported_position(packet: &ServerboundPlayPacket) -> Option<Vec3> {
     }
 }
 
-/// Streams chunks to follow the client's latest reported position.
+/// Streams chunks to follow the client's latest reported position, then advances
+/// the view toward the full view distance.
 ///
-/// Does nothing until the client has reported a new position. On a chunk-boundary
-/// crossing it sends `Set Center Chunk`; either way it diffs the square of chunks
-/// within view distance against the per-player loaded set, sends `Unload Chunk`
-/// for any column that left the radius, and asks the driver (via
-/// [`SimCommand::StreamChunks`]) to load-or-generate the columns newly in range —
-/// nearest-first and capped at [`MAX_CHUNK_LOADS_PER_UPDATE`] per call, with the
-/// remainder caught on a later position update. A chunk already in the loaded set
-/// is never re-requested or re-sent.
+/// If the client reported a new position since the last call, this recenters on it
+/// (sending `Set Center Chunk` on a chunk-boundary crossing). Either way it then
+/// runs [`pump_chunk_stream`] against the current center, so the view advances even
+/// when no position packet arrived (a freshly-joined or standing player). A chunk
+/// already in the loaded set is never re-requested or re-sent.
 ///
 /// The connection never generates chunks itself: it only decides the desired set
 /// and renders the packets the driver returns.
@@ -1369,38 +1398,62 @@ async fn apply_chunk_stream(
     debug: &mut SessionDebug,
     compression: &CompressionState,
 ) -> anyhow::Result<()> {
-    let Some(position) = chunk_stream.pending_position.take() else {
-        return Ok(());
-    };
-    let clock = &ctx.clock;
-
-    let new_center = chunk_of(position);
-    if new_center != chunk_stream.center {
-        chunk_stream.center = new_center;
-        enqueue_traced_classified(
-            writer,
-            debug,
-            compression,
-            clock,
-            ClientboundPlayPacket::SetCenterChunk(SetCenterChunk::new(
-                new_center.x(),
-                new_center.z(),
-            )),
-        );
+    // Position path: recenter on the latest reported position, if any.
+    if let Some(position) = chunk_stream.pending_position.take() {
+        let new_center = chunk_of(position);
+        if new_center != chunk_stream.center {
+            chunk_stream.center = new_center;
+            enqueue_traced_classified(
+                writer,
+                debug,
+                compression,
+                &ctx.clock,
+                ClientboundPlayPacket::SetCenterChunk(SetCenterChunk::new(
+                    new_center.x(),
+                    new_center.z(),
+                )),
+            );
+        }
     }
 
-    let desired = desired_chunks(new_center, chunk_stream.view_distance);
+    // Always advance the view toward full view distance from the current center,
+    // whether or not a position packet moved it.
+    pump_chunk_stream(ctx, writer, chunk_stream, debug, compression).await
+}
+
+/// Advances the chunk view one bounded batch toward the full view distance around
+/// the stream's current center, independent of any position packet.
+///
+/// Diffs the `(2 * view_distance + 1)` square against the per-player loaded set,
+/// sends `Unload Chunk` for any column that left the radius, and asks the driver
+/// (via [`SimCommand::StreamChunks`]) to load-or-generate the columns newly in
+/// range — nearest-first and capped at [`MAX_CHUNK_LOADS_PER_UPDATE`] per call (see
+/// [`next_chunk_batch`]), with the remainder caught on a later pump. Driven both
+/// after a position update and on the standing-player pump interval, so a
+/// non-moving joiner still fills out to the advertised view distance.
+async fn pump_chunk_stream(
+    ctx: &ConnContext,
+    writer: &mut PlayWriter,
+    chunk_stream: &mut ChunkStream,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+) -> anyhow::Result<()> {
+    let clock = &ctx.clock;
+    let center = chunk_stream.center;
+
+    let desired = desired_chunks(center, chunk_stream.view_distance);
     let to_unload: Vec<ChunkPos> = chunk_stream.loaded.difference(&desired).copied().collect();
-    let mut to_load: Vec<ChunkPos> = desired.difference(&chunk_stream.loaded).copied().collect();
+    // Nearest-first, bounded batch of newly-in-range columns (the pure helper
+    // computes the desired-vs-loaded diff, sorts center-out, and truncates).
+    let to_load = next_chunk_batch(
+        center,
+        chunk_stream.view_distance,
+        &chunk_stream.loaded,
+        MAX_CHUNK_LOADS_PER_UPDATE,
+    );
     if to_load.is_empty() && to_unload.is_empty() {
         return Ok(());
     }
-
-    // Nearest-first so the player always receives the chunks closest to them when
-    // the per-update cap defers the rest; the coordinate tiebreak keeps it
-    // deterministic.
-    to_load.sort_by_key(|pos| (chebyshev_distance(new_center, *pos), pos.x(), pos.z()));
-    to_load.truncate(MAX_CHUNK_LOADS_PER_UPDATE);
 
     // Drop the departed columns from the client now (tiny packets) and from the
     // tracked set; the driver releases their tickets via the command below.
@@ -1495,6 +1548,27 @@ fn chebyshev_distance(a: ChunkPos, b: ChunkPos) -> i64 {
     let dx = (i64::from(a.x()) - i64::from(b.x())).abs();
     let dz = (i64::from(a.z()) - i64::from(b.z())).abs();
     dx.max(dz)
+}
+
+/// The next bounded, nearest-first batch of chunk columns to load around `center`.
+///
+/// Diffs the `(2 * view_distance + 1)` desired square against the already-`loaded`
+/// set, sorts the missing columns center-out by [`chebyshev_distance`] (with a
+/// coordinate tiebreak for determinism), and truncates to `bound`. Pure (no I/O),
+/// so each pump — whether driven by a position update or the standing-player
+/// interval — makes bounded, center-out progress toward the full view distance, and
+/// the policy is unit-testable without a live socket.
+fn next_chunk_batch(
+    center: ChunkPos,
+    view_distance: i32,
+    loaded: &BTreeSet<ChunkPos>,
+    bound: usize,
+) -> Vec<ChunkPos> {
+    let desired = desired_chunks(center, view_distance);
+    let mut to_load: Vec<ChunkPos> = desired.difference(loaded).copied().collect();
+    to_load.sort_by_key(|pos| (chebyshev_distance(center, *pos), pos.x(), pos.z()));
+    to_load.truncate(bound);
+    to_load
 }
 
 /// Handles a block break at the plugin intent boundary.
@@ -2029,11 +2103,12 @@ fn send_mandatory(
 /// The request `text` is the full chat-box content including the leading `/`; the
 /// slash is stripped before suggesting, and `start`/`length` are computed so the
 /// client replaces exactly the in-progress token. Suggestions are filtered to the
-/// literals the player's permission level may use (matching the permission-filtered
-/// command graph the join kit declared), and argument *hints* such as
-/// `<mode: 0..3>` are dropped — only concrete literal completions are sent, never
-/// placeholder text the client would insert verbatim. The offsets are byte indices,
-/// which coincide with character indices for the ASCII command literals in scope.
+/// literals the player's permission level *and* granted permission nodes allow
+/// (matching the permission-filtered command graph the join kit declared), and
+/// argument *hints* such as `<mode: 0..3>` are dropped — only concrete literal
+/// completions are sent, never placeholder text the client would insert verbatim.
+/// The offsets are character positions (the units the protocol's Command
+/// Suggestions field expects), so a non-ASCII prefix is indexed correctly.
 fn handle_tab_complete(
     ctx: &ConnContext,
     player: PlayerId,
@@ -2044,7 +2119,9 @@ fn handle_tab_complete(
     compression: &CompressionState,
 ) {
     let level = ctx.policy.permission_level(player);
-    let (start, length, suggestions) = tab_complete_reply(ctx.policy.command_tree(), level, text);
+    let allowed = |node: &str| ctx.policy.permissions().is_allowed(player, node);
+    let (start, length, suggestions) =
+        tab_complete_reply(ctx.policy.command_tree(), level, &allowed, text);
 
     let matches: Vec<CommandSuggestionMatch> = suggestions
         .into_iter()
@@ -2072,23 +2149,40 @@ fn handle_tab_complete(
 }
 
 /// Computes the tab-complete reply for `text` at permission `level` against
-/// `tree`: the `(start, length)` byte span of `text` the matches replace, and the
+/// `tree`, gating permission-node-declared commands through `is_allowed`: the
+/// `(start, length)` *character* span of `text` the matches replace, and the
 /// filtered list of literal completions.
 ///
 /// Pure (no I/O), so it is unit-tested directly. The leading `/` is stripped
 /// before suggesting; `start`/`length` delimit the in-progress token (from after
-/// the last whitespace to the end of `text`). Matches are filtered to the literals
-/// the player's `level` may use (the declared graph is filtered the same way), and
-/// argument *hints* (which begin with `<`) are dropped so the client is never sent
-/// placeholder text to insert verbatim.
-fn tab_complete_reply(tree: &CommandTree, level: u8, text: &str) -> (usize, usize, Vec<String>) {
+/// the last whitespace to the end of `text`). They are reported in character units
+/// — what the protocol's Command Suggestions field expects — so a non-ASCII prefix
+/// is indexed correctly rather than by UTF-8 byte offset. Matches are filtered to
+/// the literals the player's `level` and granted permission nodes allow (the
+/// declared graph is filtered the same way), and argument *hints* (which begin with
+/// `<`) are dropped so the client is never sent placeholder text to insert verbatim.
+fn tab_complete_reply(
+    tree: &CommandTree,
+    level: u8,
+    is_allowed: &dyn Fn(&str) -> bool,
+    text: &str,
+) -> (usize, usize, Vec<String>) {
     let input = text.strip_prefix('/').unwrap_or(text);
     let offset = text.len() - input.len();
-    let token_start = input.rfind(char::is_whitespace).map_or(0, |idx| idx + 1);
-    let start = offset + token_start;
-    let length = text.len().saturating_sub(start);
+    // Byte index in `input` just past the last whitespace char (the token start).
+    // Stepping by the whitespace char's UTF-8 width (not a bare `+ 1`) keeps the
+    // index on a char boundary even for a multi-byte whitespace char, so the slices
+    // below never panic on hostile input.
+    let token_start = input.rfind(char::is_whitespace).map_or(0, |idx| {
+        idx + input[idx..].chars().next().map_or(1, char::len_utf8)
+    });
+    let start_bytes = offset + token_start;
+    // The protocol carries start/length as character positions, so convert the byte
+    // offsets to char counts; for ASCII (the common case) the two coincide.
+    let start = text[..start_bytes].chars().count();
+    let length = text[start_bytes..].chars().count();
 
-    let graph = tree.to_brigadier(level);
+    let graph = tree.to_brigadier(level, is_allowed);
     let allowed: Vec<&str> = graph
         .nodes()
         .iter()
@@ -2344,8 +2438,8 @@ mod tests {
     #[test]
     fn tab_complete_offers_literal_completion_for_a_prefix() {
         let tree = build_command_tree();
-        // "/sp" -> the in-progress token "sp" (byte 1..3) completes to "spawn".
-        let (start, length, matches) = tab_complete_reply(&tree, OP_LEVEL, "/sp");
+        // "/sp" -> the in-progress token "sp" (char 1..3) completes to "spawn".
+        let (start, length, matches) = tab_complete_reply(&tree, OP_LEVEL, &|_| true, "/sp");
         assert_eq!((start, length), (1, 2));
         assert_eq!(matches, vec![SPAWN_COMMAND.to_string()]);
     }
@@ -2353,7 +2447,7 @@ mod tests {
     #[test]
     fn tab_complete_lists_all_commands_after_the_slash() {
         let tree = build_command_tree();
-        let (start, length, matches) = tab_complete_reply(&tree, OP_LEVEL, "/");
+        let (start, length, matches) = tab_complete_reply(&tree, OP_LEVEL, &|_| true, "/");
         assert_eq!((start, length), (1, 0));
         assert!(matches.contains(&SPAWN_COMMAND.to_string()));
         assert!(matches.contains(&GAMEMODE_COMMAND.to_string()));
@@ -2363,9 +2457,9 @@ mod tests {
     fn tab_complete_hides_gated_commands_from_low_level_players() {
         let tree = build_command_tree();
         // A level-0 player gets `/spawn` but never `/gamemode`.
-        let (_, _, op_matches) = tab_complete_reply(&tree, OP_LEVEL, "/ga");
+        let (_, _, op_matches) = tab_complete_reply(&tree, OP_LEVEL, &|_| true, "/ga");
         assert_eq!(op_matches, vec![GAMEMODE_COMMAND.to_string()]);
-        let (_, _, member_matches) = tab_complete_reply(&tree, MEMBER_LEVEL, "/ga");
+        let (_, _, member_matches) = tab_complete_reply(&tree, MEMBER_LEVEL, &|_| true, "/ga");
         assert!(member_matches.is_empty());
     }
 
@@ -2374,8 +2468,67 @@ mod tests {
         let tree = build_command_tree();
         // After "/gamemode " the only candidate is the `<mode: 0..3>` hint, which is
         // display-only and must not be sent as an insertable match.
-        let (start, length, matches) = tab_complete_reply(&tree, OP_LEVEL, "/gamemode ");
+        let (start, length, matches) = tab_complete_reply(&tree, OP_LEVEL, &|_| true, "/gamemode ");
         assert_eq!((start, length), (10, 0));
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn chunk_pump_makes_center_out_progress_without_a_position_packet() {
+        use std::collections::BTreeSet;
+
+        use ferrumc_math::ChunkPos;
+
+        use super::{
+            chebyshev_distance, desired_chunks, next_chunk_batch, MAX_CHUNK_LOADS_PER_UPDATE,
+        };
+
+        let center = ChunkPos::new(0, 0);
+        let view_distance = 10;
+        // A fresh joiner holds only the spawn batch (radius-2 square, 25 columns)
+        // before sending any movement packet.
+        let mut loaded: BTreeSet<ChunkPos> = desired_chunks(center, 2);
+
+        // The first batch is the nearest ring (center-out): every column sits at the
+        // closest missing Chebyshev distance — 3, just outside the spawn batch.
+        let first = next_chunk_batch(center, view_distance, &loaded, MAX_CHUNK_LOADS_PER_UPDATE);
+        assert_eq!(first.len(), MAX_CHUNK_LOADS_PER_UPDATE);
+        assert!(first
+            .iter()
+            .all(|pos| chebyshev_distance(center, *pos) == 3));
+
+        // Driving the pump repeatedly — with NO position packet ever — fills the
+        // whole advertised view square. Each call simulates the driver loading the
+        // returned batch.
+        let desired = desired_chunks(center, view_distance);
+        let mut iterations = 0;
+        loop {
+            let batch =
+                next_chunk_batch(center, view_distance, &loaded, MAX_CHUNK_LOADS_PER_UPDATE);
+            if batch.is_empty() {
+                break;
+            }
+            for pos in batch {
+                loaded.insert(pos);
+            }
+            iterations += 1;
+            assert!(iterations < 1000, "the pump must terminate");
+        }
+        assert!(
+            desired.is_subset(&loaded),
+            "the pump fills out to the full advertised view distance"
+        );
+        // 441 desired - 25 seeded = 416 columns, in bounded batches of 16 -> 26 pumps.
+        assert_eq!(iterations, 26);
+    }
+
+    #[test]
+    fn tab_complete_range_is_in_char_units_for_non_ascii() {
+        let tree = build_command_tree();
+        // "/éa": the accented `é` is two UTF-8 bytes, so the in-progress token "éa"
+        // begins at character 1 (right after the slash) and is two characters long.
+        // The old byte computation would report length 3, mis-indexing the client.
+        let (start, length, _) = tab_complete_reply(&tree, OP_LEVEL, &|_| true, "/\u{e9}a");
+        assert_eq!((start, length), (1, 2));
     }
 }

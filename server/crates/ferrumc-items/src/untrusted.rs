@@ -189,11 +189,13 @@ impl UntrustedItemStack {
     /// Applies hostile-input rules: an empty stack (and a present
     /// `minecraft:air` stack) normalizes to the empty slot; otherwise the item
     /// id must exist (else [`ItemValidationError::UnknownItemId`]), the count is
-    /// clamped to `1..=max_stack`, the arbitrary-NBT / nested-item components
-    /// ([`ComponentTypeId::is_dangerous`]) and out-of-range component types are
-    /// stripped, the supported components are parsed and validated, and any
-    /// recognized-but-unmodeled in-range component is kept as a bounded
-    /// [`ComponentValue::Opaque`] passthrough.
+    /// clamped to `1..=max_stack`, and only the explicitly-modeled components are
+    /// kept (parsed and validated). Every other client-authored component is
+    /// stripped: the dangerous arbitrary-NBT / nested-item components
+    /// ([`ComponentTypeId::is_dangerous`]), out-of-range component types, *and*
+    /// any recognized-but-unmodeled in-range component. Nothing the client
+    /// authored survives as an opaque passthrough, so malformed bytes can never
+    /// be re-emitted as trusted clientbound data.
     ///
     /// # Errors
     ///
@@ -222,7 +224,7 @@ impl UntrustedItemStack {
         let limits = nbt_limits();
         let mut added = Vec::new();
         for (type_id, raw) in self.added {
-            let tid = ComponentTypeId(type_id);
+            let tid = ComponentTypeId::new(type_id);
             // Strip the dangerous components and anything outside 0..=95.
             if tid.is_dangerous() || !tid.is_in_range() {
                 continue;
@@ -244,9 +246,12 @@ impl UntrustedItemStack {
                     }
                     ComponentValue::Unbreakable
                 }
-                // In range and not dangerous, but not specifically modeled: keep
-                // the bounded bytes as a passthrough.
-                _ => ComponentValue::Opaque { type_id, raw },
+                // In range and not dangerous, but not specifically modeled: strip
+                // it. A client-authored component the server does not model would
+                // otherwise exit the trust boundary as opaque bytes the trusted
+                // slot encoder re-emits verbatim (e.g. a malformed `item_name`),
+                // so it is dropped rather than kept as a passthrough.
+                _ => continue,
             };
             added.push(value);
         }
@@ -254,14 +259,14 @@ impl UntrustedItemStack {
         let removed = self
             .removed
             .into_iter()
-            .map(ComponentTypeId)
+            .map(ComponentTypeId::new)
             .filter(|tid| tid.is_in_range() && !tid.is_dangerous())
             .collect();
 
         Ok(ItemStack::new(
             item,
             count,
-            ComponentPatch { added, removed },
+            ComponentPatch::new(added, removed),
         ))
     }
 }
@@ -402,13 +407,13 @@ mod tests {
         );
         let validated = stack.into_validated().unwrap();
         assert_eq!(
-            validated.components().added,
-            vec![ComponentValue::Unbreakable]
+            validated.components().added(),
+            [ComponentValue::Unbreakable]
         );
         // Only the in-range, non-dangerous removal survives.
         assert_eq!(
-            validated.components().removed,
-            vec![ComponentTypeId(DAMAGE)]
+            validated.components().removed(),
+            [ComponentTypeId::new(DAMAGE)]
         );
     }
 
@@ -433,8 +438,8 @@ mod tests {
         );
         let validated = stack.into_validated().unwrap();
         assert_eq!(
-            validated.components().added,
-            vec![ComponentValue::Unbreakable]
+            validated.components().added(),
+            [ComponentValue::Unbreakable]
         );
     }
 
@@ -448,15 +453,36 @@ mod tests {
     }
 
     #[test]
-    fn into_validated_keeps_unmodeled_inrange_as_opaque() {
+    fn into_validated_strips_unmodeled_inrange() {
+        // `item_name` (6) is in range and not dangerous, but the server does not
+        // model it: it is stripped rather than kept as an opaque passthrough.
         let stack = UntrustedItemStack::present(1, 1, vec![(ITEM_NAME, vec![9, 9, 9])], Vec::new());
         let validated = stack.into_validated().unwrap();
-        assert_eq!(
-            validated.components().added,
-            vec![ComponentValue::Opaque {
-                type_id: ITEM_NAME,
-                raw: vec![9, 9, 9]
-            }]
+        assert!(validated.components().added().is_empty());
+    }
+
+    #[test]
+    fn into_validated_strips_hostile_unmodeled_never_reemitted() {
+        // A hostile creative slot authoring an in-range-but-unmodeled `item_name`
+        // with a malformed payload must not survive the trust boundary: it is
+        // dropped on input and can never be re-emitted as trusted clientbound bytes.
+        let payload = vec![0xFF, 0xFF, 0xFF];
+        let stack =
+            UntrustedItemStack::present(1, 1, vec![(ITEM_NAME, payload.clone())], Vec::new());
+        let validated = stack.into_validated().unwrap();
+        assert!(validated.components().added().is_empty());
+
+        // Encoding the validated stack as a trusted slot emits neither the
+        // `item_name` type id nor the hostile payload bytes.
+        let mut buf = Vec::new();
+        validated.encode_slot(&mut buf).unwrap();
+        assert!(
+            !buf.contains(&u8::try_from(ITEM_NAME).unwrap()),
+            "stripped item_name type id must not appear in the trusted slot"
+        );
+        assert!(
+            !buf.windows(payload.len()).any(|window| window == payload),
+            "hostile payload bytes must not appear in the trusted slot"
         );
     }
 
@@ -514,8 +540,8 @@ mod tests {
         );
         let validated = stack.into_validated().unwrap();
         assert_eq!(
-            validated.components().added,
-            vec![ComponentValue::MaxStackSize(99)]
+            validated.components().added(),
+            [ComponentValue::MaxStackSize(99)]
         );
     }
 

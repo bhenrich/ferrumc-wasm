@@ -104,13 +104,13 @@ impl ItemStack {
             Some(item) => {
                 write_var_int(out, i32::from(self.count));
                 write_var_int(out, item.id());
-                write_count(out, self.components.added.len());
-                write_count(out, self.components.removed.len());
+                write_count(out, self.components.added().len());
+                write_count(out, self.components.removed().len());
                 let limits = nbt_limits();
-                for value in &self.components.added {
+                for value in self.components.added() {
                     encode_component_trusted(out, value, &limits)?;
                 }
-                for removed in &self.components.removed {
+                for removed in self.components.removed() {
                     write_var_int(out, removed.get());
                 }
             }
@@ -139,7 +139,7 @@ fn encode_component_trusted(
             out.extend_from_slice(&bytes);
         }
         // Opaque carries already-typed wire bytes verbatim (no length prefix).
-        ComponentValue::Opaque { raw, .. } => out.extend_from_slice(raw),
+        ComponentValue::Opaque(c) => out.extend_from_slice(c.raw()),
     }
     Ok(())
 }
@@ -219,12 +219,12 @@ mod tests {
 
         let mut removed = Vec::with_capacity(removed_count);
         for _ in 0..removed_count {
-            removed.push(ComponentTypeId(read_var_int_advance(data, &mut pos)?));
+            removed.push(ComponentTypeId::new(read_var_int_advance(data, &mut pos)?));
         }
 
         let count = NonZeroU8::new(u8::try_from(item_count).unwrap()).unwrap();
         Ok((
-            ItemStack::new(item, count, ComponentPatch { added, removed }),
+            ItemStack::new(item, count, ComponentPatch::new(added, removed)),
             pos,
         ))
     }
@@ -263,15 +263,18 @@ mod tests {
         let stack = ItemStack::new(
             ItemId::from_name("diamond_sword").unwrap(),
             nz(1),
-            ComponentPatch {
-                added: vec![
+            ComponentPatch::new(
+                vec![
                     ComponentValue::MaxStackSize(99),
                     ComponentValue::Damage(42),
                     ComponentValue::Unbreakable,
                     ComponentValue::CustomName(NbtTag::Compound(name)),
                 ],
-                removed: vec![ComponentTypeId(DAMAGE), ComponentTypeId(MAX_STACK_SIZE)],
-            },
+                vec![
+                    ComponentTypeId::new(DAMAGE),
+                    ComponentTypeId::new(MAX_STACK_SIZE),
+                ],
+            ),
         );
         let mut buf = Vec::new();
         stack.encode_slot(&mut buf).unwrap();

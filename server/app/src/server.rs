@@ -210,6 +210,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         join_kit: setup.join_kit,
         config: config_registries,
         keep_alive_interval: config.keep_alive_interval,
+        chunk_stream_interval: config.chunk_stream_interval,
         commands: commands_tx,
         policy,
         block_events,

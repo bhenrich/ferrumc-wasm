@@ -50,6 +50,14 @@ const DEFAULT_SPAWN_PROTECT_RADIUS: i32 = 0;
 /// without a wall-clock wait.
 const DEFAULT_KEEP_ALIVE_INTERVAL_MS: u64 = 10_000;
 
+/// Default chunk-stream pump interval, in milliseconds.
+///
+/// How often a standing player's view is advanced toward the full advertised view
+/// distance without waiting for a movement packet. One server tick (50 ms at the
+/// 20 TPS default) keeps the backlog draining promptly while the per-pump load cap
+/// bounds the burst.
+const DEFAULT_CHUNK_STREAM_INTERVAL_MS: u64 = 50;
+
 /// Default permission level granted to a non-operator player.
 ///
 /// Zero is the vanilla "ordinary player" tier: it satisfies no operator gate, so
@@ -94,6 +102,12 @@ pub struct AppConfig {
     pub spawn_protect_bypass: Vec<String>,
     /// Interval between clientbound play-phase Keep Alive pings.
     pub keep_alive_interval: Duration,
+    /// How often a standing player's view is pumped toward the full advertised
+    /// view distance. The chunk stream otherwise only advances on a movement
+    /// packet, so without this a non-moving joiner would never receive chunks past
+    /// the initial spawn batch. Each pump is bounded by the per-update load cap, so
+    /// a short interval drains the backlog promptly without flooding the socket.
+    pub chunk_stream_interval: Duration,
     /// Names of players granted operator status (permission level 4), letting
     /// them run operator-gated commands such as `/gamemode`. Everyone else acts
     /// at [`default_permission_level`](Self::default_permission_level).
@@ -154,6 +168,7 @@ impl Default for AppConfig {
             spawn_protect_radius: DEFAULT_SPAWN_PROTECT_RADIUS,
             spawn_protect_bypass: Vec::new(),
             keep_alive_interval: Duration::from_millis(DEFAULT_KEEP_ALIVE_INTERVAL_MS),
+            chunk_stream_interval: Duration::from_millis(DEFAULT_CHUNK_STREAM_INTERVAL_MS),
             ops: Vec::new(),
             default_permission_level: DEFAULT_PERMISSION_LEVEL,
             // None = in-memory, keeping `AppConfig::default()` deterministic and
@@ -197,6 +212,8 @@ struct RawConfig {
     spawn_protect_bypass: Option<Vec<String>>,
     /// Override for [`AppConfig::keep_alive_interval`], expressed in milliseconds.
     keep_alive_interval_ms: Option<u64>,
+    /// Override for [`AppConfig::chunk_stream_interval`], expressed in milliseconds.
+    chunk_stream_interval_ms: Option<u64>,
     /// Override for [`AppConfig::ops`].
     ops: Option<Vec<String>>,
     /// Override for [`AppConfig::default_permission_level`].
@@ -256,6 +273,9 @@ impl RawConfig {
             keep_alive_interval: self
                 .keep_alive_interval_ms
                 .map_or(defaults.keep_alive_interval, Duration::from_millis),
+            chunk_stream_interval: self
+                .chunk_stream_interval_ms
+                .map_or(defaults.chunk_stream_interval, Duration::from_millis),
             ops: self.ops.unwrap_or(defaults.ops),
             default_permission_level: self
                 .default_permission_level
@@ -291,6 +311,7 @@ mod tests {
             spawn_protect_radius = 12
             spawn_protect_bypass = ["Admin", "Mod"]
             keep_alive_interval_ms = 250
+            chunk_stream_interval_ms = 33
             ops = ["Admin"]
             default_permission_level = 1
             world_dir = "/srv/world"
@@ -309,9 +330,18 @@ mod tests {
         assert_eq!(parsed.spawn_protect_radius, 12);
         assert_eq!(parsed.spawn_protect_bypass, vec!["Admin", "Mod"]);
         assert_eq!(parsed.keep_alive_interval, Duration::from_millis(250));
+        assert_eq!(parsed.chunk_stream_interval, Duration::from_millis(33));
         assert_eq!(parsed.ops, vec!["Admin"]);
         assert_eq!(parsed.default_permission_level, 1);
         assert_eq!(parsed.world_dir, Some(PathBuf::from("/srv/world")));
+    }
+
+    #[test]
+    fn chunk_stream_interval_defaults_to_one_tick() {
+        let parsed = AppConfig::from_toml_str("").expect("empty config is valid");
+        // Defaults to 50 ms (one tick at 20 TPS), so a standing joiner's view is
+        // pumped toward full view distance promptly.
+        assert_eq!(parsed.chunk_stream_interval, Duration::from_millis(50));
     }
 
     #[test]

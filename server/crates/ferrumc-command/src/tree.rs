@@ -155,27 +155,40 @@ impl CommandTree {
 
     /// Lowers this tree into the Brigadier command-node graph the clientbound
     /// `Commands` packet carries, filtered to the commands a player at
-    /// `player_level` may use.
+    /// `player_level` may use *and* whose permission node strings `is_allowed`
+    /// grants.
     ///
-    /// A node whose required permission *level* exceeds `player_level` is dropped
-    /// along with its whole subtree, and the surviving child indices are
-    /// renumbered. Permission *node strings* are not consulted here: the level is
-    /// the only gate the client graph can express. The synthetic root is always
-    /// present at index 0. See [`crate::BrigadierGraph`] for the resulting shape
-    /// and [`CommandTree::encode_commands_body`] for the wire bytes.
-    pub fn to_brigadier(&self, player_level: u8) -> BrigadierGraph {
-        brigadier::lower(&self.root, player_level)
+    /// A node is dropped (along with its whole subtree) when its required
+    /// permission *level* exceeds `player_level` or when it declares a required
+    /// permission *node string* `is_allowed` rejects. A dead-end parent left with
+    /// no retained children after filtering is pruned too, and the surviving child
+    /// indices are assigned over the retained set so none dangle. The synthetic
+    /// root is always present at index 0. See [`crate::BrigadierGraph`] for the
+    /// resulting shape and [`CommandTree::encode_commands_body`] for the wire bytes.
+    ///
+    /// The checker is borrowed, so callers pass a reference to a closure, e.g.
+    /// `tree.to_brigadier(level, &|node| backend.has(node))`.
+    pub fn to_brigadier(
+        &self,
+        player_level: u8,
+        is_allowed: &dyn Fn(&str) -> bool,
+    ) -> BrigadierGraph {
+        brigadier::lower(&self.root, player_level, is_allowed)
     }
 
-    /// Encodes the `Commands` packet body for a player at `player_level`: the
-    /// `VarInt` node count, each Brigadier node's bytes, then the trailing
-    /// `VarInt` root index.
+    /// Encodes the `Commands` packet body for a player at `player_level` whose
+    /// permission node strings `is_allowed` grants: the `VarInt` node count, each
+    /// Brigadier node's bytes, then the trailing `VarInt` root index.
     ///
     /// This is the opaque payload the generated `Commands` packet wraps (the
     /// Brigadier node graph is not expressible in the declarative packet grammar).
-    /// Equivalent to `self.to_brigadier(player_level).encode()`.
-    pub fn encode_commands_body(&self, player_level: u8) -> Vec<u8> {
-        self.to_brigadier(player_level).encode()
+    /// Equivalent to `self.to_brigadier(player_level, is_allowed).encode()`.
+    pub fn encode_commands_body(
+        &self,
+        player_level: u8,
+        is_allowed: &dyn Fn(&str) -> bool,
+    ) -> Vec<u8> {
+        self.to_brigadier(player_level, is_allowed).encode()
     }
 }
 

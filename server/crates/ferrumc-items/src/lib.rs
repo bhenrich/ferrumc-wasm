@@ -18,7 +18,7 @@ pub mod stack;
 pub mod untrusted;
 pub mod wire;
 
-pub use component::{ComponentPatch, ComponentTypeId, ComponentValue};
+pub use component::{ComponentPatch, ComponentTypeId, ComponentValue, OpaqueComponent};
 pub use item_id::ItemId;
 pub use stack::ItemStack;
 pub use untrusted::{ItemValidationError, UntrustedItemStack};

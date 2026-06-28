@@ -236,10 +236,18 @@ impl BrigadierProps {
 /// Flattens `root` and its (permission-permitted) descendants into a
 /// [`BrigadierGraph`].
 ///
-/// The synthetic root is always present at index 0. A descendant whose
-/// `required_level` exceeds `player_level` is dropped along with its whole subtree,
-/// and the surviving child indices are renumbered to match.
-pub(crate) fn lower(root: &CommandNode, player_level: u8) -> BrigadierGraph {
+/// The synthetic root is always present at index 0. A descendant is dropped (along
+/// with its whole subtree) when its `required_level` exceeds `player_level` or when
+/// it declares a `required_permission` node string `is_allowed` rejects. After that
+/// filtering, a non-root, non-executable node left with no retained children is
+/// itself pruned (a dead-end literal would otherwise dangle), bottom-up, so a
+/// parent whose every child pruned away prunes too. The surviving child indices are
+/// assigned over the retained set only, so no child index ever dangles.
+pub(crate) fn lower(
+    root: &CommandNode,
+    player_level: u8,
+    is_allowed: &dyn Fn(&str) -> bool,
+) -> BrigadierGraph {
     // The root is synthetic and never permission-gated, so it always occupies
     // index 0; only its descendants are subject to filtering.
     let mut nodes = vec![BrigadierNode {
@@ -248,10 +256,13 @@ pub(crate) fn lower(root: &CommandNode, player_level: u8) -> BrigadierGraph {
         redirect: None,
         extra: BrigadierExtra::Root,
     }];
+    // Phase 1: prune the subtree by permission, bottom-up, before any index is
+    // assigned, so a dropped node never reserves a slot a child index could point
+    // at. Phase 2: assign indices over the retained set only.
     let mut root_children = Vec::new();
     for child in &root.children {
-        if let Some(index) = flatten(child, player_level, &mut nodes) {
-            root_children.push(index);
+        if let Some(retained) = retain(child, player_level, is_allowed) {
+            root_children.push(assign(&retained, &mut nodes));
         }
     }
     if let Some(root_node) = nodes.first_mut() {
@@ -263,30 +274,73 @@ pub(crate) fn lower(root: &CommandNode, player_level: u8) -> BrigadierGraph {
     }
 }
 
-/// Recursively appends `node` (if the player may use it) and its permitted
-/// children to `nodes`, returning the index assigned to `node`, or `None` if it
-/// was filtered out.
-fn flatten(node: &CommandNode, player_level: u8, nodes: &mut Vec<BrigadierNode>) -> Option<u32> {
+/// A command-tree node retained after permission filtering, holding its own
+/// retained children (the pruning is already applied, so an `assign` pass can map
+/// the survivors to contiguous indices).
+struct Retained<'a> {
+    node: &'a CommandNode,
+    children: Vec<Retained<'a>>,
+}
+
+/// Recursively decides whether `node` survives permission filtering, pruning
+/// dead-ends bottom-up.
+///
+/// Returns `None` when `node` fails the level gate (`required_level` exceeds
+/// `player_level`) or the permission-node gate (`required_permission` is rejected
+/// by `is_allowed`). Otherwise its children are retained first; a non-root,
+/// non-executable node left with no retained children is then dropped as a
+/// dead-end, so a parent whose entire subtree pruned away prunes too.
+fn retain<'a>(
+    node: &'a CommandNode,
+    player_level: u8,
+    is_allowed: &dyn Fn(&str) -> bool,
+) -> Option<Retained<'a>> {
     if let Some(required) = node.required_level {
         if player_level < required {
             return None;
         }
     }
-
-    // Reserve this node's slot before recursing so children get later indices.
-    let my_index = u32::try_from(nodes.len()).ok()?;
-    nodes.push(build_node(node));
-
-    let mut child_indices = Vec::new();
-    for child in &node.children {
-        if let Some(index) = flatten(child, player_level, nodes) {
-            child_indices.push(index);
+    if let Some(permission) = &node.required_permission {
+        if !is_allowed(permission) {
+            return None;
         }
+    }
+
+    // Retain children first so pruning propagates upward: a node whose children all
+    // drop becomes a dead-end and is pruned below.
+    let children: Vec<Retained<'a>> = node
+        .children
+        .iter()
+        .filter_map(|child| retain(child, player_level, is_allowed))
+        .collect();
+
+    // A non-root, non-executable node with no retained children would be a dead-end
+    // literal/argument the client could enter but never complete; drop it.
+    if !matches!(node.kind, NodeKind::Root) && node.handler.is_none() && children.is_empty() {
+        return None;
+    }
+
+    Some(Retained { node, children })
+}
+
+/// Appends a retained node and its retained children to `nodes` in pre-order,
+/// filling each node's child indices over the retained set, and returns the index
+/// assigned to this node.
+fn assign(retained: &Retained, nodes: &mut Vec<BrigadierNode>) -> u32 {
+    // Reserve this node's slot before recursing so children get later indices. The
+    // count is bounded by the (tiny) command tree, so the saturating cast is
+    // unreachable in practice — it only avoids an `unwrap`.
+    let my_index = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+    nodes.push(build_node(retained.node));
+
+    let mut child_indices = Vec::with_capacity(retained.children.len());
+    for child in &retained.children {
+        child_indices.push(assign(child, nodes));
     }
     if let Some(slot) = nodes.get_mut(my_index as usize) {
         slot.children = child_indices;
     }
-    Some(my_index)
+    my_index
 }
 
 /// Builds a single (childless) [`BrigadierNode`] from a command-tree node; the
@@ -404,7 +458,7 @@ mod tests {
 
     #[test]
     fn to_brigadier_op_has_both_commands_with_typed_argument() {
-        let graph = app_tree().to_brigadier(4);
+        let graph = app_tree().to_brigadier(4, &|_| true);
 
         // Root is present at the reported index and is genuinely a root node.
         assert_eq!(graph.root_index(), 0);
@@ -466,7 +520,7 @@ mod tests {
 
     #[test]
     fn to_brigadier_level_zero_hides_gated_gamemode() {
-        let graph = app_tree().to_brigadier(0);
+        let graph = app_tree().to_brigadier(0, &|_| true);
         assert!(graph.nodes().iter().any(|n| n.name() == Some("spawn")));
         assert!(graph.nodes().iter().all(|n| n.name() != Some("gamemode")));
         assert!(graph.nodes().iter().all(|n| n.name() != Some("mode")));
@@ -477,7 +531,7 @@ mod tests {
 
     #[test]
     fn encode_commands_body_op_matches_expected_bytes() {
-        let body = app_tree().encode_commands_body(4);
+        let body = app_tree().encode_commands_body(4, &|_| true);
 
         let mut expected = Vec::new();
         expected.push(0x04); // node count = 4
@@ -502,7 +556,7 @@ mod tests {
 
     #[test]
     fn encode_commands_body_level_zero_drops_gamemode_subtree() {
-        let body = app_tree().encode_commands_body(0);
+        let body = app_tree().encode_commands_body(0, &|_| true);
 
         let mut expected = Vec::new();
         expected.push(0x02); // node count = 2 (root + spawn)
@@ -529,7 +583,7 @@ mod tests {
                     .executes(|_| CommandResult::success(TextComponent::text("whispered"))),
             ),
         );
-        let graph = tree.to_brigadier(0);
+        let graph = tree.to_brigadier(0, &|_| true);
 
         let message = graph
             .nodes()
@@ -565,5 +619,69 @@ mod tests {
             ),
             other => panic!("expected argument, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn permission_gated_command_excluded_with_no_dangling_indices() {
+        let mut tree = CommandTree::new();
+        tree.register(
+            literal("spawn").executes(|_| CommandResult::success(TextComponent::text("spawn"))),
+        );
+        // `/say <message>` is gated solely by a permission node string (no level).
+        tree.register(
+            literal("say")
+                .requires_permission("ferrumc.command.say")
+                .then(
+                    argument("message", ArgumentType::GreedyString)
+                        .executes(|_| CommandResult::success(TextComponent::text("said"))),
+                ),
+        );
+
+        // A predicate that denies the `say` node drops it (and its `<message>`
+        // child) even though the player has every permission level.
+        let graph = tree.to_brigadier(4, &|node| node != "ferrumc.command.say");
+
+        assert!(graph.nodes().iter().any(|n| n.name() == Some("spawn")));
+        assert!(graph.nodes().iter().all(|n| n.name() != Some("say")));
+        assert!(graph.nodes().iter().all(|n| n.name() != Some("message")));
+
+        // No dangling child indices: every child index addresses a retained node.
+        let count = u32::try_from(graph.nodes().len()).unwrap();
+        for node in graph.nodes() {
+            for &child in node.children() {
+                assert!(
+                    child < count,
+                    "child index {child} dangles past {count} nodes"
+                );
+            }
+        }
+        // The root keeps exactly the single survivor (`/spawn`).
+        let root = &graph.nodes()[graph.root_index() as usize];
+        assert_eq!(root.children().len(), 1);
+    }
+
+    #[test]
+    fn dead_end_parent_pruned_when_only_child_permission_denied() {
+        let mut tree = CommandTree::new();
+        // `/admin reload` — a non-executable parent literal whose only child is
+        // permission-gated. The parent has no handler, so once the child drops the
+        // parent is a dead-end and must prune too.
+        tree.register(
+            literal("admin").then(
+                literal("reload")
+                    .requires_permission("ferrumc.admin.reload")
+                    .executes(|_| CommandResult::success(TextComponent::text("reloaded"))),
+            ),
+        );
+
+        // Deny the child's permission: the whole `/admin` subtree prunes away.
+        let graph = tree.to_brigadier(4, &|_| false);
+
+        assert!(graph.nodes().iter().all(|n| n.name() != Some("admin")));
+        assert!(graph.nodes().iter().all(|n| n.name() != Some("reload")));
+        // Only the synthetic root survives, with no children.
+        assert_eq!(graph.nodes().len(), 1);
+        let root = &graph.nodes()[graph.root_index() as usize];
+        assert!(root.children().is_empty());
     }
 }
