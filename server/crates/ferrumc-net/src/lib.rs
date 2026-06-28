@@ -41,6 +41,7 @@ mod accept;
 mod compression;
 mod error;
 mod inbound;
+mod ip_limit;
 mod limits;
 mod login;
 mod offline;
@@ -54,6 +55,7 @@ pub use error::{
     CompressionError, DecodeError, DisconnectClass, EncodeError, FrameDecodeError, FrameEncodeError,
 };
 pub use inbound::{decode_inbound_frame, DecodeOutcome, InboundDecoder, InboundPacket};
+pub use ip_limit::{IpConnectionGuard, PerIpConnections};
 pub use limits::{
     ConnectionLimits, DEFAULT_CONFIGURATION_MAX_FRAME, DEFAULT_HANDSHAKE_MAX_FRAME,
     DEFAULT_LOGIN_MAX_FRAME, DEFAULT_PLAY_MAX_FRAME, DEFAULT_STATUS_MAX_FRAME,
