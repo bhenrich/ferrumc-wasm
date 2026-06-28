@@ -7,11 +7,13 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 
 use ferrumc_core::{PlayerId, TextComponent};
 use ferrumc_math::{BlockPos, ChunkPos, ShardPos, Vec3};
+use ferrumc_net::{Criticality, OutboundPriority};
 use ferrumc_proto::generated::play::ClientboundPlayPacket;
 use ferrumc_sim::{BlockStateId, GameInput, GameOutput, MutationCause};
 
 use crate::error::SessionError;
 use crate::event::NetEvent;
+use crate::outbound::OutboundMessage;
 use crate::translate::{
     ack_shell, block_update_shell, chunk_for_position, entity_spawn_shell, entity_teleport_shell,
     move_shell, play_packet_to_input, player_info_add, player_info_remove, remove_entities_shell,
@@ -61,7 +63,7 @@ const FIRST_ENTITY_ID: i32 = 2;
 #[derive(Debug)]
 struct SessionEntry {
     shard: ShardPos,
-    outbound: mpsc::Sender<ClientboundPlayPacket>,
+    outbound: mpsc::Sender<OutboundMessage>,
     name: String,
     entity_id: i32,
     position: Vec3,
@@ -93,7 +95,7 @@ struct SessionEntry {
 pub struct PlayerSessionHandle {
     player: PlayerId,
     shard: ShardPos,
-    outbound: mpsc::Receiver<ClientboundPlayPacket>,
+    outbound: mpsc::Receiver<OutboundMessage>,
 }
 
 impl PlayerSessionHandle {
@@ -107,15 +109,21 @@ impl PlayerSessionHandle {
         self.shard
     }
 
-    /// Awaits the next clientbound packet, or `None` once the router has dropped
-    /// the session and the channel is drained.
-    pub async fn recv(&mut self) -> Option<ClientboundPlayPacket> {
+    /// Awaits the next outbound message, or `None` once the router has dropped the
+    /// session and the channel is drained.
+    ///
+    /// The [`OutboundMessage`] carries the packet together with the
+    /// [`Criticality`](ferrumc_net::Criticality) and
+    /// [`OutboundPriority`](ferrumc_net::OutboundPriority) the router assigned it,
+    /// so the writer enqueues at the carried priority and escalates a dropped
+    /// mandatory packet without re-inferring either from packet type.
+    pub async fn recv(&mut self) -> Option<OutboundMessage> {
         self.outbound.recv().await
     }
 
-    /// Returns the next queued clientbound packet without waiting, or `None` if
-    /// none is ready (the queue is empty or the router has dropped the session).
-    pub fn try_recv(&mut self) -> Option<ClientboundPlayPacket> {
+    /// Returns the next queued outbound message without waiting, or `None` if none
+    /// is ready (the queue is empty or the router has dropped the session).
+    pub fn try_recv(&mut self) -> Option<OutboundMessage> {
         self.outbound.try_recv().ok()
     }
 }
@@ -150,12 +158,16 @@ impl PlayerSessionHandle {
 /// classified [`SessionError::ShardInboxFull`] for the caller to act on.
 ///
 /// Outbound traffic carries an explicit criticality (see
-/// [`Criticality`](ferrumc_net::Criticality)). *Droppable* sends — movement
-/// broadcasts and viewer block updates — are lossy: a full recipient misses the
-/// update, which the next one supersedes. *Mandatory* sends — block-change acks,
-/// rejected-edit resyncs, position corrections, join spawns, and despawns — are
-/// never silently dropped: a recipient that cannot accept one (full *or* closed) is
-/// returned by
+/// [`Criticality`](ferrumc_net::Criticality)) tagged onto each packet in an
+/// [`OutboundMessage`] envelope **at the send site** — so the connection writer
+/// (Layer B) honors the router's intent instead of re-inferring criticality from
+/// packet type, which is wrong for context-dependent packets (a `BlockUpdate` is a
+/// droppable viewer broadcast in one send, a mandatory actor resync in another).
+/// *Droppable* sends — movement broadcasts and viewer block updates — are lossy: a
+/// full recipient misses the update, which the next one supersedes. *Mandatory*
+/// sends — block-change acks, rejected-edit resyncs, position corrections, join
+/// spawns, visibility-enter spawns, and despawns — are never silently dropped: a
+/// recipient that cannot accept one (full *or* closed) is returned by
 /// [`route_output`](Self::route_output) / [`disconnect_player`](Self::disconnect_player)
 /// for disconnection, since losing one would strand a prediction, leave an
 /// invisible body, or ghost an entity. The router is the *sole sender* of each
@@ -307,6 +319,12 @@ impl SessionRouter {
     ///
     /// - [`SessionError::UnknownShard`] if no shard owns `position`.
     /// - [`SessionError::DuplicatePlayer`] if `player` already has a session.
+    /// - [`SessionError::OutboundFull`] if the joiner's fresh outbound channel is
+    ///   too small to hold its mandatory existing-player visibility — a tab-list
+    ///   add + entity spawn for every in-range player. The join is *staged* against
+    ///   guaranteed capacity, so this is rejected up front (the app maps it to a
+    ///   disconnect) rather than leaving the joiner connected in a broken
+    ///   half-world after a mid-burst overflow.
     /// - [`SessionError::ShardInboxFull`] / [`SessionError::ShardClosed`] if the
     ///   join could not be delivered to the shard.
     ///
@@ -315,9 +333,9 @@ impl SessionRouter {
     /// The joiner's tab-list add and entity spawn are delivered to existing viewers
     /// as *mandatory* packets: a viewer whose outbound channel cannot accept either
     /// is disconnected (the slow-client backpressure policy), and that cascade is
-    /// drained iteratively here. The joiner itself is never disconnected for its own
-    /// initial visibility burst — a server-driven bulk load is not the client
-    /// failing to keep up — so its own overflows are dropped rather than escalated.
+    /// drained iteratively here. The joiner's *own* mandatory visibility is instead
+    /// guaranteed by the capacity staging above — its fresh channel provably holds
+    /// every existing-player add + spawn — so a joiner is never left half-loaded.
     pub fn join_player(
         &mut self,
         player: PlayerId,
@@ -330,6 +348,30 @@ impl SessionRouter {
         }
         if self.players.contains_key(&player) {
             return Err(SessionError::DuplicatePlayer { player });
+        }
+
+        // Stage the joiner's mandatory existing-player visibility against
+        // guaranteed channel capacity. Each in-range existing player costs the
+        // joiner two mandatory packets (a tab-list add + an entity spawn) on its
+        // own fresh outbound channel, so the burst fits only when `2 * in_range <=
+        // outbound_capacity`. If it would not fit, the joiner could not receive its
+        // full visibility (finding #9: a silently dropped mandatory spawn leaves an
+        // invisible body), so reject the join up front with ZERO side effects — no
+        // shard `PlayerJoin`, no map insert — rather than half-load the world.
+        let joiner_chunk = chunk_for_position(position);
+        let in_range = self
+            .players
+            .values()
+            .filter(|entry| {
+                within_view(
+                    joiner_chunk,
+                    chunk_for_position(entry.position),
+                    self.view_distance,
+                )
+            })
+            .count();
+        if in_range.saturating_mul(2) > self.outbound_capacity {
+            return Err(SessionError::OutboundFull { player });
         }
 
         // Notify the shard before recording anything: if the join cannot be
@@ -353,7 +395,9 @@ impl SessionRouter {
         self.broadcast_join_visibility(player, position, &mut to_disconnect);
         // Disconnect existing viewers whose mandatory tab-list add overflowed,
         // draining the resulting leave cascade iteratively (bounded by player
-        // count). The joiner is mid-join, so it is never disconnected here.
+        // count). Capacity staging above guarantees the joiner's own channel held
+        // its full visibility, so it can no longer surface here; the `== player`
+        // skip remains as a defensive guard.
         while let Some(viewer) = to_disconnect.pop() {
             if viewer == player {
                 continue;
@@ -386,8 +430,8 @@ impl SessionRouter {
     /// spawn is unrecoverable, leaving the viewer a tab-list entry with no visible
     /// body. Each successful spawn also seeds the recipient's `delivered` baseline so
     /// the very next movement delta is measured against the position they actually
-    /// received. The joiner's own overflows are still exempt from disconnect (see
-    /// [`join_player`](Self::join_player)).
+    /// received. The joiner's own visibility cannot overflow here: [`join_player`](Self::join_player)
+    /// stages it against guaranteed channel capacity before calling this.
     fn broadcast_join_visibility(
         &mut self,
         joiner: PlayerId,
@@ -587,16 +631,26 @@ impl SessionRouter {
                 // mandatory AND must arrive together: an ack without the resync
                 // heals to the wrong state, and a resync without the ack leaves the
                 // ghost block (the ack is what ends the client's prediction via
-                // endPredictionsUpTo). Reserve both slots up front — the router is
-                // the sole sender of this channel, so `capacity()` cannot shrink
-                // under us — and if the pair will not fit, treat it as a mandatory
-                // overflow (disconnect) rather than enqueue a partial group.
+                // endPredictionsUpTo). Both are forced onto the (Mandatory, State)
+                // class — the resync overrides a `BlockUpdate`'s droppable/`World`
+                // default so it shares the ack's queue. The channel is FIFO and the
+                // writer drains one message at a time (flushing after each), so the
+                // resync is always processed before the ack: the ack can never
+                // survive a dropped resync, and a dropped mandatory resync escalates
+                // to a disconnect at Layer B. Reserve both slots up front — the
+                // router is the sole sender of this channel, so `capacity()` cannot
+                // shrink under us — and if the pair will not fit, disconnect rather
+                // than enqueue a partial group.
                 if let Some(entry) = self.players.get(player) {
                     if entry.outbound.capacity() >= 2 {
-                        let resync = entry
+                        let resync = entry.outbound.try_send(OutboundMessage::new(
+                            block_update_shell(*position, *authoritative_state),
+                            Criticality::Mandatory,
+                            OutboundPriority::State,
+                        ));
+                        let ack = entry
                             .outbound
-                            .try_send(block_update_shell(*position, *authoritative_state));
-                        let ack = entry.outbound.try_send(ack_shell(*sequence));
+                            .try_send(OutboundMessage::mandatory(ack_shell(*sequence)));
                         // With capacity >= 2 and a sole sender, only a closed
                         // channel can fail either send.
                         if resync.is_err() || ack.is_err() {
@@ -627,7 +681,11 @@ impl SessionRouter {
         player: PlayerId,
         to_disconnect: &mut Vec<PlayerId>,
     ) {
-        if entry.outbound.try_send(packet).is_err() {
+        if entry
+            .outbound
+            .try_send(OutboundMessage::mandatory(packet))
+            .is_err()
+        {
             to_disconnect.push(player);
         }
     }
@@ -653,7 +711,11 @@ impl SessionRouter {
         player: PlayerId,
         to_disconnect: &mut Vec<PlayerId>,
     ) {
-        if entry.outbound.try_send(spawn).is_ok() {
+        if entry
+            .outbound
+            .try_send(OutboundMessage::mandatory(spawn))
+            .is_ok()
+        {
             entry.delivered.insert(subject_eid, subject_position);
         } else {
             to_disconnect.push(player);
@@ -669,7 +731,7 @@ impl SessionRouter {
         player: PlayerId,
         to_disconnect: &mut Vec<PlayerId>,
     ) {
-        match entry.outbound.try_send(packet) {
+        match entry.outbound.try_send(OutboundMessage::droppable(packet)) {
             Ok(()) | Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Closed(_)) => to_disconnect.push(player),
         }
@@ -685,16 +747,25 @@ impl SessionRouter {
     /// Broadcasts `mover`'s new `position` to every other player within view
     /// distance, recording any closed recipients in `to_disconnect`.
     ///
-    /// Each viewer's carrier is chosen against *that viewer's* last-delivered
-    /// baseline (see [`SessionEntry::delivered`]): a relative
-    /// [`update_entity_position_shell`] when every axis fits the i16 fixed-point
-    /// range, otherwise an absolute [`entity_teleport_shell`]. A viewer with no
-    /// baseline (its spawn for the mover was dropped, or it just came into view)
-    /// gets an absolute teleport. The baseline advances **only** on a successful
+    /// A viewer that *already* has a [`delivered`](SessionEntry::delivered)
+    /// baseline for the mover gets a **droppable** movement carrier chosen against
+    /// that baseline: a relative [`update_entity_position_shell`] when every axis
+    /// fits the i16 fixed-point range, otherwise an absolute
+    /// [`entity_teleport_shell`]. The baseline advances **only** on a successful
     /// enqueue, so a move dropped under backpressure self-corrects: its next delta
     /// is measured from the stale baseline, grows, and promotes to a teleport —
     /// the viewer never drifts. Movement is droppable, so a *full* channel simply
     /// skips this update; a *closed* channel is recorded for disconnect.
+    ///
+    /// A viewer with **no** baseline is one the mover is *entering view of* (it
+    /// joined out of range, or its earlier spawn was lost). Such a viewer must
+    /// never receive a bare teleport for an entity it never spawned — a real client
+    /// ignores movement for an unknown entity id, leaving an invisible body. So the
+    /// mover is *spawned* into view instead: a **mandatory** [`player_info_add`]
+    /// then a **mandatory** [`entity_spawn_shell`] (which seeds the baseline at this
+    /// position), and no movement packet this tick — the spawn already carries the
+    /// position. A viewer that cannot accept either mandatory packet is pushed to
+    /// `to_disconnect` (the slow-client policy).
     fn broadcast_move(
         &mut self,
         mover: PlayerId,
@@ -705,6 +776,10 @@ impl SessionRouter {
             return;
         };
         let mover_eid = mover_entry.entity_id;
+        // Clone the mover's name before the loop: the per-viewer entries are
+        // mutably borrowed inside it, so the immutable borrow of the mover entry
+        // cannot survive (mirrors `broadcast_join_visibility`).
+        let mover_name = mover_entry.name.clone();
         let mover_chunk = chunk_for_position(position);
         let view_distance = self.view_distance;
         // Snapshot the in-range viewers so each entry can be mutated (advancing its
@@ -726,18 +801,35 @@ impl SessionRouter {
             let Some(entry) = self.players.get_mut(&viewer) else {
                 continue;
             };
-            let packet = match entry.delivered.get(&mover_eid).copied() {
-                Some(last) => relative_or_teleport(mover_eid, last, position),
-                None => entity_teleport_shell(mover_eid, position),
-            };
-            match entry.outbound.try_send(packet) {
-                // Advance the delivered baseline only on success (the self-correcting
-                // invariant; see the method and field docs).
-                Ok(()) => {
-                    entry.delivered.insert(mover_eid, position);
+            if let Some(last) = entry.delivered.get(&mover_eid).copied() {
+                // Already in view: ordinary droppable movement.
+                let packet = relative_or_teleport(mover_eid, last, position);
+                match entry.outbound.try_send(OutboundMessage::droppable(packet)) {
+                    // Advance the delivered baseline only on success (the
+                    // self-correcting invariant; see the method and field docs).
+                    Ok(()) => {
+                        entry.delivered.insert(mover_eid, position);
+                    }
+                    Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Closed(_)) => to_disconnect.push(viewer),
                 }
-                Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Closed(_)) => to_disconnect.push(viewer),
+            } else {
+                // Entering view: spawn the mover (mandatory add + spawn) and seed
+                // the baseline; never a bare teleport for an unspawned entity.
+                Self::send_mandatory(
+                    entry,
+                    player_info_add(mover, &mover_name),
+                    viewer,
+                    to_disconnect,
+                );
+                Self::send_mandatory_spawn(
+                    entry,
+                    entity_spawn_shell(mover_eid, mover, position),
+                    mover_eid,
+                    position,
+                    viewer,
+                    to_disconnect,
+                );
             }
         }
     }
@@ -823,16 +915,27 @@ impl SessionRouter {
         Ok(entry.shard)
     }
 
-    /// Tells every remaining player to drop `departed` (whose network id is
-    /// `entity_id`) from both their tab list and their world, and prunes the
-    /// departed subject from each viewer's delivered baselines.
+    /// Tells every remaining player that *had `departed` in view* to drop it
+    /// (whose network id is `entity_id`) from both their tab list and their world,
+    /// and prunes the departed subject from each notified viewer's delivered
+    /// baseline.
     ///
-    /// Sends two **mandatory** packets per viewer: a [`player_info_remove`]
+    /// Only viewers holding a [`delivered`](SessionEntry::delivered) baseline for
+    /// `entity_id` are notified. That baseline is seeded together with the tab-list
+    /// add and spawn (in [`broadcast_join_visibility`](Self::broadcast_join_visibility)
+    /// and the enter branch of [`broadcast_move`](Self::broadcast_move)), so it is
+    /// exactly the set of viewers that ever received the entity. A viewer that never
+    /// saw it has neither a tab-list entry nor a spawned body to clear, so sending it
+    /// a *mandatory* remove would clean up nothing while risking a spurious
+    /// disconnect of a slow, far-away client (a full channel forces the cascade) for
+    /// an entity it never had.
+    ///
+    /// Each notified viewer gets two **mandatory** packets: a [`player_info_remove`]
     /// (Player Info Remove, `0x3E`) to clear the tab-list entry, and a
-    /// [`remove_entities_shell`] (Remove Entities, `0x46`) to despawn the entity
-    /// so it does not linger as a ghost. A viewer that cannot accept either is
-    /// pushed to `to_disconnect`: a dropped despawn is exactly the ghost-entity bug
-    /// this fixes, so it is never silently dropped.
+    /// [`remove_entities_shell`] (Remove Entities, `0x46`) to despawn the entity so
+    /// it does not linger as a ghost. A viewer that cannot accept either is pushed to
+    /// `to_disconnect`: a dropped despawn is exactly the ghost-entity bug this fixes,
+    /// so it is never silently dropped.
     fn broadcast_leave_visibility(
         &mut self,
         departed: PlayerId,
@@ -842,15 +945,23 @@ impl SessionRouter {
         let viewers: Vec<PlayerId> = self.players.keys().copied().collect();
         for viewer in viewers {
             if let Some(entry) = self.players.get_mut(&viewer) {
-                Self::send_mandatory(entry, player_info_remove(departed), viewer, to_disconnect);
-                Self::send_mandatory(
-                    entry,
-                    remove_entities_shell(&[entity_id]),
-                    viewer,
-                    to_disconnect,
-                );
-                // Drop the stale baseline so the map stays bounded by live players.
-                entry.delivered.remove(&entity_id);
+                // Pruning the baseline both keeps the map bounded by live players and
+                // gates the cleanup: a present entry means this viewer actually saw
+                // the entity, so it (and only it) is sent the mandatory removes.
+                if entry.delivered.remove(&entity_id).is_some() {
+                    Self::send_mandatory(
+                        entry,
+                        player_info_remove(departed),
+                        viewer,
+                        to_disconnect,
+                    );
+                    Self::send_mandatory(
+                        entry,
+                        remove_entities_shell(&[entity_id]),
+                        viewer,
+                        to_disconnect,
+                    );
+                }
             }
         }
     }
@@ -873,7 +984,9 @@ impl SessionRouter {
     pub fn broadcast_system_chat(&self, component: &TextComponent, overlay: bool) {
         let packet = crate::system_chat(component, overlay);
         for entry in self.players.values() {
-            let _ = entry.outbound.try_send(packet.clone());
+            let _ = entry
+                .outbound
+                .try_send(OutboundMessage::droppable(packet.clone()));
         }
     }
 
@@ -1144,7 +1257,7 @@ mod tests {
         });
         assert!(closed.is_empty());
         let ClientboundPlayPacket::SynchronizePlayerPosition(sync) =
-            handle.try_recv().expect("a sync packet")
+            handle.try_recv().expect("a sync packet").into_packet()
         else {
             panic!("expected a SynchronizePlayerPosition packet");
         };
@@ -1330,7 +1443,7 @@ mod tests {
         });
         assert!(closed.is_empty());
 
-        let packet = handle.recv().await.expect("a packet");
+        let packet = handle.recv().await.expect("a packet").into_packet();
         let ClientboundPlayPacket::SynchronizePlayerPosition(sync) = packet else {
             panic!("expected a SynchronizePlayerPosition packet");
         };
@@ -1392,8 +1505,10 @@ mod tests {
 
         // Both players (the sender included) receive the same chat-box SystemChat.
         for handle in [&mut a_handle, &mut b_handle] {
-            let ClientboundPlayPacket::SystemChat(chat) =
-                handle.try_recv().expect("a system chat packet")
+            let ClientboundPlayPacket::SystemChat(chat) = handle
+                .try_recv()
+                .expect("a system chat packet")
+                .into_packet()
             else {
                 panic!("expected a SystemChat");
             };
@@ -1427,8 +1542,10 @@ mod tests {
             position: Vec3::new(10.0, 64.0, 9.0),
         });
         assert!(closed.is_empty());
-        let ClientboundPlayPacket::UpdateEntityPosition(rel) =
-            viewer_handle.try_recv().expect("a relative move")
+        let ClientboundPlayPacket::UpdateEntityPosition(rel) = viewer_handle
+            .try_recv()
+            .expect("a relative move")
+            .into_packet()
         else {
             panic!("expected an UpdateEntityPosition for a small move");
         };
@@ -1465,7 +1582,7 @@ mod tests {
         });
         assert!(closed.is_empty());
         let ClientboundPlayPacket::EntityTeleport(tp) =
-            viewer_handle.try_recv().expect("a teleport")
+            viewer_handle.try_recv().expect("a teleport").into_packet()
         else {
             panic!("expected an EntityTeleport for a large jump");
         };
@@ -1520,8 +1637,10 @@ mod tests {
             cause: MutationCause::Command,
         });
         assert!(closed.is_empty());
-        let ClientboundPlayPacket::BlockUpdate(update) =
-            viewer_handle.try_recv().expect("a block update")
+        let ClientboundPlayPacket::BlockUpdate(update) = viewer_handle
+            .try_recv()
+            .expect("a block update")
+            .into_packet()
         else {
             panic!("expected a BlockUpdate");
         };
@@ -1602,21 +1721,25 @@ mod tests {
 
         // The actor sees the authoritative BlockUpdate (it is in range too) and
         // then the AcknowledgeBlockChange echoing its sequence.
-        let ClientboundPlayPacket::BlockUpdate(_) =
-            actor_handle.try_recv().expect("actor block update")
+        let ClientboundPlayPacket::BlockUpdate(_) = actor_handle
+            .try_recv()
+            .expect("actor block update")
+            .into_packet()
         else {
             panic!("expected a BlockUpdate for the actor first");
         };
         let ClientboundPlayPacket::AcknowledgeBlockChange(ack) =
-            actor_handle.try_recv().expect("actor ack")
+            actor_handle.try_recv().expect("actor ack").into_packet()
         else {
             panic!("expected an AcknowledgeBlockChange for the actor");
         };
         assert_eq!(ack.sequence(), 55);
 
         // The viewer sees the broadcast BlockUpdate but never an ack.
-        let ClientboundPlayPacket::BlockUpdate(_) =
-            viewer_handle.try_recv().expect("viewer block update")
+        let ClientboundPlayPacket::BlockUpdate(_) = viewer_handle
+            .try_recv()
+            .expect("viewer block update")
+            .into_packet()
         else {
             panic!("expected a BlockUpdate for the viewer");
         };
@@ -1656,7 +1779,7 @@ mod tests {
         assert!(closed.is_empty());
 
         let ClientboundPlayPacket::BlockUpdate(update) =
-            actor_handle.try_recv().expect("actor resync")
+            actor_handle.try_recv().expect("actor resync").into_packet()
         else {
             panic!("expected a BlockUpdate resync for the actor");
         };
@@ -1666,7 +1789,7 @@ mod tests {
         // The ack follows the resync, echoing the rejected sequence so the client
         // ends its prediction and displays the authoritative state.
         let ClientboundPlayPacket::AcknowledgeBlockChange(ack) =
-            actor_handle.try_recv().expect("actor ack")
+            actor_handle.try_recv().expect("actor ack").into_packet()
         else {
             panic!("expected an AcknowledgeBlockChange after the resync");
         };
@@ -1699,15 +1822,19 @@ mod tests {
 
         // The staying player is told to drop the leaver from the tab list, via the
         // dedicated Player Info Remove (0x3E) packet carrying the leaver's UUID.
-        let ClientboundPlayPacket::RemovePlayerInfo(remove) =
-            stay_handle.try_recv().expect("a player-remove packet")
+        let ClientboundPlayPacket::RemovePlayerInfo(remove) = stay_handle
+            .try_recv()
+            .expect("a player-remove packet")
+            .into_packet()
         else {
             panic!("expected a RemovePlayerInfo");
         };
         assert_eq!(remove.players(), [leave.as_uuid()].as_slice());
         // ...and to despawn the leaver's entity so it does not linger as a ghost.
-        let ClientboundPlayPacket::RemoveEntities(despawn) =
-            stay_handle.try_recv().expect("a remove-entities packet")
+        let ClientboundPlayPacket::RemoveEntities(despawn) = stay_handle
+            .try_recv()
+            .expect("a remove-entities packet")
+            .into_packet()
         else {
             panic!("expected a RemoveEntities");
         };
@@ -1717,6 +1844,49 @@ mod tests {
             inbox.try_recv(),
             Ok(GameInput::PlayerLeave { player: leave })
         );
+    }
+
+    #[test]
+    fn leave_does_not_force_disconnect_a_viewer_that_never_saw_the_departed() {
+        // Outbound capacity 1: any mandatory send to a full channel overflows and
+        // cascade-disconnects the recipient. The old all-viewers leave broadcast
+        // sent a mandatory remove to *every* player, so a far client that never saw
+        // the leaver would be force-disconnected for an entity it never had.
+        let mut router = SessionRouter::with_capacities(16, 1);
+        router.set_view_distance(1);
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+
+        let leaver = player("leaver");
+        let far = player("far");
+        // Block 80 -> chunk 5, five chunks from spawn: out of a view distance of
+        // one, so the two never exchange visibility and `far` holds no `delivered`
+        // baseline for the leaver.
+        let far_pos = Vec3::new(80.0, 64.0, 80.0);
+        let _leaver_handle = router
+            .join_player(leaver, "leaver", spawn_pos())
+            .expect("leaver join");
+        let mut far_handle = router.join_player(far, "far", far_pos).expect("far join");
+        // No join visibility crossed the range gap.
+        assert!(far_handle.try_recv().is_none());
+
+        // Occupy `far`'s single outbound slot so any further mandatory send would
+        // overflow (and, under the old code, trip the disconnect cascade).
+        router.broadcast_system_chat(&TextComponent::text("hi"), false);
+
+        // The leaver disconnects. `far` never saw it, so it must be left untouched.
+        router.disconnect_player(leaver).expect("disconnect");
+
+        // `far` is still connected and was sent no leave packets: only the chat that
+        // was buffered before the leave remains.
+        assert!(router.is_player_connected(far));
+        let ClientboundPlayPacket::SystemChat(_) = far_handle
+            .try_recv()
+            .expect("the buffered chat")
+            .into_packet()
+        else {
+            panic!("expected the buffered SystemChat");
+        };
+        assert!(far_handle.try_recv().is_none());
     }
 
     #[test]
@@ -1791,10 +1961,13 @@ mod tests {
 
     #[test]
     fn full_outbound_disconnects_a_viewer_on_a_mandatory_spawn() {
-        // A viewer whose channel fills on the mandatory tab-list add has no room for
-        // the now-mandatory entity spawn. Rather than ghosting an invisible body (a
-        // tab entry whose entity was never spawned), the viewer is disconnected.
-        let mut router = SessionRouter::with_capacities(16, 1);
+        // An *existing* viewer whose channel is full when a new player arrives has
+        // no room for the joiner's mandatory tab-list add + entity spawn. Rather
+        // than ghosting an invisible body (a tab entry whose entity was never
+        // spawned), the viewer is disconnected. The joiner itself is fine: its own
+        // fresh channel is staged with guaranteed capacity for the visibility it
+        // receives (one in-range player needs 2 slots, and capacity is 2).
+        let mut router = SessionRouter::with_capacities(16, 2);
         let _inbox = router.register_shard(ShardPos::new(0, 0));
         let viewer = player("viewer");
         let joiner = player("joiner");
@@ -1803,14 +1976,156 @@ mod tests {
             .expect("viewer join");
         assert!(router.is_player_connected(viewer));
 
-        // The joiner's arrival sends the viewer a mandatory add (fills its single
-        // slot) then a mandatory spawn (overflows) -> the viewer is disconnected,
-        // while the joiner itself is exempt from disconnect for its own burst.
+        // Pre-fill the viewer's 2-slot channel with two mandatory corrections so it
+        // has no room left for the joiner's incoming add + spawn.
+        for _ in 0..2 {
+            assert!(router
+                .route_output(&GameOutput::PlayerPositionCorrected {
+                    player: viewer,
+                    position: spawn_pos(),
+                })
+                .is_empty());
+        }
+
+        // The joiner's arrival tries to send the (full) viewer a mandatory add then
+        // spawn -> the viewer is disconnected. The join itself succeeds (staging:
+        // in_range=1 needs 2 <= capacity 2) and the joiner stays connected.
         let _joiner_handle = router
             .join_player(joiner, "joiner", spawn_pos())
             .expect("joiner join");
         assert!(!router.is_player_connected(viewer));
         assert!(router.is_player_connected(joiner));
+    }
+
+    #[test]
+    fn rejected_resync_envelope_is_mandatory_on_the_state_queue() {
+        // The rejected-edit resync `BlockUpdate` is forced onto the (Mandatory,
+        // State) class so it co-queues with the ack and cannot be silently dropped
+        // at Layer B — even though a `BlockUpdate`'s type default is (Droppable,
+        // World). The ack rides (Mandatory, State) by type, so the pair shares the
+        // State queue and FIFO keeps the resync ahead of the ack.
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let actor = player("actor");
+        let mut handle = router
+            .join_player(actor, "actor", spawn_pos())
+            .expect("join");
+
+        let closed = router.route_output(&GameOutput::BlockChangeRejected {
+            player: actor,
+            position: BlockPos::new(8, 63, 8),
+            sequence: 12,
+            requested_state: BlockStateId::AIR,
+            authoritative_state: BlockStateId::new(1),
+        });
+        assert!(closed.is_empty());
+
+        let resync = handle.try_recv().expect("resync envelope");
+        assert!(matches!(
+            resync.packet(),
+            ClientboundPlayPacket::BlockUpdate(_)
+        ));
+        assert_eq!(resync.criticality(), Criticality::Mandatory);
+        assert_eq!(resync.priority(), OutboundPriority::State);
+        // The carried classification diverges from the packet type's default — the
+        // whole reason the envelope exists.
+        assert_eq!(
+            Criticality::for_packet(resync.packet()),
+            Criticality::Droppable
+        );
+        assert_eq!(
+            OutboundPriority::for_packet(resync.packet()),
+            OutboundPriority::World
+        );
+
+        let ack = handle.try_recv().expect("ack envelope");
+        assert!(matches!(
+            ack.packet(),
+            ClientboundPlayPacket::AcknowledgeBlockChange(_)
+        ));
+        assert_eq!(ack.criticality(), Criticality::Mandatory);
+        assert_eq!(ack.priority(), OutboundPriority::State);
+    }
+
+    #[test]
+    fn mover_entering_view_range_spawns_instead_of_teleporting() {
+        // A player that moves INTO a viewer's range has no delivered baseline there,
+        // so it must be SPAWNED (mandatory player_info add + entity spawn) before any
+        // movement — never a bare teleport for an entity the client never spawned.
+        let mut router = SessionRouter::new();
+        router.set_view_distance(1);
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let viewer = player("viewer");
+        let mover = player("mover");
+        let mut viewer_handle = router
+            .join_player(viewer, "viewer", spawn_pos())
+            .expect("viewer join");
+        // The mover joins far out of view (chunk 5 vs the viewer's chunk 0).
+        let far_pos = Vec3::new(80.0, 64.0, 80.0);
+        let _mover_handle = router
+            .join_player(mover, "mover", far_pos)
+            .expect("mover join");
+        let mover_eid = router.player_entity_id(mover).expect("mover entity id");
+        // Out of range on join: the viewer learned nothing about the mover.
+        assert!(viewer_handle.try_recv().is_none());
+
+        // The mover steps into the viewer's chunk: a mandatory add + spawn, no move.
+        let near_pos = Vec3::new(10.0, 64.0, 9.0);
+        let closed = router.route_output(&GameOutput::PlayerMoved {
+            player: mover,
+            position: near_pos,
+        });
+        assert!(closed.is_empty());
+        assert_player_info_add(&mut viewer_handle, mover);
+        assert_entity_spawn(&mut viewer_handle, mover, mover_eid, near_pos);
+        // No movement packet this tick — the spawn already carries the position.
+        assert!(viewer_handle.try_recv().is_none());
+
+        // The baseline is now seeded at the spawn position, so the next small step
+        // is a relative move measured from there (not another spawn).
+        let step = Vec3::new(11.0, 64.0, 9.0);
+        let closed = router.route_output(&GameOutput::PlayerMoved {
+            player: mover,
+            position: step,
+        });
+        assert!(closed.is_empty());
+        let ClientboundPlayPacket::UpdateEntityPosition(rel) = viewer_handle
+            .try_recv()
+            .expect("a relative move after the spawn seeded the baseline")
+            .into_packet()
+        else {
+            panic!("expected an UpdateEntityPosition once a baseline exists");
+        };
+        assert_eq!(rel.entity_id(), mover_eid);
+        // dx = (11 - 10) * 4096 = 4096.
+        assert_eq!((rel.delta_x(), rel.delta_y(), rel.delta_z()), (4096, 0, 0));
+    }
+
+    #[test]
+    fn join_rejected_when_outbound_too_small_for_existing_visibility() {
+        // Capacity 2 holds exactly one existing player's mandatory add + spawn. A
+        // third joiner sees two in-range players -> needs 4 slots, so it is rejected
+        // up front (finding #9) rather than left half-loaded with a dropped spawn.
+        let mut router = SessionRouter::with_capacities(16, 2);
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let a = player("aaa");
+        let b = player("bbb");
+        let _a = router.join_player(a, "aaa", spawn_pos()).expect("a join");
+        let _b = router.join_player(b, "bbb", spawn_pos()).expect("b join");
+        // Drain the two existing shard joins.
+        let _ = inbox.try_recv();
+        let _ = inbox.try_recv();
+        assert_eq!(router.player_count(), 2);
+
+        let c = player("ccc");
+        let err = router
+            .join_player(c, "ccc", spawn_pos())
+            .expect_err("staging rejects an oversized visibility burst");
+        assert_eq!(err, SessionError::OutboundFull { player: c });
+        // Nothing half-registered, and no PlayerJoin reached the shard.
+        assert_eq!(router.player_count(), 2);
+        assert!(!router.is_player_connected(c));
+        assert!(inbox.try_recv().is_err());
     }
 
     #[test]
@@ -1867,7 +2182,7 @@ mod tests {
         });
         assert!(closed.is_empty());
         let ClientboundPlayPacket::EntityTeleport(tp) =
-            viewer_handle.try_recv().expect("a teleport")
+            viewer_handle.try_recv().expect("a teleport").into_packet()
         else {
             panic!("expected an EntityTeleport for an exact-8-block move");
         };
@@ -1914,8 +2229,10 @@ mod tests {
             position: Vec3::new(11.0, 64.0, 8.0),
         });
         assert!(closed.is_empty());
-        let ClientboundPlayPacket::UpdateEntityPosition(rel) =
-            viewer_handle.try_recv().expect("a relative move")
+        let ClientboundPlayPacket::UpdateEntityPosition(rel) = viewer_handle
+            .try_recv()
+            .expect("a relative move")
+            .into_packet()
         else {
             panic!("expected an UpdateEntityPosition");
         };
@@ -1928,8 +2245,10 @@ mod tests {
     /// The Add Player body leads with a count byte (`1`) then the 16-byte UUID;
     /// the name / properties / listed fields follow (asserted in `translate.rs`).
     fn assert_player_info_add(handle: &mut PlayerSessionHandle, expected: PlayerId) {
-        let ClientboundPlayPacket::PlayerInfoUpdate(info) =
-            handle.try_recv().expect("a player-info packet")
+        let ClientboundPlayPacket::PlayerInfoUpdate(info) = handle
+            .try_recv()
+            .expect("a player-info packet")
+            .into_packet()
         else {
             panic!("expected a PlayerInfoUpdate");
         };
@@ -1946,7 +2265,8 @@ mod tests {
         eid: i32,
         pos: Vec3,
     ) {
-        let ClientboundPlayPacket::SpawnEntity(spawn) = handle.try_recv().expect("a spawn packet")
+        let ClientboundPlayPacket::SpawnEntity(spawn) =
+            handle.try_recv().expect("a spawn packet").into_packet()
         else {
             panic!("expected a SpawnEntity packet");
         };

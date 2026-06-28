@@ -10,8 +10,14 @@
 //! ```text
 //!   NetEvent  --net_event_to_input-->  GameInput  --bounded mpsc-->  shard inbox
 //!                                                                          |
-//!   client  <--bounded mpsc--  ClientboundPlayPacket  <--output_to_clientbound--
+//!   client  <--bounded mpsc--  OutboundMessage  <--output_to_clientbound--
 //! ```
+//!
+//! The per-player outbound channel carries an [`OutboundMessage`] — a
+//! [`ClientboundPlayPacket`](ferrumc_proto::generated::play::ClientboundPlayPacket)
+//! tagged with the [`Criticality`](ferrumc_net::Criticality) and
+//! [`OutboundPriority`](ferrumc_net::OutboundPriority) the router assigns it at the
+//! send site — so the connection writer never re-infers either from packet type.
 //!
 //! The [`SessionRouter`] is the only component that knows where each player
 //! lives. It holds no [`SimShard`](ferrumc_sim::SimShard), chunk, socket, or
@@ -37,12 +43,14 @@
 
 mod error;
 mod event;
+mod outbound;
 mod router;
 mod text;
 mod translate;
 
 pub use error::SessionError;
 pub use event::NetEvent;
+pub use outbound::OutboundMessage;
 pub use router::{
     PlayerSessionHandle, SessionRouter, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_SHARD_INPUT_CAPACITY,
     DEFAULT_VIEW_DISTANCE,

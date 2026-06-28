@@ -735,19 +735,32 @@ async fn enter_play(
             }
             outbound = handle.recv() => match outbound {
                 // Clientbound simulation output: queue and flush to the socket.
-                Some(packet) => {
-                    // The session router (Layer A) already disconnects a slow client
-                    // rather than silently drop a mandatory packet; mirror that at the
-                    // connection writer (Layer B) so a full priority queue can never
-                    // silently drop a despawn/spawn/ack/correction either.
-                    let criticality = Criticality::for_packet(&packet);
+                Some(msg) => {
+                    // The envelope carries the criticality AND priority the router
+                    // (Layer A) assigned at the send site, so Layer B honors that
+                    // intent instead of re-inferring it from packet type — which is
+                    // wrong for context-dependent packets (an actor-resync BlockUpdate
+                    // is mandatory, a viewer-broadcast BlockUpdate is droppable). The
+                    // router already disconnects a slow client rather than silently
+                    // drop a mandatory packet; this mirrors that here so a full
+                    // priority queue can never silently drop a mandatory frame
+                    // (despawn/spawn/ack/correction/resync) either.
+                    let criticality = msg.criticality();
+                    let priority = msg.priority();
+                    let packet = msg.into_packet();
                     let outcome =
-                        enqueue_traced_classified(&mut writer, &mut debug, &compression, &ctx.clock, packet);
+                        enqueue_traced(&mut writer, &mut debug, &compression, &ctx.clock, priority, packet);
                     if is_mandatory_overflow(criticality, outcome) {
                         break Err(anyhow::anyhow!(
                             "outbound overflow: a mandatory clientbound packet was dropped at the connection writer"
                         ));
                     }
+                    // One channel message is enqueued and flushed per loop turn.
+                    // The router's atomic resync+ack group relies on this: the FIFO
+                    // channel yields the (Mandatory, State) resync before the ack, so
+                    // batching several messages before a flush must NOT be introduced
+                    // here without re-establishing that ordering, or a dropped resync
+                    // could leave the ack behind.
                     if let Err(err) = flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
                         break Err(err);
                     }
@@ -1637,10 +1650,13 @@ fn enqueue_traced_classified(
 /// or strand a prediction. Droppable frames (movement, chunks, chat) may still
 /// shed without disconnecting.
 ///
-/// A `BlockUpdate` carried as an actor resync is mandatory only by router context,
-/// not by [`Criticality::for_packet`](ferrumc_net::Criticality::for_packet), so
-/// that rare frame is not escalated here; Layer A still guarantees it via a
-/// capacity reservation on the per-player channel.
+/// The `criticality` is the one the router tagged onto the packet's
+/// [`OutboundMessage`](ferrumc_session::OutboundMessage) envelope at the send
+/// site, **not** [`Criticality::for_packet`](ferrumc_net::Criticality::for_packet).
+/// So a context-dependent frame is escalated exactly when the router meant it to
+/// be: an actor-resync `BlockUpdate` carries `Mandatory` and is escalated here,
+/// while the same packet type sent as a viewer broadcast carries `Droppable` and
+/// is allowed to shed.
 fn is_mandatory_overflow(criticality: Criticality, outcome: EnqueueOutcome) -> bool {
     outcome.is_dropped() && matches!(criticality, Criticality::Mandatory)
 }
@@ -1797,6 +1813,41 @@ mod tests {
         assert!(!is_mandatory_overflow(Criticality::Droppable, dropped));
         assert!(!is_mandatory_overflow(Criticality::Mandatory, enqueued));
         assert!(!is_mandatory_overflow(Criticality::Droppable, enqueued));
+    }
+
+    #[test]
+    fn actor_resync_envelope_escalates_at_layer_b_despite_droppable_type() {
+        // Acceptance 5a: the actor-resync `BlockUpdate` rides a (Mandatory, State)
+        // envelope, so Layer B escalates a dropped resync to an outbound overflow —
+        // never silently dropped while its ack survives — even though the packet
+        // TYPE defaults to (Droppable, World). This is the seam the envelope closes.
+        use ferrumc_net::{Criticality, EnqueueOutcome, OutboundPriority};
+        use ferrumc_proto::generated::play::{BlockUpdate, ClientboundPlayPacket};
+        use ferrumc_proto::types::BlockPosition;
+        use ferrumc_session::OutboundMessage;
+
+        use super::is_mandatory_overflow;
+
+        let resync = OutboundMessage::new(
+            ClientboundPlayPacket::BlockUpdate(BlockUpdate::new(BlockPosition::new(8, 63, 8), 1)),
+            Criticality::Mandatory,
+            OutboundPriority::State,
+        );
+
+        // The carried criticality is Mandatory while the type default is Droppable:
+        // re-inferring from the type (the old Layer-B bug) would mis-drop the resync.
+        assert_eq!(resync.criticality(), Criticality::Mandatory);
+        assert_eq!(
+            Criticality::for_packet(resync.packet()),
+            Criticality::Droppable
+        );
+
+        // With the carried criticality, a dropped resync at a full State queue is an
+        // outbound overflow (disconnect), not a silent drop.
+        let dropped_state = EnqueueOutcome::Dropped {
+            priority: OutboundPriority::State,
+        };
+        assert!(is_mandatory_overflow(resync.criticality(), dropped_state));
     }
 
     #[test]
