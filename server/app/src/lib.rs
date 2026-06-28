@@ -14,6 +14,7 @@
 //!   [`load_plugins`] scans a directory for dynamic plugins — both public so the
 //!   MVP test can assert server-side behaviour that has no fake-client carrier.
 
+mod cli;
 mod command;
 mod config;
 mod connection;
@@ -26,6 +27,7 @@ mod server;
 mod storage_worker;
 mod world;
 
+pub use cli::{load_or_init_config, Cli};
 pub use command::build_command_tree;
 pub use config::AppConfig;
 pub use plugins::load_plugins;

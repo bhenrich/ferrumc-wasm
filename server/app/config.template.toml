@@ -1,0 +1,99 @@
+# FerrumC server configuration
+# =============================
+#
+# This file was written automatically on first run. Every setting below is shown
+# COMMENTED OUT with its built-in default value. Uncomment a line and change it to
+# override that default; leave a line commented to keep the default. An entirely
+# untouched file (every line still commented) is valid and runs with the exact
+# defaults shown here.
+#
+# Unknown keys are rejected, so do not invent new ones. After editing, restart the
+# server for changes to take effect. The CLI flags --port and --bind override the
+# corresponding values below at startup without editing this file.
+
+# --- Networking ---
+
+# Socket address the TCP listener binds to ("IP:port"). Use 0.0.0.0:25565 to accept
+# connections from other machines on your network; 127.0.0.1 is loopback only.
+# bind = "127.0.0.1:25565"
+
+# Ceiling on simultaneously accepted connections. Also advertised as the player max
+# in the server-list ping.
+# max_connections = 256
+
+# Deadline applied to each individual socket read and write, in whole seconds.
+# io_timeout_secs = 30
+
+# Packet-compression threshold in bytes: frames larger than this are zlib-compressed.
+# Omitted (commented) means compression is DISABLED — frames travel uncompressed.
+# compression_threshold = 256
+
+# --- World view ---
+
+# Play view distance advertised to clients, in chunks.
+# view_distance = 10
+
+# Play simulation distance advertised to clients, in chunks.
+# simulation_distance = 10
+
+# World-spawn position players join at, as [x, y, z]. The default sits one block
+# above the flat grass surface at the centre of the spawn chunk.
+# spawn = [8.0, 64.0, 8.0]
+
+# Radius, in chunks, of the spawn area kept permanently resident around spawn
+# (a (2 * r + 1) square). Larger keeps more chunks loaded and costs more memory.
+# spawn_chunk_radius = 2
+
+# --- Simulation ---
+
+# Simulation tick rate, in ticks per second. Must be greater than zero. The vanilla
+# rate is 20; lowering it slows the whole simulation.
+# ticks_per_second = 20
+
+# Interval between clientbound keep-alive pings, in milliseconds. A vanilla client
+# disconnects after 20 s of silence, so keep this comfortably below 20000.
+# keep_alive_interval_ms = 10000
+
+# How often a standing player's view is pumped toward the full view distance, in
+# milliseconds. One tick (50 ms at 20 TPS) drains the chunk backlog promptly.
+# chunk_stream_interval_ms = 50
+
+# --- Spawn protection ---
+
+# Spawn-protection radius in blocks (Chebyshev) around the spawn column. 0 DISABLES
+# spawn protection entirely, which is the default.
+# spawn_protect_radius = 0
+
+# Player names allowed to bypass spawn protection. Only meaningful when
+# spawn_protect_radius is greater than zero.
+# spawn_protect_bypass = []
+
+# --- Permissions ---
+
+# Player names granted operator status (permission level 4), letting them run
+# operator-gated commands such as /gamemode.
+# ops = []
+
+# Permission level granted to a player who is NOT an operator. 0 is the ordinary
+# "player" tier, which is what makes the operator gate meaningful.
+# default_permission_level = 0
+
+# --- Storage & plugins ---
+
+# Directory the persistent world database lives in. The shipping default is "world"
+# (a durable redb store created under that directory). Comment this out only if you
+# build a custom binary that wants the in-memory store.
+# world_dir = "world"
+
+# Directory scanned for dynamic (cdylib) plugins at startup. Omitted means no
+# dynamic plugins are loaded.
+# plugins_dir = "plugins"
+
+# --- Observability dashboard ---
+
+# Whether the read-only observability dashboard starts alongside the server.
+# dashboard_enabled = true
+
+# Socket address the dashboard binds to. Loopback by design so it is not reachable
+# off-host unless you change this deliberately.
+# dashboard_bind = "127.0.0.1:9090"

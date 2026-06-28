@@ -73,6 +73,9 @@ tracing-subscriber = { workspace = true }
 # Minimal TOML config parsing.
 serde = { workspace = true }
 toml = { workspace = true }
+# CLI arg parsing (--config/--port/--bind/--version/--help) for the ferrumc
+# binary, replacing the old argv[1]-as-config-path footgun.
+clap = { workspace = true }
 
 [dev-dependencies]
 # The integration test drives a real socket using the same proto encoders and

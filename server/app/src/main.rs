@@ -1,14 +1,9 @@
-//! `FerrumC` server binary: load config, start the server, and run until Ctrl-C.
+//! `FerrumC` server binary: parse the CLI, load (or first-run init) the config,
+//! start the server, log a startup banner, and run until Ctrl-C.
 
-use std::path::PathBuf;
+use clap::Parser;
 
-use ferrumc_app::AppConfig;
-
-/// Default world directory the shipping server persists to when the config does
-/// not name one. This is what makes the durable redb store the runtime default;
-/// tests construct [`AppConfig`] directly and leave `world_dir` unset (in-memory)
-/// or point it at a temp directory.
-const DEFAULT_WORLD_DIR: &str = "world";
+use ferrumc_app::{load_or_init_config, AppConfig, Cli, RunningServer};
 
 /// Installs the tracing subscriber, honouring `RUST_LOG`, defaulting to `info`.
 fn init_tracing() {
@@ -20,36 +15,37 @@ fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-/// Loads the config from the first CLI argument or `FERRUMC_CONFIG`, falling
-/// back to the documented defaults when neither is set.
-fn load_config() -> anyhow::Result<AppConfig> {
-    let path = std::env::args()
-        .nth(1)
-        .or_else(|| std::env::var("FERRUMC_CONFIG").ok());
-    let mut config = match path {
-        Some(path) => {
-            let text = std::fs::read_to_string(&path)
-                .map_err(|err| anyhow::anyhow!("reading config {path}: {err}"))?;
-            AppConfig::from_toml_str(&text)?
-        }
-        None => AppConfig::default(),
-    };
-    // Make durable redb storage the runtime default: a real server persists its
-    // world unless the operator names a directory explicitly. (Tests bypass this
-    // by constructing `AppConfig` directly.)
-    if config.world_dir.is_none() {
-        config.world_dir = Some(PathBuf::from(DEFAULT_WORLD_DIR));
+/// Emits the one-block startup banner: identity + protocol, the bound address,
+/// the dashboard address when enabled, and a `RUST_LOG` discoverability hint.
+///
+/// Reads the *actual* bound address from the [`RunningServer`] so it is correct
+/// even when the config binds port `0` (an OS-assigned ephemeral port).
+fn log_startup_banner(config: &AppConfig, server: &RunningServer) {
+    tracing::info!(
+        "FerrumC {} — protocol {} (Minecraft {})",
+        env!("CARGO_PKG_VERSION"),
+        ferrumc_registry::PROTOCOL_VERSION,
+        ferrumc_registry::MINECRAFT_VERSION,
+    );
+    tracing::info!(addr = %server.local_addr(), "listening for Minecraft clients");
+    if config.dashboard_enabled {
+        tracing::info!(addr = %config.dashboard_bind, "observability dashboard available");
     }
-    Ok(config)
+    tracing::info!("set RUST_LOG=debug for verbose logs (e.g. RUST_LOG=debug ferrumc)");
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let config = load_config()?;
+    // `clap` handles --help and --version (printing and exiting 0) before this
+    // returns; anything else surfaces as a usage error.
+    let cli = Cli::parse();
+    let config_path = cli.config_path();
+    let config = load_or_init_config(&config_path, cli.port, cli.bind)?;
+
     let server = ferrumc_app::run(&config).await?;
-    tracing::info!(addr = %server.local_addr(), "ferrumc listening");
+    log_startup_banner(&config, &server);
 
     // Start the read-only observability dashboard on its own task so it never
     // blocks or stalls the simulation tick. It reads the snapshot the driver
@@ -62,7 +58,6 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(%err, "dashboard server exited");
             }
         });
-        tracing::info!(addr = %config.dashboard_bind, "dashboard listening");
     }
 
     tokio::signal::ctrl_c().await?;

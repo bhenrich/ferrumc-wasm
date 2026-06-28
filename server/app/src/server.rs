@@ -217,7 +217,22 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         shutdown_rx.clone(),
     ));
 
-    let listener = TcpListener::bind(config.bind).await?;
+    // A port clash is the common operator mistake, so name the port and the fix
+    // instead of surfacing a bare "Address already in use (os error 48)".
+    let listener = match TcpListener::bind(config.bind).await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+            return Err(anyhow::anyhow!(
+                "port {} is already in use (bind {}). Another server may be running — \
+                 pick a different port with --port <PORT> (or set `bind` in config.toml), \
+                 or find what holds it with `lsof -i :{}`.",
+                config.bind.port(),
+                config.bind,
+                config.bind.port(),
+            ));
+        }
+        Err(err) => return Err(anyhow::anyhow!("binding to {}: {err}", config.bind)),
+    };
     let local_addr = listener.local_addr()?;
 
     // Render the server-list status response once; it advertises the connection
