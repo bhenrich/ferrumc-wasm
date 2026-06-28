@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 
 use ferrumc_net::ConnectionLimits;
-use ferrumc_observability::{CounterRegistry, ServerClock, SnapshotPublisher};
+use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock, SnapshotPublisher};
 use ferrumc_session::{shard_for_position, SessionRouter};
 
 use crate::config::AppConfig;
@@ -141,6 +141,7 @@ impl RunningServer {
 ///
 /// Returns an error if the spawn area fails to load, the join payload cannot be
 /// built, or the listener cannot bind the configured address.
+#[allow(clippy::too_many_lines)] // wires every layer together once at startup
 pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     let shard_pos = shard_for_position(config.spawn);
     let setup = build_world(config, shard_pos).await?;
@@ -189,6 +190,10 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     // tick lands.
     let snapshots = SnapshotPublisher::default();
 
+    // Shared network-telemetry hub: connections publish off the hot path; the
+    // driver folds and prunes it each tick (bounded, roster-scoped).
+    let net_telemetry = Arc::new(NetTelemetryHub::new());
+
     // The driver emits persistence work onto this bounded channel; the storage
     // worker owns the world store and commits it off the tick. The store is shared
     // (the driver also reads it on the chunk load-or-generate path).
@@ -214,6 +219,8 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         clock.clone(),
         storage_tx,
         snapshots.clone(),
+        Arc::clone(&net_telemetry),
+        Arc::clone(&block_events),
         shutdown_rx.clone(),
     ));
 
@@ -256,6 +263,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         view_distance: config.view_distance,
         metrics: Arc::clone(&metrics),
         clock,
+        net_telemetry,
     };
 
     let accept_task = tokio::spawn(accept_loop(

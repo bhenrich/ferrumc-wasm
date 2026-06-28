@@ -38,6 +38,7 @@ use std::sync::Mutex;
 
 use ferrumc_core::{DimensionId, PlayerId};
 use ferrumc_math::{BlockPos, ChunkPos, Vec3, WorldIntent};
+use ferrumc_observability::{PluginDecisionSnapshot, PluginDecisions};
 use ferrumc_permission::{Grant, PermissionNode, Resolution, Subject};
 use ferrumc_plugin_api::{
     BlockBreakAttempt, BlockPlaceAttempt, CommandSink, IntentError, PermissionApi, PluginEvent,
@@ -227,6 +228,31 @@ impl BlockEventDispatcher {
         Self {
             host: Mutex::new(host),
         }
+    }
+
+    /// Snapshots each plugin's cumulative block-edit decision counts for the live
+    /// `ServerSnapshot`.
+    ///
+    /// Locks the host briefly to copy the per-plugin
+    /// [`PluginDecisionReport`](ferrumc_plugin_host::PluginDecisionReport) tally
+    /// and maps it onto the observability vocabulary. Cheap and bounded (one row
+    /// per registered plugin); the driver calls it once per tick, contending with
+    /// the connection tasks' decision dispatch only for the brief copy, never
+    /// across an `.await`.
+    pub(crate) fn decision_snapshots(&self) -> Vec<PluginDecisionSnapshot> {
+        self.lock()
+            .plugin_decision_reports()
+            .into_iter()
+            .map(|report| PluginDecisionSnapshot {
+                plugin_name: report.name,
+                decisions: PluginDecisions {
+                    allow: report.allow,
+                    deny: report.deny,
+                    replace: report.replace,
+                    panic: report.panic,
+                },
+            })
+            .collect()
     }
 
     /// Locks the host, recovering the guard even if a previous holder panicked.
@@ -612,6 +638,40 @@ mod tests {
                 block_state_id: ferrumc_plugin_block_rules::TINTED_GLASS_BLOCK_STATE_ID
             }
         );
+    }
+
+    #[test]
+    fn decision_snapshots_reflect_dispatched_outcomes() {
+        // radius 0 disables spawn protection (it then allows everything), leaving
+        // block_rules as the deciding voter: bedrock is denied, glass is replaced.
+        let (policy, dispatcher) = build_play_policy(&config_with(0, &[])).expect("policy builds");
+        let perms = PermissionFacade::new(policy.permissions());
+        let steve = PlayerId::offline("Steve");
+        let pos = BlockPos::new(100, 64, 100);
+
+        let _ = dispatcher.before_block_place(
+            &BlockPlaceAttempt::new(
+                steve,
+                pos,
+                ferrumc_plugin_block_rules::DENIED_BLOCK_STATE_ID,
+            ),
+            &perms,
+        );
+        let _ = dispatcher.before_block_place(
+            &BlockPlaceAttempt::new(steve, pos, ferrumc_plugin_block_rules::GLASS_BLOCK_STATE_ID),
+            &perms,
+        );
+        // `1` is stone: allowed by everyone.
+        let _ = dispatcher.before_block_place(&BlockPlaceAttempt::new(steve, pos, 1), &perms);
+
+        let snaps = dispatcher.decision_snapshots();
+        assert!(!snaps.is_empty(), "every registered plugin appears");
+        let deny: u64 = snaps.iter().map(|s| s.decisions.deny).sum();
+        let replace: u64 = snaps.iter().map(|s| s.decisions.replace).sum();
+        let allow: u64 = snaps.iter().map(|s| s.decisions.allow).sum();
+        assert_eq!(deny, 1, "exactly one placement was denied");
+        assert_eq!(replace, 1, "exactly one placement was replaced");
+        assert!(allow >= 1, "the plain placement was allowed");
     }
 
     #[test]

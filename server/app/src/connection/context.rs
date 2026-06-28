@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use ferrumc_codec::BoundedString;
 use ferrumc_net::{ConnectionLimits, OutboundPacket, StatusInfo};
-use ferrumc_observability::{CounterRegistry, ServerClock};
+use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock};
 use ferrumc_proto::generated::status::{ClientboundStatusPacket, StatusResponse};
 
 use crate::driver::SimCommand;
@@ -78,6 +78,11 @@ pub(crate) struct ConnContext {
     /// The shared server clock (driver-written, connection-read) used to stamp
     /// packet traces with the current simulation tick.
     pub(crate) clock: ServerClock,
+    /// The shared per-connection network-telemetry hub. Each play connection
+    /// publishes its latest counters and packet-trace tallies here at its
+    /// outbound queue-depth sample (off the per-packet hot path); the driver
+    /// folds every session's snapshot into the per-tick `ServerSnapshot`.
+    pub(crate) net_telemetry: Arc<NetTelemetryHub>,
 }
 
 impl ConnContext {

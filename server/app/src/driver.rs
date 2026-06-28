@@ -17,7 +17,7 @@
 //! never blocks: channel sends are non-blocking inside the router, and a full
 //! inbox defers inputs rather than stalling.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,8 +27,9 @@ use tokio::time::MissedTickBehavior;
 use ferrumc_core::{GameMode, PlayerId, TextComponent, Tick};
 use ferrumc_math::{BlockPos, ChunkPos, Direction, Vec3};
 use ferrumc_observability::{
-    ChunkPosSnapshot, CounterRegistry, MutationKind, MutationResult, PlayerSnapshot, ServerClock,
-    ServerSnapshotParts, SnapshotPublisher, TickMetrics, Vec3Snapshot,
+    ChunkPosSnapshot, CounterRegistry, MutationKind, MutationResult, NetTelemetryHub,
+    PlayerSnapshot, ServerClock, ServerSnapshotParts, SnapshotPublisher, TickMetrics, Vec3Snapshot,
+    DEFAULT_TOP_N,
 };
 use ferrumc_proto::generated::play::ChunkDataAndLight;
 use ferrumc_session::{NetEvent, PlayerSessionHandle, SessionError, SessionRouter};
@@ -41,6 +42,7 @@ use ferrumc_storage::{
 };
 use ferrumc_world::FlatWorldGenerator;
 
+use crate::plugins::BlockEventDispatcher;
 use crate::storage_worker::StorageFlushRequest;
 use crate::world::chunk_packet;
 
@@ -80,11 +82,21 @@ struct SnapshotCtx {
     /// Recent tick timestamps within the last wall-second, used to derive the
     /// effective TPS. Bounded by [`TPS_WINDOW_CAP`].
     tps_window: VecDeque<Instant>,
+    /// The shared per-connection network-telemetry hub. Connection tasks publish
+    /// into it off the hot path; the driver prunes and folds it each tick.
+    net_telemetry: Arc<NetTelemetryHub>,
+    /// The long-lived block-event dispatcher, read once per tick for the
+    /// per-plugin block-edit decision counts.
+    block_events: Arc<BlockEventDispatcher>,
 }
 
 impl SnapshotCtx {
     /// Builds the publish context, capturing the fixed build/start fields once.
-    fn new(publisher: SnapshotPublisher) -> Self {
+    fn new(
+        publisher: SnapshotPublisher,
+        net_telemetry: Arc<NetTelemetryHub>,
+        block_events: Arc<BlockEventDispatcher>,
+    ) -> Self {
         Self {
             publisher,
             build: format!("ferrumc {}", env!("CARGO_PKG_VERSION")),
@@ -95,6 +107,8 @@ impl SnapshotCtx {
             start_instant: Instant::now(),
             roster: BTreeMap::new(),
             tps_window: VecDeque::new(),
+            net_telemetry,
+            block_events,
         }
     }
 
@@ -349,6 +363,8 @@ pub(crate) async fn run(
     clock: ServerClock,
     storage_tx: mpsc::Sender<StorageFlushRequest>,
     snapshots: SnapshotPublisher,
+    net_telemetry: Arc<NetTelemetryHub>,
+    block_events: Arc<BlockEventDispatcher>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(tick_period);
@@ -366,7 +382,7 @@ pub(crate) async fn run(
 
     // Read-only snapshot publishing state (roster, TPS window, build/start
     // context). Updated only from this task, never holding a lock across a tick.
-    let mut snap_ctx = SnapshotCtx::new(snapshots);
+    let mut snap_ctx = SnapshotCtx::new(snapshots, net_telemetry, block_events);
 
     loop {
         tokio::select! {
@@ -911,12 +927,16 @@ fn run_tick(
 /// Builds and publishes the read-only [`ServerSnapshot`] for this tick.
 ///
 /// Folds the metric-derived fields from `metrics` with app-side context: the
-/// effective TPS (from a bounded timestamp window), uptime, and the per-player
-/// list assembled from the driver-owned roster plus public, read-only shard and
-/// router queries. Player network/queue fields and the plugin/packet-trace
-/// summaries are left at their defaults here; the net and plugin lanes feed those
-/// through the same registry later. The roster is pruned against the router's
-/// public connection check so it never grows without bound.
+/// effective TPS (from a bounded timestamp window), uptime, the per-player list
+/// assembled from the driver-owned roster plus public read-only shard/router
+/// queries, the per-player network counters and server-wide packet-trace
+/// summaries aggregated from the network-telemetry hub, and the per-plugin
+/// block-edit decision counts read from the block-event dispatcher.
+///
+/// The roster is pruned against the router's public connection check and the
+/// telemetry hub is pruned against the surviving roster, so neither grows without
+/// bound. All folds are cheap and bounded (a handful of sessions, a top-N
+/// summary, one row per plugin), and none touches the simulation hot path.
 fn publish_snapshot(
     router: &SessionRouter,
     shard: &SimShard,
@@ -932,6 +952,13 @@ fn publish_snapshot(
     snap.roster
         .retain(|player, _| router.is_player_connected(*player));
 
+    // Prune the telemetry hub against the surviving roster so disconnected
+    // sessions never linger, then aggregate the rest into the per-player counters
+    // and the server-wide top-N packet-trace summaries.
+    let connected_names: BTreeSet<String> = snap.roster.values().cloned().collect();
+    snap.net_telemetry.retain_sessions(&connected_names);
+    let net = snap.net_telemetry.aggregate(DEFAULT_TOP_N);
+
     let players: Vec<PlayerSnapshot> = snap
         .roster
         .iter()
@@ -946,6 +973,9 @@ fn publish_snapshot(
             // Chunk column = floor(block / 16); floor the float to a block first.
             let chunk_x = (position.x.floor() as i32) >> 4;
             let chunk_z = (position.z.floor() as i32) >> 4;
+            // Fold this player's network counters in, keyed by the session label
+            // (the player name); absent until the player's first flush publishes.
+            let counters = net.by_session.get(name).copied().unwrap_or_default();
             PlayerSnapshot {
                 player_id: player.as_uuid().as_u128(),
                 name: name.clone(),
@@ -959,7 +989,12 @@ fn publish_snapshot(
                     z: chunk_z,
                 },
                 gamemode: gamemode_label(mode),
-                ..PlayerSnapshot::default()
+                outbound_queue_len: counters.outbound_queue_len,
+                network_in_bytes: counters.network_in_bytes,
+                network_out_bytes: counters.network_out_bytes,
+                frames_decoded: counters.frames_decoded,
+                frames_encoded: counters.frames_encoded,
+                packets_dropped_total: counters.packets_dropped_total,
             }
         })
         .collect();
@@ -977,7 +1012,11 @@ fn publish_snapshot(
         // counts; surface the flag as a 0/1 approximation and leave dirty at 0.
         chunks_dirty: 0,
         chunks_persist_dirty: usize::from(shard.loaded_chunks().has_persist_dirty()),
-        ..ServerSnapshotParts::default()
+        // Per-plugin block-edit decision counts, read from the shared dispatcher.
+        plugin_decisions: snap.block_events.decision_snapshots(),
+        network_per_player: net.per_player,
+        inbound_trace_summary: net.inbound,
+        outbound_trace_summary: net.outbound,
     };
 
     snap.publisher.publish(metrics.server_snapshot(parts));

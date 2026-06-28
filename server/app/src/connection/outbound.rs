@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 
 use ferrumc_net::{CompressionState, Criticality, EnqueueOutcome, OutboundPriority, PlayWriter};
-use ferrumc_observability::{ServerClock, SessionDebug};
+use ferrumc_observability::{ConnNetTelemetry, ServerClock, SessionDebug};
 use ferrumc_proto::generated::play::{AcknowledgeBlockChange, ClientboundPlayPacket};
 
 use crate::observe;
@@ -136,12 +136,38 @@ pub(super) fn enqueue_traced(
     outcome
 }
 
-/// Samples the writer's outbound queue depth into both the per-session dump and
-/// the `ferrumc_session_outbound_queue_len{session}` aggregate gauge.
+/// Samples the writer's outbound queue depth into the per-session dump and the
+/// `ferrumc_session_outbound_queue_len{session}` aggregate gauge, and republishes
+/// this connection's network telemetry into the shared hub for the live snapshot.
+///
+/// Called at each flush boundary — not per packet — so publishing a fresh
+/// telemetry snapshot here is off the hot path. The per-connection counters and
+/// packet-name tallies are read straight from the writer's metrics and the
+/// session debug recorder (which already funnels every traced packet), so no new
+/// per-packet bookkeeping is added; the hub merges these into the per-tick
+/// `ServerSnapshot` and prunes the session when the connection disconnects.
 pub(super) fn observe_queue_len(debug: &mut SessionDebug, ctx: &ConnContext, writer: &PlayWriter) {
     let depth = writer.total_queued();
     debug.observe_outbound_queue_len(depth);
     ctx.metrics.observe_outbound_queue_len(depth);
+
+    let metrics = writer.metrics();
+    let mut dropped = [0u64; 4];
+    for priority in OutboundPriority::ALL {
+        dropped[priority.index()] = metrics.dropped(priority);
+    }
+    ctx.net_telemetry.publish(ConnNetTelemetry {
+        session: debug.session().to_owned(),
+        frames_in: debug.inbound_frames(),
+        bytes_in: debug.inbound_bytes(),
+        frames_out: metrics.frames_encoded(),
+        bytes_out: metrics.bytes_out(),
+        over_budget: metrics.over_budget(),
+        dropped,
+        queue_depth: depth as u64,
+        inbound: debug.inbound_tally().clone(),
+        outbound: debug.outbound_tally().clone(),
+    });
 }
 
 /// Drains the writer into back-to-back batches and writes each to the socket.
