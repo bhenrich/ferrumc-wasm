@@ -17,8 +17,9 @@
 //! never blocks: channel sends are non-blocking inside the router, and a full
 //! inbox defers inputs rather than stalling.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
@@ -26,7 +27,8 @@ use tokio::time::MissedTickBehavior;
 use ferrumc_core::{GameMode, PlayerId, TextComponent, Tick};
 use ferrumc_math::{BlockPos, ChunkPos, Direction, Vec3};
 use ferrumc_observability::{
-    CounterRegistry, MutationKind, MutationResult, ServerClock, TickMetrics,
+    ChunkPosSnapshot, CounterRegistry, MutationKind, MutationResult, PlayerSnapshot, ServerClock,
+    ServerSnapshotParts, SnapshotPublisher, TickMetrics, Vec3Snapshot,
 };
 use ferrumc_proto::generated::play::ChunkDataAndLight;
 use ferrumc_session::{NetEvent, PlayerSessionHandle, SessionError, SessionRouter};
@@ -47,6 +49,83 @@ use crate::world::chunk_packet;
 /// Independent of the chunk/overlay record versions (the journal is its own
 /// versioned format), per the versioned-record rule.
 const MUTATION_LOG_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+
+/// Upper bound on the number of recent tick timestamps the effective-TPS window
+/// retains. At 20 TPS only ~21 fall inside the one-second window, so this is
+/// generous headroom that keeps the deque strictly bounded under any tick rate.
+const TPS_WINDOW_CAP: usize = 128;
+
+/// Driver-owned state used to build and publish the read-only [`ServerSnapshot`]
+/// once per tick.
+///
+/// It carries the snapshot publisher (a clone of the handle the dashboard reads),
+/// the fixed build/start context, a bounded roster of connected players keyed on
+/// join/disconnect, and a bounded window of recent tick timestamps for the
+/// effective-TPS gauge. None of it touches the forbidden net/session internals:
+/// the roster is filled from [`SimCommand::Join`] and pruned against the router's
+/// public connection check, and every other field comes from the registry or
+/// public read-only shard queries.
+struct SnapshotCtx {
+    /// The write side of the shared snapshot cell; the dashboard holds clones.
+    publisher: SnapshotPublisher,
+    /// Build string reported in every snapshot (computed once at startup).
+    build: String,
+    /// Server start time as a Unix timestamp in seconds.
+    started_at_unix: u64,
+    /// Monotonic start instant used to derive uptime.
+    start_instant: Instant,
+    /// Bounded roster of connected players (`PlayerId -> display name`), filled on
+    /// join and pruned each tick against the router's public connection state.
+    roster: BTreeMap<PlayerId, String>,
+    /// Recent tick timestamps within the last wall-second, used to derive the
+    /// effective TPS. Bounded by [`TPS_WINDOW_CAP`].
+    tps_window: VecDeque<Instant>,
+}
+
+impl SnapshotCtx {
+    /// Builds the publish context, capturing the fixed build/start fields once.
+    fn new(publisher: SnapshotPublisher) -> Self {
+        Self {
+            publisher,
+            build: format!("ferrumc {}", env!("CARGO_PKG_VERSION")),
+            started_at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or(0),
+            start_instant: Instant::now(),
+            roster: BTreeMap::new(),
+            tps_window: VecDeque::new(),
+        }
+    }
+
+    /// Records a tick timestamp and returns the effective TPS: the number of ticks
+    /// observed within the trailing wall-second.
+    fn record_tps(&mut self, now: Instant) -> f64 {
+        self.tps_window.push_back(now);
+        while self.tps_window.len() > TPS_WINDOW_CAP {
+            self.tps_window.pop_front();
+        }
+        while let Some(&front) = self.tps_window.front() {
+            if now.duration_since(front) > Duration::from_secs(1) {
+                self.tps_window.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.tps_window.len() as f64
+    }
+}
+
+/// Maps a [`GameMode`] onto its lowercase protocol label for the snapshot.
+fn gamemode_label(mode: GameMode) -> String {
+    match mode {
+        GameMode::Survival => "survival",
+        GameMode::Creative => "creative",
+        GameMode::Adventure => "adventure",
+        GameMode::Spectator => "spectator",
+    }
+    .to_string()
+}
 
 /// A request from a connection task to the simulation/session driver.
 ///
@@ -223,6 +302,7 @@ pub(crate) async fn run(
     metrics: Arc<CounterRegistry>,
     clock: ServerClock,
     storage_tx: mpsc::Sender<StorageFlushRequest>,
+    snapshots: SnapshotPublisher,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(tick_period);
@@ -237,6 +317,10 @@ pub(crate) async fn run(
     // Monotonic id stamped on each journal entry so the append-only mutation log
     // stays ordered across the server's lifetime.
     let mut next_mutation_id: u64 = 0;
+
+    // Read-only snapshot publishing state (roster, TPS window, build/start
+    // context). Updated only from this task, never holding a lock across a tick.
+    let mut snap_ctx = SnapshotCtx::new(snapshots);
 
     loop {
         tokio::select! {
@@ -255,7 +339,15 @@ pub(crate) async fn run(
                 break;
             }
             _ = ticker.tick() => {
-                run_tick(&mut router, &mut shard, &mut shard_rx, &metrics, &clock, &mut tick);
+                run_tick(
+                    &mut router,
+                    &mut shard,
+                    &mut shard_rx,
+                    &metrics,
+                    &clock,
+                    &mut tick,
+                    &mut snap_ctx,
+                );
                 // End-of-tick flush: hand the tick's player edits to the storage
                 // worker without ever blocking the tick (see the helper).
                 try_flush_persist_dirty(&mut shard, &storage_tx, tick, &mut next_mutation_id);
@@ -270,6 +362,7 @@ pub(crate) async fn run(
                         &storage_tx,
                         tick,
                         &mut next_mutation_id,
+                        &mut snap_ctx.roster,
                         command,
                     )
                     .await;
@@ -380,6 +473,7 @@ async fn handle_command(
     storage_tx: &mpsc::Sender<StorageFlushRequest>,
     tick: Tick,
     next_mutation_id: &mut u64,
+    player_roster: &mut BTreeMap<PlayerId, String>,
     command: SimCommand,
 ) {
     match command {
@@ -390,6 +484,13 @@ async fn handle_command(
             reply,
         } => {
             let result = router.join_player(player, &name, position);
+            // Record the joiner in the driver-owned roster for the dashboard
+            // snapshot only once the router accepted the join; a rejected join must
+            // not leave a phantom roster entry. The roster is pruned each tick
+            // against the router's public connection check, so it stays bounded.
+            if result.is_ok() {
+                player_roster.insert(player, name);
+            }
             // The connection task may have already gone away; a failed reply send
             // means the join handle is simply discarded.
             let _ = reply.send(result);
@@ -629,6 +730,7 @@ fn run_tick(
     metrics: &CounterRegistry,
     clock: &ServerClock,
     tick: &mut Tick,
+    snap: &mut SnapshotCtx,
 ) {
     let start = Instant::now();
 
@@ -713,4 +815,84 @@ fn run_tick(
         inbox_len = tick_metrics.inbox_len,
         "tick"
     );
+
+    // Publish the read-only snapshot for the dashboard. This runs at the very end
+    // of the tick and only swaps an `Arc` pointer, so it never holds a lock across
+    // the simulation work above.
+    publish_snapshot(router, shard, metrics, *tick, snap);
+}
+
+/// Builds and publishes the read-only [`ServerSnapshot`] for this tick.
+///
+/// Folds the metric-derived fields from `metrics` with app-side context: the
+/// effective TPS (from a bounded timestamp window), uptime, and the per-player
+/// list assembled from the driver-owned roster plus public, read-only shard and
+/// router queries. Player network/queue fields and the plugin/packet-trace
+/// summaries are left at their defaults here; the net and plugin lanes feed those
+/// through the same registry later. The roster is pruned against the router's
+/// public connection check so it never grows without bound.
+fn publish_snapshot(
+    router: &SessionRouter,
+    shard: &SimShard,
+    metrics: &CounterRegistry,
+    tick: Tick,
+    snap: &mut SnapshotCtx,
+) {
+    let now = Instant::now();
+    let tps = snap.record_tps(now);
+
+    // Drop any roster entries the router no longer considers connected (covers
+    // every disconnect path without reaching into session internals).
+    snap.roster
+        .retain(|player, _| router.is_player_connected(*player));
+
+    let players: Vec<PlayerSnapshot> = snap
+        .roster
+        .iter()
+        .map(|(player, name)| {
+            // Prefer the authoritative sim position; fall back to the router's
+            // join-seeded position for the tick before the join is applied.
+            let position = shard
+                .player_position(*player)
+                .or_else(|| router.player_position(*player))
+                .unwrap_or(Vec3::ZERO);
+            let mode = shard.player_game_mode(*player).unwrap_or_default();
+            // Chunk column = floor(block / 16); floor the float to a block first.
+            let chunk_x = (position.x.floor() as i32) >> 4;
+            let chunk_z = (position.z.floor() as i32) >> 4;
+            PlayerSnapshot {
+                player_id: player.as_uuid().as_u128(),
+                name: name.clone(),
+                position: Vec3Snapshot {
+                    x: position.x,
+                    y: position.y,
+                    z: position.z,
+                },
+                chunk: ChunkPosSnapshot {
+                    x: chunk_x,
+                    z: chunk_z,
+                },
+                gamemode: gamemode_label(mode),
+                ..PlayerSnapshot::default()
+            }
+        })
+        .collect();
+
+    let parts = ServerSnapshotParts {
+        build: snap.build.clone(),
+        started_at: snap.started_at_unix,
+        uptime_secs: now.duration_since(snap.start_instant).as_secs(),
+        tick: tick.get(),
+        tps,
+        players_online: players.len(),
+        players,
+        chunks_loaded: shard.loaded_chunks().loaded_count(),
+        // The chunk map exposes only a persist-dirty flag today, not exact dirty
+        // counts; surface the flag as a 0/1 approximation and leave dirty at 0.
+        chunks_dirty: 0,
+        chunks_persist_dirty: usize::from(shard.loaded_chunks().has_persist_dirty()),
+        ..ServerSnapshotParts::default()
+    };
+
+    snap.publisher.publish(metrics.server_snapshot(parts));
 }

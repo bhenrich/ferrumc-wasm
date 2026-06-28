@@ -51,6 +51,20 @@ async fn main() -> anyhow::Result<()> {
     let server = ferrumc_app::run(&config).await?;
     tracing::info!(addr = %server.local_addr(), "ferrumc listening");
 
+    // Start the read-only observability dashboard on its own task so it never
+    // blocks or stalls the simulation tick. It reads the snapshot the driver
+    // publishes through `server.snapshot_handle()` and binds loopback by default.
+    if config.dashboard_enabled {
+        let snapshots = server.snapshot_handle();
+        let dashboard_bind = config.dashboard_bind;
+        tokio::spawn(async move {
+            if let Err(err) = ferrumc_dashboard::run(dashboard_bind, snapshots).await {
+                tracing::warn!(%err, "dashboard server exited");
+            }
+        });
+        tracing::info!(addr = %config.dashboard_bind, "dashboard listening");
+    }
+
     tokio::signal::ctrl_c().await?;
     tracing::info!("shutdown signal received; winding down");
     server.shutdown().await?;

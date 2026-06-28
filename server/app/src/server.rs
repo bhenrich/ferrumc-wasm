@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 
 use ferrumc_net::ConnectionLimits;
-use ferrumc_observability::{CounterRegistry, ServerClock};
+use ferrumc_observability::{CounterRegistry, ServerClock, SnapshotPublisher};
 use ferrumc_session::{shard_for_position, SessionRouter};
 
 use crate::config::AppConfig;
@@ -65,6 +65,12 @@ pub struct RunningServer {
     /// Exposed for an on-demand metrics snapshot (see [`metrics`](Self::metrics)
     /// and [`dump_metrics`](Self::dump_metrics)).
     metrics: Arc<CounterRegistry>,
+    /// The read side of the per-tick [`ServerSnapshot`] the driver publishes.
+    /// Handed to the read-only dashboard task via [`snapshot_handle`].
+    ///
+    /// [`ServerSnapshot`]: ferrumc_observability::ServerSnapshot
+    /// [`snapshot_handle`]: Self::snapshot_handle
+    snapshots: SnapshotPublisher,
 }
 
 impl RunningServer {
@@ -90,6 +96,17 @@ impl RunningServer {
     /// the snapshot in the logs (for example on a future SIGUSR1 or admin hook).
     pub fn dump_metrics(&self) {
         self.metrics.dump();
+    }
+
+    /// A read handle onto the per-tick [`ServerSnapshot`] the driver publishes.
+    ///
+    /// Cloned and handed to the read-only dashboard task; the handle only ever
+    /// reads the latest snapshot and never mutates server state.
+    ///
+    /// [`ServerSnapshot`]: ferrumc_observability::ServerSnapshot
+    #[must_use]
+    pub fn snapshot_handle(&self) -> SnapshotPublisher {
+        self.snapshots.clone()
     }
 
     /// Signals shutdown and waits for the accept loop and driver to finish.
@@ -167,6 +184,11 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     let metrics = Arc::new(CounterRegistry::new());
     let clock = ServerClock::new();
 
+    // The driver publishes a read-only snapshot here every tick; the dashboard
+    // task reads it through a clone of this handle. Seeded empty until the first
+    // tick lands.
+    let snapshots = SnapshotPublisher::default();
+
     // The driver emits persistence work onto this bounded channel; the storage
     // worker owns the world store and commits it off the tick. The store is shared
     // (the driver also reads it on the chunk load-or-generate path).
@@ -191,6 +213,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         Arc::clone(&metrics),
         clock.clone(),
         storage_tx,
+        snapshots.clone(),
         shutdown_rx.clone(),
     ));
 
@@ -234,6 +257,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         driver_task,
         storage_worker_task,
         metrics,
+        snapshots,
     })
 }
 

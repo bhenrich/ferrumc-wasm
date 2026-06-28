@@ -16,6 +16,13 @@ use serde::Deserialize;
 /// Default address the server binds to when the config omits one.
 const DEFAULT_BIND: &str = "127.0.0.1:25565";
 
+/// Default address the read-only observability dashboard binds to. Loopback by
+/// design: the dashboard is never exposed off-host unless the operator opts in.
+const DEFAULT_DASHBOARD_BIND: &str = "127.0.0.1:9090";
+
+/// Whether the read-only observability dashboard starts by default.
+const DEFAULT_DASHBOARD_ENABLED: bool = true;
+
 /// Default ceiling on concurrent connections.
 const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
@@ -124,6 +131,11 @@ pub struct AppConfig {
     ///
     /// [`WorldStore`]: ferrumc_storage::WorldStore
     pub world_dir: Option<PathBuf>,
+    /// Whether the read-only observability dashboard starts alongside the server.
+    pub dashboard_enabled: bool,
+    /// The socket address the read-only dashboard binds to. Defaults to a loopback
+    /// address so the dashboard is not reachable off-host unless reconfigured.
+    pub dashboard_bind: SocketAddr,
 }
 
 impl AppConfig {
@@ -175,6 +187,10 @@ impl Default for AppConfig {
             // file-free for tests. `main` substitutes a durable redb directory so
             // the shipping server persists by default.
             world_dir: None,
+            dashboard_enabled: DEFAULT_DASHBOARD_ENABLED,
+            dashboard_bind: DEFAULT_DASHBOARD_BIND
+                .parse()
+                .expect("default dashboard bind address is valid"),
         }
     }
 }
@@ -221,6 +237,10 @@ struct RawConfig {
     /// Override for [`AppConfig::world_dir`], as a filesystem path. When set, the
     /// durable redb store is used at this directory.
     world_dir: Option<String>,
+    /// Override for [`AppConfig::dashboard_enabled`].
+    dashboard_enabled: Option<bool>,
+    /// Override for [`AppConfig::dashboard_bind`], as a parseable socket address.
+    dashboard_bind: Option<String>,
 }
 
 impl RawConfig {
@@ -244,6 +264,13 @@ impl RawConfig {
         let spawn = self
             .spawn
             .map_or(defaults.spawn, |[x, y, z]| Vec3::new(x, y, z));
+
+        let dashboard_bind = match self.dashboard_bind {
+            Some(text) => text
+                .parse()
+                .map_err(|err| anyhow::anyhow!("invalid dashboard_bind address {text:?}: {err}"))?,
+            None => defaults.dashboard_bind,
+        };
 
         Ok(AppConfig {
             bind,
@@ -281,6 +308,8 @@ impl RawConfig {
                 .default_permission_level
                 .unwrap_or(defaults.default_permission_level),
             world_dir: self.world_dir.map(PathBuf::from).or(defaults.world_dir),
+            dashboard_enabled: self.dashboard_enabled.unwrap_or(defaults.dashboard_enabled),
+            dashboard_bind,
         })
     }
 }
@@ -315,6 +344,8 @@ mod tests {
             ops = ["Admin"]
             default_permission_level = 1
             world_dir = "/srv/world"
+            dashboard_enabled = false
+            dashboard_bind = "127.0.0.1:8181"
         "#;
         let parsed = AppConfig::from_toml_str(toml).expect("valid config");
         assert_eq!(parsed.bind, "0.0.0.0:0".parse().unwrap());
@@ -334,6 +365,15 @@ mod tests {
         assert_eq!(parsed.ops, vec!["Admin"]);
         assert_eq!(parsed.default_permission_level, 1);
         assert_eq!(parsed.world_dir, Some(PathBuf::from("/srv/world")));
+        assert!(!parsed.dashboard_enabled);
+        assert_eq!(parsed.dashboard_bind, "127.0.0.1:8181".parse().unwrap());
+    }
+
+    #[test]
+    fn dashboard_defaults_to_enabled_on_loopback() {
+        let parsed = AppConfig::from_toml_str("").expect("empty config is valid");
+        assert!(parsed.dashboard_enabled);
+        assert_eq!(parsed.dashboard_bind, "127.0.0.1:9090".parse().unwrap());
     }
 
     #[test]

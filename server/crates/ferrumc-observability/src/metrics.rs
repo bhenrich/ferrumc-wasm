@@ -40,6 +40,11 @@ const DECODE_ERROR_TABLE_CAPACITY: usize = 64;
 /// Microseconds per millisecond, for the `*_ms` snapshot conversions.
 const US_PER_MS: f64 = 1_000.0;
 
+/// Capacity of the sliding tick-duration window used for percentile reporting.
+/// 600 samples is 30 seconds at the 20 TPS default — a fixed `[u32; 600]` array
+/// (2.4 KiB) that never grows.
+const TICK_DURATION_WINDOW: usize = 600;
+
 /// The kind dimension of `ferrumc_block_mutation_total{kind,result}`.
 ///
 /// The discriminants double as the row index into the counter grid.
@@ -147,6 +152,66 @@ fn lock_table<T>(table: &Mutex<T>) -> MutexGuard<'_, T> {
     table.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Fixed-capacity ring of recent tick durations (microseconds), behind the
+/// registry's `Mutex`. Overwrites the oldest sample on wrap; never grows past
+/// [`TICK_DURATION_WINDOW`].
+#[derive(Debug)]
+struct TickDurationRing {
+    samples: [u32; TICK_DURATION_WINDOW],
+    /// Number of valid samples (saturates at the capacity).
+    len: usize,
+    /// Write cursor for the next sample.
+    next: usize,
+}
+
+impl TickDurationRing {
+    fn new() -> Self {
+        Self {
+            samples: [0; TICK_DURATION_WINDOW],
+            len: 0,
+            next: 0,
+        }
+    }
+
+    /// Records one tick duration in microseconds, evicting the oldest on wrap.
+    fn push(&mut self, sample_us: u32) {
+        self.samples[self.next] = sample_us;
+        self.next = (self.next + 1) % TICK_DURATION_WINDOW;
+        if self.len < TICK_DURATION_WINDOW {
+            self.len += 1;
+        }
+    }
+
+    /// Returns `(p50, p95, p99)` tick durations in microseconds over the window,
+    /// computed by nearest-rank over a bounded copy. Empty windows report zeros.
+    fn percentiles_us(&self) -> (u64, u64, u64) {
+        if self.len == 0 {
+            return (0, 0, 0);
+        }
+        // Copy the valid prefix onto the stack (bounded by the fixed capacity),
+        // sort it, then select — never touching the live ring under the lock.
+        let mut buf = [0u32; TICK_DURATION_WINDOW];
+        buf[..self.len].copy_from_slice(&self.samples[..self.len]);
+        let sorted = &mut buf[..self.len];
+        sorted.sort_unstable();
+        (
+            u64::from(nearest_rank(sorted, 50)),
+            u64::from(nearest_rank(sorted, 95)),
+            u64::from(nearest_rank(sorted, 99)),
+        )
+    }
+}
+
+/// Nearest-rank percentile selection over a non-empty sorted slice.
+fn nearest_rank(sorted: &[u32], p: usize) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (p * sorted.len()).div_ceil(100);
+    let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[idx]
+}
+
 /// The shared, lock-light metric sink.
 ///
 /// Cloned behind an [`Arc`] and threaded through the app; every method takes
@@ -175,6 +240,9 @@ pub struct CounterRegistry {
     tick_table: Mutex<TickTable>,
     /// `ferrumc_packet_decode_error_total{state,packet}`.
     decode_errors: Mutex<DecodeErrorTable>,
+    /// Sliding window of recent tick durations for percentile reporting; fed from
+    /// the same single-writer `record_tick` path as the tick table.
+    tick_durations: Mutex<TickDurationRing>,
 }
 
 impl CounterRegistry {
@@ -194,6 +262,7 @@ impl CounterRegistry {
             decode_error_overflow: AtomicU64::new(0),
             tick_table: Mutex::new(TickTable::new()),
             decode_errors: Mutex::new(DecodeErrorTable::new()),
+            tick_durations: Mutex::new(TickDurationRing::new()),
         }
     }
 
@@ -224,6 +293,13 @@ impl CounterRegistry {
     /// New shards beyond [`TICK_TABLE_CAPACITY`] are dropped rather than growing
     /// the table; a single shard runs today, so this is headroom, not a limit hit.
     pub fn record_tick(&self, metrics: &TickMetrics) {
+        // Feed the percentile window first (a separate lock scope from the table),
+        // saturating a pathologically long tick into the `u32` microsecond sample.
+        {
+            let mut ring = lock_table(&self.tick_durations);
+            ring.push(u32::try_from(metrics.duration_us).unwrap_or(u32::MAX));
+        }
+
         let mut table = lock_table(&self.tick_table);
         let len = table.len;
         for row in table.rows.iter_mut().take(len).flatten() {
@@ -364,6 +440,18 @@ impl CounterRegistry {
             },
             packet_decode_error_total,
         }
+    }
+
+    /// Returns `(p50, p95, p99)` tick durations in milliseconds over the sliding
+    /// window. Used by [`server_snapshot`](Self::server_snapshot) to fold the tick
+    /// percentiles into the dashboard's [`ServerSnapshot`](crate::ServerSnapshot).
+    pub(crate) fn tick_percentiles_ms(&self) -> (f64, f64, f64) {
+        let (p50, p95, p99) = lock_table(&self.tick_durations).percentiles_us();
+        (
+            p50 as f64 / US_PER_MS,
+            p95 as f64 / US_PER_MS,
+            p99 as f64 / US_PER_MS,
+        )
     }
 
     /// Dumps every metric: one structured `info` event carrying the JSON
