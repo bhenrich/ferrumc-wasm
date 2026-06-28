@@ -12,7 +12,7 @@ use ferrumc_placement::{
     PlacementResult, PlacementRule,
 };
 use ferrumc_registry::block_state::{block_metadata, state_id_to_block_name};
-use ferrumc_world::BlockStateId;
+use ferrumc_world::{sign_kind_for_state, BlockEntity, BlockStateId, Sign, SIGN_LINES};
 
 use crate::error::SimError;
 use crate::loaded::LoadedChunkMap;
@@ -527,6 +527,15 @@ impl SimShard {
                     {
                         outputs.push(output);
                     }
+                    // An accepted sign placement created the (blank) sign block-entity
+                    // in apply_block_edit; open the editor for the placer so they can
+                    // type its text (the client replies with an UpdateSign). Ordered
+                    // after the BlockChanged so the block exists client-side first.
+                    if matches!(result, MutationResult::Applied { .. })
+                        && sign_kind_for_state(placed.as_u32()).is_some()
+                    {
+                        outputs.push(GameOutput::OpenSignEditor { player, position });
+                    }
                     // A placed fence updates its same-fence cardinal neighbours so
                     // they connect back to it (broadcast-only, no extra ack).
                     if is_fence {
@@ -584,6 +593,23 @@ impl SimShard {
                 }
                 GameInput::RegionUndo { player } => {
                     self.apply_region_undo(&mut outputs, player);
+                }
+                GameInput::UpdateSign {
+                    player,
+                    position,
+                    is_front,
+                    lines,
+                } => {
+                    // Validate and apply the sign-text edit (actor present, chunk
+                    // resident, in reach, a non-waxed sign present). On acceptance,
+                    // broadcast the new text; a failed validation is a silent no-op
+                    // (net never writes the world directly).
+                    if let Some(sign) = self.apply_sign_update(player, position, is_front, lines) {
+                        outputs.push(GameOutput::SignUpdated {
+                            position,
+                            sign: Box::new(sign),
+                        });
+                    }
                 }
             }
         }
@@ -709,6 +735,27 @@ impl SimShard {
         // than mutating or panicking.
         match chunk.set_block(position, requested_state) {
             Ok(()) => {
+                // Reconcile the block-entity with the new block: a sign block keeps
+                // (or, if absent/of a different kind, gains) a blank sign
+                // block-entity; any non-sign block clears a stale one. An existing
+                // sign of the same kind is preserved so re-placing the same sign
+                // keeps its text. The map is bounded; an at-capacity insert is
+                // dropped best-effort (the block itself is still placed).
+                match sign_kind_for_state(requested_state.as_u32()) {
+                    Some(kind) => {
+                        let needs_fresh = !matches!(
+                            chunk.block_entity(position),
+                            Some(BlockEntity::Sign(sign)) if sign.kind() == kind
+                        );
+                        if needs_fresh {
+                            let _ = chunk
+                                .set_block_entity(position, BlockEntity::Sign(Sign::new(kind)));
+                        }
+                    }
+                    None => {
+                        chunk.remove_block_entity(position);
+                    }
+                }
                 // A non-test gameplay edit drives the *persistence* signal: mark
                 // the owning section persist-dirty (so only player-modified chunks
                 // ever produce an overlay) and journal the mutation. A `Test` cause
@@ -857,6 +904,42 @@ impl SimShard {
                 outputs.push(output);
             }
         }
+    }
+
+    /// Validates and applies a sign-text edit at the tick boundary, returning the
+    /// sign's full post-edit state on success or `None` if the edit is refused.
+    ///
+    /// Refused (silently, mutating nothing and emitting no output) when the actor
+    /// is absent, the target chunk is not resident, the target is beyond
+    /// [`MAX_REACH`] of the actor, there is no sign block-entity at `position`, or
+    /// the sign is waxed (its text is locked). On acceptance it replaces the
+    /// addressed face's four text lines, leaving the face's color/glow and the
+    /// other face untouched, and returns a clone of the updated sign for the
+    /// [`GameOutput::SignUpdated`] broadcast. No persistence signal is raised this
+    /// milestone (sign-text persistence is a follow-up).
+    fn apply_sign_update(
+        &mut self,
+        player: PlayerId,
+        position: BlockPos,
+        is_front: bool,
+        lines: [String; SIGN_LINES],
+    ) -> Option<Sign> {
+        let actor = self.players.get(&player).map(|state| state.position)?;
+        if !self.chunks.is_loaded(position.to_chunk_pos()) {
+            return None;
+        }
+        if !within_reach(actor, position) {
+            return None;
+        }
+        let chunk = self.chunks.get_mut(position.to_chunk_pos())?;
+        let Some(BlockEntity::Sign(sign)) = chunk.block_entity_mut(position) else {
+            return None;
+        };
+        if sign.is_waxed() {
+            return None;
+        }
+        sign.set_face_lines(is_front, lines);
+        Some(sign.clone())
     }
 
     /// Refines a player placement's held state into the final block-state using
@@ -2393,5 +2476,175 @@ mod tests {
         );
         assert_eq!(block_at(&s, cells[1]), Some(BlockStateId::AIR));
         assert_eq!(block_at(&s, cells[2]), Some(BlockStateId::AIR));
+    }
+
+    /// The default `oak_sign` block-state id from the pinned registry.
+    fn oak_sign() -> u32 {
+        ferrumc_registry::block_state::block_default_state("oak_sign")
+            .expect("oak_sign in registry")
+    }
+
+    /// Reads the sign block-entity at `pos`, panicking if there is none.
+    fn sign_at(s: &SimShard, pos: BlockPos) -> Sign {
+        let chunk = s.loaded_chunks().get(pos.to_chunk_pos()).expect("resident");
+        match chunk.block_entity(pos) {
+            Some(BlockEntity::Sign(sign)) => sign.clone(),
+            other => panic!("expected a sign block-entity, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn placing_a_sign_creates_block_entity_and_opens_the_editor() {
+        let p = player("signer");
+        let mut s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+
+        let outputs = place_block(&mut s, p, target, oak_sign(), Direction::Up, 1.0, 0.0, 1);
+
+        // The block change is broadcast AND the editor opens for the placer.
+        assert!(outputs.iter().any(
+            |o| matches!(o, GameOutput::BlockChanged { position, .. } if *position == target)
+        ));
+        assert!(outputs.contains(&GameOutput::OpenSignEditor {
+            player: p,
+            position: target,
+        }));
+        // A blank sign block-entity now exists at the target.
+        let sign = sign_at(&s, target);
+        assert!(sign.front().lines().iter().all(String::is_empty));
+        assert!(sign.back().lines().iter().all(String::is_empty));
+    }
+
+    #[tokio::test]
+    async fn breaking_a_sign_removes_its_block_entity() {
+        let p = player("breaker");
+        let mut s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+        let _ = place_block(&mut s, p, target, oak_sign(), Direction::Up, 1.0, 0.0, 1);
+        assert_eq!(
+            s.loaded_chunks()
+                .get(target.to_chunk_pos())
+                .expect("resident")
+                .block_entity_count(),
+            1
+        );
+
+        // Breaking the sign replaces it with air and clears the block-entity.
+        s.enqueue(GameInput::BlockBreak {
+            player: p,
+            position: target,
+            sequence: 2,
+        })
+        .expect("room");
+        let _ = s.run_tick();
+        assert!(s
+            .loaded_chunks()
+            .get(target.to_chunk_pos())
+            .expect("resident")
+            .block_entity(target)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn update_sign_round_trips_text_and_emits_sign_updated() {
+        let p = player("editor");
+        let mut s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+        let _ = place_block(&mut s, p, target, oak_sign(), Direction::Up, 1.0, 0.0, 1);
+
+        let lines = [
+            "Welcome".to_owned(),
+            "to".to_owned(),
+            "FerrumC".to_owned(),
+            String::new(),
+        ];
+        s.enqueue(GameInput::UpdateSign {
+            player: p,
+            position: target,
+            is_front: true,
+            lines: lines.clone(),
+        })
+        .expect("room");
+        let outputs = s.run_tick();
+
+        // Exactly one SignUpdated carries the full sign with the new front text.
+        let signs: Vec<_> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                GameOutput::SignUpdated { position, sign } => Some((*position, sign.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signs.len(), 1);
+        assert_eq!(signs[0].0, target);
+        assert_eq!(signs[0].1.front().lines(), &lines);
+
+        // The stored block-entity reflects the edit; the back face stays blank.
+        let stored = sign_at(&s, target);
+        assert_eq!(stored.front().lines(), &lines);
+        assert!(stored.back().lines().iter().all(String::is_empty));
+    }
+
+    #[tokio::test]
+    async fn update_sign_is_rejected_when_no_sign_out_of_reach_or_absent() {
+        let p = player("validator");
+        let mut s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+        let lines = ["x".to_owned(), String::new(), String::new(), String::new()];
+
+        // 1. No sign block-entity at the target yet -> silent no-op.
+        s.enqueue(GameInput::UpdateSign {
+            player: p,
+            position: target,
+            is_front: true,
+            lines: lines.clone(),
+        })
+        .expect("room");
+        assert!(s.run_tick().is_empty());
+
+        // Place a sign so the position now has a sign block-entity.
+        let _ = place_block(&mut s, p, target, oak_sign(), Direction::Up, 1.0, 0.0, 1);
+
+        // 2. Move the editor far out of reach, then try to edit -> rejected.
+        s.enqueue(GameInput::PlayerMove {
+            player: p,
+            position: Some(Vec3::new(8.0, 64.0, 100.0)),
+            yaw: None,
+            pitch: None,
+        })
+        .expect("room");
+        let _ = s.run_tick();
+        s.enqueue(GameInput::UpdateSign {
+            player: p,
+            position: target,
+            is_front: true,
+            lines: lines.clone(),
+        })
+        .expect("room");
+        assert!(!s
+            .run_tick()
+            .iter()
+            .any(|o| matches!(o, GameOutput::SignUpdated { .. })));
+
+        // 3. An absent player editing the existing sign -> no output.
+        let ghost = player("ghost");
+        s.enqueue(GameInput::UpdateSign {
+            player: ghost,
+            position: target,
+            is_front: true,
+            lines,
+        })
+        .expect("room");
+        assert!(!s
+            .run_tick()
+            .iter()
+            .any(|o| matches!(o, GameOutput::SignUpdated { .. })));
+
+        // The sign's front text was never modified by any rejected edit.
+        assert!(sign_at(&s, target)
+            .front()
+            .lines()
+            .iter()
+            .all(String::is_empty));
     }
 }

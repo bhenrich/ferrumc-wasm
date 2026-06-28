@@ -8,7 +8,7 @@
 
 use ferrumc_core::{GameMode, PlayerId};
 use ferrumc_math::{BlockPos, Cuboid, Direction, Vec3};
-use ferrumc_world::BlockStateId;
+use ferrumc_world::{BlockStateId, Sign, SIGN_LINES};
 
 use crate::mutation::MutationCause;
 use crate::region::RegionOp;
@@ -210,6 +210,28 @@ pub enum GameInput {
         /// Identity of the player whose most recent region edit is undone.
         player: PlayerId,
     },
+    /// A player submitted new text for one face of a sign they were editing.
+    ///
+    /// Decoded upstream from a serverbound `UpdateSign`. The simulation validates
+    /// the edit at the tick boundary (the actor is present, the target chunk is
+    /// resident, the target is within [`MAX_REACH`](crate::SimShard) reach, and a
+    /// sign block-entity exists there and is not waxed) and, on acceptance,
+    /// replaces the addressed face's four text lines and emits a
+    /// [`GameOutput::SignUpdated`] for the session layer to broadcast as a
+    /// `BlockEntityData`. A failed validation is a silent no-op (no output, no
+    /// mutation): net never writes the world directly, so a stale or out-of-reach
+    /// edit is simply dropped.
+    UpdateSign {
+        /// Identity of the editing player.
+        player: PlayerId,
+        /// Absolute position of the sign being edited.
+        position: BlockPos,
+        /// `true` to edit the front face, `false` the back.
+        is_front: bool,
+        /// The four new text lines, top to bottom (each a plain string the
+        /// network layer wraps as a text component).
+        lines: [String; SIGN_LINES],
+    },
 }
 
 /// An output produced by the simulation during a tick.
@@ -312,6 +334,34 @@ pub enum GameOutput {
         requested_state: BlockStateId,
         /// The authoritative state to resync the actor to.
         authoritative_state: BlockStateId,
+    },
+    /// A sign block-entity's text was created or changed and must be (re)rendered
+    /// for everyone who can see it.
+    ///
+    /// Emitted at the tick boundary after an accepted [`GameInput::UpdateSign`].
+    /// The session layer encodes `sign` into the network NBT and broadcasts a
+    /// `BlockEntityData` (droppable) to every viewer within view distance of
+    /// `position`, so the sign renders its new text. The full sign snapshot is
+    /// carried (not just the edited face) so the carrier is self-contained.
+    SignUpdated {
+        /// Absolute position of the sign.
+        position: BlockPos,
+        /// The sign's full post-edit state (both faces). Boxed to keep
+        /// [`GameOutput`] small (a [`Sign`] holds eight text lines).
+        sign: Box<Sign>,
+    },
+    /// A player placed a sign and should be shown its editing screen.
+    ///
+    /// Emitted at the tick boundary after an accepted [`GameInput::BlockPlace`]
+    /// (or exact write) whose resulting block is a sign and whose block-entity was
+    /// just created. The session layer sends only `player` an `OpenSignEditor`
+    /// targeting `position`'s front face, opening the client's sign-edit screen;
+    /// the client replies with an `UpdateSign` when the player confirms.
+    OpenSignEditor {
+        /// The player to open the editor for (the placer).
+        player: PlayerId,
+        /// Absolute position of the just-placed sign.
+        position: BlockPos,
     },
 }
 

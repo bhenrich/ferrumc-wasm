@@ -71,5 +71,9 @@ pub use shard::SimShard;
 /// carried by [`GameOutput::BlockChanged`] / produced by block-edit inputs
 /// without taking a direct dependency on the world crate.
 pub use ferrumc_world::BlockStateId;
+/// Re-exported from [`ferrumc_world`] so the session layer can name the sign
+/// block-entity carried by [`GameOutput::SignUpdated`] (to encode its network
+/// NBT) without depending on the world crate directly.
+pub use ferrumc_world::{Sign, SignFace, SignKind, SIGN_LINES};
 pub use spawn::SpawnChunkTickets;
 pub use ticket::{ChunkTicket, TicketLevel, TicketReason};
