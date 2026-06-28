@@ -782,6 +782,27 @@ impl SessionRouter {
                     }
                 }
             }
+            GameOutput::SignUpdated { position, sign } => {
+                // Broadcast the sign's new text to every viewer within view
+                // distance, exactly like a block update (the world is correct
+                // regardless, so the carrier is droppable). The acting editor is
+                // included so the server-authoritative text confirms their edit.
+                let packet = crate::sign_block_entity_data(*position, sign);
+                self.broadcast_block_entity_data(*position, &packet, &mut to_disconnect);
+            }
+            GameOutput::OpenSignEditor { player, position } => {
+                // Open the editor for the placer alone. Droppable: a dropped editor
+                // just means the sign stays blank (the player can re-place), so it
+                // never escalates to a disconnect.
+                if let Some(entry) = self.players.get(player) {
+                    Self::send_droppable(
+                        entry,
+                        crate::open_sign_editor(*position),
+                        *player,
+                        &mut to_disconnect,
+                    );
+                }
+            }
             // A despawn carries no wire packet here; leave handling lives in
             // disconnect_player.
             _ => {}
@@ -1083,6 +1104,32 @@ impl SessionRouter {
             if let Some(packet) = block_update_shell(position, state) {
                 Self::send_droppable(entry, packet, player, to_disconnect);
             }
+        }
+    }
+
+    /// Broadcasts a pre-built `BlockEntityData` packet (a sign's text) to every
+    /// viewer within view distance of `position`, cloning it per recipient.
+    ///
+    /// Droppable, mirroring [`broadcast_block_update`](Self::broadcast_block_update):
+    /// a *full* recipient simply misses this render (the simulation still holds the
+    /// authoritative sign, re-sent when the chunk next streams in) while a *closed*
+    /// recipient is recorded in `to_disconnect`.
+    fn broadcast_block_entity_data(
+        &self,
+        position: BlockPos,
+        packet: &ClientboundPlayPacket,
+        to_disconnect: &mut Vec<PlayerId>,
+    ) {
+        let block_chunk = position.to_chunk_pos();
+        for (&player, entry) in &self.players {
+            if !within_view(
+                block_chunk,
+                chunk_for_position(entry.position),
+                self.view_distance,
+            ) {
+                continue;
+            }
+            Self::send_droppable(entry, packet.clone(), player, to_disconnect);
         }
     }
 
@@ -1394,6 +1441,7 @@ mod tests {
 
     use ferrumc_net::DisconnectReason;
     use ferrumc_proto::generated::play::{ServerboundKeepAlive, ServerboundPlayPacket};
+    use ferrumc_sim::{Sign, SignKind};
 
     use super::*;
     use crate::translate::PLAYER_INFO_ADD;
@@ -2117,6 +2165,101 @@ mod tests {
             cause: MutationCause::Command,
         });
         assert_eq!(closed, vec![viewer]);
+    }
+
+    #[test]
+    fn sign_update_broadcasts_block_entity_data_to_in_range_viewer() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let viewer = player("viewer");
+        let mut viewer_handle = router
+            .join_player(viewer, "viewer", spawn_pos())
+            .expect("viewer join");
+
+        let mut sign = Sign::new(SignKind::Sign);
+        sign.set_face_lines(
+            true,
+            ["hi".to_owned(), String::new(), String::new(), String::new()],
+        );
+        let position = BlockPos::new(8, 64, 8);
+        let closed = router.route_output(&GameOutput::SignUpdated {
+            position,
+            sign: Box::new(sign),
+        });
+        assert!(closed.is_empty());
+
+        let ClientboundPlayPacket::BlockEntityData(packet) = viewer_handle
+            .try_recv()
+            .expect("a block-entity data")
+            .into_packet()
+        else {
+            panic!("expected a BlockEntityData");
+        };
+        let loc = packet.location();
+        assert_eq!((loc.x(), loc.y(), loc.z()), (8, 64, 8));
+        assert_eq!(packet.block_entity_type(), 7);
+    }
+
+    #[test]
+    fn sign_update_excludes_a_far_viewer() {
+        let mut router = SessionRouter::new();
+        router.set_view_distance(1);
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let viewer = player("viewer");
+        let mut viewer_handle = router
+            .join_player(viewer, "viewer", spawn_pos())
+            .expect("viewer join");
+
+        // A sign five chunks away is out of a view distance of one.
+        let closed = router.route_output(&GameOutput::SignUpdated {
+            position: BlockPos::new(88, 64, 8),
+            sign: Box::new(Sign::new(SignKind::Sign)),
+        });
+        assert!(closed.is_empty());
+        assert!(viewer_handle.try_recv().is_none());
+    }
+
+    #[test]
+    fn open_sign_editor_reaches_only_the_placer() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let placer = player("placer");
+        let mut placer_handle = router
+            .join_player(placer, "placer", spawn_pos())
+            .expect("placer join");
+
+        let position = BlockPos::new(8, 64, 8);
+        let closed = router.route_output(&GameOutput::OpenSignEditor {
+            player: placer,
+            position,
+        });
+        assert!(closed.is_empty());
+
+        let ClientboundPlayPacket::OpenSignEditor(packet) = placer_handle
+            .try_recv()
+            .expect("an open-sign-editor")
+            .into_packet()
+        else {
+            panic!("expected an OpenSignEditor");
+        };
+        let loc = packet.location();
+        assert_eq!((loc.x(), loc.y(), loc.z()), (8, 64, 8));
+        assert!(packet.is_front_text());
+        // No further packet was sent to the placer.
+        assert!(placer_handle.try_recv().is_none());
+    }
+
+    #[test]
+    fn open_sign_editor_for_unknown_player_is_a_no_op() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        // No player joined: routing the editor is a silent no-op (nothing to send,
+        // no one to disconnect).
+        let closed = router.route_output(&GameOutput::OpenSignEditor {
+            player: player("ghost"),
+            position: BlockPos::new(0, 64, 0),
+        });
+        assert!(closed.is_empty());
     }
 
     #[test]

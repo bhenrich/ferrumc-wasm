@@ -41,6 +41,7 @@
 //! ids). A player stays bound to the shard they joined; cross-shard handoff,
 //! richer events, and fully populated packets arrive in later milestones.
 
+mod block_entity;
 mod error;
 mod event;
 mod outbound;
@@ -50,6 +51,7 @@ mod scoreboard;
 mod text;
 mod translate;
 
+pub use block_entity::{open_sign_editor, sign_block_entity_data};
 pub use error::SessionError;
 pub use event::NetEvent;
 pub use outbound::OutboundMessage;
