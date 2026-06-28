@@ -7,6 +7,7 @@
 //! lets future auditing/metrics attribute the change.
 
 use ferrumc_core::PlayerId;
+use ferrumc_math::BlockPos;
 use ferrumc_world::BlockStateId;
 
 /// Who requested a block mutation.
@@ -30,6 +31,63 @@ pub enum MutationCause {
     Plugin,
     /// A test or replay harness.
     Test,
+}
+
+/// An accepted block mutation captured for the storage journal.
+///
+/// Buffered by [`SimShard`](crate::SimShard) on every non-[`Test`](MutationCause::Test)
+/// accepted edit and drained each tick by the driver, which stamps it with a tick
+/// and a monotonic id to build a `BlockMutationLogRecord`. It records the cause,
+/// the block position, and the before/after states so a future crash-replay can
+/// re-apply (or undo) the edit. Carries no tick/id itself: those are assigned at
+/// drain time so the deterministic sim never reads a clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingMutation {
+    cause: MutationCause,
+    position: BlockPos,
+    old_state: BlockStateId,
+    new_state: BlockStateId,
+}
+
+impl PendingMutation {
+    /// Builds a pending mutation record.
+    pub(crate) fn new(
+        cause: MutationCause,
+        position: BlockPos,
+        old_state: BlockStateId,
+        new_state: BlockStateId,
+    ) -> Self {
+        Self {
+            cause,
+            position,
+            old_state,
+            new_state,
+        }
+    }
+
+    /// Returns who caused the mutation.
+    #[must_use]
+    pub fn cause(&self) -> MutationCause {
+        self.cause
+    }
+
+    /// Returns the mutated block position.
+    #[must_use]
+    pub fn position(&self) -> BlockPos {
+        self.position
+    }
+
+    /// Returns the block state before the mutation.
+    #[must_use]
+    pub fn old_state(&self) -> BlockStateId {
+        self.old_state
+    }
+
+    /// Returns the block state after the mutation.
+    #[must_use]
+    pub fn new_state(&self) -> BlockStateId {
+        self.new_state
+    }
 }
 
 /// Why a block mutation was rejected.

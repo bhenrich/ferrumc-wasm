@@ -1,6 +1,14 @@
 //! `FerrumC` server binary: load config, start the server, and run until Ctrl-C.
 
+use std::path::PathBuf;
+
 use ferrumc_app::AppConfig;
+
+/// Default world directory the shipping server persists to when the config does
+/// not name one. This is what makes the durable redb store the runtime default;
+/// tests construct [`AppConfig`] directly and leave `world_dir` unset (in-memory)
+/// or point it at a temp directory.
+const DEFAULT_WORLD_DIR: &str = "world";
 
 /// Installs the tracing subscriber, honouring `RUST_LOG`, defaulting to `info`.
 fn init_tracing() {
@@ -18,14 +26,21 @@ fn load_config() -> anyhow::Result<AppConfig> {
     let path = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("FERRUMC_CONFIG").ok());
-    match path {
+    let mut config = match path {
         Some(path) => {
             let text = std::fs::read_to_string(&path)
                 .map_err(|err| anyhow::anyhow!("reading config {path}: {err}"))?;
-            AppConfig::from_toml_str(&text)
+            AppConfig::from_toml_str(&text)?
         }
-        None => Ok(AppConfig::default()),
+        None => AppConfig::default(),
+    };
+    // Make durable redb storage the runtime default: a real server persists its
+    // world unless the operator names a directory explicitly. (Tests bypass this
+    // by constructing `AppConfig` directly.)
+    if config.world_dir.is_none() {
+        config.world_dir = Some(PathBuf::from(DEFAULT_WORLD_DIR));
     }
+    Ok(config)
 }
 
 #[tokio::main]

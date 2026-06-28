@@ -30,11 +30,22 @@ use ferrumc_observability::{
 };
 use ferrumc_proto::generated::play::ChunkDataAndLight;
 use ferrumc_session::{NetEvent, PlayerSessionHandle, SessionError, SessionRouter};
-use ferrumc_sim::{ChunkTicket, GameInput, GameOutput, SimShard, TicketReason};
-use ferrumc_storage::{InMemoryStore, WorldStore, MAX_SAVE_BATCH};
+use ferrumc_sim::{
+    ChunkTicket, GameInput, GameOutput, MutationCause, PendingMutation, SimShard, TicketReason,
+};
+use ferrumc_storage::{
+    BlockMutationLogRecord, MutationActor, MutationLogCause, SchemaVersion, WorldStore,
+};
 use ferrumc_world::FlatWorldGenerator;
 
+use crate::storage_worker::StorageFlushRequest;
 use crate::world::chunk_packet;
+
+/// Schema version stamped on every [`BlockMutationLogRecord`] the driver appends.
+///
+/// Independent of the chunk/overlay record versions (the journal is its own
+/// versioned format), per the versioned-record rule.
+const MUTATION_LOG_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 
 /// A request from a connection task to the simulation/session driver.
 ///
@@ -128,13 +139,14 @@ pub(crate) enum SimCommand {
 pub(crate) async fn run(
     mut router: SessionRouter,
     mut shard: SimShard,
-    store: InMemoryStore,
+    store: Arc<dyn WorldStore>,
     generator: FlatWorldGenerator,
     mut shard_rx: mpsc::Receiver<GameInput>,
     mut commands: mpsc::Receiver<SimCommand>,
     tick_period: Duration,
     metrics: Arc<CounterRegistry>,
     clock: ServerClock,
+    storage_tx: mpsc::Sender<StorageFlushRequest>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut ticker = tokio::time::interval(tick_period);
@@ -146,16 +158,45 @@ pub(crate) async fn run(
     // stamp their packet traces with the current tick.
     let mut tick = Tick::ZERO;
 
+    // Monotonic id stamped on each journal entry so the append-only mutation log
+    // stays ordered across the server's lifetime.
+    let mut next_mutation_id: u64 = 0;
+
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.changed() => break,
+            _ = shutdown.changed() => {
+                // Final flush before stopping: capture any remaining persist-dirty
+                // chunks and journal entries and send them, awaiting briefly if the
+                // channel is momentarily full so a graceful shutdown loses nothing.
+                if let Some(request) = build_flush_request(&mut shard, tick, &mut next_mutation_id) {
+                    if let Err(err) = storage_tx.send(request).await {
+                        tracing::warn!(%err, "failed to send final storage flush on shutdown");
+                    }
+                }
+                // Dropping `storage_tx` (on return) closes the channel, which the
+                // storage worker observes to drain and exit.
+                break;
+            }
             _ = ticker.tick() => {
                 run_tick(&mut router, &mut shard, &mut shard_rx, &metrics, &clock, &mut tick);
+                // End-of-tick flush: hand the tick's player edits to the storage
+                // worker without ever blocking the tick (see the helper).
+                try_flush_persist_dirty(&mut shard, &storage_tx, tick, &mut next_mutation_id);
             }
             maybe_command = commands.recv() => match maybe_command {
                 Some(command) => {
-                    handle_command(&mut router, &mut shard, &store, &generator, &metrics, command).await;
+                    handle_command(
+                        &mut router,
+                        &mut shard,
+                        &*store,
+                        &generator,
+                        &storage_tx,
+                        tick,
+                        &mut next_mutation_id,
+                        command,
+                    )
+                    .await;
                 }
                 None => break,
             },
@@ -163,13 +204,103 @@ pub(crate) async fn run(
     }
 }
 
+/// Builds a [`StorageFlushRequest`] from the shard's pending persist-dirty chunks
+/// and journaled mutations, stamping the overlays' capture tick and assigning a
+/// monotonic id to each journal entry from `next_mutation_id`.
+///
+/// Returns `None` (taking nothing, clearing nothing) when there is nothing to
+/// flush. Otherwise it drains the shard's persist-dirty masks and mutation buffer,
+/// so the caller is committed to delivering the returned request.
+fn build_flush_request(
+    shard: &mut SimShard,
+    tick: Tick,
+    next_mutation_id: &mut u64,
+) -> Option<StorageFlushRequest> {
+    if !shard.loaded_chunks().has_persist_dirty() && !shard.has_pending_mutations() {
+        return None;
+    }
+    let tick_n = tick.get();
+    let overlays = shard.loaded_chunks_mut().take_persist_dirty(tick_n);
+    let mutations = shard
+        .take_mutations()
+        .into_iter()
+        .map(|mutation| {
+            let id = *next_mutation_id;
+            *next_mutation_id = next_mutation_id.saturating_add(1);
+            build_mutation_record(id, tick_n, &mutation)
+        })
+        .collect();
+    Some(StorageFlushRequest {
+        overlays,
+        mutations,
+    })
+}
+
+/// Maps a sim-layer [`PendingMutation`] (plus an assigned `id` and `tick`) into a
+/// storage [`BlockMutationLogRecord`].
+fn build_mutation_record(id: u64, tick: u64, mutation: &PendingMutation) -> BlockMutationLogRecord {
+    let (actor, cause) = match mutation.cause() {
+        MutationCause::PlayerCreative { player } => (
+            MutationActor::Player(player),
+            MutationLogCause::PlayerCreative,
+        ),
+        MutationCause::Plugin => (MutationActor::System, MutationLogCause::Plugin),
+        MutationCause::Test => (MutationActor::System, MutationLogCause::Test),
+        // `MutationCause::Command` and any future (non-exhaustive) source are
+        // attributed to the system with a command-like cause rather than dropped.
+        _ => (MutationActor::System, MutationLogCause::Command),
+    };
+    BlockMutationLogRecord::new(
+        MUTATION_LOG_SCHEMA_VERSION,
+        id,
+        tick,
+        actor,
+        mutation.position(),
+        mutation.old_state(),
+        mutation.new_state(),
+        cause,
+    )
+}
+
+/// End-of-tick flush, run on the tick hot path and therefore strictly
+/// non-blocking.
+///
+/// If there is anything to persist, it reserves a slot on the bounded storage
+/// channel up front; only on success does it drain the shard's persist-dirty
+/// chunks and send them. If the channel is full it leaves the chunks marked
+/// persist-dirty and retries next tick, so backpressure can never block the tick
+/// or lose an edit.
+fn try_flush_persist_dirty(
+    shard: &mut SimShard,
+    storage_tx: &mpsc::Sender<StorageFlushRequest>,
+    tick: Tick,
+    next_mutation_id: &mut u64,
+) {
+    if !shard.loaded_chunks().has_persist_dirty() && !shard.has_pending_mutations() {
+        return;
+    }
+    match storage_tx.try_reserve() {
+        Ok(permit) => {
+            if let Some(request) = build_flush_request(shard, tick, next_mutation_id) {
+                permit.send(request);
+            }
+        }
+        Err(_) => {
+            tracing::trace!("storage flush channel full; deferring dirty chunks to next tick");
+        }
+    }
+}
+
 /// Applies one command against the router and/or the shard's chunk map.
+#[allow(clippy::too_many_arguments)] // threads the storage flush channel + tick context through
 async fn handle_command(
     router: &mut SessionRouter,
     shard: &mut SimShard,
-    store: &InMemoryStore,
+    store: &dyn WorldStore,
     generator: &FlatWorldGenerator,
-    metrics: &CounterRegistry,
+    storage_tx: &mpsc::Sender<StorageFlushRequest>,
+    tick: Tick,
+    next_mutation_id: &mut u64,
     command: SimCommand,
 ) {
     match command {
@@ -196,13 +327,13 @@ async fn handle_command(
         } => {
             // Release first (frees tickets the new view no longer needs) before
             // acquiring, so a chunk that both left and re-entered nets out cleanly.
-            release_chunks(shard, store, metrics, &unload).await;
+            release_chunks(shard, storage_tx, tick, next_mutation_id, &unload).await;
             let packets = load_chunks(shard, store, generator, &load).await;
             // A gone connection just discards the packets; nothing to clean up.
             let _ = reply.send(packets);
         }
         SimCommand::ReleaseChunks { positions } => {
-            release_chunks(shard, store, metrics, &positions).await;
+            release_chunks(shard, storage_tx, tick, next_mutation_id, &positions).await;
         }
         SimCommand::BroadcastSystemChat { content, overlay } => {
             router.broadcast_system_chat(&content, overlay);
@@ -227,7 +358,7 @@ async fn handle_command(
 /// so a skipped chunk is not left pinned with no client tracking it.
 async fn load_chunks(
     shard: &mut SimShard,
-    store: &InMemoryStore,
+    store: &dyn WorldStore,
     generator: &FlatWorldGenerator,
     positions: &[ChunkPos],
 ) -> Vec<ChunkDataAndLight> {
@@ -263,36 +394,33 @@ async fn load_chunks(
     packets
 }
 
-/// Releases the player ticket on each chunk in `positions`, persisting the save
-/// record of any chunk that unloads with unsaved edits so a streamed-out chunk is
-/// not lost.
+/// Releases the player ticket on each chunk in `positions`.
+///
+/// Before dropping any tickets, it flushes the shard's pending player edits to the
+/// storage worker, so a chunk that unloads with unsaved edits has them captured as
+/// an overlay first. A generated-but-unmodified chunk has no persist-dirty
+/// sections, so it produces nothing and unloads for free. Persistence itself
+/// happens off-tick on the storage worker; this only enqueues it.
 async fn release_chunks(
     shard: &mut SimShard,
-    store: &InMemoryStore,
-    metrics: &CounterRegistry,
+    storage_tx: &mpsc::Sender<StorageFlushRequest>,
+    tick: Tick,
+    next_mutation_id: &mut u64,
     positions: &[ChunkPos],
 ) {
-    let ticket = ChunkTicket::of(TicketReason::Player);
-    let mut dirty = Vec::new();
-    for &pos in positions {
-        if let Some(record) = shard.loaded_chunks_mut().release(pos, ticket).into_dirty() {
-            dirty.push(record);
+    // Capture any unsaved edits (on these chunks or any other resident chunk)
+    // before unloading. `await` here is fine: this runs between ticks on a
+    // command, not on the tick hot path, so blocking briefly is acceptable
+    // backpressure and keeps the flush lossless.
+    if let Some(request) = build_flush_request(shard, tick, next_mutation_id) {
+        if let Err(err) = storage_tx.send(request).await {
+            tracing::warn!(%err, "failed to flush edits before releasing chunks");
         }
     }
 
-    // Persist in store-bounded batches so a large unload (e.g. a disconnect that
-    // drops a whole view square of freshly generated chunks) never exceeds the
-    // store's per-call batch limit.
-    while !dirty.is_empty() {
-        let take = dirty.len().min(MAX_SAVE_BATCH);
-        let batch: Vec<_> = dirty.drain(..take).collect();
-        // Time each persist call for ferrumc_storage_flush_ms.
-        let start = Instant::now();
-        let result = store.save_chunks(batch).await;
-        metrics.record_storage_flush_ms(start.elapsed().as_millis() as u64);
-        if let Err(err) = result {
-            tracing::warn!(%err, "failed to persist streamed-out chunks");
-        }
+    let ticket = ChunkTicket::of(TicketReason::Player);
+    for &pos in positions {
+        let _ = shard.loaded_chunks_mut().release(pos, ticket);
     }
 }
 

@@ -9,17 +9,21 @@
 //!
 //! > A chunk position is resident **iff** it holds at least one ticket.
 //!
-//! Mutations to a resident chunk mark it dirty (the chunk tracks this itself);
-//! [`LoadedChunkMap::take_dirty`] hands those dirty chunks off as save records.
-//! This module collects dirty chunks but never persists them — choosing *when*
-//! to flush is the caller's policy, deliberately out of scope here.
+//! Mutations to a resident chunk mark it dirty (the chunk tracks this itself).
+//! There are two handoffs: [`LoadedChunkMap::take_dirty`] emits a full
+//! [`ChunkRecord`] for every network-dirty chunk (including freshly generated
+//! ones), while [`LoadedChunkMap::take_persist_dirty`] emits a
+//! [`ChunkOverlayRecord`] only for chunks a *gameplay* edit marked persist-dirty
+//! — so untouched generated terrain produces zero overlay records. This module
+//! collects but never persists; choosing *when* to flush is the caller's policy,
+//! deliberately out of scope here.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 
 use ferrumc_core::{DimensionId, WorldId};
 use ferrumc_math::ChunkPos;
-use ferrumc_storage::{ChunkKey, ChunkRecord, SchemaVersion, WorldStore};
+use ferrumc_storage::{ChunkKey, ChunkOverlayRecord, ChunkRecord, SchemaVersion, WorldStore};
 use ferrumc_world::{Chunk, FlatWorldGenerator};
 
 use crate::error::{SimError, SimResult};
@@ -33,6 +37,14 @@ use crate::ticket::{ChunkTicket, TicketLevel};
 /// detect and migrate older data. It is the simulation's notion of "current";
 /// storage preserves it verbatim.
 pub const CHUNK_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+
+/// The schema version stamped on chunk *overlay* records.
+///
+/// Distinct from [`CHUNK_SCHEMA_VERSION`] (full-chunk snapshots, v1): an overlay
+/// carries only the player-modified sections plus a section mask and capture
+/// tick, a different on-disk shape, so it is versioned separately (v2). Storage
+/// preserves it verbatim.
+pub const OVERLAY_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
 
 /// How a chunk entered memory during the load-or-generate flow.
 ///
@@ -115,17 +127,15 @@ pub enum TicketRelease {
     /// resident.
     StillLoaded,
 
-    /// The last ticket was removed and the chunk was unloaded. If it had
-    /// unsaved changes, `dirty` carries the record the caller must persist
-    /// before the chunk is gone for good.
-    Unloaded {
-        /// The save record for the unloaded chunk, present only if it was dirty.
-        ///
-        /// Boxed because a [`ChunkRecord`] is large (a whole chunk column) while
-        /// the other outcomes carry nothing — keeping the record behind a
-        /// pointer keeps every [`TicketRelease`] value small.
-        dirty: Option<Box<(ChunkKey, ChunkRecord)>>,
-    },
+    /// The last ticket was removed and the chunk was unloaded.
+    ///
+    /// Persistence is **not** surfaced here: a chunk's player edits are captured
+    /// into overlay records by [`take_persist_dirty`](LoadedChunkMap::take_persist_dirty)
+    /// at the tick boundary (and again, by the caller, immediately before an
+    /// unload), so an unloaded chunk has nothing left to save. A generated-only
+    /// chunk has no persist-dirty sections and therefore costs no storage on
+    /// unload, which is the whole point of the persist-dirty signal.
+    Unloaded,
 
     /// No matching ticket existed at the position; nothing changed.
     NotPresent,
@@ -141,23 +151,13 @@ impl TicketRelease {
     /// Returns `true` if the release unloaded the chunk.
     #[must_use]
     pub fn is_unloaded(&self) -> bool {
-        matches!(self, TicketRelease::Unloaded { .. })
+        matches!(self, TicketRelease::Unloaded)
     }
 
     /// Returns `true` if no matching ticket was present.
     #[must_use]
     pub fn is_not_present(&self) -> bool {
         matches!(self, TicketRelease::NotPresent)
-    }
-
-    /// Consumes the outcome, returning the save record for an unloaded dirty
-    /// chunk, or `None` in every other case.
-    #[must_use]
-    pub fn into_dirty(self) -> Option<(ChunkKey, ChunkRecord)> {
-        match self {
-            TicketRelease::Unloaded { dirty } => dirty.map(|boxed| *boxed),
-            _ => None,
-        }
     }
 }
 
@@ -173,24 +173,58 @@ struct ResidentChunk {
 
 /// Runs the load-or-generate flow for a single chunk.
 ///
-/// Tries [`WorldStore::load_chunk`] for `key`; on a hit it returns the stored
-/// chunk, and on a miss it generates a fresh chunk for `key`'s position with
-/// `generator`. The returned [`ChunkProvenance`] records which path was taken.
+/// Resolution order, all surfacing a storage failure as [`SimError::ChunkLoad`]:
+/// 1. **Overlay** ([`WorldStore::load_chunk_overlay`]): on a hit, the flat
+///    baseline is regenerated for `key`'s position and the overlay's
+///    player-modified sections are [applied](ChunkOverlayRecord::apply_to_chunk)
+///    over it, reconstructing exactly the chunk as it was saved. This is the
+///    normal persisted-edit path.
+/// 2. **Full chunk** ([`WorldStore::load_chunk`]): a complete stored snapshot, if
+///    one exists (legacy / full-snapshot path).
+/// 3. **Generate**: neither is stored, so a fresh flat chunk is produced.
 ///
-/// A storage failure is surfaced as [`SimError::ChunkLoad`]; a *missing* chunk
-/// is not a failure (it is the generate path).
+/// The returned [`ChunkProvenance`] is [`Loaded`](ChunkProvenance::Loaded) for
+/// cases 1–2 and [`Generated`](ChunkProvenance::Generated) for case 3. A loaded
+/// chunk is returned clean: both the network and persist-dirty masks are cleared,
+/// since what came back from the store is by definition already persisted.
 pub async fn load_or_generate(
     store: &dyn WorldStore,
     generator: &FlatWorldGenerator,
     key: ChunkKey,
 ) -> SimResult<(Chunk, ChunkProvenance)> {
     let pos = key.pos();
+
+    // 1. Overlay over a regenerated baseline (the persisted-edit path).
+    let overlay = store
+        .load_chunk_overlay(key)
+        .await
+        .map_err(|source| SimError::ChunkLoad { pos, source })?;
+    if let Some(overlay) = overlay {
+        let mut chunk = generator.generate(pos);
+        overlay
+            .apply_to_chunk(&mut chunk)
+            .map_err(|source| SimError::ChunkLoad {
+                pos,
+                source: source.into(),
+            })?;
+        chunk.clear_dirty();
+        chunk.clear_persist_dirty();
+        return Ok((chunk, ChunkProvenance::Loaded));
+    }
+
+    // 2. A full stored snapshot, if any.
     let stored = store
         .load_chunk(key)
         .await
         .map_err(|source| SimError::ChunkLoad { pos, source })?;
     match stored {
-        Some(record) => Ok((record.into_chunk(), ChunkProvenance::Loaded)),
+        Some(record) => {
+            let mut chunk = record.into_chunk();
+            // The decoder already clears the network dirty mask; a stored chunk is
+            // not pending a fresh overlay either.
+            chunk.clear_persist_dirty();
+            Ok((chunk, ChunkProvenance::Loaded))
+        }
         None => Ok((generator.generate(pos), ChunkProvenance::Generated)),
     }
 }
@@ -384,9 +418,11 @@ impl LoadedChunkMap {
     /// Releases one `ticket` from the chunk at `pos`.
     ///
     /// Decrements that ticket's holder count. If it was the chunk's last ticket
-    /// the chunk is unloaded; a dirty chunk's save record is returned in
-    /// [`TicketRelease::Unloaded`] so the caller can persist it before it is
-    /// dropped. Releasing a ticket that is not held (or a chunk that is not
+    /// the chunk is unloaded ([`TicketRelease::Unloaded`]). Persistence is not
+    /// surfaced here: the caller captures any pending player edits via
+    /// [`take_persist_dirty`](Self::take_persist_dirty) before releasing, so an
+    /// unloaded chunk has nothing left to save and a generated-only chunk costs
+    /// no storage. Releasing a ticket that is not held (or a chunk that is not
     /// resident) is a no-op reported as [`TicketRelease::NotPresent`].
     pub fn release(&mut self, pos: ChunkPos, ticket: ChunkTicket) -> TicketRelease {
         let Some(resident) = self.resident.get_mut(&pos) else {
@@ -404,21 +440,9 @@ impl LoadedChunkMap {
             return TicketRelease::StillLoaded;
         }
 
-        // Last ticket gone: unload, surfacing the save record if it was dirty.
-        let key = self.chunk_key(pos);
+        // Last ticket gone: unload and drop the chunk.
         match self.resident.remove(&pos) {
-            Some(mut resident) => {
-                let dirty = if resident.chunk.dirty_sections().any() {
-                    resident.chunk.clear_dirty();
-                    Some(Box::new((
-                        key,
-                        ChunkRecord::new(self.schema_version, resident.chunk),
-                    )))
-                } else {
-                    None
-                };
-                TicketRelease::Unloaded { dirty }
-            }
+            Some(_) => TicketRelease::Unloaded,
             // `pos` was present at the start of the method and only this `&mut`
             // path could have removed it, so this arm is unreachable; report it
             // as a no-op rather than panicking.
@@ -448,6 +472,50 @@ impl LoadedChunkMap {
                     ChunkKey::new(world, dimension, pos),
                     ChunkRecord::new(schema, resident.chunk.clone()),
                 ));
+            }
+        }
+        batch
+    }
+
+    /// Returns `true` if any resident chunk has unsaved gameplay edits.
+    ///
+    /// A cheap pre-check for the flush hot path: the driver only reserves a
+    /// storage-channel slot when there is something to persist.
+    #[must_use]
+    pub fn has_persist_dirty(&self) -> bool {
+        self.resident
+            .values()
+            .any(|resident| resident.chunk.persist_dirty_sections().any())
+    }
+
+    /// Collects an overlay record for every resident chunk with unsaved gameplay
+    /// edits and clears those chunks' persist-dirty masks.
+    ///
+    /// This is the persistence handoff: unlike [`take_dirty`](Self::take_dirty)
+    /// (which emits a full [`ChunkRecord`] for any network-dirty chunk, including
+    /// a freshly generated one), this emits a [`ChunkOverlayRecord`] carrying only
+    /// the player-modified sections, gated on the persist-dirty signal. A
+    /// generated-but-never-edited chunk has an empty persist-dirty mask and so is
+    /// **never** included, which is what keeps untouched terrain at zero storage.
+    /// Each overlay is stamped with `tick` as its capture time and
+    /// [`OVERLAY_SCHEMA_VERSION`]. The batch is ordered by [`ChunkPos`] for
+    /// determinism. As with `take_dirty`, this captures and clears but does not
+    /// itself persist — flush *policy* is the caller's.
+    #[must_use]
+    pub fn take_persist_dirty(&mut self, tick: u64) -> Vec<(ChunkKey, ChunkOverlayRecord)> {
+        let world = self.world;
+        let dimension = self.dimension;
+        let mut batch = Vec::new();
+        for (&pos, resident) in &mut self.resident {
+            if resident.chunk.persist_dirty_sections().any() {
+                let record = ChunkOverlayRecord::from_chunk(
+                    OVERLAY_SCHEMA_VERSION,
+                    pos,
+                    &resident.chunk,
+                    tick,
+                );
+                resident.chunk.clear_persist_dirty();
+                batch.push((ChunkKey::new(world, dimension, pos), record));
             }
         }
         batch
@@ -674,7 +742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unloading_dirty_chunk_surfaces_save_record() {
+    async fn unloading_generated_chunk_yields_no_overlay() {
         let store = InMemoryStore::new();
         let generator = gen();
         let pos = ChunkPos::new(1, 1);
@@ -684,11 +752,94 @@ mod tests {
         m.acquire(&store, &generator, pos, ticket)
             .await
             .expect("acquire");
-        // Generated chunk is dirty; releasing the last ticket must surface its
-        // save record so it is not lost on unload.
-        let record = m.release(pos, ticket).into_dirty();
-        assert!(record.is_some());
+        // A freshly generated, never-edited chunk has an empty persist-dirty mask,
+        // so it produces NO overlay and costs zero storage even on unload.
+        assert!(!m.has_persist_dirty());
+        assert!(m.take_persist_dirty(0).is_empty());
+        assert!(m.release(pos, ticket).is_unloaded());
         assert!(!m.is_loaded(pos));
+    }
+
+    #[tokio::test]
+    async fn take_persist_dirty_collects_only_player_marked_chunks() {
+        let store = InMemoryStore::new();
+        let generator = gen();
+        let edited = ChunkPos::new(0, 0);
+        let untouched = ChunkPos::new(1, 0);
+        let mut m = map();
+
+        m.acquire(&store, &generator, edited, spawn_ticket())
+            .await
+            .expect("acquire edited");
+        m.acquire(&store, &generator, untouched, spawn_ticket())
+            .await
+            .expect("acquire untouched");
+
+        // Nothing is persist-dirty yet, even though both are freshly generated
+        // (and therefore network-dirty).
+        assert!(!m.has_persist_dirty());
+        assert!(m.take_persist_dirty(5).is_empty());
+
+        // Simulate a gameplay edit: mark a section persist-dirty (the sim layer's
+        // job) on exactly one chunk.
+        let target = BlockPos::new(2, 70, 2);
+        m.get_mut(edited)
+            .expect("resident")
+            .set_block(target, BlockStateId::new(5))
+            .expect("in range");
+        m.get_mut(edited)
+            .expect("resident")
+            .mark_persist_dirty(target);
+
+        assert!(m.has_persist_dirty());
+        let overlays = m.take_persist_dirty(7);
+        assert_eq!(
+            overlays.len(),
+            1,
+            "only the player-edited chunk is captured"
+        );
+        assert_eq!(overlays[0].0, ChunkKey::new(world(), dimension(), edited));
+        assert_eq!(overlays[0].1.updated_at_tick(), 7);
+        assert_eq!(overlays[0].1.schema_version(), OVERLAY_SCHEMA_VERSION);
+        // Draining cleared the persist mask: a second take yields nothing.
+        assert!(m.take_persist_dirty(8).is_empty());
+    }
+
+    #[tokio::test]
+    async fn overlay_round_trips_through_store_reload() {
+        let store = InMemoryStore::new();
+        let generator = gen();
+        let pos = ChunkPos::new(3, -1);
+        let key = ChunkKey::new(world(), dimension(), pos);
+        let mut m = map();
+
+        m.acquire(&store, &generator, pos, spawn_ticket())
+            .await
+            .expect("acquire");
+        // Break the grass surface and persist the overlay.
+        let surface = pos.origin_block(63);
+        {
+            let chunk = m.get_mut(pos).expect("resident");
+            chunk
+                .set_block(surface, BlockStateId::AIR)
+                .expect("in range");
+            chunk.mark_persist_dirty(surface);
+        }
+        let overlays = m.take_persist_dirty(1);
+        store.save_chunk_overlays(overlays).await.expect("persist");
+
+        // A fresh map loading the same key reconstructs the edit over a baseline.
+        let mut m2 = map();
+        let outcome = m2
+            .acquire(&store, &generator, pos, spawn_ticket())
+            .await
+            .expect("acquire reload");
+        assert_eq!(outcome.provenance(), Some(ChunkProvenance::Loaded));
+        let reloaded = m2.get(pos).expect("resident");
+        assert_eq!(reloaded.get_block(surface), Some(BlockStateId::AIR));
+        // A loaded chunk is clean: it is not immediately re-persisted.
+        assert!(!reloaded.persist_dirty_sections().any());
+        let _ = key;
     }
 
     #[tokio::test]

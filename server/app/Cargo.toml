@@ -74,8 +74,15 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 # Build the player UUID carried by the client's Login Start packet.
 uuid = { workspace = true }
-# Stages the built spawn-protect cdylib in an isolated /plugins directory.
+# Stages the built spawn-protect cdylib in an isolated /plugins directory, and
+# backs the world-persistence integration test with a throwaway redb directory.
 tempfile = { workspace = true }
+# Reopen the persisted redb world store directly and reconstruct chunks to assert
+# the persistence integration test's saved-block / zero-overlay properties.
+ferrumc-storage = { workspace = true }
+ferrumc-world = { workspace = true }
+ferrumc-math = { workspace = true }
+ferrumc-core = { workspace = true }
 
 [lints]
 workspace = true

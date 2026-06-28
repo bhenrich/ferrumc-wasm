@@ -23,6 +23,7 @@ use crate::connection::{build_status_response, handle_connection, ConnContext};
 use crate::driver;
 use crate::plugins::{build_play_policy, load_plugins};
 use crate::registries::ConfigRegistries;
+use crate::storage_worker::{run_storage_worker, StorageFlushRequest};
 use crate::world::build_world;
 
 /// Capacity of the bounded command channel from connections to the driver.
@@ -31,6 +32,15 @@ use crate::world::build_world;
 /// reaching it means a connection task is forced to await (backpressure) rather
 /// than the driver ever blocking.
 const COMMAND_CHANNEL_CAPACITY: usize = 1024;
+
+/// Capacity of the bounded storage-flush channel from the driver to the storage
+/// worker.
+///
+/// Each slot is one tick's (or one chunk-release's) batch of overlays + journal
+/// entries. Sized so the worker has ample headroom under normal edit volume; when
+/// it does fill, the driver's end-of-tick flush *defers* (keeps the chunks
+/// persist-dirty and retries next tick) rather than blocking the tick.
+const STORAGE_FLUSH_CHANNEL_CAPACITY: usize = 256;
 
 /// A bound, running server: a handle to its listening address and shutdown.
 ///
@@ -47,6 +57,10 @@ pub struct RunningServer {
     accept_task: JoinHandle<()>,
     /// The simulation/session driver task.
     driver_task: JoinHandle<()>,
+    /// The off-tick storage worker task that persists chunk overlays and the
+    /// mutation journal. Awaited *after* the driver on shutdown so the driver's
+    /// final flush is committed before the server returns.
+    storage_worker_task: JoinHandle<()>,
     /// The shared metric registry, fed by the driver and every connection task.
     /// Exposed for an on-demand metrics snapshot (see [`metrics`](Self::metrics)
     /// and [`dump_metrics`](Self::dump_metrics)).
@@ -90,7 +104,12 @@ impl RunningServer {
         // A send error means every receiver is already gone — also a clean stop.
         let _ = self.shutdown.send(true);
         self.accept_task.await?;
+        // The driver performs its final flush and then drops its storage sender;
+        // await it first so that send completes, then await the worker so it
+        // observes the closed channel, drains everything pending, and exits. This
+        // ordering is what makes a graceful shutdown durable.
         self.driver_task.await?;
+        self.storage_worker_task.await?;
         Ok(())
     }
 }
@@ -144,16 +163,30 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     let metrics = Arc::new(CounterRegistry::new());
     let clock = ServerClock::new();
 
+    // The driver emits persistence work onto this bounded channel; the storage
+    // worker owns the world store and commits it off the tick. The store is shared
+    // (the driver also reads it on the chunk load-or-generate path).
+    let store = setup.store;
+    let (storage_tx, storage_rx) =
+        mpsc::channel::<StorageFlushRequest>(STORAGE_FLUSH_CHANNEL_CAPACITY);
+    let storage_worker_task = tokio::spawn(run_storage_worker(
+        storage_rx,
+        Arc::clone(&store),
+        Arc::clone(&metrics),
+        config.tick_period(),
+    ));
+
     let driver_task = tokio::spawn(driver::run(
         router,
         setup.shard,
-        setup.store,
+        store,
         setup.generator,
         shard_rx,
         commands_rx,
         config.tick_period(),
         Arc::clone(&metrics),
         clock.clone(),
+        storage_tx,
         shutdown_rx.clone(),
     ));
 
@@ -193,6 +226,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         shutdown: shutdown_tx,
         accept_task,
         driver_task,
+        storage_worker_task,
         metrics,
     })
 }

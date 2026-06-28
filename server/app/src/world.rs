@@ -16,8 +16,10 @@ use ferrumc_math::{BlockPos, ChunkPos};
 use ferrumc_proto::generated::play::{ChunkDataAndLight, Heightmap, JoinGame, SpawnInfo};
 use ferrumc_proto::types::BlockPosition;
 use ferrumc_registry::dimension;
+use std::sync::Arc;
+
 use ferrumc_sim::{SimShard, SpawnChunkTickets};
-use ferrumc_storage::InMemoryStore;
+use ferrumc_storage::{InMemoryStore, RedbStore, WorldStore};
 use ferrumc_world::{
     encode_chunk_section_data, pack_motion_blocking_heightmap, Chunk, ChunkLightData,
     FlatWorldGenerator,
@@ -121,8 +123,10 @@ pub(crate) struct WorldSetup {
     pub(crate) shard: SimShard,
     /// The shared join payload replayed to connecting players.
     pub(crate) join_kit: std::sync::Arc<JoinKit>,
-    /// The chunk store the driver streams new chunks through.
-    pub(crate) store: InMemoryStore,
+    /// The chunk store the driver and storage worker share, behind the
+    /// [`WorldStore`] trait so the backend (durable redb or in-memory) is chosen
+    /// once at startup and the rest of the app stays backend-agnostic.
+    pub(crate) store: Arc<dyn WorldStore>,
     /// The terrain generator the driver uses on a store miss.
     pub(crate) generator: FlatWorldGenerator,
 }
@@ -149,14 +153,14 @@ pub(crate) async fn build_world(
     config: &AppConfig,
     shard_pos: ferrumc_math::ShardPos,
 ) -> anyhow::Result<WorldSetup> {
-    let store = InMemoryStore::new();
+    let store = open_store(config)?;
     let generator = FlatWorldGenerator::new();
     let spawn = SpawnChunkTickets::new(spawn_center_chunk(config), config.spawn_chunk_radius);
 
     let mut shard = SimShard::new(shard_pos);
     shard
         .loaded_chunks_mut()
-        .acquire_spawn(&store, &generator, &spawn)
+        .acquire_spawn(&*store, &generator, &spawn)
         .await?;
 
     let join_kit = std::sync::Arc::new(build_join_kit(config, &shard, &spawn)?);
@@ -166,6 +170,34 @@ pub(crate) async fn build_world(
         store,
         generator,
     })
+}
+
+/// Opens the world store the runtime will use, selected by
+/// [`AppConfig::world_dir`].
+///
+/// `Some(dir)` opens the durable redb-backed [`RedbStore`] at `dir/world.redb`
+/// (creating the directory if needed) — the runtime default. `None` constructs an
+/// [`InMemoryStore`], used by tests and any ephemeral run. Either way the concrete
+/// backend is erased to `Arc<dyn WorldStore>` so the driver and storage worker are
+/// backend-agnostic.
+///
+/// # Errors
+///
+/// Returns an error if the world directory cannot be created or the redb file
+/// cannot be opened.
+fn open_store(config: &AppConfig) -> anyhow::Result<Arc<dyn WorldStore>> {
+    match &config.world_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(|err| {
+                anyhow::anyhow!("creating world directory {}: {err}", dir.display())
+            })?;
+            let path = dir.join("world.redb");
+            let store = RedbStore::open(&path)
+                .map_err(|err| anyhow::anyhow!("opening world store {}: {err}", path.display()))?;
+            Ok(Arc::new(store))
+        }
+        None => Ok(Arc::new(InMemoryStore::new())),
+    }
 }
 
 /// Assembles the [`JoinKit`] from the shard's resident spawn chunks.

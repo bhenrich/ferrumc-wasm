@@ -24,7 +24,9 @@ use async_trait::async_trait;
 use ferrumc_core::{PlayerId, PluginId, Result};
 
 use crate::key::{ChunkKey, EntityKey, StorageKey};
-use crate::record::{ChunkRecord, EntityRecord, PlayerRecord};
+use crate::record::{
+    BlockMutationLogRecord, ChunkOverlayRecord, ChunkRecord, EntityRecord, PlayerRecord,
+};
 
 /// Maximum number of items accepted in a single batched save call.
 ///
@@ -60,6 +62,32 @@ pub trait WorldStore: Send + Sync {
     /// Removes the chunk at `key`. Returns `Ok(true)` if a chunk was present,
     /// `Ok(false)` if there was nothing to remove.
     async fn delete_chunk(&self, key: ChunkKey) -> Result<bool>;
+
+    /// Loads the overlay at `key`, or `Ok(None)` if no overlay is stored there.
+    ///
+    /// An overlay holds only the player-modified sections of a chunk; the caller
+    /// reconstructs the full chunk by regenerating the flat baseline and applying
+    /// the overlay over it (see [`ChunkOverlayRecord::apply_to_chunk`]).
+    async fn load_chunk_overlay(&self, key: ChunkKey) -> Result<Option<ChunkOverlayRecord>>;
+
+    /// Saves a batch of chunk overlays, overwriting any existing overlay at each
+    /// key. An untouched generated chunk has no persist-dirty sections and so is
+    /// never present in such a batch, keeping its storage footprint zero.
+    ///
+    /// Rejects a batch larger than [`MAX_SAVE_BATCH`] with
+    /// [`crate::StorageError::BatchTooLarge`] before storing anything.
+    async fn save_chunk_overlays(
+        &self,
+        overlays: Vec<(ChunkKey, ChunkOverlayRecord)>,
+    ) -> Result<()>;
+
+    /// Appends `mutations` to the block-mutation journal in order.
+    ///
+    /// The journal is append-only: entries carry a caller-assigned monotonic id
+    /// and are never overwritten, forming the foundation for future crash replay
+    /// and rollback. Rejects a batch larger than [`MAX_SAVE_BATCH`] with
+    /// [`crate::StorageError::BatchTooLarge`] before storing anything.
+    async fn append_block_mutations(&self, mutations: Vec<BlockMutationLogRecord>) -> Result<()>;
 
     /// Loads the entity at `key`, or `Ok(None)` if no entity is stored there.
     async fn load_entity(&self, key: EntityKey) -> Result<Option<EntityRecord>>;

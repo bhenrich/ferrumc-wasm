@@ -98,6 +98,16 @@ pub struct Chunk {
     sections: [ChunkSection; SECTION_COUNT],
     /// Sections modified since the last [`Chunk::clear_dirty`].
     dirty: DirtySections,
+    /// Sections changed by a *gameplay* mutation (not generation) since the last
+    /// [`Chunk::clear_persist_dirty`]. This is the persistence signal, kept
+    /// separate from [`Chunk::dirty`]: the flat generator marks `dirty` for every
+    /// section it fills, so `dirty` cannot distinguish a generated baseline from a
+    /// player edit. `persist_dirty` is marked **only** by the simulation layer
+    /// (via [`Chunk::mark_persist_dirty`]) on an accepted block edit, never by
+    /// [`Chunk::set_block`] or the generator, so a freshly generated and otherwise
+    /// untouched chunk has an empty `persist_dirty` set and therefore produces no
+    /// overlay record.
+    persist_dirty: DirtySections,
     /// Placeholder lighting; always `None` until the lighting milestone.
     light: Option<ChunkLight>,
     /// Placeholder block entities; always empty until the block-entity
@@ -114,6 +124,7 @@ impl Chunk {
             pos,
             sections: std::array::from_fn(|_| ChunkSection::new()),
             dirty: DirtySections::new(),
+            persist_dirty: DirtySections::new(),
             light: None,
             block_entities: Vec::new(),
         }
@@ -187,6 +198,44 @@ impl Chunk {
     /// the chunk's changes have been persisted or sent.
     pub fn clear_dirty(&mut self) {
         self.dirty.clear();
+    }
+
+    /// Returns the persist-dirty section set: the sections changed by a gameplay
+    /// mutation since construction or the last [`Chunk::clear_persist_dirty`].
+    ///
+    /// This is the persistence signal (see the `persist_dirty` field): unlike
+    /// [`Chunk::dirty_sections`], it is empty for a freshly generated chunk, so
+    /// only player-modified chunks ever produce an overlay record.
+    #[must_use]
+    pub const fn persist_dirty_sections(&self) -> &DirtySections {
+        &self.persist_dirty
+    }
+
+    /// Returns `true` if section `index` was changed by a gameplay mutation since
+    /// the last [`Chunk::clear_persist_dirty`].
+    #[must_use]
+    pub fn is_section_persist_dirty(&self, index: usize) -> bool {
+        self.persist_dirty.is_dirty(index)
+    }
+
+    /// Marks the section owning `pos` persist-dirty: a gameplay mutation changed a
+    /// block there and the chunk must be written to the overlay store.
+    ///
+    /// Called **only** by the simulation layer after an accepted block edit, never
+    /// by [`Chunk::set_block`] or the generator, so the world model stays
+    /// cause-agnostic and the generated baseline never marks itself for
+    /// persistence. A `pos` outside this chunk's column or buildable range is a
+    /// no-op (it resolves to no section), so the call can never panic.
+    pub fn mark_persist_dirty(&mut self, pos: BlockPos) {
+        if let Some((section_index, _)) = self.resolve(pos) {
+            self.persist_dirty.mark(section_index);
+        }
+    }
+
+    /// Clears every persist-dirty section. Called after the chunk's gameplay
+    /// edits have been captured into an overlay record for the storage layer.
+    pub fn clear_persist_dirty(&mut self) {
+        self.persist_dirty.clear();
     }
 
     /// Returns the chunk's lighting, or `None` while lighting is unimplemented
@@ -336,6 +385,46 @@ mod tests {
             .set_block(BlockPos::new(0, 0, 0), BlockStateId::AIR)
             .is_ok());
         assert!(!chunk.dirty_sections().any());
+    }
+
+    #[test]
+    fn set_block_does_not_mark_persist_dirty() {
+        // The persist-dirty signal must be driven only by the simulation layer,
+        // never by an ordinary write or the generator, so a generated/edited chunk
+        // is not persisted unless gameplay explicitly marks it.
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        let pos = BlockPos::new(3, 5, 9);
+        chunk
+            .set_block(pos, BlockStateId::new(1))
+            .expect("in range");
+        assert!(chunk.dirty_sections().any());
+        assert!(
+            !chunk.persist_dirty_sections().any(),
+            "set_block must not touch the persist-dirty mask"
+        );
+    }
+
+    #[test]
+    fn mark_persist_dirty_tracks_owning_section() {
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        let pos = BlockPos::new(3, 5, 9); // section ((5 - (-64)) / 16) == 4
+        chunk.mark_persist_dirty(pos);
+        assert!(chunk.persist_dirty_sections().any());
+        assert!(chunk.is_section_persist_dirty(4));
+        assert_eq!(chunk.persist_dirty_sections().count(), 1);
+        // The network dirty mask is independent and untouched by this call.
+        assert!(!chunk.dirty_sections().any());
+
+        chunk.clear_persist_dirty();
+        assert!(!chunk.persist_dirty_sections().any());
+    }
+
+    #[test]
+    fn mark_persist_dirty_out_of_range_is_noop() {
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        chunk.mark_persist_dirty(BlockPos::new(0, MIN_Y - 1, 0));
+        chunk.mark_persist_dirty(BlockPos::new(16, 0, 0)); // a different column
+        assert!(!chunk.persist_dirty_sections().any());
     }
 
     #[test]

@@ -101,6 +101,15 @@ pub struct AppConfig {
     /// Permission level granted to a player who is not an operator. Defaults to
     /// `0` (ordinary player), so the operator gate is meaningful.
     pub default_permission_level: u8,
+    /// Where the persistent world database lives.
+    ///
+    /// `Some(path)` selects the durable redb-backed [`WorldStore`] at that path
+    /// (the runtime default — `main` fills in a default directory when the config
+    /// omits one); `None` selects the in-memory store, which keeps tests
+    /// deterministic and file-free. The redb file is created under this directory.
+    ///
+    /// [`WorldStore`]: ferrumc_storage::WorldStore
+    pub world_dir: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -147,6 +156,10 @@ impl Default for AppConfig {
             keep_alive_interval: Duration::from_millis(DEFAULT_KEEP_ALIVE_INTERVAL_MS),
             ops: Vec::new(),
             default_permission_level: DEFAULT_PERMISSION_LEVEL,
+            // None = in-memory, keeping `AppConfig::default()` deterministic and
+            // file-free for tests. `main` substitutes a durable redb directory so
+            // the shipping server persists by default.
+            world_dir: None,
         }
     }
 }
@@ -188,6 +201,9 @@ struct RawConfig {
     ops: Option<Vec<String>>,
     /// Override for [`AppConfig::default_permission_level`].
     default_permission_level: Option<u8>,
+    /// Override for [`AppConfig::world_dir`], as a filesystem path. When set, the
+    /// durable redb store is used at this directory.
+    world_dir: Option<String>,
 }
 
 impl RawConfig {
@@ -244,6 +260,7 @@ impl RawConfig {
             default_permission_level: self
                 .default_permission_level
                 .unwrap_or(defaults.default_permission_level),
+            world_dir: self.world_dir.map(PathBuf::from).or(defaults.world_dir),
         })
     }
 }
@@ -276,6 +293,7 @@ mod tests {
             keep_alive_interval_ms = 250
             ops = ["Admin"]
             default_permission_level = 1
+            world_dir = "/srv/world"
         "#;
         let parsed = AppConfig::from_toml_str(toml).expect("valid config");
         assert_eq!(parsed.bind, "0.0.0.0:0".parse().unwrap());
@@ -293,6 +311,13 @@ mod tests {
         assert_eq!(parsed.keep_alive_interval, Duration::from_millis(250));
         assert_eq!(parsed.ops, vec!["Admin"]);
         assert_eq!(parsed.default_permission_level, 1);
+        assert_eq!(parsed.world_dir, Some(PathBuf::from("/srv/world")));
+    }
+
+    #[test]
+    fn world_dir_defaults_to_in_memory() {
+        let parsed = AppConfig::from_toml_str("").expect("empty config is valid");
+        assert_eq!(parsed.world_dir, None);
     }
 
     #[test]

@@ -15,7 +15,8 @@ pub use error::StorageError;
 pub use key::{ChunkKey, EntityKey, StorageKey, MAX_PLUGIN_KEY_LEN};
 pub use memory::InMemoryStore;
 pub use record::{
-    ChunkRecord, EntityRecord, PlayerRecord, MAX_ENTITY_DATA_LEN, MAX_PLAYER_DATA_LEN,
+    BlockMutationLogRecord, ChunkOverlayRecord, ChunkRecord, EntityRecord, MutationActor,
+    MutationLogCause, PlayerRecord, MAX_ENTITY_DATA_LEN, MAX_OVERLAY_SECTIONS, MAX_PLAYER_DATA_LEN,
 };
 pub use redb_store::RedbStore;
 pub use schema::SchemaVersion;

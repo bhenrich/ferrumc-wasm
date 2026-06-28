@@ -36,7 +36,9 @@ use redb::{Database, ReadableTable, TableDefinition};
 use crate::codec;
 use crate::error::StorageError;
 use crate::key::{ChunkKey, EntityKey, StorageKey};
-use crate::record::{ChunkRecord, EntityRecord, PlayerRecord};
+use crate::record::{
+    BlockMutationLogRecord, ChunkOverlayRecord, ChunkRecord, EntityRecord, PlayerRecord,
+};
 use crate::store::{PlayerStore, PluginStore, WorldStore, MAX_PLUGIN_VALUE_LEN, MAX_SAVE_BATCH};
 
 /// On-disk layout version recorded in the metadata table.
@@ -63,6 +65,19 @@ const PLAYER_TABLE: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("fe
 
 /// Plugin table: namespaced `(plugin, key)` bytes to the raw stored value.
 const PLUGIN_TABLE: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("ferrumc:plugin");
+
+/// Chunk-overlay table: [`ChunkKey`] bytes to [`ChunkOverlayRecord`] bytes.
+///
+/// Holds only the player-modified sections of a chunk; an untouched generated
+/// chunk never appears here, so generated terrain costs zero storage.
+const CHUNK_OVERLAY_TABLE: TableDefinition<'_, &[u8], &[u8]> =
+    TableDefinition::new("ferrumc:chunk_overlay");
+
+/// Mutation-journal table: monotonic entry id (`u64` big-endian bytes) to a
+/// [`BlockMutationLogRecord`]. Append-only; keyed by id so a forward scan yields
+/// the journal in order.
+const MUTATION_LOG_TABLE: TableDefinition<'_, &[u8], &[u8]> =
+    TableDefinition::new("ferrumc:mutation_log");
 
 /// Wraps any redb error as a classified [`ServerError`].
 fn backend_err<E: fmt::Display>(err: E) -> ServerError {
@@ -124,6 +139,12 @@ impl RedbStore {
         txn.open_table(ENTITY_TABLE).map_err(backend_err)?;
         txn.open_table(PLAYER_TABLE).map_err(backend_err)?;
         txn.open_table(PLUGIN_TABLE).map_err(backend_err)?;
+        // Overlay + journal tables are created lazily here too. They are purely
+        // additive to the v1 layout (no existing table changes shape), so opening
+        // a pre-existing v1 database simply gains two empty tables rather than
+        // tripping a format-version mismatch — see docs/adr/0007 for the rationale.
+        txn.open_table(CHUNK_OVERLAY_TABLE).map_err(backend_err)?;
+        txn.open_table(MUTATION_LOG_TABLE).map_err(backend_err)?;
         {
             let mut meta = txn.open_table(META_TABLE).map_err(backend_err)?;
             let existing = meta
@@ -224,6 +245,83 @@ impl WorldStore for RedbStore {
             };
             txn.commit().map_err(backend_err)?;
             Ok(removed)
+        });
+        join.await.map_err(join_err)?
+    }
+
+    async fn load_chunk_overlay(&self, key: ChunkKey) -> Result<Option<ChunkOverlayRecord>> {
+        let db = Arc::clone(&self.db);
+        let join = tokio::task::spawn_blocking(move || -> Result<Option<ChunkOverlayRecord>> {
+            let txn = db.begin_read().map_err(backend_err)?;
+            let table = txn.open_table(CHUNK_OVERLAY_TABLE).map_err(backend_err)?;
+            let key_bytes = codec::chunk_key_bytes(key);
+            let Some(guard) = table.get(key_bytes.as_slice()).map_err(backend_err)? else {
+                return Ok(None);
+            };
+            Ok(Some(codec::decode_chunk_overlay_record(guard.value())?))
+        });
+        join.await.map_err(join_err)?
+    }
+
+    async fn save_chunk_overlays(
+        &self,
+        overlays: Vec<(ChunkKey, ChunkOverlayRecord)>,
+    ) -> Result<()> {
+        if overlays.len() > MAX_SAVE_BATCH {
+            return Err(StorageError::BatchTooLarge {
+                len: overlays.len(),
+                max: MAX_SAVE_BATCH,
+            }
+            .into());
+        }
+        let db = Arc::clone(&self.db);
+        let join = tokio::task::spawn_blocking(move || -> Result<()> {
+            let txn = db.begin_write().map_err(backend_err)?;
+            {
+                // One atomic commit for the whole overlay batch, mirroring
+                // `save_chunks`.
+                let mut table = txn.open_table(CHUNK_OVERLAY_TABLE).map_err(backend_err)?;
+                for (key, record) in &overlays {
+                    let key_bytes = codec::chunk_key_bytes(*key);
+                    let value = codec::encode_chunk_overlay_record(record);
+                    table
+                        .insert(key_bytes.as_slice(), value.as_slice())
+                        .map_err(backend_err)?;
+                }
+            }
+            txn.commit().map_err(backend_err)?;
+            Ok(())
+        });
+        join.await.map_err(join_err)?
+    }
+
+    async fn append_block_mutations(&self, mutations: Vec<BlockMutationLogRecord>) -> Result<()> {
+        if mutations.len() > MAX_SAVE_BATCH {
+            return Err(StorageError::BatchTooLarge {
+                len: mutations.len(),
+                max: MAX_SAVE_BATCH,
+            }
+            .into());
+        }
+        let db = Arc::clone(&self.db);
+        let join = tokio::task::spawn_blocking(move || -> Result<()> {
+            let txn = db.begin_write().map_err(backend_err)?;
+            {
+                // Append-only: each entry is keyed by its monotonic id (big-endian
+                // so a forward scan returns the journal in order). The caller
+                // assigns ids monotonically, so this never overwrites an entry
+                // unless the same id is replayed, which is idempotent.
+                let mut table = txn.open_table(MUTATION_LOG_TABLE).map_err(backend_err)?;
+                for record in &mutations {
+                    let key_bytes = record.id().to_be_bytes();
+                    let value = codec::encode_mutation_log_record(record);
+                    table
+                        .insert(key_bytes.as_slice(), value.as_slice())
+                        .map_err(backend_err)?;
+                }
+            }
+            txn.commit().map_err(backend_err)?;
+            Ok(())
         });
         join.await.map_err(join_err)?
     }

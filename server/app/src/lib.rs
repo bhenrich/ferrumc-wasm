@@ -22,6 +22,7 @@ mod observe;
 mod plugins;
 mod registries;
 mod server;
+mod storage_worker;
 mod world;
 
 pub use command::build_command_tree;

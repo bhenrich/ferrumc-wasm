@@ -12,7 +12,7 @@ use ferrumc_world::BlockStateId;
 use crate::error::SimError;
 use crate::loaded::LoadedChunkMap;
 use crate::message::{GameInput, GameOutput};
-use crate::mutation::{MutationCause, MutationResult, RejectionReason};
+use crate::mutation::{MutationCause, MutationResult, PendingMutation, RejectionReason};
 
 /// Maximum absolute value allowed for any player position coordinate.
 ///
@@ -93,6 +93,16 @@ const DEFAULT_WORLD: WorldId = WorldId::new(0);
 /// Default dimension a shard owns chunks for when none is specified (the
 /// overworld, index `0`).
 const DEFAULT_DIMENSION: DimensionId = DimensionId::new(0);
+
+/// Upper bound on buffered [`PendingMutation`]s between drains.
+///
+/// The driver drains the buffer with [`SimShard::take_mutations`] every tick, and
+/// at most one mutation is produced per queued block-edit input, so the buffer
+/// never exceeds one inbox's worth in normal operation. This cap is a defensive
+/// ceiling for the pathological case where the driver stalls without draining:
+/// past it, new journal entries are dropped (the journal is best-effort and the
+/// authoritative overlay still persists the block) rather than growing unbounded.
+const MUTATION_LOG_CAP: usize = 4096;
 
 /// Per-player state owned exclusively by the shard.
 #[derive(Debug, Clone, Copy)]
@@ -180,6 +190,9 @@ pub struct SimShard {
     inbox_capacity: usize,
     players: BTreeMap<PlayerId, PlayerState>,
     chunks: LoadedChunkMap,
+    /// Accepted gameplay mutations buffered for the storage journal, drained each
+    /// tick by the driver. Bounded by [`MUTATION_LOG_CAP`].
+    mutation_log: Vec<PendingMutation>,
 }
 
 impl SimShard {
@@ -224,6 +237,7 @@ impl SimShard {
             inbox_capacity: capacity.get(),
             players: BTreeMap::new(),
             chunks: LoadedChunkMap::new(world, dimension),
+            mutation_log: Vec::new(),
         }
     }
 
@@ -261,6 +275,23 @@ impl SimShard {
     /// Returns the number of players currently present in the shard.
     pub fn player_count(&self) -> usize {
         self.players.len()
+    }
+
+    /// Returns `true` if any accepted gameplay mutations are buffered for the
+    /// storage journal.
+    pub fn has_pending_mutations(&self) -> bool {
+        !self.mutation_log.is_empty()
+    }
+
+    /// Drains and returns the buffered gameplay mutations for the storage
+    /// journal, leaving the buffer empty.
+    ///
+    /// Called by the driver each tick; it stamps each entry with the current tick
+    /// and a monotonic id when building the journal records, so the deterministic
+    /// shard never reads a clock or allocates an id itself.
+    #[must_use]
+    pub fn take_mutations(&mut self) -> Vec<PendingMutation> {
+        std::mem::take(&mut self.mutation_log)
     }
 
     /// Returns `true` if `player` is currently present in the shard.
@@ -495,9 +526,31 @@ impl SimShard {
         // only fail on an out-of-range `y`; treat that as a rejected edit rather
         // than mutating or panicking.
         match chunk.set_block(position, requested_state) {
-            Ok(()) => MutationResult::Applied {
-                new_state: requested_state,
-            },
+            Ok(()) => {
+                // A non-test gameplay edit drives the *persistence* signal: mark
+                // the owning section persist-dirty (so only player-modified chunks
+                // ever produce an overlay) and journal the mutation. A `Test` cause
+                // is excluded so deterministic test/replay edits never persist.
+                // `set_block` already marked the network dirty mask for everyone.
+                if !matches!(cause, MutationCause::Test) {
+                    chunk.mark_persist_dirty(position);
+                    // Defensive bound only: the driver drains this every tick, so
+                    // it is cleared long before reaching the cap. Past the cap a
+                    // journal entry is dropped (best-effort; the overlay still
+                    // persists the block) rather than growing the buffer unbounded.
+                    if self.mutation_log.len() < MUTATION_LOG_CAP {
+                        self.mutation_log.push(PendingMutation::new(
+                            cause,
+                            position,
+                            old_state,
+                            requested_state,
+                        ));
+                    }
+                }
+                MutationResult::Applied {
+                    new_state: requested_state,
+                }
+            }
             Err(_) => MutationResult::Rejected {
                 reason: RejectionReason::YOutOfBounds,
                 authoritative_state: old_state,
@@ -986,14 +1039,55 @@ mod tests {
                 cause: MutationCause::PlayerCreative { player: p },
             }]
         );
-        // The chunk reflects the break and the owning section is now dirty.
+        // The chunk reflects the break and the owning section is now dirty for
+        // BOTH the network mask and the persistence (persist-dirty) mask, since a
+        // PlayerCreative edit is a real gameplay mutation.
         assert_eq!(block_at(&s, target), Some(BlockStateId::AIR));
+        let resident = s.loaded_chunks().get(chunk).expect("resident");
+        assert!(resident.dirty_sections().any());
+        assert!(
+            resident.persist_dirty_sections().any(),
+            "a player break must mark the chunk persist-dirty"
+        );
+        // The edit is also journaled for the storage worker.
+        assert!(s.has_pending_mutations());
+    }
+
+    #[tokio::test]
+    async fn place_marks_persist_dirty_and_journals_the_mutation() {
+        let chunk = ChunkPos::new(0, 0);
+        let mut s = shard_with_loaded_chunk(chunk).await;
+        let p = player("placer");
+        let target = BlockPos::new(8, 65, 8);
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: spawn(),
+        })
+        .expect("room");
+        let _ = s.run_tick();
+        assert!(!s.has_pending_mutations());
+
+        s.enqueue(GameInput::BlockPlace {
+            player: p,
+            position: target,
+            sequence: 1,
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
         assert!(s
             .loaded_chunks()
             .get(chunk)
             .expect("resident")
-            .dirty_sections()
+            .persist_dirty_sections()
             .any());
+        let mutations = s.take_mutations();
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].position(), target);
+        assert_eq!(mutations[0].new_state(), DEFAULT_PLACED_STATE);
+        assert_eq!(mutations[0].old_state(), BlockStateId::AIR);
+        // Draining empties the buffer.
+        assert!(!s.has_pending_mutations());
     }
 
     #[tokio::test]

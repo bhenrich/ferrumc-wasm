@@ -15,7 +15,9 @@ use ferrumc_core::{PlayerId, PluginId, Result};
 
 use crate::error::StorageError;
 use crate::key::{ChunkKey, EntityKey, StorageKey};
-use crate::record::{ChunkRecord, EntityRecord, PlayerRecord};
+use crate::record::{
+    BlockMutationLogRecord, ChunkOverlayRecord, ChunkRecord, EntityRecord, PlayerRecord,
+};
 use crate::store::{PlayerStore, PluginStore, WorldStore, MAX_PLUGIN_VALUE_LEN, MAX_SAVE_BATCH};
 
 /// An in-memory store implementing [`WorldStore`], [`PlayerStore`], and
@@ -27,6 +29,11 @@ use crate::store::{PlayerStore, PluginStore, WorldStore, MAX_PLUGIN_VALUE_LEN, M
 #[derive(Debug, Default)]
 pub struct InMemoryStore {
     chunks: RwLock<HashMap<ChunkKey, ChunkRecord>>,
+    /// Per-chunk overlays (only player-modified sections), keyed independently of
+    /// the full-chunk map above.
+    overlays: RwLock<HashMap<ChunkKey, ChunkOverlayRecord>>,
+    /// The append-only block-mutation journal, in append order.
+    mutation_log: RwLock<Vec<BlockMutationLogRecord>>,
     entities: RwLock<HashMap<EntityKey, EntityRecord>>,
     players: RwLock<HashMap<PlayerId, PlayerRecord>>,
     /// Each plugin id maps to its own private key-value namespace. Nesting the
@@ -82,6 +89,45 @@ impl WorldStore for InMemoryStore {
     async fn delete_chunk(&self, key: ChunkKey) -> Result<bool> {
         let mut map = self.chunks.write().map_err(|_| poisoned("chunk"))?;
         Ok(map.remove(&key).is_some())
+    }
+
+    async fn load_chunk_overlay(&self, key: ChunkKey) -> Result<Option<ChunkOverlayRecord>> {
+        let map = self.overlays.read().map_err(|_| poisoned("overlay"))?;
+        Ok(map.get(&key).cloned())
+    }
+
+    async fn save_chunk_overlays(
+        &self,
+        overlays: Vec<(ChunkKey, ChunkOverlayRecord)>,
+    ) -> Result<()> {
+        if overlays.len() > MAX_SAVE_BATCH {
+            return Err(StorageError::BatchTooLarge {
+                len: overlays.len(),
+                max: MAX_SAVE_BATCH,
+            }
+            .into());
+        }
+        let mut map = self.overlays.write().map_err(|_| poisoned("overlay"))?;
+        for (key, record) in overlays {
+            map.insert(key, record);
+        }
+        Ok(())
+    }
+
+    async fn append_block_mutations(&self, mutations: Vec<BlockMutationLogRecord>) -> Result<()> {
+        if mutations.len() > MAX_SAVE_BATCH {
+            return Err(StorageError::BatchTooLarge {
+                len: mutations.len(),
+                max: MAX_SAVE_BATCH,
+            }
+            .into());
+        }
+        let mut log = self
+            .mutation_log
+            .write()
+            .map_err(|_| poisoned("mutation log"))?;
+        log.extend(mutations);
+        Ok(())
     }
 
     async fn load_entity(&self, key: EntityKey) -> Result<Option<EntityRecord>> {

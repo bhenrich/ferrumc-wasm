@@ -31,6 +31,10 @@ redb = { workspace = true }
 # async" rule. Only the `rt` capability is used; the raw redb handle never
 # escapes the crate.
 tokio = { workspace = true }
+# Reconstructs a `PlayerId` from its 16 raw UUID bytes when decoding a
+# `BlockMutationLogRecord` journal entry. Already a workspace dependency;
+# pure-Rust, no native deps.
+uuid = { workspace = true }
 
 [dev-dependencies]
 # Backs the `RedbStore` round-trip/persistence tests with a throwaway on-disk

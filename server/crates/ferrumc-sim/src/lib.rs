@@ -57,12 +57,12 @@ pub use error::{SimError, SimResult};
 pub use harness::{SimHarness, TickOutcome};
 pub use loaded::{
     load_or_generate, ChunkAcquired, ChunkProvenance, LoadedChunkMap, TicketRelease,
-    CHUNK_SCHEMA_VERSION,
+    CHUNK_SCHEMA_VERSION, OVERLAY_SCHEMA_VERSION,
 };
 pub use message::{GameInput, GameOutput};
 // Only the cause is public: the structured `MutationResult` stays internal to
 // the shard so the app never confuses it with `ferrumc_observability::MutationResult`.
-pub use mutation::MutationCause;
+pub use mutation::{MutationCause, PendingMutation};
 pub use shard::SimShard;
 
 /// Re-exported from [`ferrumc_world`] so callers can name the block-state ids
