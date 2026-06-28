@@ -19,6 +19,7 @@
 //! [`SnapshotPublisher`]: ferrumc_observability::SnapshotPublisher
 
 mod api;
+mod prometheus;
 mod server;
 
 use std::fmt;

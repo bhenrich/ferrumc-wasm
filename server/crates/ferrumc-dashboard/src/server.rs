@@ -1,12 +1,12 @@
 //! The axum router, the read-only method guard, and the static SPA service.
 //!
 //! The router carries the [`SnapshotPublisher`] as shared state and exposes the
-//! two read-only data endpoints ([`api::snapshot`], [`api::events`]) plus a
-//! [`ServeDir`] static service for the built single-page app. A
-//! [`from_fn`](axum::middleware::from_fn) layer rejects any method other than
-//! `GET`/`HEAD` with `405 Method Not Allowed`, so the dashboard stays read-only by
-//! construction: there is no route that mutates server state, and non-read methods
-//! never reach a handler or the file service.
+//! read-only data endpoints ([`api::snapshot`], [`api::events`], and the Prometheus
+//! [`prometheus::metrics`] exporter) plus a [`ServeDir`] static service for the
+//! built single-page app. A [`from_fn`](axum::middleware::from_fn) layer rejects
+//! any method other than `GET`/`HEAD` with `405 Method Not Allowed`, so the
+//! dashboard stays read-only by construction: there is no route that mutates server
+//! state, and non-read methods never reach a handler or the file service.
 
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
@@ -17,7 +17,7 @@ use axum::Router;
 use ferrumc_observability::SnapshotPublisher;
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::api;
+use crate::{api, prometheus};
 
 /// Absolute path to the committed SPA build output (`dist/`), resolved at compile
 /// time from the crate root so the binary serves the right directory regardless of
@@ -29,6 +29,7 @@ const DIST_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dist");
 /// Routes:
 /// - `GET /api/snapshot` — one-shot JSON snapshot.
 /// - `GET /events` — Server-Sent Events live snapshot stream.
+/// - `GET /metrics` — the latest snapshot in Prometheus text exposition format.
 /// - everything else — the static SPA from `dist/`, with `index.html` as the
 ///   not-found fallback so client-side navigation survives a hard refresh.
 ///
@@ -44,6 +45,7 @@ pub fn router(snapshots: SnapshotPublisher) -> Router {
     Router::new()
         .route("/api/snapshot", get(api::snapshot))
         .route("/events", get(api::events))
+        .route("/metrics", get(prometheus::metrics))
         .fallback_service(spa)
         .layer(middleware::from_fn(reject_non_get))
         .with_state(snapshots)
@@ -147,6 +149,53 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert!(content_type.starts_with("text/event-stream"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_returns_prometheus_text() {
+        let app = router(publisher_with_player());
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        // The exposition `Content-Type` (with the `version=0.0.4` parameter) is what
+        // makes Prometheus pick the text parser.
+        assert!(content_type.starts_with("text/plain"));
+        assert!(content_type.contains("version=0.0.4"));
+        let body = body_string(response).await;
+        assert!(body.contains("# HELP ferrumc_tps"));
+        assert!(body.contains("# TYPE ferrumc_players_online gauge"));
+        assert!(body.contains("ferrumc_players_online 1\n"));
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_rejects_post_with_405() {
+        // `/metrics` rides the same read-only method guard as every other route.
+        let app = router(publisher_with_player());
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::POST)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]
