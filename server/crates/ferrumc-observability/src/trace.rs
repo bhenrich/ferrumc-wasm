@@ -9,6 +9,7 @@
 use ferrumc_core::Tick;
 use serde::Serialize;
 
+use crate::net_telemetry::PacketTally;
 use crate::ring::RingBuffer;
 
 /// Capacity of the inbound trace ring (the acceptance number).
@@ -137,6 +138,17 @@ pub struct SessionDebug {
     outbound: RingBuffer<PacketTrace, OUTBOUND_CAPACITY>,
     /// The last sampled outbound queue depth, surfaced in the dump.
     outbound_queue_len: usize,
+    /// Cumulative count of inbound traces recorded (the connection's
+    /// frames-decoded total, unbounded by the ring's eviction window).
+    inbound_frames: u64,
+    /// Cumulative sum of inbound trace sizes in bytes (the connection's
+    /// bytes-in total; `0`-sized login traces contribute nothing).
+    inbound_bytes: u64,
+    /// Bounded `(state, packet)` frequency tally of every inbound trace, for the
+    /// server-wide live summary (distinct from the eviction-bounded ring above).
+    inbound_tally: PacketTally,
+    /// Bounded `(state, packet)` frequency tally of every outbound trace.
+    outbound_tally: PacketTally,
 }
 
 impl SessionDebug {
@@ -148,6 +160,10 @@ impl SessionDebug {
             inbound: RingBuffer::new(),
             outbound: RingBuffer::new(),
             outbound_queue_len: 0,
+            inbound_frames: 0,
+            inbound_bytes: 0,
+            inbound_tally: PacketTally::new(),
+            outbound_tally: PacketTally::new(),
         }
     }
 
@@ -158,13 +174,53 @@ impl SessionDebug {
     }
 
     /// Records one inbound trace, evicting the oldest if the ring is full.
+    ///
+    /// Also folds the trace into the cumulative inbound frame/byte counters and
+    /// the inbound frequency tally (both unbounded by the ring's eviction
+    /// window), so a connection's live network telemetry reflects its whole
+    /// lifetime, not just the last [`INBOUND_CAPACITY`] packets.
     pub fn record_inbound(&mut self, trace: PacketTrace) {
+        self.inbound_frames = self.inbound_frames.saturating_add(1);
+        self.inbound_bytes = self.inbound_bytes.saturating_add(trace.size as u64);
+        self.inbound_tally.record(trace.state, trace.packet_name);
         self.inbound.push(trace);
     }
 
-    /// Records one outbound trace, evicting the oldest if the ring is full.
+    /// Records one outbound trace, evicting the oldest if the ring is full, and
+    /// folds it into the outbound frequency tally for the live summary.
     pub fn record_outbound(&mut self, trace: PacketTrace) {
+        self.outbound_tally.record(trace.state, trace.packet_name);
         self.outbound.push(trace);
+    }
+
+    /// The session label (peer address, or player name once login completes).
+    #[must_use]
+    pub fn session(&self) -> &str {
+        &self.session
+    }
+
+    /// Cumulative inbound frames recorded (the connection's frames-decoded total).
+    #[must_use]
+    pub fn inbound_frames(&self) -> u64 {
+        self.inbound_frames
+    }
+
+    /// Cumulative inbound bytes recorded (the connection's bytes-in total).
+    #[must_use]
+    pub fn inbound_bytes(&self) -> u64 {
+        self.inbound_bytes
+    }
+
+    /// The inbound `(state, packet)` frequency tally for the live summary.
+    #[must_use]
+    pub fn inbound_tally(&self) -> &PacketTally {
+        &self.inbound_tally
+    }
+
+    /// The outbound `(state, packet)` frequency tally for the live summary.
+    #[must_use]
+    pub fn outbound_tally(&self) -> &PacketTally {
+        &self.outbound_tally
     }
 
     /// Samples the current outbound queue depth for the next dump.

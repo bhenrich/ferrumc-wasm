@@ -23,6 +23,7 @@
 //!   for the localhost dashboard to render.
 
 mod metrics;
+mod net_telemetry;
 mod ring;
 mod snapshot;
 mod trace;
@@ -31,6 +32,10 @@ pub use metrics::{
     BlockMutationResults, BlockMutationTotals, CounterRegistry, DecodeErrorEntry,
     DecodeErrorTotals, MetricsSnapshot, MutationKind, MutationResult, QueueLenGauge, ServerClock,
     StorageFlushStats, TickMetrics, TickMsEntry,
+};
+pub use net_telemetry::{
+    ConnNetTelemetry, NetTelemetryHub, NetTelemetryParts, PacketTally, PlayerNetCounters,
+    DEFAULT_TOP_N, HUB_CAPACITY, TALLY_CAPACITY,
 };
 pub use ring::RingBuffer;
 pub use snapshot::{

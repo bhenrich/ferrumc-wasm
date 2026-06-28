@@ -276,7 +276,7 @@ pub struct ServerSnapshotParts {
 }
 
 /// Maps the observability-local [`PacketState`] onto its lowercase label.
-fn packet_state_label(state: PacketState) -> String {
+pub(crate) fn packet_state_label(state: PacketState) -> String {
     match state {
         PacketState::Handshaking => "handshaking",
         PacketState::Status => "status",
