@@ -160,7 +160,13 @@ pub(super) async fn enter_play(
         &inventory,
     )
     .await?;
-    pump_serverbound(
+    // Drain the frames already buffered before the loop. Any error here — a
+    // serverbound budget kick on a flood pipelined during the login handoff, or a
+    // decode/socket failure — is deferred to a break inside the loop rather than
+    // returned via `?`, so this connection still runs the shared leave-save and
+    // chunk-ticket release teardown below instead of leaking the join's tickets.
+    let mut deferred_break: Option<anyhow::Error> = None;
+    if let Err(err) = pump_serverbound(
         &mut decoder,
         &compression,
         ctx,
@@ -175,9 +181,16 @@ pub(super) async fn enter_play(
         &mut player_pitch,
         &mut debug,
     )
-    .await?;
-    flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await?;
-    observe_queue_len(&mut debug, ctx, &writer, budget.over_budget());
+    .await
+    {
+        deferred_break = Some(err);
+    }
+    if deferred_break.is_none() {
+        match flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
+            Ok(()) => observe_queue_len(&mut debug, ctx, &writer, budget.over_budget()),
+            Err(err) => deferred_break = Some(err),
+        }
+    }
 
     // Keep Alive: a real client disconnects if it hears nothing for 20 s. Ping on
     // an interval; the client echoes with a serverbound Keep Alive the play pump
@@ -202,6 +215,13 @@ pub(super) async fn enter_play(
 
     let mut read_buf = [0u8; READ_CHUNK];
     let result = loop {
+        // A deferred failure from the pre-loop drain (e.g. a budget kick on a
+        // flood pipelined during the login handoff) breaks here so the teardown
+        // below still runs — the same save + ticket-release path a steady-state
+        // disconnect takes.
+        if let Some(err) = deferred_break.take() {
+            break Err(err);
+        }
         tokio::select! {
             biased;
             _ = shutdown.changed() => break Ok(()),
