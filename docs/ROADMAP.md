@@ -13,12 +13,12 @@
 
 These are the near-term items that unblock the most player-visible parity, ordered.
 
-- [ ] **Fix spawn-area edits lost on rejoin.** Rebuild (or re-stream from store) the spawn-chunk JoinKit per connection instead of freezing it at startup. Confirmed bug; biggest "my builds vanished" surprise.
-- [~] **Block state on placement: facing / axis / half / waterlogging.** Use the UseItemOn cursor + face to derive the real state instead of the item's default state. Needs a block-state property model in `ferrumc-world`.
-- [ ] **Held-item & armor equipment visibility.** Add the SetEquipment packet + sim plumbing so other players see your hand/armor.
-- [ ] **Remote player rotation & head yaw.** Thread yaw/pitch/head through the sim and send the move-and-rotate / head-rotation packets (already in the enum, currently never sent).
+- [x] **Spawn-area edits survive rejoin (fixed).** Spawn chunks are streamed live from the resident chunk per join (not a frozen startup JoinKit), and unload flushes are acked before ticket release.
+- [x] **Block state on placement: facing / axis / half.** UseItemOn cursor + face + yaw derive the real state via the `ferrumc-placement` engine + `ferrumc-registry` block-state catalog (logs/slabs/stairs/torches/fences). Waterlogging still out of scope.
+- [x] **Held-item equipment visibility.** SetEquipment sent on enter-view + hotbar change (armor/offhand still TODO).
+- [x] **Remote player rotation & head yaw.** Serverbound yaw/pitch threaded through the sim; move-and-rotate / head-rotation packets now broadcast.
 - [ ] **Player state persistence.** Wire the existing redb `PlayerStore` into join/leave/shutdown for position, game mode, and inventory.
-- [ ] **Fix sample-plugin Replace.** Point block-rules at real block-state ids (glass 562 → tinted-glass 23377) so the Replace path is actually exercised at runtime.
+- [x] **Sample-plugin Replace (fixed).** block-rules uses real block-state ids (glass 562 → tinted-glass 23377); the Replace path is exercised at runtime.
 - [ ] **Wire the serverbound packet budget.** The 300 fps token bucket (`PlayReader`/`PacketBudget`) exists but is never constructed; the play loop is currently unbudgeted.
 - [ ] **Block entities (chests/signs).** First container/block-entity type — prerequisite for survival storage and a lot of gameplay.
 
@@ -125,7 +125,7 @@ These are the near-term items that unblock the most player-visible parity, order
 - [x] redb default backend
 - [x] Player-edited chunk overlays + mutation journal (per-tick / pre-unload / shutdown flush)
 - [x] Edits survive restart
-- [~] Edits survive rejoin (broken for spawn-area chunks; frozen JoinKit)
+- [x] Edits survive rejoin (live spawn-chunk fetch per join + acked unload flush)
 - [ ] Player state persistence (position / game mode / inventory)
 - [ ] Anvil import/export (skeleton crate only; not wired)
 - [ ] Mutation-journal replay/recovery (journal is currently write-only)
