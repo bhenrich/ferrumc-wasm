@@ -16,6 +16,9 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# Property-based malformed-input testing: assert the bounded primitives never
+# panic, never overread, and never allocate from an attacker-declared length.
+proptest = { workspace = true }
 
 [lints]
 workspace = true
