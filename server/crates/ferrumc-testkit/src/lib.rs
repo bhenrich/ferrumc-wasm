@@ -14,6 +14,10 @@
 //!   hex fixtures and compare byte runs with a readable [`HexDiff`].
 //! - [`assert_packet_roundtrip`]: encode a `ferrumc-proto` packet, decode it
 //!   back, and confirm the value (and wire bytes) survive the trip.
+//! - [`assert_wire_frame`] / [`assert_frame_length`] / [`frame`]: the strict
+//!   frame oracle — assert an encoded packet forms a well-shaped
+//!   `[VarInt len][VarInt id][body]` frame (correct length prefix, expected id,
+//!   no trailing bytes) and optionally matches a committed golden fixture.
 //! - [`PacketScript`] / [`ScriptEntry`] / [`Replay`]: an ordered, directional
 //!   record of wire bytes with a record/replay API and a serializable text
 //!   transcript ([`PacketScript::to_transcript`] /
@@ -24,10 +28,12 @@
 
 mod client;
 mod hex;
+mod oracle;
 mod roundtrip;
 mod transcript;
 
 pub use client::ScriptedClient;
 pub use hex::{hex_diff, parse_hex, to_hex, HexDiff, HexError, HexFixture};
+pub use oracle::{assert_frame_length, assert_wire_frame, frame, FrameOracleError};
 pub use roundtrip::{assert_packet_roundtrip, RoundtripError};
 pub use transcript::{PacketScript, Replay, ScriptEntry, ScriptMismatch, TranscriptError};

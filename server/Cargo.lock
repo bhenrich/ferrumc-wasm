@@ -612,8 +612,10 @@ version = "0.2.0-dev"
 dependencies = [
  "bytes",
  "ferrumc-codec",
+ "ferrumc-nbt",
  "ferrumc-proto",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

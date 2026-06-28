@@ -19,6 +19,11 @@ ferrumc-codec.workspace = true
 ferrumc-proto.workspace = true
 
 [dev-dependencies]
+# Golden fixtures construct UUID-bearing packets (LoginSuccess, PlayerInfoUpdate,
+# RemovePlayerInfo) by literal bytes.
+uuid.workspace = true
+# SystemChat's golden builds its network-NBT `content` via the NBT value tree.
+ferrumc-nbt.workspace = true
 
 [lints]
 workspace = true
