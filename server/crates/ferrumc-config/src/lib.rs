@@ -9,14 +9,17 @@
 //!   form [`ResolvedAccess`]): the per-IP connection limit, the ban list, and the
 //!   optional whitelist that gate a public-facing server;
 //! - the serverbound [`PacketBudgetConfig`]: the token-bucket sustained rate and
-//!   burst that throttle a flooding client.
+//!   burst that throttle a flooding client;
+//! - the [`WorldConfig`]: where the world's initial terrain comes from (the
+//!   built-in flat world by default, or a vanilla Anvil map imported at startup).
 //!
 //! The larger [`AppConfig`](../ferrumc_app/struct.AppConfig.html) still lives in
-//! the application crate and embeds these as its `[access]` and `[budget]`
-//! sections.
+//! the application crate and embeds these as its `[access]`, `[budget]`, and
+//! `[world]` sections.
 
 mod access;
 mod budget;
+mod world;
 
 pub use access::{
     AccessConfig, AccessConfigError, DenyReason, LoginDecision, ResolvedAccess,
@@ -25,3 +28,4 @@ pub use access::{
 pub use budget::{
     PacketBudgetConfig, PacketBudgetConfigError, DEFAULT_PLAY_FRAME_BURST, DEFAULT_PLAY_FRAME_RATE,
 };
+pub use world::WorldConfig;
