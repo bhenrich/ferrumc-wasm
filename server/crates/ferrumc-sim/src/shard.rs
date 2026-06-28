@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 
 use ferrumc_core::{DimensionId, GameMode, PlayerId, WorldId};
-use ferrumc_math::{BlockPos, Direction, ShardPos, Vec3};
+use ferrumc_math::{BlockPos, Cuboid, Direction, ShardPos, Vec3};
 use ferrumc_placement::{
     compute_fence_connection_state, compute_placement, NeighborQuery, PlacementContext,
     PlacementResult, PlacementRule,
@@ -18,6 +18,7 @@ use crate::error::SimError;
 use crate::loaded::LoadedChunkMap;
 use crate::message::{GameInput, GameOutput};
 use crate::mutation::{MutationCause, MutationResult, PendingMutation, RejectionReason};
+use crate::region::{RegionLimits, RegionOp};
 
 /// Maximum absolute value allowed for any player position coordinate.
 ///
@@ -107,6 +108,18 @@ const DEFAULT_DIMENSION: DimensionId = DimensionId::new(0);
 /// past it, new journal entries are dropped (the journal is best-effort and the
 /// authoritative overlay still persists the block) rather than growing unbounded.
 const MUTATION_LOG_CAP: usize = 4096;
+
+/// The prior block-states a single region edit overwrote, captured so the edit
+/// can be undone.
+///
+/// Each pair is `(position, state_before_the_edit)`. Restoring re-applies every
+/// state through the same block-edit funnel. Bounded indirectly: the edit that
+/// produced it could touch at most [`RegionLimits::max_volume`] cells, and a
+/// player keeps at most [`RegionLimits::max_undo_entries`] of these.
+#[derive(Debug, Clone)]
+struct RegionUndoEntry {
+    blocks: Vec<(BlockPos, BlockStateId)>,
+}
 
 /// Per-player state owned exclusively by the shard.
 #[derive(Debug, Clone, Copy)]
@@ -220,6 +233,14 @@ pub struct SimShard {
     /// Accepted gameplay mutations buffered for the storage journal, drained each
     /// tick by the driver. Bounded by [`MUTATION_LOG_CAP`].
     mutation_log: Vec<PendingMutation>,
+    /// Per-player history of region edits (newest at the back), each recording the
+    /// prior states it overwrote so `/undo` can restore them. Bounded per player by
+    /// [`RegionLimits::max_undo_entries`]; an entry is dropped when its player
+    /// leaves the shard.
+    undo_history: BTreeMap<PlayerId, VecDeque<RegionUndoEntry>>,
+    /// Caps bounding region edits and the per-player undo history. Set from
+    /// configuration by the app via [`set_region_limits`](SimShard::set_region_limits).
+    region_limits: RegionLimits,
 }
 
 impl SimShard {
@@ -265,7 +286,17 @@ impl SimShard {
             players: BTreeMap::new(),
             chunks: LoadedChunkMap::new(world, dimension),
             mutation_log: Vec::new(),
+            undo_history: BTreeMap::new(),
+            region_limits: RegionLimits::default(),
         }
+    }
+
+    /// Replaces the region-edit caps with operator-configured `limits`.
+    ///
+    /// Called once at startup by the app from configuration; tests rely on the
+    /// [`RegionLimits::default`] a freshly built shard carries.
+    pub fn set_region_limits(&mut self, limits: RegionLimits) {
+        self.region_limits = limits;
     }
 
     /// Returns the position of this shard in shard coordinates.
@@ -441,6 +472,9 @@ impl SimShard {
                     // point moving or correcting a player who is gone.
                     pending_moves.remove(&player);
                     corrections.remove(&player);
+                    // Drop the player's undo history so it cannot leak past their
+                    // session (it is keyed by player and bounded only per-player).
+                    self.undo_history.remove(&player);
                     if self.players.remove(&player).is_some() {
                         outputs.push(GameOutput::PlayerDespawned { player });
                     }
@@ -544,6 +578,12 @@ impl SimShard {
                         requested_state,
                         authoritative_state: self.authoritative_state(position),
                     });
+                }
+                GameInput::RegionEdit { player, region, op } => {
+                    self.apply_region_edit(&mut outputs, player, region, op);
+                }
+                GameInput::RegionUndo { player } => {
+                    self.apply_region_undo(&mut outputs, player);
                 }
             }
         }
@@ -697,6 +737,125 @@ impl SimShard {
                 reason: RejectionReason::YOutOfBounds,
                 authoritative_state: old_state,
             },
+        }
+    }
+
+    /// Applies a region (cuboid) block edit through the single block-edit funnel,
+    /// capturing the prior states it overwrites into `player`'s bounded undo
+    /// history.
+    ///
+    /// The whole cuboid is applied at this one tick boundary under
+    /// [`MutationCause::Command`], so every changed cell persists via the overlay
+    /// and broadcasts a viewer `BlockUpdate` (no ack — a command edit is
+    /// authoritative, not a client prediction). A cell is skipped (no write, no
+    /// broadcast, no undo entry) when its chunk is not resident in this shard
+    /// (cross-shard edits are out of scope this milestone), when a
+    /// [`RegionOp::Replace`] does not match, or when the new state already equals
+    /// the current one.
+    ///
+    /// The cuboid's volume is re-checked against [`RegionLimits::max_volume`]: an
+    /// over-cap region is rejected wholesale (the command layer already reported a
+    /// user-facing error; this guards every other caller from stalling the tick).
+    fn apply_region_edit(
+        &mut self,
+        outputs: &mut Vec<GameOutput>,
+        player: PlayerId,
+        region: Cuboid,
+        op: RegionOp,
+    ) {
+        // Defense in depth: never iterate a region larger than the configured cap.
+        if region.volume() > self.region_limits.max_volume {
+            return;
+        }
+        let cause = MutationCause::Command;
+        let mut prior: Vec<(BlockPos, BlockStateId)> = Vec::new();
+        for position in region.iter() {
+            // Only mutate cells in resident chunks; a cell whose chunk is absent is
+            // skipped (no client to heal under an authoritative command edit). The
+            // immutable borrow ends before `apply_block_edit` re-borrows mutably.
+            let Some(current) = self
+                .chunks
+                .get(position.to_chunk_pos())
+                .and_then(|chunk| chunk.get_block(position))
+            else {
+                continue;
+            };
+            let new_state = match op {
+                RegionOp::Fill { state } => state,
+                RegionOp::Replace { from, to } => {
+                    if current != from {
+                        continue;
+                    }
+                    to
+                }
+            };
+            // A write that changes nothing is skipped, so `/undo` restores only
+            // genuinely-changed cells and no redundant `BlockUpdate` is broadcast.
+            if new_state == current {
+                continue;
+            }
+            let result = self.apply_block_edit(cause, position, new_state);
+            // Record the prior state only for cells that actually changed, so undo
+            // restores exactly what the edit overwrote.
+            if matches!(result, MutationResult::Applied { .. }) {
+                prior.push((position, current));
+            }
+            if let Some(output) = block_change_output(cause, 0, position, new_state, result) {
+                outputs.push(output);
+            }
+        }
+        if !prior.is_empty() {
+            self.push_undo(player, RegionUndoEntry { blocks: prior });
+        }
+    }
+
+    /// Pushes a region edit's captured prior states onto `player`'s undo history,
+    /// evicting the oldest entry once [`RegionLimits::max_undo_entries`] is
+    /// exceeded. A cap of zero disables history entirely.
+    fn push_undo(&mut self, player: PlayerId, entry: RegionUndoEntry) {
+        let cap = self.region_limits.max_undo_entries;
+        if cap == 0 {
+            return;
+        }
+        let stack = self.undo_history.entry(player).or_default();
+        stack.push_back(entry);
+        // Evict oldest-first until within the cap (a single push can exceed it by
+        // at most one, but the loop is robust if the cap is lowered at runtime).
+        while stack.len() > cap {
+            stack.pop_front();
+        }
+    }
+
+    /// Undoes `player`'s most recent region edit, restoring every captured prior
+    /// state through the same funnel (so the restoration also persists and
+    /// broadcasts a viewer `BlockUpdate`).
+    ///
+    /// A no-op if the player has no recorded edits. The undo is *not* itself
+    /// recorded, so repeated calls walk back through successive edits.
+    fn apply_region_undo(&mut self, outputs: &mut Vec<GameOutput>, player: PlayerId) {
+        // Pop the newest entry, ending the mutable borrow on `undo_history` before
+        // the funnel re-borrows `self` to apply the restores.
+        let entry = match self.undo_history.get_mut(&player) {
+            Some(stack) => stack.pop_back(),
+            None => None,
+        };
+        let Some(entry) = entry else {
+            return;
+        };
+        // Drop an emptied stack so the map does not retain idle players.
+        if self
+            .undo_history
+            .get(&player)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.undo_history.remove(&player);
+        }
+        let cause = MutationCause::Command;
+        for (position, state) in entry.blocks {
+            let result = self.apply_block_edit(cause, position, state);
+            if let Some(output) = block_change_output(cause, 0, position, state, result) {
+                outputs.push(output);
+            }
         }
     }
 
@@ -2066,5 +2225,173 @@ mod tests {
             sequence: 0,
             cause: MutationCause::Command,
         }));
+    }
+
+    /// Enqueues and applies a single region edit, returning the tick's outputs.
+    fn region_edit(
+        s: &mut SimShard,
+        player: PlayerId,
+        a: BlockPos,
+        b: BlockPos,
+        op: RegionOp,
+    ) -> Vec<GameOutput> {
+        s.enqueue(GameInput::RegionEdit {
+            player,
+            region: Cuboid::new(a, b),
+            op,
+        })
+        .expect("room");
+        s.run_tick()
+    }
+
+    /// Enqueues and applies a single region undo, returning the tick's outputs.
+    fn region_undo(s: &mut SimShard, player: PlayerId) -> Vec<GameOutput> {
+        s.enqueue(GameInput::RegionUndo { player }).expect("room");
+        s.run_tick()
+    }
+
+    #[tokio::test]
+    async fn region_fill_sets_every_cell_and_broadcasts_under_command_cause() {
+        let mut s = shard_with_loaded_chunk(ChunkPos::new(0, 0)).await;
+        let p = player("builder");
+        let stone = BlockStateId::new(1);
+        // A 3x2x3 = 18-cell cuboid of air just above the flat surface.
+        let (a, b) = (BlockPos::new(2, 64, 2), BlockPos::new(4, 65, 4));
+        let outputs = region_edit(&mut s, p, a, b, RegionOp::Fill { state: stone });
+        // Every cell changed air -> stone: one broadcast BlockChanged per cell, all
+        // under the non-acking Command cause (sequence 0).
+        assert_eq!(outputs.len(), 18);
+        assert!(outputs.iter().all(|o| matches!(
+            o,
+            GameOutput::BlockChanged { state, sequence: 0, cause: MutationCause::Command, .. }
+                if *state == stone
+        )));
+        // Spot-check several positions, including both corners.
+        assert_eq!(block_at(&s, a), Some(stone));
+        assert_eq!(block_at(&s, b), Some(stone));
+        assert_eq!(block_at(&s, BlockPos::new(3, 64, 3)), Some(stone));
+        // The edit persisted (overlay marked) and journaled.
+        assert!(s.has_pending_mutations());
+    }
+
+    #[tokio::test]
+    async fn region_replace_changes_only_matching_cells() {
+        let mut s = shard_with_loaded_chunk(ChunkPos::new(0, 0)).await;
+        let p = player("editor");
+        let stone = BlockStateId::new(1);
+        let dirt = BlockStateId::new(10);
+        let glass = BlockStateId::new(562);
+        let (a, b) = (BlockPos::new(2, 64, 2), BlockPos::new(4, 65, 4)); // 18 cells
+        let _ = region_edit(&mut s, p, a, b, RegionOp::Fill { state: stone });
+        // Punch one cell to glass so it is a non-match for the replace below.
+        let odd = BlockPos::new(3, 64, 3);
+        let _ = region_edit(&mut s, p, odd, odd, RegionOp::Fill { state: glass });
+        assert_eq!(block_at(&s, odd), Some(glass));
+
+        // Replace stone -> dirt over the whole region: the 17 stone cells change,
+        // the single glass cell is left untouched.
+        let outputs = region_edit(
+            &mut s,
+            p,
+            a,
+            b,
+            RegionOp::Replace {
+                from: stone,
+                to: dirt,
+            },
+        );
+        assert_eq!(outputs.len(), 17, "only the 17 stone cells change");
+        assert_eq!(block_at(&s, odd), Some(glass), "a non-match is untouched");
+        assert_eq!(block_at(&s, a), Some(dirt));
+        assert_eq!(block_at(&s, b), Some(dirt));
+    }
+
+    #[tokio::test]
+    async fn region_undo_restores_the_prior_state() {
+        let mut s = shard_with_loaded_chunk(ChunkPos::new(0, 0)).await;
+        let p = player("undoer");
+        let stone = BlockStateId::new(1);
+        let (a, b) = (BlockPos::new(2, 64, 2), BlockPos::new(4, 65, 4));
+        // Capture originals (all air above the surface).
+        let sample = [a, b, BlockPos::new(3, 65, 3)];
+        let before: Vec<_> = sample.iter().map(|&pos| block_at(&s, pos)).collect();
+        assert!(before.iter().all(|state| *state == Some(BlockStateId::AIR)));
+
+        let _ = region_edit(&mut s, p, a, b, RegionOp::Fill { state: stone });
+        assert!(sample.iter().all(|&pos| block_at(&s, pos) == Some(stone)));
+
+        let outputs = region_undo(&mut s, p);
+        assert_eq!(
+            outputs.len(),
+            18,
+            "every changed cell is restored and rebroadcast"
+        );
+        for (&pos, original) in sample.iter().zip(before) {
+            assert_eq!(
+                block_at(&s, pos),
+                original,
+                "cell restored to its prior state"
+            );
+        }
+        // History is now empty: a second undo is a silent no-op.
+        assert!(region_undo(&mut s, p).is_empty());
+    }
+
+    #[tokio::test]
+    async fn region_edit_over_the_volume_cap_is_rejected() {
+        let mut s = shard_with_loaded_chunk(ChunkPos::new(0, 0)).await;
+        s.set_region_limits(RegionLimits {
+            max_volume: 8,
+            max_undo_entries: 16,
+        });
+        let p = player("flooder");
+        let stone = BlockStateId::new(1);
+        // A 3x2x3 = 18-cell cuboid exceeds the cap of 8: nothing changes, nothing
+        // is broadcast, and no undo entry is recorded.
+        let (a, b) = (BlockPos::new(2, 64, 2), BlockPos::new(4, 65, 4));
+        let outputs = region_edit(&mut s, p, a, b, RegionOp::Fill { state: stone });
+        assert!(outputs.is_empty());
+        assert_eq!(block_at(&s, a), Some(BlockStateId::AIR));
+        assert_eq!(block_at(&s, b), Some(BlockStateId::AIR));
+        assert!(!s.has_pending_mutations());
+        // With nothing recorded, /undo does nothing.
+        assert!(region_undo(&mut s, p).is_empty());
+    }
+
+    #[tokio::test]
+    async fn region_undo_history_is_bounded_and_evicts_oldest() {
+        let mut s = shard_with_loaded_chunk(ChunkPos::new(0, 0)).await;
+        s.set_region_limits(RegionLimits {
+            max_volume: 32_768,
+            max_undo_entries: 2,
+        });
+        let p = player("historian");
+        let stone = BlockStateId::new(1);
+        // Three separate single-cell fills -> three undo entries, but only the last
+        // two are retained (cap = 2); the first is evicted.
+        let cells = [
+            BlockPos::new(2, 64, 2),
+            BlockPos::new(3, 64, 2),
+            BlockPos::new(4, 64, 2),
+        ];
+        for &c in &cells {
+            let _ = region_edit(&mut s, p, c, c, RegionOp::Fill { state: stone });
+        }
+        assert!(cells.iter().all(|&c| block_at(&s, c) == Some(stone)));
+
+        // Two undos restore the two newest edits; a third finds nothing.
+        assert_eq!(region_undo(&mut s, p).len(), 1);
+        assert_eq!(region_undo(&mut s, p).len(), 1);
+        assert!(region_undo(&mut s, p).is_empty());
+
+        // The oldest edit's entry was evicted, so its cell stays changed; the other
+        // two were restored to air.
+        assert_eq!(
+            block_at(&s, cells[0]),
+            Some(stone),
+            "evicted edit is not undone"
+        );
+        assert_eq!(block_at(&s, cells[1]), Some(BlockStateId::AIR));
+        assert_eq!(block_at(&s, cells[2]), Some(BlockStateId::AIR));
     }
 }

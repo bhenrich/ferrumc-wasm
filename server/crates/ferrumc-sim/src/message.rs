@@ -7,10 +7,11 @@
 //! these typed messages.
 
 use ferrumc_core::{GameMode, PlayerId};
-use ferrumc_math::{BlockPos, Direction, Vec3};
+use ferrumc_math::{BlockPos, Cuboid, Direction, Vec3};
 use ferrumc_world::BlockStateId;
 
 use crate::mutation::MutationCause;
+use crate::region::RegionOp;
 
 /// An input applied to the simulation at the next tick boundary.
 ///
@@ -170,6 +171,44 @@ pub enum GameInput {
         player: PlayerId,
         /// The new authoritative game mode.
         mode: GameMode,
+    },
+    /// Apply a region (cuboid) block edit on behalf of `player`.
+    ///
+    /// Produced by the app's `/fill` and `/replace` commands. The whole cuboid is
+    /// applied at one tick boundary through the same single block-edit funnel a
+    /// single edit uses (under [`MutationCause::Command`]): every changed cell
+    /// persists via the chunk overlay and broadcasts a `BlockUpdate` to viewers,
+    /// but carries no acked sequence (a command edit is authoritative, not a
+    /// client prediction). The shard captures the prior block-state of every
+    /// changed cell into a bounded per-player undo history before applying, so a
+    /// later [`RegionUndo`](GameInput::RegionUndo) can restore it.
+    ///
+    /// The edit is bounded: a cuboid whose volume exceeds the shard's configured
+    /// region cap is rejected wholesale (the command layer already rejected it
+    /// with a user-facing error; this is defense in depth). Cells in chunks not
+    /// resident in this shard are skipped (cross-shard region edits are out of
+    /// scope this milestone).
+    RegionEdit {
+        /// Identity of the player on whose behalf the edit is applied (keys the
+        /// undo history; the player need not be present, since a command edit is
+        /// authoritative and not reach-checked).
+        player: PlayerId,
+        /// The cuboid of blocks the edit addresses.
+        region: Cuboid,
+        /// How every block in the cuboid changes.
+        op: RegionOp,
+    },
+    /// Undo `player`'s most recent region edit, restoring the prior block-states
+    /// it captured.
+    ///
+    /// Produced by the app's `/undo` command. Pops the player's newest undo entry
+    /// and re-applies each captured prior state through the same funnel (so the
+    /// restoration also persists and broadcasts). An undo is *not* itself pushed
+    /// onto the history, so repeated `/undo` walks back through successive edits.
+    /// A `RegionUndo` for a player with no history is a silent no-op.
+    RegionUndo {
+        /// Identity of the player whose most recent region edit is undone.
+        player: PlayerId,
     },
 }
 

@@ -48,6 +48,7 @@ mod harness;
 mod loaded;
 mod message;
 mod mutation;
+mod region;
 mod shard;
 mod spawn;
 mod ticket;
@@ -63,6 +64,7 @@ pub use message::{GameInput, GameOutput};
 // Only the cause is public: the structured `MutationResult` stays internal to
 // the shard so the app never confuses it with `ferrumc_observability::MutationResult`.
 pub use mutation::{MutationCause, PendingMutation};
+pub use region::{RegionLimits, RegionOp};
 pub use shard::SimShard;
 
 /// Re-exported from [`ferrumc_world`] so callers can name the block-state ids
