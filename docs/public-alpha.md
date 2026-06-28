@@ -10,18 +10,18 @@ Status legend: `[x]` verified done (cross-checked against [FEATURES.md](FEATURES
 ## User-visible
 
 - [ ] Fresh clone builds
-- [ ] Running with no config starts safely (no panic)
+- [x] Running with no config starts safely (no panic)
 - [x] Vanilla 1.21.8 joins in offline mode
 - [x] Two clients see each other
-- [ ] Two clients see movement/head rotation
+- [x] Two clients see movement/head rotation
 - [x] Two clients see block changes
-- [ ] Other clients see held main-hand item
+- [x] Other clients see held main-hand item
 - [x] Creative hotbar placement works
-- [ ] Basic block states work: logs, slabs, stairs, torches, fences
+- [x] Basic block states work: logs, slabs, stairs, torches, fences
 - [x] Leave/rejoin preserves placed blocks
 - [x] Restart preserves placed blocks
-- [ ] Plugin Replace visibly works
-- [ ] Dashboard opens locally
+- [x] Plugin Replace visibly works
+- [x] Dashboard opens locally
 
 ## Correctness
 
@@ -30,9 +30,9 @@ Status legend: `[x]` verified done (cross-checked against [FEATURES.md](FEATURES
 - [ ] Persistence tests cover pinned chunks
 - [ ] Dirty state/journal path has metrics
 - [ ] Reject/resync behavior tested for invalid placement
-- [ ] No unbounded channels
-- [ ] No unwrap outside tests
-- [ ] xtask generate --check green
+- [x] No unbounded channels
+- [x] No unwrap outside tests
+- [x] xtask generate --check green
 
 ## Performance
 
@@ -45,8 +45,8 @@ Status legend: `[x]` verified done (cross-checked against [FEATURES.md](FEATURES
 
 ## Honesty (README must say)
 
-- [ ] Flat-only
-- [ ] Offline-only
-- [ ] No survival yet
-- [ ] No full vanilla parity
-- [ ] Roadmap: Anvil import/export, online mode, lighting next
+- [x] Flat-only
+- [x] Offline-only
+- [x] No survival yet
+- [x] No full vanilla parity
+- [x] Roadmap: Anvil import/export, online mode, lighting next

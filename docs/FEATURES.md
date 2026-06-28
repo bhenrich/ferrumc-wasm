@@ -8,9 +8,9 @@
 
 ## How to connect (applies to every test below)
 
-1. From `core/server`: `RUST_LOG=info cargo run -p ferrumc-app` (binds `127.0.0.1:25565`, creative, view-distance 10, spawn `(8, 64, 8)`).
+1. From `core/server`: `RUST_LOG=info cargo run -p ferrumc-app` (binds `127.0.0.1:25565`, creative, view-distance 10, spawn `(8, 64, 8)`). A real CLI is wired up — `--config <path>`, `--port`, `--bind`, `--version`, `--help`. First run with no config writes a commented `config.template.toml` and starts on defaults (it never dies for lack of a config); a startup banner prints the name/version, protocol 772, bind + dashboard address, and a `RUST_LOG` hint.
 2. A real **1.21.8** vanilla client in **offline mode** (the server does no auth/encryption). Add `localhost` to the server list — it should read **COMPATIBLE / FerrumC 1.21.8**.
-3. Defaults that affect tests: every player is forced into **Creative**; permission level is **0** unless the player's name is in the config `ops` list (so `/gamemode` needs config — see below); spawn-protect is **off** (radius 0) by default.
+3. Defaults that affect tests: every player is forced into **Creative**; permission level is **0** unless the player's name is in the config `ops` list (so `/gamemode` needs config — see below); spawn-protect is **off** (radius 0) by default. The read-only observability dashboard is **on** by default at `127.0.0.1:9090` (loopback-only).
 
 ---
 
@@ -52,16 +52,18 @@
 
 - **Block breaking.** Creative insta-break via PlayerAction; validated (actor present, chunk resident, reach ≤6) and applied on the owning shard.
   - *Test:* Left-click a block in creative — it turns to air for you (and any nearby player).
-- **Block placing from the hotbar.** Right-click a face with a placeable held item; the held item resolves to its block state and is placed.
+- **Block placing from the hotbar.** Right-click a face with a placeable held item; the held item resolves to its block state and is placed on the clicked face.
   - *Test:* Select a hotbar block and right-click the ground/a wall — the block appears on the clicked face.
+- **Block-state placement engine (rotation / facing / half).** `UseItemOn` threads the clicked face, cursor hit position, and player yaw into the shard, which computes the *correct* state via `ferrumc-placement` against the `ferrumc-registry` block-state catalog (built from the vendored 1.21.8 `blocks.json`). v0 families: logs/wood (axis), slabs (top/bottom/double), stairs (facing + half, straight shape), torches (floor vs wall), fences (cardinal connectivity, with neighbor updates), and horizontal-facing blocks (the furnace family). Plugin/command exact-state writes bypass the engine so a substituted state is honored verbatim.
+  - *Test:* Place a log on a wall vs the floor (axis follows the face); place stairs facing you and click the top half of a face (facing + upper half); place a slab in the top vs bottom of a block face; place two torches, one on the ground and one on a wall side; place fences in a row and watch them connect. Rotated states persist across rejoin and replicate to a second client.
 - **Shard-owned mutation path.** All world writes funnel through one tick-boundary funnel on the owning shard; networking never mutates the world directly.
   - *Test:* (architecture) Break/place rapidly — edits stay consistent; no torn state.
 - **Block-change sequence acknowledgement.** Every edit carries the client's sequence number; accepted edits are acked, rejected ones get a resync + ack as an atomic pair (heals client prediction).
   - *Test:* Try to break a block >6 blocks away in a loaded chunk — your client's ghost block snaps back (resync).
 - **Block-update broadcast.** Edits are fanned out to other players who can see the chunk.
   - *Test:* Two clients in view of each other; one places/breaks a block — the other sees the change.
-- ⚠ **Block state / rotation / facing / waterlogging NOT derived.** Placement writes each item's **default** block state only — it ignores the click cursor position.
-  - *Test:* Place a log (never gets an axis), stairs/furnace (always default facing), a slab (always bottom half), or a block "in" water (never waterlogs).
+- ⚠ **Some placement properties still default (out of v0 scope).** The engine covers the families above; it does **not** yet derive waterlogging, doors, beds, rails, signs/banners, fence gates, stair inner/outer corners, redstone, or double-slab merging — those are placed as their default/simple state.
+  - *Test:* Place a block "in" water (never waterlogs), or place a door/bed/sign (default state, no orientation logic yet).
 
 ---
 
@@ -92,10 +94,10 @@
   - *Test:* Watch another player walk around — their position updates smoothly; they disappear when far and reappear when close.
 - **Despawn on leave.** Disconnecting players are removed for everyone (RemoveEntities + RemovePlayerInfo).
   - *Test:* One player disconnects — their model and tab entry vanish immediately (no ghost).
-- ⚠ **Rotation / head-yaw not broadcast.** Remote players always face north and never turn their head (only position is threaded through the sim).
-  - *Test:* Have another player spin in place — to you they never rotate.
-- ⚠ **Held item / armor not visible to others.** No SetEquipment is sent; your held slot is tracked server-side only.
-  - *Test:* Hold a sword or wear armor — other players see empty hands and no armor.
+- **Rotation + head-yaw broadcast.** Serverbound yaw/pitch (SetPlayerRotation, SetPlayerPositionAndRotation, rotation-only included) is threaded through the sim and broadcast as UpdateEntityPositionAndRotation / UpdateEntityRotation + SetHeadRotation (angle-byte encoded, floored to match vanilla).
+  - *Test:* Have another player spin in place — to you they turn their body and head correctly (no longer stuck facing north).
+- **Held main-hand item visible to others (SetEquipment).** Clientbound SetEquipment is sent when a player enters view and whenever they change their held hotbar slot, encoded via the trusted Slot codec.
+  - *Test:* Hold a sword/block on one client — the other client sees it in your hand, and sees it change when you scroll the hotbar. (Armor slots are not broadcast yet — main hand only.)
 
 ---
 
@@ -122,8 +124,8 @@
   - *Test:* Run the server; a `world` directory with a redb file appears next to the binary's working dir.
 - **Player-edited chunks persisted (overlays + journal).** Only player-modified sections are written as schema-versioned overlays over the regenerated baseline, plus an append-only block-mutation journal. Flushed every tick, before any chunk unload, and on shutdown (worker commits ~every 200 ms / 128 edits / on shutdown).
   - *Test:* Edit blocks **outside** the spawn area, fly far so the chunk unloads, fly back — your edits are still there (within one run).
-- ⚠ **Edits in the spawn area are lost on rejoin (survive restart).** The per-join spawn-chunk "JoinKit" is built once at startup and never rebuilt, so a reconnecting player is re-sent the original spawn chunks. The edit is in redb but isn't re-shown until the server restarts.
-  - *Test:* Edit a block near spawn, disconnect, reconnect (no restart) — the edit looks gone. Now restart the server and rejoin — it's back.
+- **Edits survive leave + rejoin (no restart needed).** Spawn chunks are served **live** from the resident chunks through the overlay-applying load path, and the disconnect path waits on an acked flush barrier before releasing chunk tickets, so a fast reconnect reads the committed state — not a stale baseline. (This was previously broken: edits near spawn only reappeared after a full restart.)
+  - *Test:* Edit a block near spawn, disconnect, reconnect (no restart) — the edit is still there. Restart and rejoin — still there.
 - ⚠ **Player state not persisted.** Position, game mode, and inventory are not saved/loaded (the redb `PlayerStore` is implemented but never called).
   - *Test:* Move, change hotbar, relog — you're back at spawn in creative with the default starter kit.
 
@@ -133,10 +135,10 @@
 
 - **Live block before/after events.** `before_block_break` / `before_block_place` run on the real packet path before the world is touched; `after_*` fire on accepted edits. Plugin host is shared across all connections.
   - *Test:* Enable spawn-protect (`spawn_protect_radius = 16`), restart, try to break a block near spawn as a non-bypass player — it's denied and reverts.
-- **Decision model: Deny / Replace / EmitIntents.** Folded by the host (first Deny wins and is absorbing; Replace is last-writer; intents capped at 64) and applied back on the connection (Deny → ack-heal + optional message; Replace → place the substitute; SetBlock/Message intents routed).
-  - *Test:* The block-rules sample denies placing **bedrock** in creative — put bedrock in a slot and try to place it; it's rejected and the ghost block heals.
-- ⚠ **Replace never fires from the sample plugin (constant mismatch).** The dispatch wiring is correct, but block-rules watches the wrong block-state ids (199/9279) — the real glass item places state 562, so the rule's condition never matches. Deny works only because its bedrock constant happens to equal the real id.
-  - *Test:* Place glass with block-rules active — it stays plain glass (no tinted-glass substitution).
+- **Decision model: Deny / Replace / EmitIntents.** Folded by the host (first Deny wins and is absorbing; Replace is last-writer; intents capped at 64) and applied back through the sim (Deny → routed through the single reject funnel: mandatory ack + authoritative resync to the actor, no ghost block; Replace → the substitute state is placed verbatim via the exact-state path, bypassing the placement engine; SetBlock/Message intents routed). `after_block_place` fires with the final computed state.
+  - *Test:* The block-rules sample denies placing **bedrock** in creative — put bedrock in a slot and try to place it; it's rejected and the ghost block heals (no leftover ghost).
+- **Replace works end-to-end (glass → tinted glass).** block-rules now watches the real 1.21.8 block-states (glass `562` → tinted_glass `23377`), pinned in tests against the registry so a demo-id regression fails the build.
+  - *Test:* Place glass with block-rules active — it comes out as **tinted glass**, for you and for any nearby player.
 - **Panic isolation.** A panicking plugin hook is caught, the plugin is disabled, and the edit fails safe (Deny).
   - *Test:* (sample-level) A faulty plugin can't crash the server; its block ops just get denied.
 - **Spawn-protect sample plugin.** Vetoes edits inside a configurable spawn radius unless the actor holds the bypass permission; welcomes joiners with a message. **Off by default (radius 0).**
@@ -154,7 +156,20 @@
   - *Test:* Run with default `RUST_LOG=info`, join then disconnect — a `ferrumc::observability::session` JSON event lists the recent packets for that session.
 - **Counter + tick metrics (logged).** Counters for chunks sent/unloaded, block mutations (accepted/rejected), storage-flush timing, decode errors, queue lengths; per-tick metrics (duration, inputs/outputs, players).
   - *Test:* Run with `RUST_LOG=ferrumc::observability::tick=debug` — per-tick metrics print every tick.
-- ⚠ **No metrics endpoint.** Metrics surface only via tracing logs; the aggregate snapshot (`dump_metrics`) has no automatic trigger (no HTTP/Prometheus, no SIGUSR1).
-  - *Test:* There is no `/metrics` HTTP endpoint to scrape — logs only.
+- **Read-only localhost dashboard.** `ferrumc-dashboard` (axum + htmx) renders the latest `ServerSnapshot` published by the driver. On by default at `127.0.0.1:9090`; **loopback-only by construction** — it refuses to bind a non-loopback address, every route is a `GET` (a method-guard returns `405` for anything else), and it never mutates state. Pages: Overview, Players, World, Packet trace, Backpressure, Plugins, Persistence, Checklist; each content region polls itself once a second.
+  - *Test:* Open `http://127.0.0.1:9090` in a browser on the server host — the pages update live as players join, move, and edit blocks. Point a non-loopback bind at it and startup refuses with a clear error.
+- ⚠ **No machine-scrapeable metrics endpoint.** The dashboard is human-facing HTML; there is still no Prometheus/OpenMetrics `/metrics` endpoint, and the aggregate snapshot (`dump_metrics`) has no automatic trigger.
+  - *Test:* There is no `/metrics` text endpoint to scrape — use the dashboard or the tracing logs.
+
+---
+
+## Configuration / CLI
+
+- **Real CLI (clap).** `--config <path>`, `--port`, `--bind`, `--version`, `--help`. Replaces the old "`argv[1]` is the config path" footgun, so `ferrumc --help` prints help instead of trying to open a file literally named `--help`. The CLI lives in the library (`ferrumc_app::cli`) so it is integration-tested.
+  - *Test:* Run `cargo run -p ferrumc-app -- --help` (help text) and `-- --version` (version); `-- --port 25566` binds the alternate port.
+- **First-run config template + safe defaults.** First run with no config writes a fully-commented `config.template.toml` and continues on defaults — it never dies for lack of a config. A *malformed* existing config is the one allowed startup-config error path: it fails with the offending key.
+  - *Test:* Delete any config and start — the server comes up on defaults and drops a `config.template.toml` next to it. Put a garbage value in a config and start — it errors naming the bad key.
+- **Startup banner + clear bind errors.** Prints name + version, protocol 772 (Minecraft 1.21.8), the bind + dashboard addresses, and a `RUST_LOG` hint. A port-in-use failure reports a clear `AddrInUse` message suggesting `--port`.
+  - *Test:* Start two instances on the same port — the second exits with a readable "address in use, try --port" message instead of a raw panic.
 </content>
 </invoke>
