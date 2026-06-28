@@ -4,8 +4,8 @@
 > Last updated: 2026-06-29.
 
 ## Snapshot
-- Branch: `rework/v2-skeleton` · HEAD `f4d7b1a5` · 79 commits ahead of the v1 base (`75d6f73e`).
-- ~1118 tests, all green. Every commit passes: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask generate --check`, `cargo test --workspace`.
+- Branch: `rework/v2-skeleton` · HEAD `f9f61c9c` · 120 commits ahead of the v1 base (`75d6f73e`) — 41 commits past the prior `f4d7b1a5` snapshot, after a large autonomous merge batch (see "Shipped (this autonomous batch)").
+- 1347 tests, all green (0 failed; grown from the prior ~1118 across the new lanes). Every commit passes: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask generate --check`, `cargo test --workspace`.
 - North star: **a deterministic, Rust-native, observable creative/minigame server core for vanilla 1.21.8 clients** — NOT full vanilla.
 - Validated by a **live independent client** (PrismarineJS `minecraft-protocol`): status (proto 772) → offline login → play → chunks → cross-boundary streaming, all pass.
 
@@ -33,32 +33,67 @@ Ops / tooling:
 - `e23c19d4`/`f4d7b1a5` independent node `minecraft-protocol` black-box smoke (passing for join/world/streaming)
 - docs: FEATURES.md · ROADMAP.md · public-alpha.md · parity/v1-v2.md · dev/parallel-workstreams.md
 
+## Shipped (this autonomous batch)
+Merged across 41 commits since the prior snapshot (newest first per the orchestration merge log). Grouped:
+
+Alpha-hardening / security:
+- `810b3ee7` serverbound packet budget wired into the play read loop (admit_frame charge → disconnect, 300/600 cfg) + audit DoS fix (post-join-drain flood was skipping leave-save + ReleaseChunks → permanent chunk-ticket leak).
+- `a2a0cacd` hostile-input proptest fuzz for codec/nbt/net + real fix (net compression empty-packet at threshold 0).
+- `89601a04` ops: per-IP connection limiter + whitelist + ban + access-control config (config `access.rs`, net `ip_limit.rs`, tests).
+- `7ab0a632` `SUPPORTED_VERSION.md` + README v2 positioning + gitignore `config.toml`.
+- `f9f61c9c` real-client black-box smoke extended — 31/31 PASS vs live + restarted server (status → login → chunks → set-creative-slot → stateful place/break with state-id asserts → cross-chunk → reconnect → restart-persistence).
+
+Persistence:
+- `69c1a77e` player-state (pos/yaw/pitch/gamemode/hotbar/46-slot inventory) persists across rejoin AND restart; JoinSet shutdown drain; Codex-found teleport-mirror bug fixed + regression test.
+
+Gameplay / creative:
+- `c59930ce` placement edge cases (trapdoor / fence-gate / button / lever / anvil / end-rod / stair-corner) + sim neighbour-state exposure.
+- `e90aa1a2` block-entities SIGNS — place → OpenSignEditor → UpdateSign → store → BlockEntityData broadcast → viewers + joiners render; world block-entity model (4096/chunk cap), sim apply, session packets, 2-client integ test. (v1: sign text in-memory only.)
+- `f84e34a2` + `dba5e41b` worldedit-lite (`/fill` `/replace` `/undo`) via sim region funnel, applied across ticks under a per-tick budget (8192/tick default; bounded pending/undo caps).
+- `0f801bb4` presentation builders (titles / subtitle / actionbar / sound / particle) + `/title` `/subtitle` `/actionbar` `/playsound` `/particle` commands.
+- `6bb1eb5f` scoreboard / team / bossbar session builders + `/scoreboard` `/team` `/bossbar` commands.
+
+Observability / dashboard:
+- `a9d65005` rebuilt dashboard — Svelte 5 SPA + axum SSE `/events` + `/api/snapshot` + `ServeDir(dist)` (retired the htmx `pages.rs`).
+- `3a9e6dd6` live telemetry wiring — bounded net_telemetry hub + plugin decision tally → live snapshot aggregation (per-player net, packet-trace summaries, plugin_decisions).
+- `b8a4df1f` Prometheus `GET /metrics` exporter in the dashboard (zero-dep, reads live snapshot).
+
+Tooling / data:
+- `f0147795` 14 CB + 1 SB reserved protocol packets (titles / sounds / particles / scoreboard / team / bossbar / block-entity); ProtoVerify 15/15 ids match.
+- `dffa2d11` registry named block/item id constants + drift-guard + de-magic'd block-rules plugin.
+- `2107c68a` real Anvil `.mca` region reader + chunk import + 16KB fixture + malformed-input tests (greenfield crate). (Startup map-load still un-wired.)
+
 ## Deferred / NOT-yet-built (GPT's "later" bucket — out of CreativeCore-v0 scope, in rough priority)
-1. **Player-state persistence** — wire the existing redb `PlayerStore` into join/leave/shutdown (position, game mode, inventory). Currently only chunk edits persist.
-2. **Real-client smoke: place/break/reconnect steps** — smoke.mjs join+stream pass; place/break/creative-slot/persistence-verify are still TODO stubs.
-3. **Published benchmark numbers** — harness exists; no numbers run on real hardware yet (commit SHA + hardware).
-4. **Fresh-clone build verification** — confirm a clean clone builds + runs.
-5. **Serverbound packet budget** — the 300 fps token bucket (`PlayReader`/`PacketBudget`) exists but is never constructed; play loop unbudgeted.
-6. **Armor/offhand equipment** + **placement edge cases** (waterlogging, doors, beds, rails, signs, stair corners).
-7. **Block entities** (chests/signs) — prerequisite for survival storage.
-8. **Online-mode** auth + encryption + whitelist; then **proxy/Velocity** forwarding.
-9. **Anvil import/export** (skeleton crate only; not wired).
-10. **Real terrain gen** (noise/biomes/caves/structures) + **real light engine** (currently full-bright).
-11. **Survival** — health/hunger/XP/death/respawn, crafting/smelting, containers/GUIs, tools/mining-time/drops.
-12. **Entities/mobs** — generic entity system, AI/pathfinding, item entities, projectiles, combat.
-13. **Fluids + block physics + redstone + scheduled/random ticks.**
-14. **Social** — scoreboards/teams/bossbars/titles, sounds/particles, signed chat, resource packs.
-15. **Ops** — RCON/admin, ban/whitelist, rate-limit/anti-cheat, config hot-reload, dashboard /metrics exporter.
-16. **Scale** — multi-shard runtime + cross-shard transfer + determinism replay harness.
-17. **Plugins** — WASM/Component-Model runtime; the C-ABI cdylib loader is a stub (in-process plugins work today).
+1. **Published benchmark numbers** — harness exists; no numbers run on real hardware yet (commit SHA + hardware).
+2. **Fresh-clone build verification** — confirm a clean clone builds + runs.
+3. **Armor/offhand equipment** + remaining **placement edge cases** (waterlogging, rails, doors/beds multi-block). (Single-block edge cases — trapdoor/fence-gate/button/lever/anvil/end-rod/stair-corner — shipped this batch.)
+4. **Block entities: chests/containers** — prerequisite for survival storage. (Signs shipped as block-entity #1.)
+5. **Online-mode** auth + encryption; then **proxy/Velocity** forwarding. (Per-IP limit + whitelist + ban shipped this batch.)
+6. **Real terrain gen** (noise/biomes/caves/structures) + **real light engine** (currently full-bright).
+7. **Survival** — health/hunger/XP/death/respawn, crafting/smelting, containers/GUIs, tools/mining-time/drops.
+8. **Entities/mobs** — generic entity system, AI/pathfinding, item entities, projectiles, combat.
+9. **Fluids + block physics + redstone + scheduled/random ticks.**
+10. **Social (remaining)** — signed chat, resource packs. (Scoreboards/teams/bossbars/titles/sounds/particles shipped this batch.)
+11. **Ops (remaining)** — RCON/admin, anti-cheat, config hot-reload. (Ban/whitelist, per-IP rate-limit, and the dashboard /metrics exporter shipped this batch.)
+12. **Scale** — multi-shard runtime + cross-shard transfer + determinism replay harness.
+13. **Plugins** — WASM/Component-Model runtime; the C-ABI cdylib loader is a stub (in-process plugins work today).
 
 ## Known minor follow-ups (not blocking)
 - JoinGame `dimension=undefined` seen by the node client (it still joins + gets chunks; likely a log/field-name detail, verify the JoinGame dimension field).
 - Window-click container handling is minimal (state-id check → resync).
 - Full-bright lighting placeholder.
 
+New tracked follow-ups (this batch; non-blocking):
+- Sign text persistence across restart/unload (v1 stores sign text in-memory only).
+- Crash-safety flush: only SIGINT (ctrl_c) flushes today; add a SIGTERM/SIGKILL graceful-shutdown path (smoke found this).
+- Player inventory data-components (schema v2) + conditional `PlayerAbilities`-on-join.
+- Anvil startup map-load wiring (reader crate done; not yet wired into startup).
+- Per-sign edit-session ownership.
+- Budget: `burst < 1.0` config validation + durable Prometheus kick metric.
+- Presentation/scoreboard hand-encoded wire payloads: confirm via a real client (golden tests guard regression only).
+
 ## Public-alpha gate
-Mostly green (see `docs/public-alpha.md`). Open: published benchmarks, place/break in the real-client smoke, fresh-clone build check.
+Mostly green (see `docs/public-alpha.md`). The real-client smoke now covers place/break/reconnect/restart-persistence (31/31). Open: published benchmarks, fresh-clone build check.
 
 ## How to run / test
 ```
