@@ -5,10 +5,12 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
 
 use ferrumc_command::CommandTree;
-use ferrumc_core::PluginId;
+use ferrumc_core::{PluginId, TextComponent};
 use ferrumc_plugin_api::{
-    CapabilityManifest, CommandRegistrar, CommandSink, EventContext, EventKind, EventRegistrar,
-    PermissionApi, Plugin, PluginEvent, PluginMetadata, SetupContext, TeardownContext, WorldView,
+    BlockBreakAttempt, BlockPlaceAttempt, Capability, CapabilityManifest, CommandRegistrar,
+    CommandSink, EventContext, EventKind, EventRegistrar, PermissionApi, Plugin,
+    PluginBlockDecision, PluginEvent, PluginMetadata, SetupContext, TeardownContext, WorldIntent,
+    WorldView, MAX_EMITTED_INTENTS,
 };
 
 use crate::budget::CallBudget;
@@ -121,6 +123,69 @@ impl DispatchReport {
     /// Returns the ids of plugins that exceeded their per-call budget.
     pub fn budget_exceeded(&self) -> &[PluginId] {
         &self.budget_exceeded
+    }
+}
+
+/// The combined verdict on a block edit after every consulted plugin has voted.
+///
+/// Produced by folding each plugin's [`PluginBlockDecision`] (see
+/// [`PluginHost::dispatch_block_place_decision`] /
+/// [`PluginHost::dispatch_block_break_decision`]). UNSTABLE / dev-only: part of
+/// the in-development block-decision surface.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum ResolvedDecision {
+    /// No plugin objected: apply the edit as the player requested.
+    Allow,
+    /// At least one plugin denied the edit; nothing is mutated.
+    Deny {
+        /// The first denial message, if any, to show the acting player.
+        message: Option<TextComponent>,
+    },
+    /// Apply the edit with a replacement block-state instead of the player's.
+    Replace {
+        /// The replacement registry block-state id.
+        block_state_id: u32,
+    },
+}
+
+/// The full result of a `before_*` block-decision dispatch: the combined
+/// [`ResolvedDecision`], any [`WorldIntent`]s plugins asked to emit, and a
+/// [`DispatchReport`] of which plugins panicked or overran their budget.
+///
+/// UNSTABLE / dev-only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedBlockDecision {
+    decision: ResolvedDecision,
+    emitted: Vec<WorldIntent>,
+    report: DispatchReport,
+}
+
+impl ResolvedBlockDecision {
+    /// Returns the combined decision.
+    pub const fn decision(&self) -> &ResolvedDecision {
+        &self.decision
+    }
+
+    /// Returns the world-mutation intents plugins emitted (capped at
+    /// [`MAX_EMITTED_INTENTS`]).
+    pub fn emitted(&self) -> &[WorldIntent] {
+        &self.emitted
+    }
+
+    /// Returns the dispatch report (panicked / budget-exceeded plugins).
+    pub const fn report(&self) -> &DispatchReport {
+        &self.report
+    }
+
+    /// Returns whether the edit was denied.
+    pub const fn is_deny(&self) -> bool {
+        matches!(self.decision, ResolvedDecision::Deny { .. })
+    }
+
+    /// Consumes the result, yielding the decision and emitted intents.
+    pub fn into_parts(self) -> (ResolvedDecision, Vec<WorldIntent>) {
+        (self.decision, self.emitted)
     }
 }
 
@@ -390,6 +455,182 @@ impl PluginHost {
         report
     }
 
+    /// Consults every enabled, [`VetoBlockEdits`](Capability::VetoBlockEdits)-capable
+    /// plugin about a pending block *placement* and folds their decisions into one
+    /// [`ResolvedBlockDecision`].
+    ///
+    /// See [`PluginHost::dispatch_block_break_decision`] for the shared semantics
+    /// (precedence, isolation, fail-safe); this is the placement-side entry point.
+    pub fn dispatch_block_place_decision(
+        &mut self,
+        attempt: &BlockPlaceAttempt,
+        world: &dyn WorldView,
+        sink: &mut dyn CommandSink,
+        permissions: &dyn PermissionApi,
+    ) -> ResolvedBlockDecision {
+        self.fold_before(world, sink, permissions, |plugin, ctx| {
+            plugin.before_block_place(attempt, ctx)
+        })
+    }
+
+    /// Consults every enabled, [`VetoBlockEdits`](Capability::VetoBlockEdits)-capable
+    /// plugin about a pending block *break* and folds their decisions into one
+    /// [`ResolvedBlockDecision`].
+    ///
+    /// # Precedence (deterministic, fail-safe)
+    ///
+    /// Plugins are consulted in registration order:
+    ///
+    /// 1. The first [`Deny`](PluginBlockDecision::Deny) is *absorbing*: it wins,
+    ///    the remaining plugins are skipped, and its message (the first non-`None`)
+    ///    is carried. A security action beats a convenience rewrite.
+    /// 2. Otherwise decisions fold: a [`Replace`](PluginBlockDecision::Replace) is
+    ///    last-writer-wins, and [`EmitIntents`](PluginBlockDecision::EmitIntents)
+    ///    vectors concatenate (capped at [`MAX_EMITTED_INTENTS`]).
+    /// 3. If nobody objects, the result is [`Allow`](ResolvedDecision::Allow).
+    ///
+    /// # Isolation and fail-safe
+    ///
+    /// Each hook is wrapped in [`catch_unwind`], exactly like
+    /// [`dispatch_event`](Self::dispatch_event). A plugin that *panics* is disabled
+    /// ([`DisableReason::Panicked`]), counted in [`PluginStats`], logged, and — the
+    /// fail-safe — treated as a [`Deny`](ResolvedDecision::Deny) so a broken plugin
+    /// can never silently let a destructive edit through. Per-call budgets apply as
+    /// for event dispatch. None of this runs inside the simulation tick, so the
+    /// server and tick are unaffected.
+    pub fn dispatch_block_break_decision(
+        &mut self,
+        attempt: &BlockBreakAttempt,
+        world: &dyn WorldView,
+        sink: &mut dyn CommandSink,
+        permissions: &dyn PermissionApi,
+    ) -> ResolvedBlockDecision {
+        self.fold_before(world, sink, permissions, |plugin, ctx| {
+            plugin.before_block_break(attempt, ctx)
+        })
+    }
+
+    /// The shared fold driving both `before_block_*` decision paths.
+    ///
+    /// `call` invokes the appropriate hook on one plugin; everything else (the
+    /// capability gate, panic isolation, budgeting, and the precedence fold) is
+    /// identical for placement and break.
+    fn fold_before<F>(
+        &mut self,
+        world: &dyn WorldView,
+        sink: &mut dyn CommandSink,
+        permissions: &dyn PermissionApi,
+        mut call: F,
+    ) -> ResolvedBlockDecision
+    where
+        F: FnMut(&mut dyn Plugin, &mut EventContext<'_>) -> PluginBlockDecision,
+    {
+        let Self {
+            plugins,
+            storage,
+            config,
+            ..
+        } = self;
+        let budget = config.call_budget();
+        let disable_on_overrun = config.disable_on_overrun();
+
+        let mut decision = ResolvedDecision::Allow;
+        let mut emitted: Vec<WorldIntent> = Vec::new();
+        let mut report = DispatchReport::default();
+
+        for slot in plugins.iter_mut() {
+            // A Deny is absorbing: once denied, stop consulting plugins.
+            if matches!(decision, ResolvedDecision::Deny { .. }) {
+                break;
+            }
+            if !slot.state.is_enabled() || !slot.capabilities.grants(Capability::VetoBlockEdits) {
+                continue;
+            }
+
+            let namespaced = NamespacedStorage::new(storage.as_ref(), slot.id.clone());
+            let mut ctx = EventContext::new(
+                slot.capabilities,
+                world,
+                &mut *sink,
+                permissions,
+                &namespaced,
+            );
+
+            let start = Instant::now();
+            let outcome = catch_unwind(AssertUnwindSafe(|| call(&mut *slot.plugin, &mut ctx)));
+            let elapsed = start.elapsed();
+
+            let Ok(plugin_decision) = outcome else {
+                // Fail-safe: a panicking plugin denies the edit and is disabled.
+                slot.stats.panics += 1;
+                slot.state = PluginState::Disabled(DisableReason::Panicked);
+                report.panicked.push(slot.id.clone());
+                tracing::warn!(
+                    plugin = %slot.id,
+                    "plugin panicked during a before_block_* decision; disabled and treated as Deny"
+                );
+                decision = ResolvedDecision::Deny { message: None };
+                continue;
+            };
+
+            report.delivered += 1;
+            if budget.is_exceeded(elapsed) {
+                slot.stats.budget_overruns += 1;
+                report.budget_exceeded.push(slot.id.clone());
+                tracing::warn!(
+                    plugin = %slot.id,
+                    ?elapsed,
+                    "plugin exceeded its time budget during a before_block_* decision"
+                );
+                if disable_on_overrun {
+                    slot.state = PluginState::Disabled(DisableReason::BudgetExceeded);
+                }
+            }
+
+            match plugin_decision {
+                PluginBlockDecision::Deny { message } => {
+                    decision = ResolvedDecision::Deny { message };
+                }
+                PluginBlockDecision::Replace { block_state_id } => {
+                    decision = ResolvedDecision::Replace { block_state_id };
+                }
+                PluginBlockDecision::EmitIntents(intents) => {
+                    for intent in intents {
+                        if emitted.len() >= MAX_EMITTED_INTENTS {
+                            tracing::warn!(
+                                plugin = %slot.id,
+                                cap = MAX_EMITTED_INTENTS,
+                                "plugin exceeded the emitted-intent cap; dropping the rest"
+                            );
+                            break;
+                        }
+                        emitted.push(intent);
+                    }
+                }
+                // `PluginBlockDecision::Allow` (no-op) and — since the enum is
+                // `#[non_exhaustive]` — any unknown future variant leave the fold
+                // unchanged.
+                _ => {}
+            }
+        }
+
+        // A resolved Deny prevents the edit entirely. Any intents an earlier plugin
+        // emitted via `EmitIntents` were predicated on the edit proceeding (the
+        // variant means "proceed with the original edit and *additionally* submit
+        // these"), so a later, absorbing Deny must drop them — otherwise a denied
+        // edit would still execute another plugin's `SetBlock` and mutate the world,
+        // breaking the boundary's "a Deny truly prevents the mutation" guarantee.
+        if matches!(decision, ResolvedDecision::Deny { .. }) {
+            emitted.clear();
+        }
+
+        ResolvedBlockDecision {
+            decision,
+            emitted,
+            report,
+        }
+    }
+
     /// Returns the number of registered plugins.
     pub fn len(&self) -> usize {
         self.plugins.len()
@@ -530,5 +771,447 @@ mod tests {
             Err(HostError::UnknownPlugin(missing.clone()))
         );
         assert_eq!(host.state(&missing), None);
+    }
+
+    // --- Block-decision surface ----------------------------------------------
+
+    use ferrumc_core::{DimensionId, PlayerId, TextComponent};
+    use ferrumc_math::{BlockPos, ChunkPos, Vec3};
+    use ferrumc_permission::{PermissionNode, Resolution};
+    use ferrumc_plugin_api::{
+        BlockBreakAttempt, BlockPlaceAttempt, IntentError, PluginBlockDecision, PluginError,
+        WorldIntent,
+    };
+
+    /// A plugin that returns a fixed decision from both `before_*` hooks.
+    struct DecisionPlugin {
+        id: &'static str,
+        decision: PluginBlockDecision,
+    }
+
+    impl DecisionPlugin {
+        fn boxed(id: &'static str, decision: PluginBlockDecision) -> Box<dyn Plugin> {
+            Box::new(Self { id, decision })
+        }
+    }
+
+    impl Plugin for DecisionPlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata::new(
+                PluginId::new(self.id),
+                self.id,
+                Version::new(0, 1, 0),
+                CapabilityManifest::empty().with(Capability::VetoBlockEdits),
+            )
+        }
+        fn before_block_place(
+            &mut self,
+            _ev: &BlockPlaceAttempt,
+            _ctx: &mut EventContext<'_>,
+        ) -> PluginBlockDecision {
+            self.decision.clone()
+        }
+        fn before_block_break(
+            &mut self,
+            _ev: &BlockBreakAttempt,
+            _ctx: &mut EventContext<'_>,
+        ) -> PluginBlockDecision {
+            self.decision.clone()
+        }
+    }
+
+    /// A plugin that panics inside its decision hooks.
+    struct PanicDecisionPlugin {
+        id: &'static str,
+    }
+
+    impl Plugin for PanicDecisionPlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata::new(
+                PluginId::new(self.id),
+                self.id,
+                Version::new(0, 1, 0),
+                CapabilityManifest::empty().with(Capability::VetoBlockEdits),
+            )
+        }
+        fn before_block_place(
+            &mut self,
+            _ev: &BlockPlaceAttempt,
+            _ctx: &mut EventContext<'_>,
+        ) -> PluginBlockDecision {
+            panic!("boom in before_block_place");
+        }
+        fn before_block_break(
+            &mut self,
+            _ev: &BlockBreakAttempt,
+            _ctx: &mut EventContext<'_>,
+        ) -> PluginBlockDecision {
+            panic!("boom in before_block_break");
+        }
+    }
+
+    /// A plugin with no `VetoBlockEdits` capability; it must never be consulted.
+    struct PassivePlugin {
+        id: &'static str,
+    }
+
+    impl Plugin for PassivePlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata::new(
+                PluginId::new(self.id),
+                self.id,
+                Version::new(0, 1, 0),
+                CapabilityManifest::empty().with(Capability::ReceiveEvents),
+            )
+        }
+        fn before_block_place(
+            &mut self,
+            _ev: &BlockPlaceAttempt,
+            _ctx: &mut EventContext<'_>,
+        ) -> PluginBlockDecision {
+            panic!("a passive plugin must never have its decision hook called");
+        }
+    }
+
+    /// A recording plugin used to prove an after-* notification is delivered.
+    struct AfterRecorder {
+        id: &'static str,
+    }
+
+    impl Plugin for AfterRecorder {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata::new(
+                PluginId::new(self.id),
+                self.id,
+                Version::new(0, 1, 0),
+                CapabilityManifest::empty()
+                    .with(Capability::ReceiveEvents)
+                    .with(Capability::SubmitIntents),
+            )
+        }
+        fn on_enable(&mut self, ctx: &mut SetupContext<'_>) -> Result<(), PluginError> {
+            ctx.events()?.subscribe(EventKind::AfterBlockPlace);
+            Ok(())
+        }
+        fn on_event(&mut self, event: &PluginEvent, ctx: &mut EventContext<'_>) {
+            if let PluginEvent::AfterBlockPlace { player, .. } = event {
+                if let Ok(sink) = ctx.sink() {
+                    let _ = sink.submit(WorldIntent::Message {
+                        player: *player,
+                        message: TextComponent::text("placed"),
+                    });
+                }
+            }
+        }
+    }
+
+    struct NullWorld;
+    impl WorldView for NullWorld {
+        fn dimension(&self) -> DimensionId {
+            DimensionId::new(0)
+        }
+        fn is_chunk_loaded(&self, _chunk: ChunkPos) -> bool {
+            false
+        }
+        fn block_state_id(&self, _pos: BlockPos) -> Option<u32> {
+            None
+        }
+        fn player_position(&self, _player: PlayerId) -> Option<Vec3> {
+            None
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        intents: Vec<WorldIntent>,
+    }
+    impl CommandSink for RecordingSink {
+        fn submit(&mut self, intent: WorldIntent) -> Result<(), IntentError> {
+            self.intents.push(intent);
+            Ok(())
+        }
+    }
+
+    struct NullPermissions;
+    impl PermissionApi for NullPermissions {
+        fn has_permission(&self, _player: PlayerId, _node: &PermissionNode) -> bool {
+            false
+        }
+        fn resolve(&self, _player: PlayerId, _node: &PermissionNode) -> Resolution {
+            Resolution::Unset
+        }
+    }
+
+    fn enable_all(host: &mut PluginHost, ids: &[&PluginId]) {
+        for id in ids {
+            host.enable(id).expect("enables");
+        }
+    }
+
+    fn break_attempt() -> BlockBreakAttempt {
+        BlockBreakAttempt::new(PlayerId::offline("Steve"), BlockPos::new(0, 64, 0))
+    }
+
+    fn place_attempt(state: u32) -> BlockPlaceAttempt {
+        BlockPlaceAttempt::new(PlayerId::offline("Steve"), BlockPos::new(0, 64, 0), state)
+    }
+
+    #[test]
+    fn deny_stops_the_edit() {
+        let mut host = PluginHost::in_memory();
+        let id = host
+            .register(DecisionPlugin::boxed(
+                "denier",
+                PluginBlockDecision::Deny {
+                    message: Some(TextComponent::text("no")),
+                },
+            ))
+            .expect("registers");
+        enable_all(&mut host, &[&id]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_block_break_decision(
+            &break_attempt(),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert_eq!(
+            resolved.decision(),
+            &ResolvedDecision::Deny {
+                message: Some(TextComponent::text("no")),
+            }
+        );
+        assert!(resolved.is_deny());
+    }
+
+    #[test]
+    fn replace_swaps_the_block_state() {
+        let mut host = PluginHost::in_memory();
+        let id = host
+            .register(DecisionPlugin::boxed(
+                "replacer",
+                PluginBlockDecision::Replace { block_state_id: 42 },
+            ))
+            .expect("registers");
+        enable_all(&mut host, &[&id]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_block_place_decision(
+            &place_attempt(1),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert_eq!(
+            resolved.decision(),
+            &ResolvedDecision::Replace { block_state_id: 42 }
+        );
+    }
+
+    #[test]
+    fn deny_is_absorbing_and_short_circuits_a_later_replace() {
+        let mut host = PluginHost::in_memory();
+        // Registration order: denier first, then a replacer that must never run.
+        let denier = host
+            .register(DecisionPlugin::boxed(
+                "denier",
+                PluginBlockDecision::Deny {
+                    message: Some(TextComponent::text("blocked")),
+                },
+            ))
+            .expect("registers denier");
+        let replacer = host
+            .register(DecisionPlugin::boxed(
+                "replacer",
+                PluginBlockDecision::Replace { block_state_id: 7 },
+            ))
+            .expect("registers replacer");
+        enable_all(&mut host, &[&denier, &replacer]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_block_place_decision(
+            &place_attempt(1),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert!(
+            resolved.is_deny(),
+            "the first Deny wins over a later Replace"
+        );
+        // Only the denier was consulted; the replacer was short-circuited.
+        assert_eq!(resolved.report().delivered(), 1);
+    }
+
+    #[test]
+    fn replace_is_last_writer_wins() {
+        let mut host = PluginHost::in_memory();
+        let first = host
+            .register(DecisionPlugin::boxed(
+                "first",
+                PluginBlockDecision::Replace { block_state_id: 1 },
+            ))
+            .expect("registers first");
+        let second = host
+            .register(DecisionPlugin::boxed(
+                "second",
+                PluginBlockDecision::Replace { block_state_id: 2 },
+            ))
+            .expect("registers second");
+        enable_all(&mut host, &[&first, &second]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_block_place_decision(
+            &place_attempt(99),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert_eq!(
+            resolved.decision(),
+            &ResolvedDecision::Replace { block_state_id: 2 },
+            "the last Replace wins"
+        );
+    }
+
+    #[test]
+    fn emit_intents_concatenate_and_are_capped() {
+        let mut host = PluginHost::in_memory();
+        let many: Vec<WorldIntent> = (0..(MAX_EMITTED_INTENTS + 10))
+            .map(|i| WorldIntent::SetBlock {
+                pos: BlockPos::new(i32::try_from(i).expect("test index fits i32"), 64, 0),
+                block_state_id: 1,
+            })
+            .collect();
+        let id = host
+            .register(DecisionPlugin::boxed(
+                "emitter",
+                PluginBlockDecision::EmitIntents(many),
+            ))
+            .expect("registers");
+        enable_all(&mut host, &[&id]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_block_break_decision(
+            &break_attempt(),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert_eq!(resolved.decision(), &ResolvedDecision::Allow);
+        assert_eq!(
+            resolved.emitted().len(),
+            MAX_EMITTED_INTENTS,
+            "the emitted-intent vector is capped"
+        );
+    }
+
+    #[test]
+    fn deny_after_an_earlier_emit_drops_the_emitted_intents() {
+        let mut host = PluginHost::in_memory();
+        // Registration order: an emitter first, then a denier. The absorbing Deny
+        // wins, and the earlier plugin's emitted intents must not survive it — else
+        // a denied edit could still mutate the world via the emitted `SetBlock`.
+        let emitter = host
+            .register(DecisionPlugin::boxed(
+                "emitter",
+                PluginBlockDecision::EmitIntents(vec![WorldIntent::SetBlock {
+                    pos: BlockPos::new(0, 64, 0),
+                    block_state_id: 1,
+                }]),
+            ))
+            .expect("registers emitter");
+        let denier = host
+            .register(DecisionPlugin::boxed(
+                "denier",
+                PluginBlockDecision::Deny { message: None },
+            ))
+            .expect("registers denier");
+        enable_all(&mut host, &[&emitter, &denier]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_block_break_decision(
+            &break_attempt(),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert!(resolved.is_deny(), "the later Deny wins");
+        assert!(
+            resolved.emitted().is_empty(),
+            "a Deny drops earlier plugins' emitted intents"
+        );
+    }
+
+    #[test]
+    fn panicking_plugin_is_contained_and_fails_safe_to_deny() {
+        let mut host = PluginHost::in_memory();
+        let id = host
+            .register(Box::new(PanicDecisionPlugin { id: "boom" }))
+            .expect("registers");
+        enable_all(&mut host, &[&id]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_block_break_decision(
+            &break_attempt(),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        // The host stays up, the plugin is disabled, and the edit fails safe.
+        assert_eq!(
+            resolved.decision(),
+            &ResolvedDecision::Deny { message: None }
+        );
+        assert_eq!(resolved.report().panicked(), std::slice::from_ref(&id));
+        assert_eq!(
+            host.state(&id),
+            Some(PluginState::Disabled(DisableReason::Panicked))
+        );
+        assert_eq!(host.stats(&id).map(PluginStats::panics), Some(1));
+    }
+
+    #[test]
+    fn plugin_without_capability_is_not_consulted() {
+        let mut host = PluginHost::in_memory();
+        let id = host
+            .register(Box::new(PassivePlugin { id: "passive" }))
+            .expect("registers");
+        enable_all(&mut host, &[&id]);
+
+        let mut sink = RecordingSink::default();
+        // PassivePlugin panics if consulted; an Allow result proves it was skipped.
+        let resolved = host.dispatch_block_place_decision(
+            &place_attempt(1),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert_eq!(resolved.decision(), &ResolvedDecision::Allow);
+        assert_eq!(resolved.report().delivered(), 0);
+    }
+
+    #[test]
+    fn after_block_place_notification_is_delivered() {
+        let mut host = PluginHost::in_memory();
+        let id = host
+            .register(Box::new(AfterRecorder { id: "after" }))
+            .expect("registers");
+        enable_all(&mut host, &[&id]);
+
+        let mut sink = RecordingSink::default();
+        let report = host.dispatch_event(
+            &PluginEvent::AfterBlockPlace {
+                player: PlayerId::offline("Steve"),
+                pos: BlockPos::new(0, 64, 0),
+                block_state_id: 1,
+            },
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert_eq!(report.delivered(), 1);
+        assert_eq!(sink.intents.len(), 1, "after_* fired and emitted a message");
     }
 }

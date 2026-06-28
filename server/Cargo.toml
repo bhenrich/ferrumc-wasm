@@ -25,6 +25,7 @@ members = [
     "crates/ferrumc-testkit",
     "plugins/ferrumc-plugin-fixture",
     "plugins/ferrumc-plugin-spawn-protect",
+    "plugins/ferrumc-plugin-block-rules",
     "xtask",
 ]
 
@@ -115,6 +116,7 @@ ferrumc-anvil = { path = "crates/ferrumc-anvil" }
 ferrumc-testkit = { path = "crates/ferrumc-testkit" }
 ferrumc-plugin-fixture = { path = "plugins/ferrumc-plugin-fixture" }
 ferrumc-plugin-spawn-protect = { path = "plugins/ferrumc-plugin-spawn-protect" }
+ferrumc-plugin-block-rules = { path = "plugins/ferrumc-plugin-block-rules" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

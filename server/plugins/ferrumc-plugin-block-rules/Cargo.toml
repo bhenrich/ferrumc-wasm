@@ -1,0 +1,49 @@
+[package]
+name = "ferrumc-plugin-block-rules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Built as both:
+# - a `cdylib` so the host's C-ABI loader can load it from a `/plugins` directory
+#   (proving the dynamic loader), and
+# - an `rlib` so the application can drive its block-decision hooks in-process
+#   (the block-decision surface is in-process only — the C ABI carries no event
+#   hook), the same dual shape as `ferrumc-plugin-spawn-protect`.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Text components for the Deny message, and the plugin id.
+ferrumc-core = { workspace = true }
+# The stable plugin SDK: the in-process `Plugin` trait, the block-decision
+# surface (before_* hooks + `PluginBlockDecision`), the capability manifest, and
+# the narrow C ABI the cdylib exports.
+ferrumc-plugin-api = { workspace = true }
+
+[dev-dependencies]
+# Typed coordinates the unit tests use to build block attempts and the WorldView
+# stub.
+ferrumc-math = { workspace = true }
+# Permission node/resolution types for the permission-facade stub.
+ferrumc-permission = { workspace = true }
+
+# This crate cannot inherit the workspace `forbid(unsafe_code)`: exporting the
+# `#[no_mangle]` C entrypoint counts as unsafe code under modern rustc. We
+# downgrade to `deny` and scope a single `#[allow(unsafe_code)]` to that export.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"

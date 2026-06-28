@@ -40,12 +40,18 @@ ferrumc-storage = { workspace = true }
 ferrumc-command = { workspace = true }
 # Permission subjects/grants backing the spawn-protection bypass check.
 ferrumc-permission = { workspace = true }
-# The plugin host: dynamic loader plus the in-process registry the spawn-protect
-# plugin runs through to seed its namespaced config.
+# The plugin SDK types the connection forms at the intent boundary: block-edit
+# attempts and the PluginBlockDecision the host folds.
+ferrumc-plugin-api = { workspace = true }
+# The plugin host: dynamic loader plus the in-process registry that drives the
+# spawn-protect and block-rules plugins' block-decision hooks.
 ferrumc-plugin-host = { workspace = true }
 # The spawn-protection plugin: loaded dynamically (cdylib) and driven in-process
 # (rlib) for its veto policy, config, and bypass permission node.
 ferrumc-plugin-spawn-protect = { workspace = true }
+# The block-rules sample plugin (deny bedrock, glass -> tinted glass), driven
+# in-process to prove the Deny + Replace decision outcomes.
+ferrumc-plugin-block-rules = { workspace = true }
 # Packet tracing + the metric registry / server clock wired into the connection
 # and driver hot paths; the app is the only crate that can fire those hooks.
 ferrumc-observability = { workspace = true }

@@ -167,6 +167,8 @@ dependencies = [
  "ferrumc-net",
  "ferrumc-observability",
  "ferrumc-permission",
+ "ferrumc-plugin-api",
+ "ferrumc-plugin-block-rules",
  "ferrumc-plugin-host",
  "ferrumc-plugin-spawn-protect",
  "ferrumc-proto",
@@ -285,6 +287,16 @@ dependencies = [
  "ferrumc-permission",
  "semver",
  "thiserror",
+]
+
+[[package]]
+name = "ferrumc-plugin-block-rules"
+version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-core",
+ "ferrumc-math",
+ "ferrumc-permission",
+ "ferrumc-plugin-api",
 ]
 
 [[package]]

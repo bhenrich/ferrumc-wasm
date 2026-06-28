@@ -5,24 +5,30 @@
 //!
 //! - [`on_enable`](SpawnProtectPlugin::on_enable) loads the [`SpawnProtect`]
 //!   policy from the plugin's private, namespaced storage (seeding the default
-//!   if none is stored) and subscribes to the join and block-break events.
-//! - [`on_event`](SpawnProtectPlugin::on_event) welcomes a joining player and,
-//!   for a block break inside the protected square, consults the permission API
-//!   for the bypass node and tells an unauthorized actor it was denied.
+//!   if none is stored) and subscribes to the join event.
+//! - [`before_block_break`](SpawnProtectPlugin::before_block_break) and
+//!   [`before_block_place`](SpawnProtectPlugin::before_block_place) are the
+//!   authoritative veto: at the intent boundary the host consults them, and for an
+//!   edit inside the protected square by an actor without the bypass permission
+//!   they return [`PluginBlockDecision::Deny`] (carrying the denial message),
+//!   stopping the edit before it reaches the simulation.
+//! - [`on_event`](SpawnProtectPlugin::on_event) welcomes a joining player.
 //!
-//! The authoritative *veto* of a block edit is the policy in [`SpawnProtect`],
-//! which the application consults before the edit reaches the simulation (the
-//! C ABI carries no event hook for a true cross-boundary veto yet — see the
-//! crate documentation). This in-process plugin demonstrates the full SDK
-//! surface the milestone requires: namespaced storage for configuration, the
-//! permission API for the bypass check, mutation intents for messaging, and
-//! event subscription.
+//! This collapses what used to be two half-mechanisms (a bespoke policy veto in
+//! the application plus a redundant denial *message* on the break notification)
+//! into the single capability-gated decision surface. It exercises the full SDK
+//! the milestone requires: the [`VetoBlockEdits`](Capability::VetoBlockEdits)
+//! decision hooks, namespaced storage for configuration, the permission API for
+//! the bypass check, mutation intents for the welcome message, and event
+//! subscription.
 
-use ferrumc_core::{PluginId, TextComponent};
+use ferrumc_core::{PlayerId, PluginId, TextComponent};
+use ferrumc_math::BlockPos;
 use ferrumc_permission::{NodeParseError, PermissionNode};
 use ferrumc_plugin_api::{
-    Capability, CapabilityManifest, EventContext, EventKind, Plugin, PluginError, PluginEvent,
-    PluginMetadata, SetupContext, Version, WorldIntent,
+    BlockBreakAttempt, BlockPlaceAttempt, Capability, CapabilityManifest, EventContext, EventKind,
+    Plugin, PluginBlockDecision, PluginError, PluginEvent, PluginMetadata, SetupContext, Version,
+    WorldIntent,
 };
 
 use crate::guard::SpawnProtect;
@@ -82,14 +88,46 @@ impl SpawnProtectPlugin {
 
     /// Returns the capability manifest the plugin requires.
     ///
-    /// It needs to receive events, query permissions, submit messaging intents,
-    /// and use its private storage.
+    /// It needs to veto block edits at the intent boundary (the authoritative
+    /// spawn-protection enforcement), receive events (the join welcome), query
+    /// permissions (the bypass node), submit messaging intents, and use its
+    /// private storage for its configuration.
     pub const fn capabilities() -> CapabilityManifest {
         CapabilityManifest::empty()
+            .with(Capability::VetoBlockEdits)
             .with(Capability::ReceiveEvents)
             .with(Capability::SubmitIntents)
             .with(Capability::ReadPermissions)
             .with(Capability::Storage)
+    }
+
+    /// Decides a pending edit at `pos` by `player`: deny it inside the protected
+    /// square unless the actor holds the bypass permission.
+    ///
+    /// Shared by [`before_block_break`](Plugin::before_block_break) and
+    /// [`before_block_place`](Plugin::before_block_place). Fails closed: any error
+    /// querying permissions counts as "no bypass", so a misconfiguration can never
+    /// silently *grant* an edit inside spawn.
+    fn decide(
+        &self,
+        player: PlayerId,
+        pos: BlockPos,
+        ctx: &EventContext<'_>,
+    ) -> PluginBlockDecision {
+        if !self.guard.is_protected(pos) {
+            return PluginBlockDecision::Allow;
+        }
+        let has_bypass = match (ctx.permissions(), bypass_node()) {
+            (Ok(perms), Ok(node)) => perms.has_permission(player, &node),
+            _ => false,
+        };
+        if self.guard.vetoes(pos, has_bypass) {
+            PluginBlockDecision::Deny {
+                message: Some(TextComponent::text(DENIED_MESSAGE)),
+            }
+        } else {
+            PluginBlockDecision::Allow
+        }
     }
 
     /// Returns the policy currently held by the plugin.
@@ -128,43 +166,37 @@ impl Plugin for SpawnProtectPlugin {
             None => storage.put(CONFIG_KEY, &self.guard.to_bytes())?,
         }
 
-        ctx.events()?
-            .subscribe(EventKind::PlayerJoin)
-            .subscribe(EventKind::BlockBreak);
+        // Only the join welcome rides the notification path now; the authoritative
+        // veto runs through the capability-gated `before_block_*` decision hooks.
+        ctx.events()?.subscribe(EventKind::PlayerJoin);
         Ok(())
     }
 
     fn on_event(&mut self, event: &PluginEvent, ctx: &mut EventContext<'_>) {
-        match event {
-            PluginEvent::PlayerJoin { player } => {
-                if let Ok(sink) = ctx.sink() {
-                    let _ = sink.submit(WorldIntent::Message {
-                        player: *player,
-                        message: TextComponent::text(WELCOME_MESSAGE),
-                    });
-                }
+        if let PluginEvent::PlayerJoin { player } = event {
+            if let Ok(sink) = ctx.sink() {
+                let _ = sink.submit(WorldIntent::Message {
+                    player: *player,
+                    message: TextComponent::text(WELCOME_MESSAGE),
+                });
             }
-            PluginEvent::BlockBreak { player, pos } => {
-                // Only protected columns are interesting.
-                if !self.guard.is_protected(*pos) {
-                    return;
-                }
-                // Fail closed: any error querying permissions means "no bypass".
-                let has_bypass = match (ctx.permissions(), bypass_node()) {
-                    (Ok(perms), Ok(node)) => perms.has_permission(*player, &node),
-                    _ => false,
-                };
-                if self.guard.vetoes(*pos, has_bypass) {
-                    if let Ok(sink) = ctx.sink() {
-                        let _ = sink.submit(WorldIntent::Message {
-                            player: *player,
-                            message: TextComponent::text(DENIED_MESSAGE),
-                        });
-                    }
-                }
-            }
-            _ => {}
         }
+    }
+
+    fn before_block_break(
+        &mut self,
+        ev: &BlockBreakAttempt,
+        ctx: &mut EventContext<'_>,
+    ) -> PluginBlockDecision {
+        self.decide(ev.player(), ev.pos(), ctx)
+    }
+
+    fn before_block_place(
+        &mut self,
+        ev: &BlockPlaceAttempt,
+        ctx: &mut EventContext<'_>,
+    ) -> PluginBlockDecision {
+        self.decide(ev.player(), ev.pos(), ctx)
     }
 }
 
@@ -273,6 +305,38 @@ mod tests {
         plugin.on_event(event, &mut ctx);
     }
 
+    /// Runs `before_block_break` against a throwaway context and returns the
+    /// decision.
+    fn decide_break(
+        plugin: &mut SpawnProtectPlugin,
+        player: PlayerId,
+        pos: BlockPos,
+        perms: &dyn PermissionApi,
+        storage: &dyn PluginStorageApi,
+    ) -> PluginBlockDecision {
+        let world = NullWorld;
+        let mut sink = RecordingSink::default();
+        let mut ctx =
+            EventContext::new(CapabilityManifest::all(), &world, &mut sink, perms, storage);
+        plugin.before_block_break(&BlockBreakAttempt::new(player, pos), &mut ctx)
+    }
+
+    /// Runs `before_block_place` against a throwaway context and returns the
+    /// decision.
+    fn decide_place(
+        plugin: &mut SpawnProtectPlugin,
+        player: PlayerId,
+        pos: BlockPos,
+        perms: &dyn PermissionApi,
+        storage: &dyn PluginStorageApi,
+    ) -> PluginBlockDecision {
+        let world = NullWorld;
+        let mut sink = RecordingSink::default();
+        let mut ctx =
+            EventContext::new(CapabilityManifest::all(), &world, &mut sink, perms, storage);
+        plugin.before_block_place(&BlockPlaceAttempt::new(player, pos, 1), &mut ctx)
+    }
+
     #[test]
     fn on_enable_seeds_then_reads_back_config() {
         let storage = MapStorage::default();
@@ -317,19 +381,39 @@ mod tests {
         enable(&mut plugin, &storage);
 
         let griefer = PlayerId::offline("Griefer");
-        let mut sink = RecordingSink::default();
-        dispatch(
+        let decision = decide_break(
             &mut plugin,
-            &PluginEvent::BlockBreak {
-                player: griefer,
-                pos: BlockPos::new(8, 63, 8),
-            },
-            &mut sink,
+            griefer,
+            BlockPos::new(8, 63, 8),
             &BypassFor(PlayerId::offline("Admin")),
             &storage,
         );
-        // The unauthorized actor is told it was denied.
-        assert_eq!(sink.intents.len(), 1);
+        // The unauthorized actor's break is denied, carrying the denial message.
+        assert!(matches!(
+            decision,
+            PluginBlockDecision::Deny { message: Some(_) }
+        ));
+    }
+
+    #[test]
+    fn protected_place_without_bypass_is_denied() {
+        let storage = MapStorage::default();
+        let mut plugin = SpawnProtectPlugin::new(SpawnProtect::new(8, 8, 16));
+        enable(&mut plugin, &storage);
+
+        let griefer = PlayerId::offline("Griefer");
+        let decision = decide_place(
+            &mut plugin,
+            griefer,
+            BlockPos::new(8, 64, 8),
+            &BypassFor(PlayerId::offline("Admin")),
+            &storage,
+        );
+        // Placement inside spawn is denied for an unauthorized actor too.
+        assert!(matches!(
+            decision,
+            PluginBlockDecision::Deny { message: Some(_) }
+        ));
     }
 
     #[test]
@@ -339,19 +423,15 @@ mod tests {
         enable(&mut plugin, &storage);
 
         let admin = PlayerId::offline("Admin");
-        let mut sink = RecordingSink::default();
-        dispatch(
+        let decision = decide_break(
             &mut plugin,
-            &PluginEvent::BlockBreak {
-                player: admin,
-                pos: BlockPos::new(8, 63, 8),
-            },
-            &mut sink,
+            admin,
+            BlockPos::new(8, 63, 8),
             &BypassFor(admin),
             &storage,
         );
-        // A bypassing actor triggers no denial message.
-        assert!(sink.intents.is_empty());
+        // A bypassing actor's edit is allowed.
+        assert_eq!(decision, PluginBlockDecision::Allow);
     }
 
     #[test]
@@ -361,17 +441,14 @@ mod tests {
         enable(&mut plugin, &storage);
 
         let griefer = PlayerId::offline("Griefer");
-        let mut sink = RecordingSink::default();
-        dispatch(
+        let decision = decide_break(
             &mut plugin,
-            &PluginEvent::BlockBreak {
-                player: griefer,
-                pos: BlockPos::new(1000, 63, 1000),
-            },
-            &mut sink,
+            griefer,
+            BlockPos::new(1000, 63, 1000),
             &BypassFor(PlayerId::offline("Admin")),
             &storage,
         );
-        assert!(sink.intents.is_empty());
+        // Outside the protected square nothing is vetoed.
+        assert_eq!(decision, PluginBlockDecision::Allow);
     }
 }

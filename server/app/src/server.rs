@@ -132,9 +132,13 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     // connection; build them once and share behind an `Arc`.
     let config_registries = Arc::new(ConfigRegistries::build()?);
 
-    // Build the play policy (spawn-protection veto, bypass permissions, command
-    // tree) by driving the in-process plugin's config round-trip through storage.
-    let policy = Arc::new(build_play_policy(config)?);
+    // Build the play policy (bypass permissions, command tree, spawn) and the
+    // long-lived block-event dispatcher that owns the plugin host. The dispatcher
+    // is shared by every connection task so the plugins' `before_block_*` decision
+    // hooks run at the intent boundary, off the simulation tick.
+    let (policy, block_events) = build_play_policy(config)?;
+    let policy = Arc::new(policy);
+    let block_events = Arc::new(block_events);
 
     // Prove the dynamic loader: scan the configured plugins directory across the
     // C ABI. Failures are logged and never fatal to startup.
@@ -208,6 +212,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         keep_alive_interval: config.keep_alive_interval,
         commands: commands_tx,
         policy,
+        block_events,
         status_response,
         view_distance: config.view_distance,
         metrics: Arc::clone(&metrics),

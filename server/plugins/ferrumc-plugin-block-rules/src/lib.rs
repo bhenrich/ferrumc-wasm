@@ -1,50 +1,34 @@
 // This crate cannot inherit the workspace `forbid(unsafe_code)`: exporting the
 // `#[no_mangle]` C entrypoint counts as unsafe code under modern rustc. It is
 // `deny`ed instead, with a single scoped `#[allow(unsafe_code)]` on the export
-// (mirroring `ferrumc-plugin-fixture`). All real FFI machinery lives on the host
-// side of the boundary; here the "unsafe" act is only exposing a C symbol.
+// (mirroring `ferrumc-plugin-spawn-protect`). All real FFI machinery lives on
+// the host side of the boundary; here the "unsafe" act is only exposing a C
+// symbol.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-//! The spawn-protection plugin.
+//! The block-rules sample plugin.
 //!
-//! This is the milestone's MVP plugin, shipped two ways from one crate:
+//! A second milestone sample, shipped two ways from one crate (the same shape as
+//! `ferrumc-plugin-spawn-protect`):
 //!
-//! - As a **`cdylib`** exporting the M28 C ABI ([`ferrumc_plugin_api::abi`]) so
-//!   the host's dynamic loader can load it from a `/plugins` directory across the
-//!   stable boundary. This proves the dynamic-loading path end to end.
-//! - As an **`rlib`** exposing an in-process [`SpawnProtectPlugin`] and the pure
-//!   [`SpawnProtect`] policy, so the application can drive the same logic
-//!   directly.
+//! - As a **`cdylib`** exporting the C ABI ([`ferrumc_plugin_api::abi`]) so the
+//!   host's dynamic loader can load it from a `/plugins` directory across the
+//!   stable boundary.
+//! - As an **`rlib`** exposing the in-process [`BlockRulesPlugin`], whose
+//!   `before_block_place` decision hook proves two of the block-decision
+//!   outcomes: it **denies** placing a configured block (bedrock) and
+//!   **replaces** glass placements with tinted glass.
 //!
-//! # Where the veto runs
-//!
-//! The plugin "vetoes" unauthorized block edits inside a configurable spawn
-//! radius. The authoritative veto is the in-process
-//! [`SpawnProtectPlugin`]'s `before_block_place` / `before_block_break` decision
-//! hooks: the host consults them at the *intent boundary* (before the edit reaches
-//! the simulation), and they return [`PluginBlockDecision::Deny`] for a protected
-//! edit by an actor without the bypass permission. See
-//! [`ferrumc_plugin_api::Plugin::before_block_break`].
-//!
-//! The C ABI ([`PluginVTable`]) still carries only lifecycle hooks
-//! (`init` / `shutdown`) — the block-decision surface is in-process only, not a
-//! cross-ABI contract. So the dynamic (`cdylib`) form proves the *loader* end to
-//! end, while the in-process (`rlib`) form provides the real veto and exercises
-//! the full SDK the deliverable calls for: the
-//! [`VetoBlockEdits`](ferrumc_plugin_api::Capability::VetoBlockEdits) decision
-//! hooks, namespaced storage for configuration, the permission API for the bypass
-//! check, mutation intents for the join welcome, and event subscription.
-//!
-//! [`PluginVTable`]: ferrumc_plugin_api::abi::PluginVTable
-//! [`PluginBlockDecision::Deny`]: ferrumc_plugin_api::PluginBlockDecision::Deny
+//! The block-decision surface is in-process only (the C ABI carries no event
+//! hook), so the `cdylib` proves the loader while the `rlib` provides the actual
+//! decisions. See the crate's [`plugin`] module for the rules.
 
-mod guard;
 mod plugin;
 
-pub use guard::{SpawnProtect, DEFAULT_RADIUS, ENCODED_LEN};
 pub use plugin::{
-    bypass_node, SpawnProtectPlugin, BYPASS_PERMISSION, CONFIG_KEY, PLUGIN_ID, PLUGIN_NAME,
+    BlockRulesPlugin, DENIED_BLOCK_STATE_ID, GLASS_BLOCK_STATE_ID, PLUGIN_ID, PLUGIN_NAME,
+    TINTED_GLASS_BLOCK_STATE_ID,
 };
 
 use core::ffi::c_char;
@@ -54,26 +38,26 @@ use ferrumc_plugin_api::abi::{PluginVTable, ABI_VERSION, STATUS_OK, STATUS_PANIC
 
 /// The capability bitset the `cdylib` declares across the C ABI.
 ///
-/// Matches [`SpawnProtectPlugin::capabilities`] so a host reads back exactly the
+/// Matches [`BlockRulesPlugin::capabilities`] so a host reads back exactly the
 /// capabilities the in-process plugin requests.
-const CAPABILITY_BITS: u32 = SpawnProtectPlugin::capabilities().bits();
+const CAPABILITY_BITS: u32 = BlockRulesPlugin::capabilities().bits();
 
 /// Returns the plugin's stable id as a nul-terminated C string.
 extern "C" fn vtable_id() -> *const c_char {
-    c"spawn-protect".as_ptr()
+    c"block-rules".as_ptr()
 }
 
 /// Returns the plugin's display name as a nul-terminated C string.
 extern "C" fn vtable_name() -> *const c_char {
-    c"Spawn Protection".as_ptr()
+    c"Block Rules".as_ptr()
 }
 
 /// The C-ABI init shim.
 ///
 /// Wrapped in [`catch_unwind`] to honor the ABI rule that a plugin must never
 /// unwind across the boundary: any panic becomes a status code. The dynamic
-/// instance holds no state of its own (the in-process plugin owns the policy),
-/// so initialization is a no-op success.
+/// instance holds no state of its own (the in-process plugin owns the rules), so
+/// initialization is a no-op success.
 extern "C" fn vtable_init(_abi_version: u32, _granted_capabilities: u32) -> i32 {
     catch_unwind(|| STATUS_OK).unwrap_or(STATUS_PANIC)
 }
@@ -119,11 +103,10 @@ mod tests {
     fn entrypoint_exposes_a_valid_vtable() {
         let ptr = ferrumc_plugin_entry();
         assert!(!ptr.is_null());
-        // SAFETY-free: we only read fields of our own `'static` vtable.
         assert_eq!(VTABLE.abi_version, ABI_VERSION);
         assert_eq!(
             CapabilityManifest::from_bits_truncate(VTABLE.capability_bits),
-            SpawnProtectPlugin::capabilities()
+            BlockRulesPlugin::capabilities()
         );
     }
 

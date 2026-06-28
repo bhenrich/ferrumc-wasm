@@ -30,6 +30,15 @@ pub enum Capability {
     /// Use the plugin's namespaced
     /// [`PluginStorageApi`](crate::PluginStorageApi).
     Storage,
+    /// Veto, rewrite, or augment block edits at the intent boundary through the
+    /// `before_*` decision hooks
+    /// ([`Plugin::before_block_place`](crate::Plugin::before_block_place) /
+    /// [`Plugin::before_block_break`](crate::Plugin::before_block_break)).
+    ///
+    /// Strictly more powerful than passive [`ReceiveEvents`](Capability::ReceiveEvents)
+    /// (it can *block* a player action), so it is granted separately. Part of the
+    /// UNSTABLE / dev-only block-decision surface.
+    VetoBlockEdits,
 }
 
 impl Capability {
@@ -37,13 +46,14 @@ impl Capability {
     ///
     /// Useful for building an all-capabilities manifest or for enumeration in
     /// tooling.
-    pub const ALL: [Capability; 6] = [
+    pub const ALL: [Capability; 7] = [
         Capability::ReadWorld,
         Capability::SubmitIntents,
         Capability::RegisterCommands,
         Capability::ReceiveEvents,
         Capability::ReadPermissions,
         Capability::Storage,
+        Capability::VetoBlockEdits,
     ];
 
     /// The single bit this capability occupies inside a [`CapabilityManifest`].
@@ -55,6 +65,7 @@ impl Capability {
             Capability::ReceiveEvents => 1 << 3,
             Capability::ReadPermissions => 1 << 4,
             Capability::Storage => 1 << 5,
+            Capability::VetoBlockEdits => 1 << 6,
         }
     }
 
@@ -67,6 +78,7 @@ impl Capability {
             Capability::ReceiveEvents => "receive-events",
             Capability::ReadPermissions => "read-permissions",
             Capability::Storage => "storage",
+            Capability::VetoBlockEdits => "veto-block-edits",
         }
     }
 }
@@ -83,7 +95,8 @@ const ALL_BITS: u32 = Capability::ReadWorld.bit()
     | Capability::RegisterCommands.bit()
     | Capability::ReceiveEvents.bit()
     | Capability::ReadPermissions.bit()
-    | Capability::Storage.bit();
+    | Capability::Storage.bit()
+    | Capability::VetoBlockEdits.bit();
 
 /// An immutable set of [`Capability`] grants.
 ///
@@ -260,5 +273,20 @@ mod tests {
     fn display_is_stable_identifier() {
         assert_eq!(Capability::ReadWorld.to_string(), "read-world");
         assert_eq!(Capability::Storage.as_str(), "storage");
+        assert_eq!(Capability::VetoBlockEdits.as_str(), "veto-block-edits");
+    }
+
+    #[test]
+    fn veto_block_edits_is_a_distinct_bit() {
+        // The new capability must not alias any existing bit, and must round-trip.
+        let only = CapabilityManifest::empty().with(Capability::VetoBlockEdits);
+        assert!(only.grants(Capability::VetoBlockEdits));
+        assert!(!only.grants(Capability::ReceiveEvents));
+        assert_eq!(only.len(), 1);
+        assert_eq!(
+            CapabilityManifest::from_bits_truncate(only.bits()),
+            only,
+            "veto-block-edits bit survives a raw round-trip"
+        );
     }
 }

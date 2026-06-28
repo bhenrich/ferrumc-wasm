@@ -28,7 +28,7 @@ use ferrumc_codec::{BoundedReader, BoundedString};
 use ferrumc_command::{CommandSource, CommandTree};
 use ferrumc_core::{GameMode, PlayerId, TextColor, TextComponent, Tick};
 use ferrumc_items::UntrustedItemStack;
-use ferrumc_math::{BlockPos, ChunkPos, Vec3};
+use ferrumc_math::{BlockPos, ChunkPos, Vec3, WorldIntent};
 use ferrumc_net::{
     offline_uuid, CompressionState, ConnectionLimits, ConnectionState, Criticality, DecodeError,
     DisconnectReason, EnqueueOutcome, FrameDecodeError, InboundDecoder, InboundPacket,
@@ -37,6 +37,8 @@ use ferrumc_net::{
 use ferrumc_observability::{
     CounterRegistry, MutationKind, MutationResult, PacketState, ServerClock, SessionDebug,
 };
+use ferrumc_plugin_api::{BlockBreakAttempt, BlockPlaceAttempt};
+use ferrumc_plugin_host::ResolvedDecision;
 use ferrumc_proto::generated::configuration::{
     ClientboundConfigurationPacket, ClientboundKnownPacks, FinishConfiguration,
     ServerboundConfigurationPacket,
@@ -62,7 +64,7 @@ use crate::command::{parse_gamemode, GAMEMODE_COMMAND, SPAWN_COMMAND};
 use crate::driver::SimCommand;
 use crate::inventory::{PlayerInventory, SLOT_COUNT, WINDOW_ID};
 use crate::observe;
-use crate::plugins::PlayPolicy;
+use crate::plugins::{BlockEventDispatcher, PermissionFacade, PlayPolicy};
 use crate::registries::ConfigRegistries;
 use crate::world::JoinKit;
 
@@ -260,9 +262,16 @@ pub(crate) struct ConnContext {
     pub(crate) keep_alive_interval: Duration,
     /// Bounded channel to the simulation/session driver.
     pub(crate) commands: mpsc::Sender<SimCommand>,
-    /// The shared play policy: spawn-protection veto, bypass permissions, and the
+    /// The shared play policy: bypass permissions, the spawn position, and the
     /// command tree consulted for serverbound play packets.
     pub(crate) policy: Arc<PlayPolicy>,
+    /// The shared block-event dispatcher: the long-lived plugin host the
+    /// connection consults at the intent boundary for every block break/place.
+    ///
+    /// The plugins' `before_block_*` decision hooks run here (synchronously,
+    /// panic-isolated, under a mutex with no lock held across an `.await`) — never
+    /// inside the deterministic, plugin-free simulation tick.
+    pub(crate) block_events: Arc<BlockEventDispatcher>,
     /// The prebuilt server-list status response, rendered once at startup and
     /// replayed for every status (`next_state == 1`) handshake. Behind an [`Arc`]
     /// so cloning the context per connection is a pointer bump, not a re-render.
@@ -1300,35 +1309,25 @@ async fn handle_play_body(
     }
 
     let event = NetEvent::play(player, packet);
-    if let Some((kind, sequence)) = veto_kind(ctx, player, &event) {
-        // Spawn protection: drop the edit so the world is never modified and no
-        // BlockUpdate is broadcast. Count the rejected mutation, then heal the
-        // actor's optimistic client-side prediction: an `AcknowledgeBlockChange`
-        // for the edit's sequence ends the client's pending prediction
-        // (endPredictionsUpTo) and reverts the ghost block.
-        //
-        // The backpressure spec (finding #4) asked for an authoritative
-        // `BlockUpdate` resync alongside this ack. For the *veto* path that is a
-        // documented false positive: the veto changed nothing, so the client's
-        // pre-prediction state is already authoritative, and endPredictionsUpTo
-        // reverts the prediction to exactly that state — the ack alone is
-        // protocol-correct for an unchanged world. Authoring a real `BlockUpdate`
-        // here is also impossible without breaking the hard rule that the net layer
-        // never reads world state. The robust resync (sim-side veto emitting
-        // `BlockChangeRejected` with the real state) is deferred; sim-originated
-        // rejections already get the mandatory resync+ack pair in the router.
-        // Without this ack a real 1.21.8 client would keep the ghost block until
-        // some later sequence happened to be acked.
-        ctx.metrics
-            .record_block_mutation(kind, MutationResult::Rejected);
-        enqueue_traced_classified(
+    // A block break crosses the plugin intent boundary: the loaded plugins'
+    // `before_block_break` decision hooks decide whether (and how) it proceeds.
+    // Every other event (movement, disconnect) carries no block decision and routes
+    // straight to the simulation.
+    if let Some(GameInput::BlockBreak {
+        position, sequence, ..
+    }) = net_event_to_input(&event)
+    {
+        return handle_block_break(
+            ctx,
+            player,
             writer,
+            position,
+            sequence,
+            event,
             debug,
             compression,
-            &ctx.clock,
-            ClientboundPlayPacket::AcknowledgeBlockChange(AcknowledgeBlockChange::new(sequence)),
-        );
-        return Ok(());
+        )
+        .await;
     }
     ctx.commands
         .send(SimCommand::Event(event))
@@ -1498,33 +1497,159 @@ fn chebyshev_distance(a: ChunkPos, b: ChunkPos) -> i64 {
     dx.max(dz)
 }
 
-/// Returns the mutation kind and block-action sequence if `event` is a
-/// break/place that spawn protection should veto (it targets a protected column
-/// and the actor lacks the bypass permission), or `None` if it is not a vetoed
-/// edit.
+/// Handles a block break at the plugin intent boundary.
 ///
-/// Returning the [`MutationKind`] lets the caller record the rejected mutation
-/// against `ferrumc_block_mutation_total{kind,result=rejected}`; the `sequence`
-/// lets it acknowledge the vetoed action so the client's prediction heals.
-fn veto_kind(ctx: &ConnContext, player: PlayerId, event: &NetEvent) -> Option<(MutationKind, i32)> {
-    let (position, sequence, kind) = match net_event_to_input(event) {
-        Some(GameInput::BlockBreak {
-            position, sequence, ..
-        }) => (position, sequence, MutationKind::Break),
-        Some(GameInput::BlockPlace {
-            position, sequence, ..
-        }) => (position, sequence, MutationKind::Place),
-        _ => return None,
-    };
-    if ctx
-        .policy
-        .guard()
-        .vetoes(position, ctx.policy.permissions().has_bypass(player))
-    {
-        Some((kind, sequence))
-    } else {
-        None
+/// Consults the loaded plugins' `before_block_break` hooks (off the tick, under
+/// the host mutex with no lock held across an `.await`) and resolves the combined
+/// decision:
+///
+/// - [`Deny`](ResolvedDecision::Deny): the edit is dropped (the world is never
+///   modified), the rejected mutation is counted, and the actor's optimistic
+///   client-side prediction is healed with an `AcknowledgeBlockChange` for the
+///   edit's sequence (`endPredictionsUpTo`, which reverts the ghost block). If the
+///   decision carries a message it is delivered as a system chat. (No authoritative
+///   `BlockUpdate` is authored here: the net layer must not read world state, and a
+///   veto changed nothing, so the pre-prediction state is already authoritative —
+///   the ack alone is protocol-correct. A true sim-routed resync is a documented
+///   follow-up.)
+/// - [`Replace`](ResolvedDecision::Replace): the broken block is set to the
+///   replacement state instead of air, by routing a [`SimCommand::PlaceBlock`] at
+///   the break position.
+/// - [`Allow`](ResolvedDecision::Allow): the original break routes to the
+///   simulation as before.
+///
+/// Any emitted [`WorldIntent`]s are routed, and on a non-denied edit the
+/// `after_block_break` notification fires.
+#[allow(clippy::too_many_arguments)] // the connection threads its writer + trace context through
+async fn handle_block_break(
+    ctx: &ConnContext,
+    player: PlayerId,
+    writer: &mut PlayWriter,
+    position: BlockPos,
+    sequence: i32,
+    event: NetEvent,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+) -> anyhow::Result<()> {
+    let perms = PermissionFacade::new(ctx.policy.permissions());
+    let (decision, emitted) = ctx
+        .block_events
+        .before_block_break(&BlockBreakAttempt::new(player, position), &perms);
+
+    match decision {
+        ResolvedDecision::Deny { message } => {
+            ctx.metrics
+                .record_block_mutation(MutationKind::Break, MutationResult::Rejected);
+            ack_sequence(writer, debug, compression, &ctx.clock, sequence)?;
+            deliver_deny_message(ctx, writer, debug, compression, message);
+            route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression)
+                .await?;
+            return Ok(());
+        }
+        ResolvedDecision::Replace { block_state_id } => {
+            // Replace the broken block with the replacement state instead of air.
+            ctx.commands
+                .send(SimCommand::PlaceBlock {
+                    player,
+                    position,
+                    sequence,
+                    state: BlockStateId::new(block_state_id),
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+        }
+        _ => {
+            ctx.commands
+                .send(SimCommand::Event(event))
+                .await
+                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+        }
     }
+
+    route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression).await?;
+    // The edit was accepted at the intent boundary and routed: notify after_*.
+    let after = ctx.block_events.after_block_break(player, position, &perms);
+    route_emitted_intents(ctx, player, writer, sequence, after, debug, compression).await
+}
+
+/// Delivers a plugin Deny message (if any) to the acting player as a system chat.
+fn deliver_deny_message(
+    ctx: &ConnContext,
+    writer: &mut PlayWriter,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+    message: Option<TextComponent>,
+) {
+    if let Some(message) = message {
+        enqueue_traced_classified(
+            writer,
+            debug,
+            compression,
+            &ctx.clock,
+            ferrumc_session::system_chat(&message, false),
+        );
+    }
+}
+
+/// Routes the [`WorldIntent`]s a plugin emitted from a block decision (or an
+/// after-* notification).
+///
+/// Mapping (best-effort; the emitted-intent surface is dev-only and bounded):
+/// - [`WorldIntent::SetBlock`] -> [`SimCommand::PlaceBlock`] by the acting player.
+/// - [`WorldIntent::Message`] -> a system chat to the acting player's own writer
+///   when it targets them, otherwise a server-wide broadcast (the connection task
+///   cannot reach another player's outbound channel directly).
+/// - [`WorldIntent::Teleport`] -> not yet routed (logged); a documented follow-up.
+async fn route_emitted_intents(
+    ctx: &ConnContext,
+    actor: PlayerId,
+    writer: &mut PlayWriter,
+    sequence: i32,
+    intents: Vec<WorldIntent>,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+) -> anyhow::Result<()> {
+    for intent in intents {
+        match intent {
+            WorldIntent::SetBlock {
+                pos,
+                block_state_id,
+            } => {
+                ctx.commands
+                    .send(SimCommand::PlaceBlock {
+                        player: actor,
+                        position: pos,
+                        sequence,
+                        state: BlockStateId::new(block_state_id),
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+            }
+            WorldIntent::Message { player, message } => {
+                if player == actor {
+                    enqueue_traced_classified(
+                        writer,
+                        debug,
+                        compression,
+                        &ctx.clock,
+                        ferrumc_session::system_chat(&message, false),
+                    );
+                } else {
+                    ctx.commands
+                        .send(SimCommand::BroadcastSystemChat {
+                            content: message,
+                            overlay: false,
+                        })
+                        .await
+                        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+                }
+            }
+            _ => {
+                tracing::debug!("plugin emitted an intent with no connection-side route; skipping");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Dispatches a `/command` for `player`, reports the outcome to them, and applies
@@ -1643,14 +1768,25 @@ async fn handle_command(
     Ok(())
 }
 
-/// Handles a serverbound `UseItemOn`: place the held block at the targeted cell.
+/// Handles a serverbound `UseItemOn`: place the held block at the targeted cell,
+/// after consulting the loaded plugins at the intent boundary.
 ///
-/// Resolves the held hotbar stack to a block-state; if it is a placeable block and
-/// spawn protection does not veto the target, routes a [`SimCommand::PlaceBlock`]
-/// carrying that state (creative never decrements the stack). An empty hand, a
-/// non-placeable item, a malformed face, or a vetoed target places nothing but
-/// still acknowledges the block-action sequence so the client's optimistic
-/// prediction ends — preserving the existing sequence-ack/resync behavior.
+/// Resolves the held hotbar stack to a block-state. An empty hand, a non-placeable
+/// item, or a malformed face places nothing but still acknowledges the
+/// block-action sequence so the client's optimistic prediction ends. A placeable
+/// block is offered to the plugins' `before_block_place` hooks (off the tick); the
+/// combined decision is then resolved:
+///
+/// - [`Deny`](ResolvedDecision::Deny): nothing is placed, the rejection is
+///   counted, the sequence is acked (healing the prediction), and any Deny message
+///   is delivered as a system chat.
+/// - [`Replace`](ResolvedDecision::Replace): the replacement block-state is placed
+///   instead of the held one.
+/// - [`Allow`](ResolvedDecision::Allow): the held block is placed (creative never
+///   decrements the stack).
+///
+/// On a non-denied placement any emitted intents are routed and the
+/// `after_block_place` notification fires.
 async fn handle_use_item_on(
     ctx: &ConnContext,
     player: PlayerId,
@@ -1663,42 +1799,55 @@ async fn handle_use_item_on(
     let sequence = packet.sequence();
     // A malformed face index yields no target: just ack so the prediction ends.
     let Some(position) = use_item_on_target(packet) else {
-        ack_sequence(writer, debug, compression, &ctx.clock, sequence);
+        ack_sequence(writer, debug, compression, &ctx.clock, sequence)?;
         return Ok(());
     };
 
-    // Spawn protection vetoes the placement regardless of the held item.
-    let vetoed = ctx
-        .policy
-        .guard()
-        .vetoes(position, ctx.policy.permissions().has_bypass(player));
+    // Empty hand or non-placeable item: nothing to place, just ack. The plugins are
+    // not consulted for a no-op placement.
+    let Some(held_state) = inventory.held().placeable_block() else {
+        ack_sequence(writer, debug, compression, &ctx.clock, sequence)?;
+        return Ok(());
+    };
 
-    match inventory.held().placeable_block() {
-        Some(state) if !vetoed => {
-            // Creative: place the held block; never touch (decrement) the stack.
-            ctx.commands
-                .send(SimCommand::PlaceBlock {
-                    player,
-                    position,
-                    sequence,
-                    state: BlockStateId::new(state),
-                })
-                .await
-                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
-        }
-        Some(_) => {
-            // Placeable but vetoed: count the rejection and ack (heal the prediction).
+    let perms = PermissionFacade::new(ctx.policy.permissions());
+    let (decision, emitted) = ctx.block_events.before_block_place(
+        &BlockPlaceAttempt::new(player, position, held_state),
+        &perms,
+    );
+
+    // The state actually placed (the held block, or a plugin's replacement).
+    let placed_state = match decision {
+        ResolvedDecision::Deny { message } => {
             ctx.metrics
                 .record_block_mutation(MutationKind::Place, MutationResult::Rejected);
-            ack_sequence(writer, debug, compression, &ctx.clock, sequence);
-            Ok(())
+            ack_sequence(writer, debug, compression, &ctx.clock, sequence)?;
+            deliver_deny_message(ctx, writer, debug, compression, message);
+            route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression)
+                .await?;
+            return Ok(());
         }
-        None => {
-            // Empty hand or non-placeable item: nothing to place, just ack.
-            ack_sequence(writer, debug, compression, &ctx.clock, sequence);
-            Ok(())
-        }
-    }
+        ResolvedDecision::Replace { block_state_id } => block_state_id,
+        _ => held_state,
+    };
+
+    // Creative: place the (possibly replaced) block; never touch the stack.
+    ctx.commands
+        .send(SimCommand::PlaceBlock {
+            player,
+            position,
+            sequence,
+            state: BlockStateId::new(placed_state),
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+
+    route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression).await?;
+    // Accepted at the intent boundary and routed: notify after_*.
+    let after = ctx
+        .block_events
+        .after_block_place(player, position, placed_state, &perms);
+    route_emitted_intents(ctx, player, writer, sequence, after, debug, compression).await
 }
 
 /// Handles a serverbound Set Creative Slot: validate the untrusted item bytes,
@@ -1824,20 +1973,28 @@ fn handle_window_click(
 
 /// Enqueues an `AcknowledgeBlockChange` echoing `sequence`, ending the client's
 /// optimistic prediction for that block action.
+///
+/// Sent as a *mandatory* frame (via [`send_mandatory`]): the ack is precisely the
+/// packet that terminates the client's optimistic prediction, so a silent tail-drop
+/// at a full outbound queue would strand the predicted (broken, placed, replaced,
+/// or no-op) block as a ghost forever. Escalating a dropped ack to an outbound
+/// overflow matches both the `Mandatory` criticality the router already tags onto
+/// this packet ([`Criticality::for_packet`]) and the sim's own block-change
+/// rejection path, which forces the same heal-ack mandatory for the same reason.
 fn ack_sequence(
     writer: &mut PlayWriter,
     debug: &mut SessionDebug,
     compression: &CompressionState,
     clock: &ServerClock,
     sequence: i32,
-) {
-    enqueue_traced_classified(
+) -> anyhow::Result<()> {
+    send_mandatory(
         writer,
         debug,
         compression,
         clock,
         ClientboundPlayPacket::AcknowledgeBlockChange(AcknowledgeBlockChange::new(sequence)),
-    );
+    )
 }
 
 /// Enqueues a mandatory clientbound packet, escalating a tail-drop at a full queue
@@ -1846,7 +2003,9 @@ fn ack_sequence(
 /// The connection-originated inventory packets (join container content, the
 /// creative-slot echo, the click resync) are authoritative state: a silent drop
 /// would desync the client's inventory view, so a dropped mandatory frame here is
-/// the same fatal condition the keep-alive and router paths already enforce.
+/// the same fatal condition the keep-alive and router paths already enforce. The
+/// block-action heal-ack ([`ack_sequence`]) routes through here for the same
+/// reason: dropping it strands the client's optimistic block prediction as a ghost.
 fn send_mandatory(
     writer: &mut PlayWriter,
     debug: &mut SessionDebug,

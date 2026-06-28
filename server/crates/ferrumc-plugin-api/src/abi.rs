@@ -46,7 +46,14 @@ use core::ffi::{c_char, CStr};
 /// the function-pointer signatures. The host refuses to load a plugin whose
 /// [`PluginVTable::abi_version`] differs, which is the entire point: it turns an
 /// incompatible binary into a clean rejection instead of undefined behavior.
-pub const ABI_VERSION: u32 = 1;
+///
+/// Bumped to `2` when the capability set gained
+/// [`VetoBlockEdits`](crate::Capability::VetoBlockEdits): the `PluginVTable`
+/// *layout* is unchanged, but the meaning of `capability_bits` widened, so a host
+/// reading an old binary's bitset would mis-interpret it. The version bump turns
+/// that into a clean rejection. The block-decision hooks themselves are
+/// in-process only — they are not carried across this C ABI.
+pub const ABI_VERSION: u32 = 2;
 
 /// The name of the symbol every plugin library must export.
 ///

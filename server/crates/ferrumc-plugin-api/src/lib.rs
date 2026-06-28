@@ -19,6 +19,18 @@
 //! plugins from dynamic libraries (see ADR-0006). It is the *only* part of this
 //! crate that is layout-stable across Rust versions.
 //!
+//! # Block-decision surface (UNSTABLE / dev-only)
+//!
+//! Beyond the read-only event notifications, a plugin holding the
+//! [`VetoBlockEdits`](Capability::VetoBlockEdits) capability can veto, rewrite, or
+//! augment a block edit at the *intent boundary* — before the edit reaches the
+//! simulation — by overriding [`Plugin::before_block_place`] /
+//! [`Plugin::before_block_break`] and returning a [`PluginBlockDecision`]. This
+//! surface (the hooks, [`BlockPlaceAttempt`] / [`BlockBreakAttempt`], and
+//! [`PluginBlockDecision`]) is **unstable and for development only**; its shape may
+//! change without a compatibility guarantee, and it is *not* carried across the C
+//! [`abi`] (it is in-process only).
+//!
 //! Access is mediated by a [`CapabilityManifest`] of [`Capability`] grants and
 //! delivered through the [`SetupContext`], [`EventContext`], and
 //! [`TeardownContext`] the host passes to lifecycle hooks. The world, sink,
@@ -44,7 +56,10 @@ pub use capability::{Capability, CapabilityManifest};
 pub use command::CommandRegistrar;
 pub use context::{EventContext, SetupContext, TeardownContext};
 pub use error::{CapabilityError, IntentError, PluginError, StorageError};
-pub use event::{EventKind, EventRegistrar, PluginEvent};
+pub use event::{
+    BlockBreakAttempt, BlockPlaceAttempt, EventKind, EventRegistrar, PluginBlockDecision,
+    PluginEvent, MAX_EMITTED_INTENTS,
+};
 pub use metadata::PluginMetadata;
 pub use permission::PermissionApi;
 pub use plugin::Plugin;
