@@ -148,6 +148,9 @@ impl OutboundPriority {
             | ClientboundPlayPacket::SetContainerContent(_)
             | ClientboundPlayPacket::SetContainerSlot(_)
             | ClientboundPlayPacket::ClientboundSetHeldItem(_)
+            // Player Abilities is join-handshake state (flight + instabuild flags);
+            // the client must reliably apply it, so it rides State.
+            | ClientboundPlayPacket::PlayerAbilities(_)
             | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::State,
             ClientboundPlayPacket::BlockUpdate(_)
             | ClientboundPlayPacket::ChunkDataAndLight(_)
@@ -239,6 +242,9 @@ impl Criticality {
             | ClientboundPlayPacket::SetContainerContent(_)
             | ClientboundPlayPacket::SetContainerSlot(_)
             | ClientboundPlayPacket::ClientboundSetHeldItem(_)
+            // Player Abilities carries the creative flight/instabuild flags the
+            // client needs on join; dropping it leaves the client without them.
+            | ClientboundPlayPacket::PlayerAbilities(_)
             | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::Mandatory,
             ClientboundPlayPacket::BlockUpdate(_)
             | ClientboundPlayPacket::ChunkDataAndLight(_)

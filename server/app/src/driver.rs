@@ -24,14 +24,15 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
 use ferrumc_core::{GameMode, PlayerId, TextComponent, Tick};
-use ferrumc_math::{ChunkPos, Vec3};
+use ferrumc_math::{BlockPos, ChunkPos, Vec3};
 use ferrumc_observability::{
     CounterRegistry, MutationKind, MutationResult, ServerClock, TickMetrics,
 };
 use ferrumc_proto::generated::play::ChunkDataAndLight;
 use ferrumc_session::{NetEvent, PlayerSessionHandle, SessionError, SessionRouter};
 use ferrumc_sim::{
-    ChunkTicket, GameInput, GameOutput, MutationCause, PendingMutation, SimShard, TicketReason,
+    BlockStateId, ChunkTicket, GameInput, GameOutput, MutationCause, PendingMutation, SimShard,
+    TicketReason,
 };
 use ferrumc_storage::{
     BlockMutationLogRecord, MutationActor, MutationLogCause, SchemaVersion, WorldStore,
@@ -116,6 +117,25 @@ pub(crate) enum SimCommand {
         player: PlayerId,
         /// The new game mode.
         mode: GameMode,
+    },
+    /// Place the held block at `position` after a `UseItemOn`.
+    ///
+    /// The connection resolved `state` from the player's selected hotbar slot
+    /// (the simulation stays inventory-free), then routed it here. The driver
+    /// forwards it to the block's owning shard as a [`GameInput::BlockPlace`],
+    /// which validates the edit (actor present, chunk resident, in reach) at the
+    /// tick boundary and, on acceptance, writes `state`. Spawn-protection veto and
+    /// the empty-hand / non-placeable cases are handled at the connection before
+    /// this command is ever sent.
+    PlaceBlock {
+        /// The placing player.
+        player: PlayerId,
+        /// The block position to place at (already stepped off the clicked face).
+        position: BlockPos,
+        /// The block-action sequence to acknowledge on accept/reject.
+        sequence: i32,
+        /// The block-state the held item places.
+        state: BlockStateId,
     },
 }
 
@@ -345,6 +365,26 @@ async fn handle_command(
                 router.route_game_input(player, GameInput::SetGameMode { player, mode })
             {
                 tracing::trace!(%err, "dropping set-game-mode");
+            }
+        }
+        SimCommand::PlaceBlock {
+            player,
+            position,
+            sequence,
+            state,
+        } => {
+            // Route the place to the block's owning shard (the same routing as any
+            // other block edit). A gone player has no shard to route to.
+            if let Err(err) = router.route_game_input(
+                player,
+                GameInput::BlockPlace {
+                    player,
+                    position,
+                    sequence,
+                    state,
+                },
+            ) {
+                tracing::trace!(%err, "dropping block place");
             }
         }
     }

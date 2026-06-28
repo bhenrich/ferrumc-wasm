@@ -835,3 +835,32 @@ direction = "clientbound"
 name = "ClientboundSetHeldItem"
 id = 0x62
 fields = [{ name = "slot", type = "varint" }]
+
+# minecraft-data: play.toClient.abilities ("Player Abilities"). Sent on join so a
+# creative client renders flight + instabuild correctly; `flags` is a bit set
+# (0x01 invulnerable, 0x02 flying, 0x04 allow flying, 0x08 instabuild/creative).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "PlayerAbilities"
+id = 0x39
+fields = [
+    { name = "flags", type = "i8" },
+    { name = "flying_speed", type = "f32" },
+    { name = "walking_speed", type = "f32" },
+]
+
+# minecraft-data: play.toServer.window_click ("Click Container"). The full body is
+# a tagged, HashedSlot-bearing variable structure the closed grammar cannot
+# express; the slice only needs windowId + stateId (to detect a state mismatch and
+# resync), so the rest is carried opaque. windowId is a ContainerID (varint).
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "WindowClick"
+id = 0x11
+fields = [
+    { name = "window_id", type = "varint" },
+    { name = "state_id", type = "varint" },
+    { name = "rest", type = "remaining_bytes" },
+]

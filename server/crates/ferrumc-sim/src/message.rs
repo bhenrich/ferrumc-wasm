@@ -63,8 +63,10 @@ pub enum GameInput {
     /// Decoded upstream from a serverbound `UseItemOn`; `position` is the block
     /// adjacent to the clicked face. The simulation validates the edit at the
     /// tick boundary (the same checks as [`BlockBreak`](GameInput::BlockBreak))
-    /// and, on acceptance, sets a fixed default block — held-item rules are out
-    /// of scope this milestone.
+    /// and, on acceptance, writes `state` — the block-state the held item places,
+    /// resolved by the app from the player's held hotbar stack before the input is
+    /// produced (so the simulation stays inventory-free and just applies the
+    /// already-resolved state).
     BlockPlace {
         /// Identity of the player placing the block.
         player: PlayerId,
@@ -73,6 +75,9 @@ pub enum GameInput {
         /// The block-action sequence the client stamped on the originating
         /// `UseItemOn`, echoed back in an `AcknowledgeBlockChange` on accept.
         sequence: i32,
+        /// The block-state to write on acceptance: the block the held item places,
+        /// resolved upstream from the player's selected hotbar slot.
+        state: BlockStateId,
     },
     /// Set the authoritative server-side game mode of a player.
     ///

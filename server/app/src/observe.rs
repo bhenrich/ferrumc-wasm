@@ -137,6 +137,7 @@ pub(crate) fn clientbound_play_name(packet: &ClientboundPlayPacket) -> &'static 
         ClientboundPlayPacket::SetContainerContent(_) => "set_container_content",
         ClientboundPlayPacket::SetContainerSlot(_) => "set_container_slot",
         ClientboundPlayPacket::ClientboundSetHeldItem(_) => "clientbound_set_held_item",
+        ClientboundPlayPacket::PlayerAbilities(_) => "player_abilities",
     }
 }
 
@@ -156,6 +157,7 @@ fn serverbound_play_name(packet: &ServerboundPlayPacket) -> &'static str {
         ServerboundPlayPacket::TabCompleteRequest(_) => "tab_complete_request",
         ServerboundPlayPacket::ServerboundSetHeldItem(_) => "serverbound_set_held_item",
         ServerboundPlayPacket::SetCreativeSlot(_) => "set_creative_slot",
+        ServerboundPlayPacket::WindowClick(_) => "window_click",
     }
 }
 

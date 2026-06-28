@@ -610,6 +610,67 @@ impl TabCompleteRequest {
     }
 }
 
+/// `WindowClick`: the play serverbound packet (wire id `0x11`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowClick {
+    window_id: i32,
+    state_id: i32,
+    rest: Vec<u8>,
+}
+
+impl WindowClick {
+    /// The wire packet id for `WindowClick`.
+    pub const PACKET_ID: i32 = 0x11;
+
+    /// Creates a new `WindowClick` from its wire fields.
+    pub fn new(window_id: i32, state_id: i32, rest: Vec<u8>) -> Self {
+        Self {
+            window_id,
+            state_id,
+            rest,
+        }
+    }
+
+    /// Returns the `window_id` field.
+    pub fn window_id(&self) -> i32 {
+        self.window_id
+    }
+
+    /// Returns the `state_id` field.
+    pub fn state_id(&self) -> i32 {
+        self.state_id
+    }
+
+    /// Returns the `rest` field.
+    pub fn rest(&self) -> &[u8] {
+        &self.rest
+    }
+
+    /// Decodes a `WindowClick` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let window_id = reader.read_var_int()?;
+        let state_id = reader.read_var_int()?;
+        let rest = {
+            let remaining = reader.remaining();
+            reader.read_bytes(remaining)?.to_vec()
+        };
+        Ok(Self {
+            window_id,
+            state_id,
+            rest,
+        })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        ferrumc_codec::write_var_int(buf, self.window_id);
+        ferrumc_codec::write_var_int(buf, self.state_id);
+        wire::write_raw(buf, &self.rest);
+        Ok(())
+    }
+}
+
 /// `ServerboundKeepAlive`: the play serverbound packet (wire id `0x1b`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerboundKeepAlive {
@@ -2478,6 +2539,64 @@ impl UpdateEntityRotation {
     }
 }
 
+/// `PlayerAbilities`: the play clientbound packet (wire id `0x39`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerAbilities {
+    flags: i8,
+    flying_speed: f32,
+    walking_speed: f32,
+}
+
+impl PlayerAbilities {
+    /// The wire packet id for `PlayerAbilities`.
+    pub const PACKET_ID: i32 = 0x39;
+
+    /// Creates a new `PlayerAbilities` from its wire fields.
+    pub fn new(flags: i8, flying_speed: f32, walking_speed: f32) -> Self {
+        Self {
+            flags,
+            flying_speed,
+            walking_speed,
+        }
+    }
+
+    /// Returns the `flags` field.
+    pub fn flags(&self) -> i8 {
+        self.flags
+    }
+
+    /// Returns the `flying_speed` field.
+    pub fn flying_speed(&self) -> f32 {
+        self.flying_speed
+    }
+
+    /// Returns the `walking_speed` field.
+    pub fn walking_speed(&self) -> f32 {
+        self.walking_speed
+    }
+
+    /// Decodes a `PlayerAbilities` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let flags = reader.read_i8()?;
+        let flying_speed = reader.read_f32()?;
+        let walking_speed = reader.read_f32()?;
+        Ok(Self {
+            flags,
+            flying_speed,
+            walking_speed,
+        })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        wire::write_i8(buf, self.flags);
+        wire::write_f32(buf, self.flying_speed);
+        wire::write_f32(buf, self.walking_speed);
+        Ok(())
+    }
+}
+
 /// `RemovePlayerInfo`: the play clientbound packet (wire id `0x3e`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovePlayerInfo {
@@ -2986,6 +3105,8 @@ pub enum ServerboundPlayPacket {
     ChatMessage(ChatMessage),
     /// The `TabCompleteRequest` packet.
     TabCompleteRequest(TabCompleteRequest),
+    /// The `WindowClick` packet.
+    WindowClick(WindowClick),
     /// The `ServerboundKeepAlive` packet.
     ServerboundKeepAlive(ServerboundKeepAlive),
     /// The `SetPlayerPosition` packet.
@@ -3014,6 +3135,7 @@ impl ServerboundPlayPacket {
             TabCompleteRequest::PACKET_ID => Ok(Self::TabCompleteRequest(
                 TabCompleteRequest::decode(reader)?,
             )),
+            WindowClick::PACKET_ID => Ok(Self::WindowClick(WindowClick::decode(reader)?)),
             ServerboundKeepAlive::PACKET_ID => Ok(Self::ServerboundKeepAlive(
                 ServerboundKeepAlive::decode(reader)?,
             )),
@@ -3046,6 +3168,7 @@ impl ServerboundPlayPacket {
             Self::ChatCommand(_) => ChatCommand::PACKET_ID,
             Self::ChatMessage(_) => ChatMessage::PACKET_ID,
             Self::TabCompleteRequest(_) => TabCompleteRequest::PACKET_ID,
+            Self::WindowClick(_) => WindowClick::PACKET_ID,
             Self::ServerboundKeepAlive(_) => ServerboundKeepAlive::PACKET_ID,
             Self::SetPlayerPosition(_) => SetPlayerPosition::PACKET_ID,
             Self::SetPlayerPositionAndRotation(_) => SetPlayerPositionAndRotation::PACKET_ID,
@@ -3063,6 +3186,7 @@ impl ServerboundPlayPacket {
             Self::ChatCommand(packet) => packet.encode(buf),
             Self::ChatMessage(packet) => packet.encode(buf),
             Self::TabCompleteRequest(packet) => packet.encode(buf),
+            Self::WindowClick(packet) => packet.encode(buf),
             Self::ServerboundKeepAlive(packet) => packet.encode(buf),
             Self::SetPlayerPosition(packet) => packet.encode(buf),
             Self::SetPlayerPositionAndRotation(packet) => packet.encode(buf),
@@ -3109,6 +3233,8 @@ pub enum ClientboundPlayPacket {
     UpdateEntityPositionAndRotation(UpdateEntityPositionAndRotation),
     /// The `UpdateEntityRotation` packet.
     UpdateEntityRotation(UpdateEntityRotation),
+    /// The `PlayerAbilities` packet.
+    PlayerAbilities(PlayerAbilities),
     /// The `RemovePlayerInfo` packet.
     RemovePlayerInfo(RemovePlayerInfo),
     /// The `PlayerInfoUpdate` packet.
@@ -3169,6 +3295,9 @@ impl ClientboundPlayPacket {
             UpdateEntityRotation::PACKET_ID => Ok(Self::UpdateEntityRotation(
                 UpdateEntityRotation::decode(reader)?,
             )),
+            PlayerAbilities::PACKET_ID => {
+                Ok(Self::PlayerAbilities(PlayerAbilities::decode(reader)?))
+            }
             RemovePlayerInfo::PACKET_ID => {
                 Ok(Self::RemovePlayerInfo(RemovePlayerInfo::decode(reader)?))
             }
@@ -3217,6 +3346,7 @@ impl ClientboundPlayPacket {
             Self::UpdateEntityPosition(_) => UpdateEntityPosition::PACKET_ID,
             Self::UpdateEntityPositionAndRotation(_) => UpdateEntityPositionAndRotation::PACKET_ID,
             Self::UpdateEntityRotation(_) => UpdateEntityRotation::PACKET_ID,
+            Self::PlayerAbilities(_) => PlayerAbilities::PACKET_ID,
             Self::RemovePlayerInfo(_) => RemovePlayerInfo::PACKET_ID,
             Self::PlayerInfoUpdate(_) => PlayerInfoUpdate::PACKET_ID,
             Self::SynchronizePlayerPosition(_) => SynchronizePlayerPosition::PACKET_ID,
@@ -3248,6 +3378,7 @@ impl ClientboundPlayPacket {
             Self::UpdateEntityPosition(packet) => packet.encode(buf),
             Self::UpdateEntityPositionAndRotation(packet) => packet.encode(buf),
             Self::UpdateEntityRotation(packet) => packet.encode(buf),
+            Self::PlayerAbilities(packet) => packet.encode(buf),
             Self::RemovePlayerInfo(packet) => packet.encode(buf),
             Self::PlayerInfoUpdate(packet) => packet.encode(buf),
             Self::SynchronizePlayerPosition(packet) => packet.encode(buf),

@@ -26,7 +26,8 @@ use tokio::time::{interval_at, timeout, Instant, MissedTickBehavior};
 
 use ferrumc_codec::{BoundedReader, BoundedString};
 use ferrumc_command::{CommandSource, CommandTree};
-use ferrumc_core::{PlayerId, TextColor, TextComponent, Tick};
+use ferrumc_core::{GameMode, PlayerId, TextColor, TextComponent, Tick};
+use ferrumc_items::UntrustedItemStack;
 use ferrumc_math::{BlockPos, ChunkPos, Vec3};
 use ferrumc_net::{
     offline_uuid, CompressionState, ConnectionLimits, ConnectionState, Criticality, DecodeError,
@@ -46,17 +47,20 @@ use ferrumc_proto::generated::login::{
 };
 use ferrumc_proto::generated::play::{
     AcknowledgeBlockChange, ClientboundKeepAlive, ClientboundPlayPacket, CommandSuggestionMatch,
-    Commands, GameEvent, ServerboundPlayPacket, SetCenterChunk, SetDefaultSpawnPosition,
-    SetPlayerPosition, SynchronizePlayerPosition, TabCompleteResponse, UnloadChunk,
+    Commands, GameEvent, PlayerAbilities, ServerboundPlayPacket, ServerboundSetHeldItem,
+    SetCenterChunk, SetContainerContent, SetContainerSlot, SetCreativeSlot,
+    SetDefaultSpawnPosition, SetPlayerPosition, SynchronizePlayerPosition, TabCompleteResponse,
+    UnloadChunk, UseItemOn, WindowClick,
 };
 use ferrumc_proto::generated::status::{
     ClientboundStatusPacket, PongResponse, ServerboundStatusPacket, StatusResponse,
 };
-use ferrumc_session::{net_event_to_input, NetEvent, PlayerSessionHandle};
-use ferrumc_sim::GameInput;
+use ferrumc_session::{net_event_to_input, use_item_on_target, NetEvent, PlayerSessionHandle};
+use ferrumc_sim::{BlockStateId, GameInput};
 
 use crate::command::{parse_gamemode, GAMEMODE_COMMAND, SPAWN_COMMAND};
 use crate::driver::SimCommand;
+use crate::inventory::{PlayerInventory, SLOT_COUNT, WINDOW_ID};
 use crate::observe;
 use crate::plugins::PlayPolicy;
 use crate::registries::ConfigRegistries;
@@ -95,6 +99,17 @@ const GAME_EVENT_LEVEL_CHUNKS_LOAD_START: u8 = 13;
 /// id as a float; sending it switches the issuing client's mode (the carrier
 /// `/gamemode` uses, since there is no dedicated set-game-mode packet).
 const GAME_EVENT_CHANGE_GAMEMODE: u8 = 3;
+
+/// Player Abilities `flags` bits sent to a creative client on join: invulnerable
+/// (`0x01`) | allow flying (`0x04`) | instabuild/creative (`0x08`). Flying itself
+/// (`0x02`) is left off so the player starts grounded but may take off.
+const CREATIVE_ABILITY_FLAGS: i8 = 0x01 | 0x04 | 0x08;
+
+/// Flying speed sent in Player Abilities (the vanilla creative default).
+const ABILITY_FLYING_SPEED: f32 = 0.05;
+
+/// Walking speed (field-of-view modifier base) sent in Player Abilities.
+const ABILITY_WALKING_SPEED: f32 = 0.1;
 
 /// Teleport id carried by the join `SynchronizePlayerPosition`.
 ///
@@ -669,6 +684,23 @@ async fn enter_play(
     // never touched by the sim/session deterministic tick path.
     let mut chat_limiter = ChatRateLimiter::new(ctx.clock.now());
 
+    // The authoritative server-side inventory for this connection. Seeded with the
+    // creative starter kit and a creative game-mode mirror; the connection is the
+    // sole writer of both, so the mirror cannot drift from the sim's mode. The
+    // matching `SetGameMode` below makes the sim's authoritative mode agree.
+    let mut inventory = PlayerInventory::with_creative_kit(GameMode::Creative);
+
+    // The shard seeds every joiner's mode to the default (survival), but JoinGame
+    // told the client creative — make the sim's authoritative mode creative too so
+    // the creative-slot gate accepts this player and later enforcement is correct.
+    ctx.commands
+        .send(SimCommand::SetGameMode {
+            player,
+            mode: GameMode::Creative,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+
     // Replay the keystone payload, then drain any already-buffered play frames.
     let mut writer = PlayWriter::with_defaults(ctx.limits);
     send_join_kit(
@@ -680,6 +712,7 @@ async fn enter_play(
         player,
         name.as_str(),
         position,
+        &inventory,
     )
     .await?;
     pump_serverbound(
@@ -691,6 +724,7 @@ async fn enter_play(
         &mut writer,
         &mut chunk_stream,
         &mut chat_limiter,
+        &mut inventory,
         &mut debug,
     )
     .await?;
@@ -784,6 +818,7 @@ async fn enter_play(
                         &mut stream,
                         &mut chunk_stream,
                         &mut chat_limiter,
+                        &mut inventory,
                         &mut debug,
                         &read_buf[..n],
                     ).await,
@@ -865,6 +900,7 @@ async fn join_simulation(
 ///
 /// Returns an error if any stage fails to encode or write to the socket.
 #[allow(clippy::too_many_arguments)] // one cohesive step: framing + self player-info + I/O + trace state
+#[allow(clippy::too_many_lines)] // one join sequence: framing, abilities, inventory, chunks
 async fn send_join_kit(
     writer: &mut PlayWriter,
     stream: &mut TcpStream,
@@ -874,6 +910,7 @@ async fn send_join_kit(
     player: PlayerId,
     name: &str,
     position: Vec3,
+    inventory: &PlayerInventory,
 ) -> anyhow::Result<()> {
     let kit = &ctx.join_kit;
     let clock = &ctx.clock;
@@ -947,6 +984,36 @@ async fn send_join_kit(
         clock,
         ClientboundPlayPacket::SynchronizePlayerPosition(spawn_sync(JOIN_TELEPORT_ID, position)),
     );
+    // Player Abilities: tell a creative client it may fly and instabuild, so the
+    // flight + creative-reach UX matches the creative mode JoinGame advertised.
+    send_mandatory(
+        writer,
+        debug,
+        compression,
+        clock,
+        ClientboundPlayPacket::PlayerAbilities(PlayerAbilities::new(
+            CREATIVE_ABILITY_FLAGS,
+            ABILITY_FLYING_SPEED,
+            ABILITY_WALKING_SPEED,
+        )),
+    )?;
+    // Initialize window 0 with the full 46-slot inventory (the starter kit in the
+    // hotbar) and an empty cursor. Mandatory: a dropped container-content leaves the
+    // client's inventory view desynced.
+    let container_payload = inventory
+        .container_content_payload()
+        .map_err(|err| anyhow::anyhow!("encoding join container content: {err}"))?;
+    send_mandatory(
+        writer,
+        debug,
+        compression,
+        clock,
+        ClientboundPlayPacket::SetContainerContent(SetContainerContent::new(
+            WINDOW_ID,
+            inventory.state_id(),
+            container_payload,
+        )),
+    )?;
     flush_writer(writer, stream, compression, ctx.io_timeout).await?;
 
     // Stage 2: the spawn-area chunk column packets (includes the player's chunk).
@@ -997,6 +1064,7 @@ async fn read_and_pump(
     stream: &mut TcpStream,
     chunk_stream: &mut ChunkStream,
     chat_limiter: &mut ChatRateLimiter,
+    inventory: &mut PlayerInventory,
     debug: &mut SessionDebug,
     bytes: &[u8],
 ) -> anyhow::Result<()> {
@@ -1010,6 +1078,7 @@ async fn read_and_pump(
         writer,
         chunk_stream,
         chat_limiter,
+        inventory,
         debug,
     )
     .await?;
@@ -1034,6 +1103,7 @@ async fn pump_serverbound(
     writer: &mut PlayWriter,
     chunk_stream: &mut ChunkStream,
     chat_limiter: &mut ChatRateLimiter,
+    inventory: &mut PlayerInventory,
     debug: &mut SessionDebug,
 ) -> anyhow::Result<()> {
     loop {
@@ -1064,6 +1134,7 @@ async fn pump_serverbound(
             writer,
             chunk_stream,
             chat_limiter,
+            inventory,
             &body,
             debug,
             compression,
@@ -1082,6 +1153,7 @@ async fn pump_serverbound(
 /// recorded on the chunk stream so the post-drain pass can react to a boundary
 /// crossing.
 #[allow(clippy::too_many_arguments)] // one play step: framing + policy + trace state
+#[allow(clippy::too_many_lines)] // one dispatch: chat, inventory, place, movement fallthrough
 async fn handle_play_body(
     ctx: &ConnContext,
     player: PlayerId,
@@ -1089,6 +1161,7 @@ async fn handle_play_body(
     writer: &mut PlayWriter,
     chunk_stream: &mut ChunkStream,
     chat_limiter: &mut ChatRateLimiter,
+    inventory: &mut PlayerInventory,
     body: &[u8],
     debug: &mut SessionDebug,
     compression: &CompressionState,
@@ -1134,7 +1207,17 @@ async fn handle_play_body(
     match &packet {
         ServerboundPlayPacket::ChatCommand(command) => {
             let command = command.command().as_str().to_owned();
-            return handle_command(ctx, player, name, writer, &command, debug, compression).await;
+            return handle_command(
+                ctx,
+                player,
+                name,
+                writer,
+                inventory,
+                &command,
+                debug,
+                compression,
+            )
+            .await;
         }
         ServerboundPlayPacket::ChatMessage(chat) => {
             // Rate-limit at the SOURCE before relaying: one spammer must not fan
@@ -1185,6 +1268,28 @@ async fn handle_play_body(
                 compression,
             );
             return Ok(());
+        }
+        // Place-with-held-item: resolve the held hotbar stack to a block-state and
+        // route a place carrying it (or just ack, on empty hand / non-placeable /
+        // veto). Handled here, not via the generic NetEvent path, because the place
+        // needs the inventory the session layer cannot see.
+        ServerboundPlayPacket::UseItemOn(p) => {
+            return handle_use_item_on(ctx, player, writer, inventory, p, debug, compression).await;
+        }
+        // Set Creative Slot (untrusted): validate the hostile item bytes, store the
+        // slot, and echo it back so the client view matches the server.
+        ServerboundPlayPacket::SetCreativeSlot(p) => {
+            return handle_set_creative_slot(ctx, name, writer, inventory, p, debug, compression);
+        }
+        // Set Held Item (serverbound): update the selected hotbar index.
+        ServerboundPlayPacket::ServerboundSetHeldItem(p) => {
+            handle_set_held_item(inventory, p);
+            return Ok(());
+        }
+        // Click Container: the slice models no click logic, so any click on window
+        // 0 triggers a safe resync of the authoritative inventory.
+        ServerboundPlayPacket::WindowClick(p) => {
+            return handle_window_click(ctx, writer, inventory, p, debug, compression);
         }
         // The teleport confirmation (reply to the join position sync) and the
         // Keep Alive echo are accepted and need no action: the slice does not
@@ -1439,11 +1544,13 @@ fn veto_kind(ctx: &ConnContext, player: PlayerId, event: &NetEvent) -> Option<(M
 /// On a successful `/gamemode <id>` a `GameEvent` with reason `3`
 /// (`change_game_mode`) carrying the mode id is queued so the client actually
 /// switches mode.
+#[allow(clippy::too_many_arguments)] // one command step: dispatch + feedback + side effects + I/O
 async fn handle_command(
     ctx: &ConnContext,
     player: PlayerId,
     name: &str,
     writer: &mut PlayWriter,
+    inventory: &mut PlayerInventory,
     command: &str,
     debug: &mut SessionDebug,
     compression: &CompressionState,
@@ -1527,7 +1634,232 @@ async fn handle_command(
                 .send(SimCommand::SetGameMode { player, mode })
                 .await
                 .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+            // Keep the connection-local mirror in lockstep: it is the synchronous
+            // source the creative-slot gate reads, and the connection is its sole
+            // writer, so it must update here too.
+            inventory.set_game_mode(mode);
         }
+    }
+    Ok(())
+}
+
+/// Handles a serverbound `UseItemOn`: place the held block at the targeted cell.
+///
+/// Resolves the held hotbar stack to a block-state; if it is a placeable block and
+/// spawn protection does not veto the target, routes a [`SimCommand::PlaceBlock`]
+/// carrying that state (creative never decrements the stack). An empty hand, a
+/// non-placeable item, a malformed face, or a vetoed target places nothing but
+/// still acknowledges the block-action sequence so the client's optimistic
+/// prediction ends — preserving the existing sequence-ack/resync behavior.
+async fn handle_use_item_on(
+    ctx: &ConnContext,
+    player: PlayerId,
+    writer: &mut PlayWriter,
+    inventory: &PlayerInventory,
+    packet: &UseItemOn,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+) -> anyhow::Result<()> {
+    let sequence = packet.sequence();
+    // A malformed face index yields no target: just ack so the prediction ends.
+    let Some(position) = use_item_on_target(packet) else {
+        ack_sequence(writer, debug, compression, &ctx.clock, sequence);
+        return Ok(());
+    };
+
+    // Spawn protection vetoes the placement regardless of the held item.
+    let vetoed = ctx
+        .policy
+        .guard()
+        .vetoes(position, ctx.policy.permissions().has_bypass(player));
+
+    match inventory.held().placeable_block() {
+        Some(state) if !vetoed => {
+            // Creative: place the held block; never touch (decrement) the stack.
+            ctx.commands
+                .send(SimCommand::PlaceBlock {
+                    player,
+                    position,
+                    sequence,
+                    state: BlockStateId::new(state),
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
+        }
+        Some(_) => {
+            // Placeable but vetoed: count the rejection and ack (heal the prediction).
+            ctx.metrics
+                .record_block_mutation(MutationKind::Place, MutationResult::Rejected);
+            ack_sequence(writer, debug, compression, &ctx.clock, sequence);
+            Ok(())
+        }
+        None => {
+            // Empty hand or non-placeable item: nothing to place, just ack.
+            ack_sequence(writer, debug, compression, &ctx.clock, sequence);
+            Ok(())
+        }
+    }
+}
+
+/// Handles a serverbound Set Creative Slot: validate the untrusted item bytes,
+/// store the slot, and echo it.
+///
+/// Requires the player to be authoritatively creative (read from the connection's
+/// drift-free game-mode mirror); a non-creative sender is ignored. The `slot` must
+/// be in `0..=45` (a `-1` "drop outside" or any other out-of-range value is
+/// ignored). The item bytes go through [`UntrustedItemStack::decode`] +
+/// `into_validated` (clamping the count, stripping dangerous/unknown components); a
+/// decode/validate error is logged and ignored, never fatal. On success the slot is
+/// stored, the state id bumped, and a mandatory `SetContainerSlot` echoes the
+/// authoritative slot back so the client view matches the server.
+fn handle_set_creative_slot(
+    ctx: &ConnContext,
+    name: &str,
+    writer: &mut PlayWriter,
+    inventory: &mut PlayerInventory,
+    packet: &SetCreativeSlot,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+) -> anyhow::Result<()> {
+    // Authoritative-creative gate: only a creative player may author slots.
+    if inventory.game_mode() != GameMode::Creative {
+        tracing::debug!(
+            player = name,
+            "ignoring set-creative-slot from non-creative player"
+        );
+        return Ok(());
+    }
+    // Bounds: -1 (drop) or anything outside 0..=45 is ignored.
+    let Ok(index) = usize::try_from(packet.slot()) else {
+        return Ok(());
+    };
+    if index >= SLOT_COUNT {
+        return Ok(());
+    }
+    // Untrusted bytes -> validated stack; never trust the client's item bytes.
+    let mut reader = BoundedReader::new(packet.item());
+    let stack = match UntrustedItemStack::decode(&mut reader)
+        .and_then(UntrustedItemStack::into_validated)
+    {
+        Ok(stack) => stack,
+        Err(err) => {
+            tracing::debug!(player = name, %err, "ignoring malformed creative slot");
+            return Ok(());
+        }
+    };
+    inventory.set_creative_slot(index, stack);
+
+    // Echo the authoritative slot (mandatory) so the client view matches.
+    let mut item_bytes = Vec::new();
+    let Some(stored) = inventory.slot(index) else {
+        return Ok(());
+    };
+    if let Err(err) = stored.encode_slot(&mut item_bytes) {
+        tracing::warn!(player = name, %err, "failed to encode creative-slot echo");
+        return Ok(());
+    }
+    send_mandatory(
+        writer,
+        debug,
+        compression,
+        &ctx.clock,
+        ClientboundPlayPacket::SetContainerSlot(SetContainerSlot::new(
+            WINDOW_ID,
+            inventory.state_id(),
+            packet.slot(),
+            item_bytes,
+        )),
+    )
+}
+
+/// Handles a serverbound Set Held Item: update the selected hotbar index.
+///
+/// The wire slot is an `i16`; values outside `0..=8` are ignored (no clientbound
+/// reply is needed — the client already moved its own selector).
+fn handle_set_held_item(inventory: &mut PlayerInventory, packet: &ServerboundSetHeldItem) {
+    if let Ok(slot) = u8::try_from(packet.slot()) {
+        inventory.set_selected(slot);
+    }
+}
+
+/// Handles a serverbound Click Container on window 0 with a conservative resync.
+///
+/// The slice models no click logic, so any click on the player inventory — a
+/// state-id mismatch or otherwise — is answered by bumping the state id and
+/// re-sending the full authoritative container content (mandatory). Clicks on any
+/// other window are ignored. Never disconnects, never trusts the click, never
+/// panics.
+fn handle_window_click(
+    ctx: &ConnContext,
+    writer: &mut PlayWriter,
+    inventory: &mut PlayerInventory,
+    packet: &WindowClick,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+) -> anyhow::Result<()> {
+    if packet.window_id() != WINDOW_ID {
+        return Ok(());
+    }
+    // Bump first so the resync carries a fresh state id the client adopts.
+    inventory.bump_state_id();
+    let payload = match inventory.container_content_payload() {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::warn!(%err, "failed to encode container-content resync");
+            return Ok(());
+        }
+    };
+    send_mandatory(
+        writer,
+        debug,
+        compression,
+        &ctx.clock,
+        ClientboundPlayPacket::SetContainerContent(SetContainerContent::new(
+            WINDOW_ID,
+            inventory.state_id(),
+            payload,
+        )),
+    )
+}
+
+/// Enqueues an `AcknowledgeBlockChange` echoing `sequence`, ending the client's
+/// optimistic prediction for that block action.
+fn ack_sequence(
+    writer: &mut PlayWriter,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+    clock: &ServerClock,
+    sequence: i32,
+) {
+    enqueue_traced_classified(
+        writer,
+        debug,
+        compression,
+        clock,
+        ClientboundPlayPacket::AcknowledgeBlockChange(AcknowledgeBlockChange::new(sequence)),
+    );
+}
+
+/// Enqueues a mandatory clientbound packet, escalating a tail-drop at a full queue
+/// to an outbound overflow (see [`is_mandatory_overflow`]).
+///
+/// The connection-originated inventory packets (join container content, the
+/// creative-slot echo, the click resync) are authoritative state: a silent drop
+/// would desync the client's inventory view, so a dropped mandatory frame here is
+/// the same fatal condition the keep-alive and router paths already enforce.
+fn send_mandatory(
+    writer: &mut PlayWriter,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+    clock: &ServerClock,
+    packet: ClientboundPlayPacket,
+) -> anyhow::Result<()> {
+    let criticality = Criticality::for_packet(&packet);
+    let outcome = enqueue_traced_classified(writer, debug, compression, clock, packet);
+    if is_mandatory_overflow(criticality, outcome) {
+        return Err(anyhow::anyhow!(
+            "outbound overflow: a mandatory inventory packet was dropped at the connection writer"
+        ));
     }
     Ok(())
 }

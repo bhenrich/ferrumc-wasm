@@ -42,12 +42,11 @@ fn is_valid_position(position: Vec3) -> bool {
 /// there is no eye-height offset, line-of-sight, or per-gamemode tuning yet.
 const MAX_REACH: f64 = 6.0;
 
-/// The block-state the simulation writes for an accepted
-/// [`GameInput::BlockPlace`].
-///
-/// This milestone ignores held-item and tool rules, so every place drops the
-/// same fixed block: `minecraft:stone` (block-state id `1` in the pinned
-/// flat-world registry). A break is the inverse, writing [`BlockStateId::AIR`].
+/// A fixed `minecraft:stone` block-state (id `1` in the pinned flat-world
+/// registry), used only by the shard's block-edit tests now that an accepted
+/// place writes the held item's resolved state threaded through
+/// [`GameInput::BlockPlace`] rather than a hardcoded default.
+#[cfg(test)]
 const DEFAULT_PLACED_STATE: BlockStateId = BlockStateId::new(1);
 
 /// Returns `true` if the block at `block` is within [`MAX_REACH`] of an actor
@@ -160,7 +159,8 @@ struct PlayerState {
 /// measured against the actor's position *as of the start of the tick* — a move
 /// queued in the same tick is coalesced and applied afterwards, so it does not
 /// extend reach for an edit earlier in the same inbox. An accepted break writes
-/// [`BlockStateId::AIR`]; an accepted place writes [`DEFAULT_PLACED_STATE`].
+/// [`BlockStateId::AIR`]; an accepted place writes the held item's resolved
+/// block-state, carried on [`GameInput::BlockPlace`].
 /// Either way the owning section is marked dirty (by
 /// [`Chunk::set_block`](ferrumc_world::Chunk::set_block)) and a single
 /// [`GameOutput::BlockChanged`] is emitted, in inbox order, for the session layer
@@ -409,12 +409,14 @@ impl SimShard {
                     player,
                     position,
                     sequence,
+                    state,
                 } => {
-                    // Place -> the fixed default block (no held-item rules yet).
+                    // Place -> the held item's resolved block-state, threaded in on
+                    // the input (the app resolves it from the player's hotbar).
                     let cause = MutationCause::PlayerCreative { player };
-                    let result = self.apply_block_edit(cause, position, DEFAULT_PLACED_STATE);
+                    let result = self.apply_block_edit(cause, position, state);
                     if let Some(output) =
-                        block_change_output(cause, sequence, position, DEFAULT_PLACED_STATE, result)
+                        block_change_output(cause, sequence, position, state, result)
                     {
                         outputs.push(output);
                     }
@@ -1071,6 +1073,7 @@ mod tests {
             player: p,
             position: target,
             sequence: 1,
+            state: DEFAULT_PLACED_STATE,
         })
         .expect("room");
         let _ = s.run_tick();
@@ -1108,6 +1111,7 @@ mod tests {
             player: p,
             position: target,
             sequence: 12,
+            state: DEFAULT_PLACED_STATE,
         })
         .expect("room");
         let outputs = s.run_tick();
@@ -1121,6 +1125,44 @@ mod tests {
             }]
         );
         assert_eq!(block_at(&s, target), Some(DEFAULT_PLACED_STATE));
+    }
+
+    #[tokio::test]
+    async fn place_writes_the_threaded_held_block_state_not_a_default() {
+        // The held item's resolved block-state is threaded on the input, so a
+        // place must write exactly that state — here glass (562), proving the old
+        // hardcoded stone default is gone.
+        let chunk = ChunkPos::new(0, 0);
+        let mut s = shard_with_loaded_chunk(chunk).await;
+        let p = player("builder");
+        let target = BlockPos::new(8, 65, 8); // air just above the surface
+        let glass = BlockStateId::new(562);
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: spawn(),
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
+        s.enqueue(GameInput::BlockPlace {
+            player: p,
+            position: target,
+            sequence: 8,
+            state: glass,
+        })
+        .expect("room");
+        let outputs = s.run_tick();
+        assert_eq!(
+            outputs,
+            vec![GameOutput::BlockChanged {
+                position: target,
+                state: glass,
+                sequence: 8,
+                cause: MutationCause::PlayerCreative { player: p },
+            }]
+        );
+        assert_eq!(block_at(&s, target), Some(glass));
+        assert_ne!(block_at(&s, target), Some(DEFAULT_PLACED_STATE));
     }
 
     #[tokio::test]
@@ -1245,6 +1287,7 @@ mod tests {
             player: ghost,
             position: BlockPos::new(8, 65, 8),
             sequence: 2,
+            state: DEFAULT_PLACED_STATE,
         })
         .expect("room");
         // An absent actor has no session to ack or resync, so nothing is emitted.

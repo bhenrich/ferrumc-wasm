@@ -99,8 +99,13 @@ pub fn net_event_to_input(event: &NetEvent) -> Option<GameInput> {
 /// Both absolute-position packets collapse to a [`GameInput::PlayerMove`] (the
 /// rotation is dropped because the simulation only tracks position this
 /// milestone). A dig-start `PlayerAction` becomes a [`GameInput::BlockBreak`]
-/// and a `UseItemOn` becomes a [`GameInput::BlockPlace`]; both carry a typed
-/// target [`BlockPos`].
+/// carrying a typed target [`BlockPos`].
+///
+/// A `UseItemOn` (block place) is deliberately *not* mapped here: a place needs
+/// the held item's resolved block-state, which the session layer cannot see (the
+/// inventory lives in the app). The app resolves the held block and builds the
+/// [`GameInput::BlockPlace`] itself, using [`use_item_on_target`] for the target
+/// position math.
 pub(crate) fn play_packet_to_input(
     player: PlayerId,
     packet: &ServerboundPlayPacket,
@@ -115,8 +120,8 @@ pub(crate) fn play_packet_to_input(
             position: Vec3::new(p.x(), p.y(), p.z()),
         }),
         ServerboundPlayPacket::PlayerAction(p) => block_break_input(player, p),
-        ServerboundPlayPacket::UseItemOn(p) => block_place_input(player, p),
-        // KeepAlive / ChatCommand have no simulation input in this milestone.
+        // UseItemOn / KeepAlive / ChatCommand have no simulation input here: a
+        // place is resolved by the app (see `use_item_on_target`).
         _ => None,
     }
 }
@@ -140,23 +145,20 @@ fn block_break_input(player: PlayerId, packet: &PlayerAction) -> Option<GameInpu
     })
 }
 
-/// Maps a serverbound `UseItemOn` to a [`GameInput::BlockPlace`] at the block
-/// adjacent to the clicked face.
+/// Resolves the block position a serverbound `UseItemOn` targets: the clicked
+/// block stepped one cell along the clicked face.
 ///
-/// The target is the clicked block stepped one block along the clicked face, so
-/// a place never overwrites the block clicked on (matching vanilla). A face
-/// index outside the canonical `0..6` range is malformed and yields `None`. The
-/// block actually placed is the simulation's fixed default this milestone, so it
-/// is not carried here.
-fn block_place_input(player: PlayerId, packet: &UseItemOn) -> Option<GameInput> {
+/// Stepping along the face means a place never overwrites the block clicked on
+/// (matching vanilla). A face index outside the canonical `0..6` range is
+/// malformed and yields `None`.
+///
+/// The held item's resolved block-state is *not* computed here — that requires
+/// the player's inventory, which the app owns. The app calls this for the target
+/// position, then builds the [`GameInput::BlockPlace`] with the resolved state.
+#[must_use]
+pub fn use_item_on_target(packet: &UseItemOn) -> Option<BlockPos> {
     let face = face_from_index(packet.direction())?;
-    Some(GameInput::BlockPlace {
-        player,
-        position: block_pos(packet.location()).offset(face),
-        // The client stamps each block action with a sequence; carry it so an
-        // accepted place can be acknowledged back to this player.
-        sequence: packet.sequence(),
-    })
+    Some(block_pos(packet.location()).offset(face))
 }
 
 /// Converts a wire [`BlockPosition`] into a typed [`BlockPos`].
@@ -518,9 +520,27 @@ mod tests {
     }
 
     #[test]
-    fn use_item_on_places_against_the_clicked_face() {
-        // Click the top face (Up = index 1) of block (8, 63, 8): the place
-        // target is the block one step up, (8, 64, 8).
+    fn use_item_on_target_steps_along_the_clicked_face() {
+        // Click the top face (Up = index 1) of block (8, 63, 8): the place target
+        // is the block one step up, (8, 64, 8).
+        let packet = UseItemOn::new(
+            0,
+            BlockPosition::new(8, 63, 8),
+            1,
+            0.5,
+            1.0,
+            0.5,
+            false,
+            false,
+            99,
+        );
+        assert_eq!(use_item_on_target(&packet), Some(BlockPos::new(8, 64, 8)));
+    }
+
+    #[test]
+    fn use_item_on_does_not_map_to_a_sim_input() {
+        // A place needs the held item's resolved state (app-owned), so the pure
+        // net->sim mapping yields nothing for a UseItemOn.
         let event = NetEvent::play(
             player(),
             ServerboundPlayPacket::UseItemOn(UseItemOn::new(
@@ -535,35 +555,24 @@ mod tests {
                 99,
             )),
         );
-        // The packet's sequence (99) must flow through to the BlockPlace input.
-        assert_eq!(
-            net_event_to_input(&event),
-            Some(GameInput::BlockPlace {
-                player: player(),
-                position: BlockPos::new(8, 64, 8),
-                sequence: 99,
-            })
-        );
+        assert_eq!(net_event_to_input(&event), None);
     }
 
     #[test]
-    fn use_item_on_with_out_of_range_face_has_no_input() {
+    fn use_item_on_target_with_out_of_range_face_is_none() {
         // Only face indices 0..6 are valid; 6 is malformed.
-        let event = NetEvent::play(
-            player(),
-            ServerboundPlayPacket::UseItemOn(UseItemOn::new(
-                0,
-                BlockPosition::new(8, 63, 8),
-                6,
-                0.5,
-                0.5,
-                0.5,
-                false,
-                false,
-                0,
-            )),
+        let packet = UseItemOn::new(
+            0,
+            BlockPosition::new(8, 63, 8),
+            6,
+            0.5,
+            0.5,
+            0.5,
+            false,
+            false,
+            0,
         );
-        assert_eq!(net_event_to_input(&event), None);
+        assert_eq!(use_item_on_target(&packet), None);
     }
 
     #[test]

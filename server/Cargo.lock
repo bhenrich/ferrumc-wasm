@@ -161,6 +161,7 @@ dependencies = [
  "ferrumc-codec",
  "ferrumc-command",
  "ferrumc-core",
+ "ferrumc-items",
  "ferrumc-math",
  "ferrumc-nbt",
  "ferrumc-net",
