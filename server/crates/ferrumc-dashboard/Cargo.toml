@@ -21,9 +21,9 @@ tower = { workspace = true }
 # Static-asset serving (`ServeDir` for the htmx page) and request tracing for the
 # read-only web server.
 tower-http = { workspace = true }
-# Error context for the server entry point (`run`); an existing workspace dep, so
-# this adds no new external crate and does not touch the locked dependency set.
-anyhow = { workspace = true }
+# Structured logging for the bind-time loopback rejection in `run`; an existing
+# workspace dep, so this adds no new external crate.
+tracing = { workspace = true }
 
 [dev-dependencies]
 

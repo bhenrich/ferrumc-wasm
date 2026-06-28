@@ -102,6 +102,34 @@ pub enum GameInput {
         /// facing (stairs face the player; furnaces face away).
         player_yaw: f32,
     },
+    /// Write an authoritative, *exact* block-state at `position`, applied
+    /// verbatim — **not** refined by `compute_placement`.
+    ///
+    /// Produced by a plugin/command exact-state write (a `before_block_*`
+    /// `Replace` decision or a `WorldIntent::SetBlock`): the state is already the
+    /// final one the plugin chose, so the simulation must store it byte-for-byte
+    /// rather than re-deriving axis/half/facing from neutral placement inputs
+    /// (which would, for example, rewrite a plugin-set `oak_log axis=x` to the
+    /// default vertical `axis=y`). Only a player [`UseItemOn`](GameInput::BlockPlace)
+    /// placement is refined by `compute_placement`.
+    ///
+    /// It is still validated by the same block-edit funnel as every other edit
+    /// (actor present, target chunk resident, target within reach); on acceptance
+    /// it emits a [`GameOutput::BlockChanged`] carrying the acting player so the
+    /// actor still gets the ack/resync. No fence-neighbour pass runs — an exact
+    /// write is authoritative, not a placement.
+    SetBlockExact {
+        /// Identity of the player on whose behalf the exact write is applied (the
+        /// actor that receives the ack/resync).
+        player: PlayerId,
+        /// Absolute position the block is written at.
+        position: BlockPos,
+        /// The block-action sequence to echo back in an `AcknowledgeBlockChange`
+        /// on accept.
+        sequence: i32,
+        /// The exact block-state to write, applied verbatim.
+        state: BlockStateId,
+    },
     /// Request a resync + acknowledgement for a block edit that was refused
     /// *upstream* of the simulation (a plugin `Deny`, spawn-protection veto, etc.)
     /// without ever mutating the world.

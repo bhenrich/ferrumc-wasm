@@ -281,7 +281,6 @@ dependencies = [
 name = "ferrumc-dashboard"
 version = "0.2.0-dev"
 dependencies = [
- "anyhow",
  "axum",
  "ferrumc-observability",
  "serde",
@@ -289,6 +288,7 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
+ "tracing",
 ]
 
 [[package]]

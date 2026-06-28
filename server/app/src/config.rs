@@ -5,7 +5,7 @@
 //! [`AppConfig`] carries the validated, runtime-ready values; [`RawConfig`] is
 //! the optional-field TOML shape that merges over the documented defaults.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,7 +18,9 @@ const DEFAULT_BIND: &str = "127.0.0.1:25565";
 
 /// Default address the read-only observability dashboard binds to. Loopback by
 /// design: the dashboard is never exposed off-host unless the operator opts in.
-const DEFAULT_DASHBOARD_BIND: &str = "127.0.0.1:9090";
+/// A typed [`SocketAddr`] const so the default needs no runtime parse (and so the
+/// [`Default`] impl carries no `parse().expect()`).
+const DEFAULT_DASHBOARD_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9090);
 
 /// Whether the read-only observability dashboard starts by default.
 const DEFAULT_DASHBOARD_ENABLED: bool = true;
@@ -188,9 +190,7 @@ impl Default for AppConfig {
             // the shipping server persists by default.
             world_dir: None,
             dashboard_enabled: DEFAULT_DASHBOARD_ENABLED,
-            dashboard_bind: DEFAULT_DASHBOARD_BIND
-                .parse()
-                .expect("default dashboard bind address is valid"),
+            dashboard_bind: DEFAULT_DASHBOARD_BIND,
         }
     }
 }

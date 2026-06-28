@@ -27,7 +27,7 @@ use tokio::time::timeout;
 use ferrumc_codec::write_var_int;
 use ferrumc_math::{BlockPos, ChunkPos};
 use ferrumc_proto::generated::play::{
-    ClientboundPlayPacket, ServerboundSetHeldItem, SetCreativeSlot, UseItemOn,
+    ClientboundPlayPacket, ServerboundSetHeldItem, SetCreativeSlot, SetPlayerRotation, UseItemOn,
 };
 use ferrumc_proto::types::BlockPosition;
 use ferrumc_world::{encode_chunk_section_data, BlockStateId, Chunk, FlatWorldGenerator};
@@ -52,6 +52,24 @@ const OAK_LOG_AXIS_X: u32 = 136;
 /// Hotbar inventory slot index 0 (the first hotbar slot).
 const HOTBAR_SLOT_0: i16 = 36;
 
+/// `UseItemOn` face index for the up (`+Y`) face (Minecraft canonical order).
+const FACE_UP: i32 = 1;
+
+/// Protocol item id of `minecraft:furnace`, a horizontal-facing block whose
+/// facing is derived from the player's yaw (not the clicked face).
+const FURNACE_ITEM: i32 = 322;
+
+/// `furnace` `facing=south` (state `4361`): the facing a furnace takes when the
+/// player turned to yaw `180` (faces north; the furnace faces away). The default
+/// (yaw `0`) facing is north (`4359`), so seeing south proves the rotation-only
+/// turn updated the yaw the placement reads.
+const FURNACE_FACING_SOUTH: u32 = 4361;
+
+/// `furnace` `facing=east` (state `4365`): the facing for a player at yaw `90`
+/// (faces west; the furnace faces away). Distinct from south, so a second turn to
+/// a different yaw yielding this proves the place tracks the latest yaw.
+const FURNACE_FACING_EAST: u32 = 4365;
+
 /// Encodes a trusted, component-free creative item stack of one `item_id`.
 fn single_item(item_id: i32) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -72,6 +90,54 @@ async fn equip_oak_log(client: &mut TestClient) -> anyhow::Result<()> {
         .await?;
     client
         .send_frame(&encode(|buf| ServerboundSetHeldItem::new(0).encode(buf)))
+        .await
+}
+
+/// Equips a furnace in hotbar slot 0 and selects it.
+async fn equip_furnace(client: &mut TestClient) -> anyhow::Result<()> {
+    client
+        .send_frame(&encode(|buf| {
+            SetCreativeSlot::new(HOTBAR_SLOT_0, single_item(FURNACE_ITEM)).encode(buf)
+        }))
+        .await?;
+    client
+        .send_frame(&encode(|buf| ServerboundSetHeldItem::new(0).encode(buf)))
+        .await
+}
+
+/// Turns the player in place to `yaw` via a rotation-only `SetPlayerRotation`
+/// (NOT a position+rotation move), the packet whose yaw the placement path must
+/// also track.
+async fn turn_in_place(client: &mut TestClient, yaw: f32) -> anyhow::Result<()> {
+    client
+        .send_frame(&encode(|buf| {
+            SetPlayerRotation::new(yaw, 0.0, 1).encode(buf)
+        }))
+        .await
+}
+
+/// Sends a `UseItemOn` clicking the top face of `clicked` (placing one step above
+/// it), stamped with `sequence`.
+async fn place_on_top_face(
+    client: &mut TestClient,
+    clicked: (i32, i32, i32),
+    sequence: i32,
+) -> anyhow::Result<()> {
+    client
+        .send_frame(&encode(|buf| {
+            UseItemOn::new(
+                0,
+                BlockPosition::new(clicked.0, clicked.1, clicked.2),
+                FACE_UP,
+                0.5,
+                0.5,
+                0.5,
+                false,
+                false,
+                sequence,
+            )
+            .encode(buf)
+        }))
         .await
 }
 
@@ -211,6 +277,54 @@ async fn rejoin_flow(addr: SocketAddr) -> anyhow::Result<()> {
         "rejoiner's spawn chunk was the unedited baseline (the placed log was lost)",
     );
     Ok(())
+}
+
+/// A turn-in-place (`SetPlayerRotation`) updates the yaw the placement path reads,
+/// so a furnace placed right after faces away from the player's new yaw.
+async fn rotate_in_place_then_place_flow(addr: SocketAddr) -> anyhow::Result<()> {
+    let mut viewer = login_to_play(addr, "RViewer").await?;
+    let mut actor = login_to_play(addr, "RActor").await?;
+
+    equip_furnace(&mut actor).await?;
+
+    // Turn in place to face north (yaw 180), then place a furnace on a top face:
+    // the furnace faces away from the player -> south (4361). A stale yaw 0 would
+    // produce the north-facing default (4359), so south proves the rotation-only
+    // packet fed the place yaw.
+    turn_in_place(&mut actor, 180.0).await?;
+    place_on_top_face(&mut actor, (8, 64, 8), 1).await?;
+    let south_wire = i32::try_from(FURNACE_FACING_SOUTH).expect("state fits i32");
+    expect_block_update(&mut viewer, (8, 65, 8), south_wire).await?;
+    expect_ack(&mut actor, 1).await?;
+
+    // A second turn to a DIFFERENT yaw (90 -> faces west) yields a DIFFERENT facing
+    // (east, 4365), confirming the place tracks the latest rotation-only yaw rather
+    // than a constant.
+    turn_in_place(&mut actor, 90.0).await?;
+    place_on_top_face(&mut actor, (10, 64, 8), 2).await?;
+    let east_wire = i32::try_from(FURNACE_FACING_EAST).expect("state fits i32");
+    expect_block_update(&mut viewer, (10, 65, 8), east_wire).await?;
+    expect_ack(&mut actor, 2).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rotate_in_place_then_place_orients_from_the_turned_yaw() {
+    let config = AppConfig::from_toml_str("bind = \"127.0.0.1:0\"\nspawn_chunk_radius = 1")
+        .expect("config parses");
+    let server = ferrumc_app::run(&config).await.expect("server starts");
+    let addr = server.local_addr();
+
+    timeout(GUARD, rotate_in_place_then_place_flow(addr))
+        .await
+        .expect("rotate-in-place flow finished within the guard")
+        .expect("rotate-in-place flow succeeded");
+
+    timeout(GUARD, server.shutdown())
+        .await
+        .expect("shutdown within the guard")
+        .expect("clean shutdown");
 }
 
 #[tokio::test]

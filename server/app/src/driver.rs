@@ -201,15 +201,19 @@ pub(crate) enum SimCommand {
         /// The new game mode.
         mode: GameMode,
     },
-    /// Place the held block at `position` after a `UseItemOn`.
+    /// Place the held block at `position` after a player `UseItemOn` (the only
+    /// caller — plugin/command exact writes use [`SetBlockExact`](Self::SetBlockExact)).
     ///
     /// The connection resolved `state` from the player's selected hotbar slot
     /// (the simulation stays inventory-free), then routed it here. The driver
-    /// forwards it to the block's owning shard as a [`GameInput::BlockPlace`],
-    /// which validates the edit (actor present, chunk resident, in reach) at the
-    /// tick boundary and, on acceptance, writes `state`. Spawn-protection veto and
-    /// the empty-hand / non-placeable cases are handled at the connection before
-    /// this command is ever sent.
+    /// previews the refined placement on the resident chunk, replies with the
+    /// final computed state over `reply` (so the connection can fire its
+    /// `after_block_place` hook with the state the world will hold), then forwards
+    /// the edit to the block's owning shard as a [`GameInput::BlockPlace`], which
+    /// validates it (actor present, chunk resident, in reach) at the tick boundary
+    /// and, on acceptance, writes the refined state. Spawn-protection veto and the
+    /// empty-hand / non-placeable cases are handled at the connection before this
+    /// command is ever sent.
     PlaceBlock {
         /// The placing player.
         player: PlayerId,
@@ -226,6 +230,32 @@ pub(crate) enum SimCommand {
         cursor_position: Vec3,
         /// The player's yaw in degrees at place time.
         player_yaw: f32,
+        /// One-shot reply carrying the final computed block-state (the refinement
+        /// the tick will apply), so the connection fires `after_block_place` with
+        /// the state the world holds rather than the held default. `None` is never
+        /// sent today (an unsupported block previews to the held state), but the
+        /// channel is `Option` so a dropped reply still has a safe fallback.
+        reply: oneshot::Sender<Option<BlockStateId>>,
+    },
+    /// Write an exact, authoritative block-state at `position`, applied verbatim
+    /// (NOT refined by `compute_placement`).
+    ///
+    /// Routes a plugin/command exact-state write — a `before_block_*` `Replace`
+    /// decision or a `WorldIntent::SetBlock` — to the block's owning shard as a
+    /// [`GameInput::SetBlockExact`]. The plugin already chose the final state, so
+    /// the simulation stores it byte-for-byte rather than re-deriving
+    /// axis/half/facing (which would corrupt a rotated state). Validated like any
+    /// edit; on accept the acting `player` gets the ack/resync.
+    SetBlockExact {
+        /// The player on whose behalf the exact write is applied (receives the
+        /// ack/resync).
+        player: PlayerId,
+        /// The block position to write at.
+        position: BlockPos,
+        /// The block-action sequence to acknowledge on accept/reject.
+        sequence: i32,
+        /// The exact block-state to write, applied verbatim.
+        state: BlockStateId,
     },
     /// Resync + acknowledge a block edit refused at the connection (a plugin
     /// `Deny` / spawn-protection veto) without mutating the world.
@@ -555,9 +585,22 @@ async fn handle_command(
             clicked_face,
             cursor_position,
             player_yaw,
+            reply,
         } => {
-            // Route the place to the block's owning shard (the same routing as any
-            // other block edit). A gone player has no shard to route to.
+            // Preview the refined placement against the resident chunk and hand it
+            // back to the connection BEFORE routing, so its after_block_place hook
+            // fires with the final computed state (not the held default). The
+            // preview shares run_tick's refinement helper and chunks mutate only at
+            // tick boundaries, so it matches what the tick applies for this single
+            // edit. The reply is sent here, off the tick — the connection does not
+            // wait ~50 ms for the next tick.
+            let computed =
+                shard.preview_placement(state, clicked_face, cursor_position, player_yaw, position);
+            let _ = reply.send(Some(computed));
+            // Route the UNCHANGED place to the block's owning shard (the same
+            // routing as any other block edit); the tick recomputes via the shared
+            // helper to an identical result, with the fence-neighbour pass intact. A
+            // gone player has no shard to route to.
             if let Err(err) = router.route_game_input(
                 player,
                 GameInput::BlockPlace {
@@ -571,6 +614,26 @@ async fn handle_command(
                 },
             ) {
                 tracing::trace!(%err, "dropping block place");
+            }
+        }
+        SimCommand::SetBlockExact {
+            player,
+            position,
+            sequence,
+            state,
+        } => {
+            // Route the exact write to the block's owning shard as a verbatim
+            // SetBlockExact (no compute_placement). A gone player has no shard.
+            if let Err(err) = router.route_game_input(
+                player,
+                GameInput::SetBlockExact {
+                    player,
+                    position,
+                    sequence,
+                    state,
+                },
+            ) {
+                tracing::trace!(%err, "dropping exact block set");
             }
         }
         SimCommand::RejectBlockEdit {
@@ -918,4 +981,65 @@ fn publish_snapshot(
     };
 
     snap.publisher.publish(metrics.server_snapshot(parts));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ferrumc_core::{PlayerId, Tick};
+    use ferrumc_math::{BlockPos, Direction, ShardPos, Vec3};
+    use ferrumc_session::SessionRouter;
+    use ferrumc_sim::{BlockStateId, SimShard};
+    use ferrumc_storage::InMemoryStore;
+    use ferrumc_world::FlatWorldGenerator;
+    use tokio::sync::{mpsc, oneshot};
+
+    use super::{handle_command, SimCommand};
+
+    #[tokio::test]
+    async fn place_block_command_replies_with_the_refined_state() {
+        // The driver previews the placement and replies with the FINAL computed
+        // state (an east-face oak_log refines to axis=x, state 136) BEFORE routing
+        // the tick edit, so the connection fires after_block_place with the state
+        // the world will hold rather than the held default (137). An empty shard is
+        // enough: the axis-from-face rule consults the clicked face, not neighbours.
+        let mut router = SessionRouter::new();
+        let mut shard = SimShard::new(ShardPos::new(0, 0));
+        let store = InMemoryStore::new();
+        let generator = FlatWorldGenerator::new();
+        let (storage_tx, _storage_rx) = mpsc::channel(1);
+        let mut next_mutation_id = 0u64;
+        let mut player_roster = BTreeMap::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        handle_command(
+            &mut router,
+            &mut shard,
+            &store,
+            &generator,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &mut player_roster,
+            SimCommand::PlaceBlock {
+                player: PlayerId::offline("placer"),
+                position: BlockPos::new(8, 65, 8),
+                sequence: 1,
+                state: BlockStateId::new(137), // oak_log default (axis=y)
+                clicked_face: Direction::East,
+                cursor_position: Vec3::new(0.5, 0.5, 0.5),
+                player_yaw: 0.0,
+                reply: reply_tx,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            reply_rx
+                .await
+                .expect("driver replied with the computed state"),
+            Some(BlockStateId::new(136)),
+        );
+    }
 }

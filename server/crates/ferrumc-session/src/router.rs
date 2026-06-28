@@ -751,18 +751,30 @@ impl SessionRouter {
                 // shrink under us — and if the pair will not fit, disconnect rather
                 // than enqueue a partial group.
                 if let Some(entry) = self.players.get(player) {
-                    if entry.outbound.capacity() >= 2 {
-                        let resync = entry.outbound.try_send(OutboundMessage::new(
-                            block_update_shell(*position, *authoritative_state),
-                            Criticality::Mandatory,
-                            OutboundPriority::State,
-                        ));
-                        let ack = entry
-                            .outbound
-                            .try_send(OutboundMessage::mandatory(ack_shell(*sequence)));
-                        // With capacity >= 2 and a sole sender, only a closed
-                        // channel can fail either send.
-                        if resync.is_err() || ack.is_err() {
+                    // The resync is mandatory and cannot be skipped. If the
+                    // authoritative state has no wire encoding (an unrepresentable
+                    // id), there is no faithful packet to heal with, so fail closed
+                    // and disconnect — the same as a channel that cannot fit the
+                    // pair. This is unreachable for legitimately stored states (the
+                    // entry boundary rejects unrepresentable ids), so it is a
+                    // defensive fail-safe, not a normal path.
+                    if let Some(resync_packet) = block_update_shell(*position, *authoritative_state)
+                    {
+                        if entry.outbound.capacity() >= 2 {
+                            let resync = entry.outbound.try_send(OutboundMessage::new(
+                                resync_packet,
+                                Criticality::Mandatory,
+                                OutboundPriority::State,
+                            ));
+                            let ack = entry
+                                .outbound
+                                .try_send(OutboundMessage::mandatory(ack_shell(*sequence)));
+                            // With capacity >= 2 and a sole sender, only a closed
+                            // channel can fail either send.
+                            if resync.is_err() || ack.is_err() {
+                                to_disconnect.push(*player);
+                            }
+                        } else {
                             to_disconnect.push(*player);
                         }
                     } else {
@@ -1064,12 +1076,13 @@ impl SessionRouter {
             ) {
                 continue;
             }
-            Self::send_droppable(
-                entry,
-                block_update_shell(position, state),
-                player,
-                to_disconnect,
-            );
+            // An unrepresentable state id has no wire encoding; skip the broadcast
+            // (it is droppable and the world stays correct) rather than diverge the
+            // viewer. The entry boundary rejects such ids before they are stored, so
+            // this is a defensive fail-safe.
+            if let Some(packet) = block_update_shell(position, state) {
+                Self::send_droppable(entry, packet, player, to_disconnect);
+            }
         }
     }
 
@@ -1289,6 +1302,7 @@ impl SessionRouter {
         let shard = match &input {
             GameInput::BlockBreak { position, .. }
             | GameInput::BlockPlace { position, .. }
+            | GameInput::SetBlockExact { position, .. }
             | GameInput::RejectBlockEdit { position, .. } => {
                 self.shard_for_block(*position, entry.shard)
             }

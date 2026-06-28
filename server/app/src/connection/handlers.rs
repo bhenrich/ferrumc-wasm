@@ -18,6 +18,7 @@ use ferrumc_proto::generated::play::{
 };
 use ferrumc_session::{net_event_to_input, use_item_on_face, use_item_on_target, NetEvent};
 use ferrumc_sim::{BlockStateId, GameInput};
+use tokio::sync::oneshot;
 
 use crate::command::{parse_gamemode, GAMEMODE_COMMAND, SPAWN_COMMAND};
 use crate::driver::SimCommand;
@@ -281,8 +282,9 @@ fn reported_yaw(packet: &ServerboundPlayPacket) -> Option<f32> {
 ///   The rejection is counted once, on the sim's resulting `BlockChangeRejected`. If
 ///   the decision carries a message it is delivered as a system chat.
 /// - [`Replace`](ResolvedDecision::Replace): the broken block is set to the
-///   replacement state instead of air, by routing a [`SimCommand::PlaceBlock`] at
-///   the break position.
+///   replacement state instead of air, by routing a [`SimCommand::SetBlockExact`]
+///   at the break position — an exact write applied verbatim (never re-run through
+///   `compute_placement`, so a rotated replacement survives).
 /// - [`Allow`](ResolvedDecision::Allow): the original break routes to the
 ///   simulation as before.
 ///
@@ -317,19 +319,28 @@ async fn handle_block_break(
             return Ok(());
         }
         ResolvedDecision::Replace { block_state_id } => {
-            // Replace the broken block with the replacement state instead of air.
-            // The plugin supplies an exact state; pass neutral placement inputs
-            // (top face, centre cursor, yaw 0) so a simple-cube replacement is
-            // written unchanged through the same funnel.
+            // A plugin Replace supplies an EXACT state: write it verbatim through
+            // the exact-write path so the simulation never re-runs it through
+            // compute_placement (a rotated replacement must survive byte-for-byte).
+            // Reject an unrepresentable state id (> i32::MAX) before it can be
+            // stored — the mandatory resync must never meet a state the wire cannot
+            // carry — and heal the actor, which predicted the break to air.
+            if i32::try_from(block_state_id).is_err() {
+                tracing::warn!(
+                    block_state_id,
+                    "plugin replace supplied an out-of-range block state id; healing actor and skipping the write"
+                );
+                reject_block_edit(ctx, player, position, sequence, BlockStateId::AIR).await?;
+                route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression)
+                    .await?;
+                return Ok(());
+            }
             ctx.commands
-                .send(SimCommand::PlaceBlock {
+                .send(SimCommand::SetBlockExact {
                     player,
                     position,
                     sequence,
                     state: BlockStateId::new(block_state_id),
-                    clicked_face: Direction::Up,
-                    cursor_position: Vec3::new(0.5, 0.0, 0.5),
-                    player_yaw: 0.0,
                 })
                 .await
                 .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
@@ -411,7 +422,8 @@ async fn reject_block_edit(
 /// after-* notification).
 ///
 /// Mapping (best-effort; the emitted-intent surface is dev-only and bounded):
-/// - [`WorldIntent::SetBlock`] -> [`SimCommand::PlaceBlock`] by the acting player.
+/// - [`WorldIntent::SetBlock`] -> [`SimCommand::SetBlockExact`] by the acting
+///   player (an exact write applied verbatim, never refined by `compute_placement`).
 /// - [`WorldIntent::Message`] -> a system chat to the acting player's own writer
 ///   when it targets them, otherwise a targeted [`SimCommand::SendSystemChat`] to
 ///   the named recipient (the connection task cannot reach another player's
@@ -434,17 +446,24 @@ async fn route_emitted_intents(
                 pos,
                 block_state_id,
             } => {
-                // A plugin set-block supplies an exact state; neutral placement
-                // inputs keep a simple-cube state unchanged through the funnel.
+                // A plugin SetBlock supplies an EXACT state: write it verbatim
+                // (bypassing compute_placement) so a rotated state survives. Skip an
+                // unrepresentable state id (> i32::MAX); an arbitrary plugin
+                // set-block carries no client prediction to heal, so log and drop it
+                // rather than store a state the wire cannot carry.
+                if i32::try_from(block_state_id).is_err() {
+                    tracing::warn!(
+                        block_state_id,
+                        "plugin set-block supplied an out-of-range block state id; skipping the write"
+                    );
+                    continue;
+                }
                 ctx.commands
-                    .send(SimCommand::PlaceBlock {
+                    .send(SimCommand::SetBlockExact {
                         player: actor,
                         position: pos,
                         sequence,
                         state: BlockStateId::new(block_state_id),
-                        clicked_face: Direction::Up,
-                        cursor_position: Vec3::new(0.5, 0.0, 0.5),
-                        player_yaw: 0.0,
                     })
                     .await
                     .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
@@ -620,14 +639,18 @@ async fn handle_command(
 ///   and ack, so no ghost block remains — and any Deny message is delivered as a
 ///   system chat. The rejection is counted on the sim's resulting
 ///   `BlockChangeRejected`.
-/// - [`Replace`](ResolvedDecision::Replace): the replacement block-state is placed
-///   instead of the held one.
+/// - [`Replace`](ResolvedDecision::Replace): the replacement block-state is written
+///   verbatim (an exact write via [`SimCommand::SetBlockExact`], never refined by
+///   `compute_placement`) instead of the held one.
 /// - [`Allow`](ResolvedDecision::Allow): the held block is placed (creative never
-///   decrements the stack).
+///   decrements the stack) and refined by `compute_placement` — the only path that
+///   runs it.
 ///
 /// On a non-denied placement any emitted intents are routed and the
-/// `after_block_place` notification fires.
+/// `after_block_place` notification fires with the FINAL state: the exact
+/// replacement for a Replace, or the driver-previewed computed state for an Allow.
 #[allow(clippy::too_many_arguments)] // one place step: inventory + plugin policy + placement context + I/O
+#[allow(clippy::too_many_lines)] // one place dispatch: deny + exact replace + refined allow arms
 async fn handle_use_item_on(
     ctx: &ConnContext,
     player: PlayerId,
@@ -668,8 +691,7 @@ async fn handle_use_item_on(
         &perms,
     );
 
-    // The state actually placed (the held block, or a plugin's replacement).
-    let placed_state = match decision {
+    match decision {
         ResolvedDecision::Deny { message } => {
             // Heal the actor through the single reject funnel: the sim reads the
             // authoritative state at the target (usually air) and sends the
@@ -685,36 +707,92 @@ async fn handle_use_item_on(
             )
             .await?;
             deliver_deny_message(ctx, writer, debug, compression, message);
+            route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression).await
+        }
+        ResolvedDecision::Replace { block_state_id } => {
+            // A plugin Replace supplies an EXACT state: write it verbatim through
+            // the exact-write path so compute_placement never re-derives it (a
+            // rotated replacement must survive). The clicked face / cursor / yaw are
+            // deliberately NOT passed — the plugin already chose the final state.
+            // Reject an unrepresentable id (> i32::MAX) and heal the actor (it
+            // predicted the held block).
+            if i32::try_from(block_state_id).is_err() {
+                tracing::warn!(
+                    block_state_id,
+                    "plugin replace supplied an out-of-range block state id; healing actor and skipping the place"
+                );
+                reject_block_edit(
+                    ctx,
+                    player,
+                    position,
+                    sequence,
+                    BlockStateId::new(held_state),
+                )
+                .await?;
+                return route_emitted_intents(
+                    ctx,
+                    player,
+                    writer,
+                    sequence,
+                    emitted,
+                    debug,
+                    compression,
+                )
+                .await;
+            }
+            ctx.commands
+                .send(SimCommand::SetBlockExact {
+                    player,
+                    position,
+                    sequence,
+                    state: BlockStateId::new(block_state_id),
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
             route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression)
                 .await?;
-            return Ok(());
+            // The exact replacement state IS the final state, so the after-hook
+            // observes it directly (no refinement to wait on).
+            let after =
+                ctx.block_events
+                    .after_block_place(player, position, block_state_id, &perms);
+            route_emitted_intents(ctx, player, writer, sequence, after, debug, compression).await
         }
-        ResolvedDecision::Replace { block_state_id } => block_state_id,
-        _ => held_state,
-    };
-
-    // Creative: place the (possibly replaced) block; never touch the stack. The
-    // clicked face, cursor hit point, and player yaw ride along so the sim can
-    // compute the correct rotated/faced/halved state.
-    ctx.commands
-        .send(SimCommand::PlaceBlock {
-            player,
-            position,
-            sequence,
-            state: BlockStateId::new(placed_state),
-            clicked_face,
-            cursor_position,
-            player_yaw,
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
-
-    route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression).await?;
-    // Accepted at the intent boundary and routed: notify after_*.
-    let after = ctx
-        .block_events
-        .after_block_place(player, position, placed_state, &perms);
-    route_emitted_intents(ctx, player, writer, sequence, after, debug, compression).await
+        _ => {
+            // Allow: a player placement refined by compute_placement (the ONLY path
+            // that runs it). Creative places the held block without touching the
+            // stack; the clicked face, cursor hit point, and player yaw ride along
+            // so the sim derives the correct rotated/faced/halved state. The driver
+            // previews that final state and replies with it BEFORE the tick, so the
+            // after-hook fires with the state the world will hold (e.g. a side-faced
+            // log's axis=x), not the held default.
+            let (reply_tx, reply_rx) = oneshot::channel();
+            ctx.commands
+                .send(SimCommand::PlaceBlock {
+                    player,
+                    position,
+                    sequence,
+                    state: BlockStateId::new(held_state),
+                    clicked_face,
+                    cursor_position,
+                    player_yaw,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+            // Falls back to the held state if the driver never replies (it is gone).
+            let computed = reply_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?
+                .unwrap_or_else(|| BlockStateId::new(held_state));
+            route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression)
+                .await?;
+            let after =
+                ctx.block_events
+                    .after_block_place(player, position, computed.as_u32(), &perms);
+            route_emitted_intents(ctx, player, writer, sequence, after, debug, compression).await
+        }
+    }
 }
 
 /// Handles a serverbound Set Creative Slot: validate the untrusted item bytes,
@@ -967,11 +1045,30 @@ fn tab_complete_reply(
 
 #[cfg(test)]
 mod tests {
-    use super::tab_complete_reply;
+    use ferrumc_proto::generated::play::{
+        ServerboundPlayPacket, SetPlayerPosition, SetPlayerRotation,
+    };
+
+    use super::{reported_yaw, tab_complete_reply};
     use crate::command::{build_command_tree, GAMEMODE_COMMAND, SPAWN_COMMAND};
 
     const OP_LEVEL: u8 = 4;
     const MEMBER_LEVEL: u8 = 0;
+
+    #[test]
+    fn reported_yaw_tracks_rotation_only_turn_in_place() {
+        // A turn-in-place (SetPlayerRotation) updates the yaw the placement path
+        // reads, so rotating then placing orients stairs/furnaces correctly. This
+        // locks in that the rotation-only packet feeds the place yaw.
+        let turn = ServerboundPlayPacket::SetPlayerRotation(SetPlayerRotation::new(90.0, -10.0, 1));
+        assert_eq!(reported_yaw(&turn), Some(90.0));
+
+        // A position-only move carries no yaw, so it must leave the mirrored yaw
+        // untouched (None), not reset it to 0.
+        let strafe =
+            ServerboundPlayPacket::SetPlayerPosition(SetPlayerPosition::new(1.0, 2.0, 3.0, 0));
+        assert_eq!(reported_yaw(&strafe), None);
+    }
 
     #[test]
     fn tab_complete_offers_literal_completion_for_a_prefix() {

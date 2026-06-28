@@ -9,7 +9,7 @@ use ferrumc_core::{DimensionId, GameMode, PlayerId, WorldId};
 use ferrumc_math::{BlockPos, Direction, ShardPos, Vec3};
 use ferrumc_placement::{
     compute_fence_connection_state, compute_placement, NeighborQuery, PlacementContext,
-    PlacementRule,
+    PlacementResult, PlacementRule,
 };
 use ferrumc_registry::block_state::{block_metadata, state_id_to_block_name};
 use ferrumc_world::BlockStateId;
@@ -472,20 +472,16 @@ impl SimShard {
                     // Refine the held item's default state into the correct placed
                     // state (rotation/facing/half/fence connectivity) against an
                     // immutable view of the resident chunks. The borrow ends before
-                    // the mutable write below.
-                    let computed = {
-                        let query = ShardNeighborQuery {
-                            chunks: &self.chunks,
-                        };
-                        let ctx = PlacementContext {
-                            item_block_state: state.as_u32(),
-                            clicked_face,
-                            cursor_position,
-                            player_yaw,
-                            position,
-                        };
-                        compute_placement(&ctx, &query)
-                    };
+                    // the mutable write below. The same refinement backs the
+                    // off-tick `preview_placement` the driver uses to report the
+                    // final state to the after-hook, so the two never diverge.
+                    let computed = self.refine_placement(
+                        state,
+                        clicked_face,
+                        cursor_position,
+                        player_yaw,
+                        position,
+                    );
                     // Unsupported/unrecognised -> safe default (the held state).
                     let placed = computed.map_or(state, |r| BlockStateId::new(r.state_id));
                     let is_fence = computed.is_some_and(|r| r.rule == PlacementRule::FenceLike);
@@ -508,6 +504,25 @@ impl SimShard {
                                 self.update_fence_neighbors(&mut outputs, position, fence_name);
                             }
                         }
+                    }
+                }
+                GameInput::SetBlockExact {
+                    player,
+                    position,
+                    sequence,
+                    state,
+                } => {
+                    // An authoritative plugin/command exact write: store `state`
+                    // verbatim through the same edit funnel, with NO
+                    // compute_placement refinement and NO fence-neighbour pass. The
+                    // plugin already chose the final state (e.g. a rotated
+                    // `oak_log axis=x`), so re-deriving it would corrupt it.
+                    let cause = MutationCause::PlayerCreative { player };
+                    let result = self.apply_block_edit(cause, position, state);
+                    if let Some(output) =
+                        block_change_output(cause, sequence, position, state, result)
+                    {
+                        outputs.push(output);
                     }
                 }
                 GameInput::RejectBlockEdit {
@@ -683,6 +698,62 @@ impl SimShard {
                 authoritative_state: old_state,
             },
         }
+    }
+
+    /// Refines a player placement's held state into the final block-state using
+    /// the resident chunks as the neighbour query, or `None` for an
+    /// unsupported/unrecognised block.
+    ///
+    /// This is the single source of placement refinement, shared by the
+    /// tick-boundary [`GameInput::BlockPlace`] apply path and the off-tick
+    /// read-only [`preview_placement`](Self::preview_placement). Sharing it
+    /// guarantees the state previewed to the after-hook equals the state the tick
+    /// applies for the common single-edit case (chunks mutate only at tick
+    /// boundaries).
+    fn refine_placement(
+        &self,
+        state: BlockStateId,
+        clicked_face: Direction,
+        cursor_position: Vec3,
+        player_yaw: f32,
+        position: BlockPos,
+    ) -> Option<PlacementResult> {
+        let query = ShardNeighborQuery {
+            chunks: &self.chunks,
+        };
+        let ctx = PlacementContext {
+            item_block_state: state.as_u32(),
+            clicked_face,
+            cursor_position,
+            player_yaw,
+            position,
+        };
+        compute_placement(&ctx, &query)
+    }
+
+    /// Computes the final placed block-state for a player placement *without*
+    /// mutating anything — the refinement [`GameInput::BlockPlace`] would apply.
+    ///
+    /// Read-only and off-tick: the driver calls it to report the final computed
+    /// state back to the connection so the `after_block_place` hook fires with the
+    /// state the world will hold, not the held item's bare default. An
+    /// unsupported/unrecognised block falls back to the held `state` unchanged,
+    /// matching the apply path. Because it shares
+    /// [`refine_placement`](Self::refine_placement) with the tick and chunks
+    /// mutate only at tick boundaries, the preview equals the applied state for
+    /// the common single-edit case (neighbour-dependent fences placed in the same
+    /// tick are the documented exception).
+    #[must_use]
+    pub fn preview_placement(
+        &self,
+        state: BlockStateId,
+        clicked_face: Direction,
+        cursor_position: Vec3,
+        player_yaw: f32,
+        position: BlockPos,
+    ) -> BlockStateId {
+        self.refine_placement(state, clicked_face, cursor_position, player_yaw, position)
+            .map_or(state, |r| BlockStateId::new(r.state_id))
     }
 
     /// Reads the authoritative block state at `position` from the resident chunk,
@@ -1866,6 +1937,79 @@ mod tests {
         let wall = BlockPos::new(9, 65, 8);
         let _ = place_block(&mut s, p, wall, TORCH, Direction::North, 0.5, 0.0, 2);
         assert_eq!(block_at(&s, wall), Some(BlockStateId::new(2402)));
+    }
+
+    #[tokio::test]
+    async fn set_block_exact_writes_a_rotated_state_verbatim_bypassing_refinement() {
+        // A plugin/command exact write of a rotated state must be stored as-is.
+        // The contrast place below proves the player path still refines, so the
+        // exact path is genuinely bypassing compute_placement (not a no-op).
+        let p = player("plugin-actor");
+        let mut s = shard_with_player(p).await;
+        let exact_target = BlockPos::new(8, 65, 8);
+        // oak_log axis=x (136): a neutral place would re-derive this to axis=y.
+        s.enqueue(GameInput::SetBlockExact {
+            player: p,
+            position: exact_target,
+            sequence: 1,
+            state: BlockStateId::new(136),
+        })
+        .expect("room");
+        let outputs = s.run_tick();
+        assert_eq!(
+            outputs,
+            vec![GameOutput::BlockChanged {
+                position: exact_target,
+                state: BlockStateId::new(136),
+                sequence: 1,
+                cause: MutationCause::PlayerCreative { player: p },
+            }]
+        );
+        assert_eq!(block_at(&s, exact_target), Some(BlockStateId::new(136)));
+
+        // Contrast: the player place path refines the SAME held id 136 with a
+        // neutral top-face click back to the default vertical axis=y (137).
+        let refined_target = BlockPos::new(9, 65, 8);
+        let _ = place_block(&mut s, p, refined_target, 136, Direction::Up, 0.5, 0.0, 2);
+        assert_eq!(block_at(&s, refined_target), Some(BlockStateId::new(137)));
+    }
+
+    #[tokio::test]
+    async fn preview_placement_matches_the_applied_state() {
+        // preview_placement (off-tick, read-only) must return the same state the
+        // BlockPlace tick applies, so the after-hook reports the final state.
+        let p = player("previewer");
+        let mut s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+        // An east-face log preview -> axis=x (136), the rotated state.
+        let preview = s.preview_placement(
+            BlockStateId::new(OAK_LOG),
+            Direction::East,
+            Vec3::new(0.5, 0.5, 0.5),
+            0.0,
+            target,
+        );
+        assert_eq!(preview, BlockStateId::new(136));
+        // Applying the same place yields exactly the previewed state.
+        let _ = place_block(&mut s, p, target, OAK_LOG, Direction::East, 0.5, 0.0, 1);
+        assert_eq!(block_at(&s, target), Some(preview));
+    }
+
+    #[tokio::test]
+    async fn preview_placement_falls_back_to_the_held_state_for_a_simple_cube() {
+        // A simple cube (stone, 1) has no placement-derived properties, so the
+        // preview is the held state unchanged.
+        let p = player("cube-previewer");
+        let s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+        let preview = s.preview_placement(
+            BlockStateId::new(1),
+            Direction::North,
+            Vec3::new(0.5, 0.9, 0.5),
+            200.0,
+            target,
+        );
+        assert_eq!(preview, BlockStateId::new(1));
     }
 
     #[tokio::test]

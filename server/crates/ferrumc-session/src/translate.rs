@@ -142,7 +142,7 @@ pub(crate) fn play_packet_to_input(
 /// Converts an angle in degrees to the protocol's single-byte angle form
 /// (`256` units = `360` degrees), wrapping into the `i8` range.
 ///
-/// The mapping is `degrees * 256 / 360` rounded to the nearest unit, reduced
+/// The mapping is `floor(degrees * 256 / 360)` (matching vanilla's angle byte), reduced
 /// modulo `256`, then reinterpreted as a signed byte — so `0 -> 0`, `90 -> 64`,
 /// `180 -> -128`, `270 -> 64` (i.e. `-64`), and `-90 -> -64`. A plain `as i8`
 /// cast would *saturate* (clamping any yaw `>= 180` to `127`) instead of
@@ -155,7 +155,7 @@ pub(crate) fn play_packet_to_input(
     reason = "reinterpreting the 0..256 angle unit as a signed byte is intentional"
 )]
 fn angle_to_byte(degrees: f32) -> i8 {
-    let units = (f64::from(degrees) / 360.0 * 256.0).round();
+    let units = (f64::from(degrees) / 360.0 * 256.0).floor();
     // `rem_euclid` yields a value in `[0, 256)`; non-finite inputs collapse to 0.
     let wrapped = if units.is_finite() {
         units.rem_euclid(256.0) as u8
@@ -257,7 +257,7 @@ pub fn output_to_clientbound(output: &GameOutput) -> Option<ClientboundPlayPacke
         | GameOutput::PlayerPositionCorrected { position, .. } => Some(move_shell(*position)),
         GameOutput::BlockChanged {
             position, state, ..
-        } => Some(block_update_shell(*position, *state)),
+        } => block_update_shell(*position, *state),
         // PlayerDespawned, BlockChangeRejected (a targeted resync the router
         // addresses to the actor, not a standalone shell), and any future variant
         // have no clientbound shell here yet.
@@ -492,18 +492,26 @@ pub(crate) fn move_shell(position: Vec3) -> ClientboundPlayPacket {
     ))
 }
 
-/// Builds the [`BlockUpdate`] packet announcing `state` at `position`.
+/// Builds the [`BlockUpdate`] packet announcing `state` at `position`, or `None`
+/// when `state` cannot be represented on the wire.
 ///
 /// This is the clientbound carrier for an accepted break or place: the router
-/// broadcasts it to every viewer within view distance of the changed block.
-pub(crate) fn block_update_shell(position: BlockPos, state: BlockStateId) -> ClientboundPlayPacket {
-    // Block-state ids are small protocol constants far below `i32::MAX`, so this
-    // conversion never saturates; the fallback only keeps the path panic-free.
-    let block_state = i32::try_from(state.as_u32()).unwrap_or(i32::MAX);
-    ClientboundPlayPacket::BlockUpdate(BlockUpdate::new(
+/// broadcasts it to every viewer within view distance of the changed block. The
+/// wire field is a signed `i32`, so a state id above `i32::MAX` has no faithful
+/// encoding — rather than silently clamp it to `i32::MAX` (which would diverge the
+/// client from the server's world), this returns `None` so the caller skips the
+/// update. Registry-derived player placements are always well below `i32::MAX`;
+/// only a malicious/buggy plugin exact id can reach this, and the entry boundary
+/// rejects those before they are ever stored, so `None` is a defensive fail-safe.
+pub(crate) fn block_update_shell(
+    position: BlockPos,
+    state: BlockStateId,
+) -> Option<ClientboundPlayPacket> {
+    let block_state = i32::try_from(state.as_u32()).ok()?;
+    Some(ClientboundPlayPacket::BlockUpdate(BlockUpdate::new(
         BlockPosition::new(position.x(), position.y(), position.z()),
         block_state,
-    ))
+    )))
 }
 
 /// Builds the [`AcknowledgeBlockChange`] packet echoing `sequence`.
@@ -781,6 +789,17 @@ mod tests {
         let loc = update.location();
         assert_eq!((loc.x(), loc.y(), loc.z()), (8, 63, 8));
         assert_eq!(update.block_state(), 0);
+    }
+
+    #[test]
+    fn block_update_shell_rejects_a_state_id_above_i32_max() {
+        // A state id beyond `i32::MAX` has no faithful signed-wire encoding, so the
+        // shell is dropped rather than silently clamped to `i32::MAX` (which would
+        // diverge the client from the server's world).
+        let unrepresentable = BlockStateId::new(u32::try_from(i32::MAX).unwrap() + 1);
+        assert!(block_update_shell(BlockPos::new(0, 0, 0), unrepresentable).is_none());
+        // A representative state still encodes.
+        assert!(block_update_shell(BlockPos::new(0, 0, 0), BlockStateId::new(1)).is_some());
     }
 
     #[test]
