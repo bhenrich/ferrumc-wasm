@@ -396,6 +396,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror",
+ "toml",
  "uuid",
 ]
 

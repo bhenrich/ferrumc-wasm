@@ -18,6 +18,9 @@ uuid = { workspace = true }
 # Drives the whitelist/ban *file* resolution tests against throwaway on-disk files
 # without polluting the working tree.
 tempfile = { workspace = true }
+# Round-trips the declarative config shapes (defaults + `deny_unknown_fields`)
+# from TOML in tests, matching how the app parses them.
+toml = { workspace = true }
 
 [lints]
 workspace = true
