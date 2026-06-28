@@ -1,0 +1,52 @@
+[package]
+name = "ferrumc-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# A tooling/bench crate (like `app`/`testkit`): it deliberately depends on
+# several measured crates so it can drive their public APIs. It is never a
+# runtime dependency of the server.
+
+[dependencies]
+# Chunk model + flat generator + section/chunk network encoders measured by the
+# `world` benchmark group.
+ferrumc-world = { workspace = true }
+# `compute_placement` and the placement families measured by the `placement` group.
+ferrumc-placement = { workspace = true }
+# Trusted/untrusted slot encode/decode measured by the `items` group.
+ferrumc-items = { workspace = true }
+# `SimShard::run_tick` measured (mspt vs edits) by the `sim` group.
+ferrumc-sim = { workspace = true }
+# `InMemoryStore` backs the synthetic-tick chunk acquire (storage miss -> generate).
+ferrumc-storage = { workspace = true }
+# Typed coordinates used to build benchmark inputs.
+ferrumc-math = { workspace = true }
+# `PlayerId` for the synthetic sim player.
+ferrumc-core = { workspace = true }
+# Block-state id constants used to build representative chunk sections.
+ferrumc-registry = { workspace = true }
+# `write_var_int` (to synthesize untrusted slot wire bytes) and `BoundedReader`
+# (the untrusted decode source).
+ferrumc-codec = { workspace = true }
+# Self-describing report serialization (JSON output) and the report value types.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Bin-only: the runner (`src/main.rs`) uses `anyhow` + `?` for ergonomic error
+# context when shelling out for metadata and writing files. The library half is
+# panic-free and uses no `anyhow`.
+anyhow = { workspace = true }
+
+[dev-dependencies]
+
+[[bin]]
+name = "ferrumc-bench"
+path = "src/main.rs"
+
+[lib]
+name = "ferrumc_bench"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

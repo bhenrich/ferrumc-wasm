@@ -343,6 +343,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrumc-bench"
+version = "0.2.0-dev"
+dependencies = [
+ "anyhow",
+ "ferrumc-codec",
+ "ferrumc-core",
+ "ferrumc-items",
+ "ferrumc-math",
+ "ferrumc-placement",
+ "ferrumc-registry",
+ "ferrumc-sim",
+ "ferrumc-storage",
+ "ferrumc-world",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ferrumc-codec"
 version = "0.2.0-dev"
 dependencies = [
