@@ -9,7 +9,10 @@ use ferrumc_items::UntrustedItemStack;
 use ferrumc_math::{BlockPos, Direction, Vec3, WorldIntent};
 use ferrumc_net::{CompressionState, PlayWriter};
 use ferrumc_observability::{PacketState, SessionDebug};
-use ferrumc_plugin_api::{BlockBreakAttempt, BlockPlaceAttempt};
+use ferrumc_plugin_api::{
+    BlockBreakAttempt, BlockPlaceAttempt, ChatAttempt, InteractAttempt, InteractHand,
+    InteractTarget, PluginEventDecision,
+};
 use ferrumc_plugin_host::ResolvedDecision;
 use ferrumc_proto::generated::play::{
     ClientboundPlayPacket, CommandSuggestionMatch, GameEvent, ServerboundPlayPacket,
@@ -92,6 +95,18 @@ pub(super) async fn handle_play_body(
     // stream centres on; the simulation stays authoritative.
     if let Some(position) = reported_position(&packet) {
         chunk_stream.observe(position);
+        // Fire the observe-only PlayerMove plugin event, throttled to block
+        // granularity: only when the player crosses into a NEW block (sub-block
+        // jitter is debounced by the last-reported block). Movement cannot be
+        // vetoed through this surface, so any decision is ignored — only the
+        // emitted intents are routed.
+        if let Some((from, to)) = chunk_stream.block_crossing(position) {
+            let perms = PermissionFacade::new(ctx.policy.permissions());
+            let intents = ctx
+                .block_events
+                .player_move(player, from, to, Some(position), &perms);
+            route_emitted_intents(ctx, player, writer, 0, intents, debug, compression).await?;
+        }
     }
 
     // Mirror the client's reported yaw so a later place can derive facing. Yaw is
@@ -137,6 +152,35 @@ pub(super) async fn handle_play_body(
                 tracing::debug!(player = name, "dropping over-budget chat line");
                 return Ok(());
             }
+            // Consult the loaded plugins at the chat intent boundary (off the tick,
+            // under the host mutex, no lock across an `.await`) BEFORE broadcasting.
+            // A Deny drops the line (it is never relayed) and shows the sender the
+            // reason, if any; a chat filter rides this path. The plugins see the raw
+            // message the player typed and the sender's last known position.
+            let perms = PermissionFacade::new(ctx.policy.permissions());
+            let (chat_decision, chat_intents) = ctx.block_events.before_chat(
+                &ChatAttempt::new(player, chat.message().as_str()),
+                chunk_stream.last_position(),
+                &perms,
+            );
+            if let PluginEventDecision::Deny { message } = chat_decision {
+                // `chat_intents` is empty on a Deny (the dispatcher drops them so a
+                // dropped message cannot still trigger a side effect); routing it is
+                // a no-op kept for symmetry with the Allow path.
+                deliver_deny_message(ctx, writer, debug, compression, message);
+                return route_emitted_intents(
+                    ctx,
+                    player,
+                    writer,
+                    0,
+                    chat_intents,
+                    debug,
+                    compression,
+                )
+                .await;
+            }
+            // Allowed: route any intents the plugins emitted, then broadcast.
+            route_emitted_intents(ctx, player, writer, 0, chat_intents, debug, compression).await?;
             // Relay unsigned player chat to everyone as a system message: format it
             // "<name> message" and hand it to the driver, the only owner of every
             // player's outbound channel. enforces_secure_chat = false, so no 1.19
@@ -188,6 +232,7 @@ pub(super) async fn handle_play_body(
                 inventory,
                 p,
                 *player_yaw,
+                chunk_stream.last_position(),
                 debug,
                 compression,
             )
@@ -288,6 +333,19 @@ fn reported_pitch(packet: &ServerboundPlayPacket) -> Option<f32> {
         ServerboundPlayPacket::SetPlayerPositionAndRotation(p) => Some(p.pitch()),
         ServerboundPlayPacket::SetPlayerRotation(p) => Some(p.pitch()),
         _ => None,
+    }
+}
+
+/// Maps the wire hand index of a use-item packet to the typed [`InteractHand`].
+///
+/// The protocol encodes `0` as the main hand and `1` as the off-hand; any other
+/// value is treated as the off-hand (the only non-main option), so a malformed
+/// index can never be mistaken for a main-hand action.
+fn interact_hand(hand: i32) -> InteractHand {
+    if hand == 0 {
+        InteractHand::Main
+    } else {
+        InteractHand::Off
     }
 }
 
@@ -722,6 +780,7 @@ async fn handle_use_item_on(
     inventory: &PlayerInventory,
     packet: &UseItemOn,
     player_yaw: f32,
+    player_position: Option<Vec3>,
     debug: &mut SessionDebug,
     compression: &CompressionState,
 ) -> anyhow::Result<()> {
@@ -742,14 +801,59 @@ async fn handle_use_item_on(
         f64::from(packet.cursor_z()),
     );
 
-    // Empty hand or non-placeable item: nothing to place, just ack. The plugins are
-    // not consulted for a no-op placement.
+    let perms = PermissionFacade::new(ctx.policy.permissions());
+
+    // Consult the plugins at the interaction intent boundary FIRST: a right-click on
+    // a block is an interaction regardless of what (if anything) it would place. A
+    // Deny stops the interaction here — ack the sequence so the client's prediction
+    // ends, show the reason, and do not place — before the block-place decision even
+    // runs. (The current protocol slice only carries use-item-on-block, so the
+    // target is always a `Block`; air/entity interactions are a future wiring.)
+    let (interact_decision, interact_intents) = ctx.block_events.before_interact(
+        &InteractAttempt::new(
+            player,
+            interact_hand(packet.hand()),
+            InteractTarget::Block {
+                pos: position,
+                face: clicked_face,
+            },
+        ),
+        player_position,
+        &perms,
+    );
+    if let PluginEventDecision::Deny { message } = interact_decision {
+        ack_sequence(writer, debug, compression, &ctx.clock, sequence)?;
+        deliver_deny_message(ctx, writer, debug, compression, message);
+        return route_emitted_intents(
+            ctx,
+            player,
+            writer,
+            sequence,
+            interact_intents,
+            debug,
+            compression,
+        )
+        .await;
+    }
+    // Allowed: route any intents the interaction emitted, then continue to placement.
+    route_emitted_intents(
+        ctx,
+        player,
+        writer,
+        sequence,
+        interact_intents,
+        debug,
+        compression,
+    )
+    .await?;
+
+    // Empty hand or non-placeable item: nothing to place, just ack. The block-place
+    // plugins are not consulted for a no-op placement (the interaction already was).
     let Some(held_state) = inventory.held().placeable_block() else {
         ack_sequence(writer, debug, compression, &ctx.clock, sequence)?;
         return Ok(());
     };
 
-    let perms = PermissionFacade::new(ctx.policy.permissions());
     let (decision, emitted) = ctx.block_events.before_block_place(
         &BlockPlaceAttempt::new(player, position, held_state),
         &perms,

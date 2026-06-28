@@ -41,12 +41,14 @@ use ferrumc_math::{BlockPos, ChunkPos, Vec3, WorldIntent};
 use ferrumc_observability::{PluginDecisionSnapshot, PluginDecisions};
 use ferrumc_permission::{Grant, PermissionNode, Resolution, Subject};
 use ferrumc_plugin_api::{
-    BlockBreakAttempt, BlockPlaceAttempt, CommandSink, IntentError, PermissionApi, PluginEvent,
-    WorldView, MAX_EMITTED_INTENTS,
+    BlockBreakAttempt, BlockPlaceAttempt, ChatAttempt, CommandSink, IntentError, InteractAttempt,
+    PermissionApi, PluginEvent, PluginEventDecision, WorldView, MAX_EMITTED_INTENTS,
 };
 use ferrumc_plugin_block_rules::BlockRulesPlugin;
+use ferrumc_plugin_greeter::GreeterPlugin;
 use ferrumc_plugin_host::{
     InMemoryPluginStorage, PluginHost, PluginLoader, PluginStorageBackend, ResolvedDecision,
+    ResolvedEventOutcome,
 };
 use ferrumc_plugin_spawn_protect::{bypass_node, SpawnProtect, SpawnProtectPlugin, CONFIG_KEY};
 
@@ -149,28 +151,57 @@ impl PermissionApi for PermissionFacade<'_> {
     }
 }
 
-/// A world-less [`WorldView`] handed to plugins during a block decision.
+/// The [`WorldView`] handed to plugins during a connection-side decision.
 ///
 /// The decision runs on the connection task, which is forbidden from reading
 /// authoritative world state (only the simulation owns it). So plugins consulted
-/// at the intent boundary see a view that reports nothing loaded: they decide from
-/// the incoming attempt (position, state, actor) and permissions, not from live
-/// world reads. A plugin needing real world reads in `before_*` is unsupported
-/// until the decision is routed through the driver/sim (documented follow-up).
-struct NullWorldView;
+/// at the intent boundary see a view that reports nothing *loaded*: they decide
+/// from the incoming attempt (position, state, actor) and permissions, not from
+/// live block reads.
+///
+/// The one piece of real state the connection *does* know is the acting player's
+/// own position (the connection mirrors every reported move), so
+/// [`player_position`](WorldView::player_position) returns it for that player.
+/// Authoritative block reads ([`is_chunk_loaded`](WorldView::is_chunk_loaded) /
+/// [`block_state_id`](WorldView::block_state_id)) remain `None`/`false`: serving
+/// them needs a sim query channel routed off the connection task, a documented
+/// future milestone.
+struct ConnectionWorldView {
+    /// The acting player whose position this view can answer.
+    player: PlayerId,
+    /// The acting player's last reported position, if the connection knows it.
+    position: Option<Vec3>,
+}
 
-impl WorldView for NullWorldView {
+impl ConnectionWorldView {
+    /// Builds a view bound to `player`, optionally carrying their last reported
+    /// `position`. Block decisions pass `None` (they do not consult position);
+    /// chat/interact/move dispatch passes the connection's last known position.
+    fn new(player: PlayerId, position: Option<Vec3>) -> Self {
+        Self { player, position }
+    }
+}
+
+impl WorldView for ConnectionWorldView {
     fn dimension(&self) -> DimensionId {
         DimensionId::new(0)
     }
     fn is_chunk_loaded(&self, _chunk: ChunkPos) -> bool {
+        // Authoritative residency is owned by the simulation; the connection task
+        // cannot read it. Future milestone: route through a sim query channel.
         false
     }
     fn block_state_id(&self, _pos: BlockPos) -> Option<u32> {
+        // See `is_chunk_loaded`: authoritative block reads are a future milestone.
         None
     }
-    fn player_position(&self, _player: PlayerId) -> Option<Vec3> {
-        None
+    fn player_position(&self, player: PlayerId) -> Option<Vec3> {
+        // The connection knows only the acting player's own position.
+        if player == self.player {
+            self.position
+        } else {
+            None
+        }
     }
 }
 
@@ -207,7 +238,13 @@ impl CommandSink for CollectingSink {
     }
 }
 
-/// The long-lived plugin host wrapped for shared, off-tick block-event dispatch.
+/// The long-lived plugin host wrapped for shared, off-tick plugin-event dispatch.
+///
+/// Despite the name (kept for the block-edit path it grew from) this is the
+/// connection's single entry point to the plugin host for *every* off-tick event:
+/// the `before_block_*` decisions, the `after_block_*` notifications, and the chat
+/// / interact / move events this milestone adds. All run the same way — synchronous,
+/// panic-isolated, under the mutex, with no lock held across an `.await`.
 ///
 /// Shared behind an [`Arc`](std::sync::Arc) by every connection task (it lives on
 /// [`ConnContext`](crate::connection::ConnContext)). Connection tasks run
@@ -277,7 +314,7 @@ impl BlockEventDispatcher {
         attempt: &BlockPlaceAttempt,
         permissions: &dyn PermissionApi,
     ) -> (ResolvedDecision, Vec<WorldIntent>) {
-        let world = NullWorldView;
+        let world = ConnectionWorldView::new(attempt.player(), None);
         let mut sink = CollectingSink::new();
         let resolved =
             self.lock()
@@ -300,7 +337,7 @@ impl BlockEventDispatcher {
         attempt: &BlockBreakAttempt,
         permissions: &dyn PermissionApi,
     ) -> (ResolvedDecision, Vec<WorldIntent>) {
-        let world = NullWorldView;
+        let world = ConnectionWorldView::new(attempt.player(), None);
         let mut sink = CollectingSink::new();
         let resolved =
             self.lock()
@@ -330,6 +367,7 @@ impl BlockEventDispatcher {
         permissions: &dyn PermissionApi,
     ) -> Vec<WorldIntent> {
         self.dispatch_after(
+            player,
             &PluginEvent::AfterBlockPlace {
                 player,
                 pos,
@@ -347,17 +385,113 @@ impl BlockEventDispatcher {
         pos: BlockPos,
         permissions: &dyn PermissionApi,
     ) -> Vec<WorldIntent> {
-        self.dispatch_after(&PluginEvent::AfterBlockBreak { player, pos }, permissions)
+        self.dispatch_after(
+            player,
+            &PluginEvent::AfterBlockBreak { player, pos },
+            permissions,
+        )
     }
 
-    /// Shared body of the `after_*` notifications: dispatch the event and drain the
+    /// Consults the loaded plugins about a pending *chat message* (before it is
+    /// broadcast), returning the combined [`PluginEventDecision`] and any intents
+    /// subscribers emitted to route.
+    ///
+    /// `position` is the sender's last known position (the connection mirrors it),
+    /// surfaced to plugins through [`ConnectionWorldView`]. Runs the synchronous,
+    /// panic-isolated host dispatch under the lock and returns owned data, so the
+    /// caller does its async routing after the lock is released. On a `Deny` the
+    /// intents are dropped (the dropped message must not still trigger side effects).
+    pub(crate) fn before_chat(
+        &self,
+        attempt: &ChatAttempt,
+        position: Option<Vec3>,
+        permissions: &dyn PermissionApi,
+    ) -> (PluginEventDecision, Vec<WorldIntent>) {
+        let world = ConnectionWorldView::new(attempt.player(), position);
+        let mut sink = CollectingSink::new();
+        let resolved = self
+            .lock()
+            .dispatch_chat_decision(attempt, &world, &mut sink, permissions);
+        Self::finish_event_decision(resolved, sink)
+    }
+
+    /// Consults the loaded plugins about a pending *interaction* (a right-click).
+    /// See [`before_chat`](Self::before_chat) for the shared semantics.
+    pub(crate) fn before_interact(
+        &self,
+        attempt: &InteractAttempt,
+        position: Option<Vec3>,
+        permissions: &dyn PermissionApi,
+    ) -> (PluginEventDecision, Vec<WorldIntent>) {
+        let world = ConnectionWorldView::new(attempt.player(), position);
+        let mut sink = CollectingSink::new();
+        let resolved =
+            self.lock()
+                .dispatch_interact_decision(attempt, &world, &mut sink, permissions);
+        Self::finish_event_decision(resolved, sink)
+    }
+
+    /// Folds a resolved event decision and its sink into the decision plus the
+    /// intents to route: a `Deny` drops the intents (the dropped event must not
+    /// still execute a plugin's side effect), an `Allow` keeps them.
+    fn finish_event_decision(
+        resolved: ResolvedEventOutcome,
+        sink: CollectingSink,
+    ) -> (PluginEventDecision, Vec<WorldIntent>) {
+        let decision = resolved.into_decision();
+        let emitted = if decision.is_deny() {
+            Vec::new()
+        } else {
+            sink.into_intents()
+        };
+        (decision, emitted)
+    }
+
+    /// Fires the observe-only [`PluginEvent::PlayerMove`] notification to
+    /// subscribers, returning any intents they emitted for the caller to route.
+    ///
+    /// `position` is the player's new position (the move that triggered this),
+    /// surfaced through [`ConnectionWorldView`]. Movement cannot be vetoed through
+    /// this surface; the connection throttles the call to one per block crossing.
+    pub(crate) fn player_move(
+        &self,
+        player: PlayerId,
+        from: BlockPos,
+        to: BlockPos,
+        position: Option<Vec3>,
+        permissions: &dyn PermissionApi,
+    ) -> Vec<WorldIntent> {
+        self.dispatch_notification(
+            player,
+            position,
+            &PluginEvent::PlayerMove { player, from, to },
+            permissions,
+        )
+    }
+
+    /// Shared body of the `after_*` notifications: dispatch the event with no
+    /// position context (a block edit carries its own position) and drain the
     /// intents subscribers emitted.
     fn dispatch_after(
         &self,
+        player: PlayerId,
         event: &PluginEvent,
         permissions: &dyn PermissionApi,
     ) -> Vec<WorldIntent> {
-        let world = NullWorldView;
+        self.dispatch_notification(player, None, event, permissions)
+    }
+
+    /// Shared body of every observe-only notification: build the connection world
+    /// view for `player` (carrying `position` when known), dispatch `event`, and
+    /// drain the intents subscribers emitted.
+    fn dispatch_notification(
+        &self,
+        player: PlayerId,
+        position: Option<Vec3>,
+        event: &PluginEvent,
+        permissions: &dyn PermissionApi,
+    ) -> Vec<WorldIntent> {
+        let world = ConnectionWorldView::new(player, position);
         let mut sink = CollectingSink::new();
         self.lock()
             .dispatch_event(event, &world, &mut sink, permissions);
@@ -466,6 +600,11 @@ pub(crate) fn build_play_policy(
 
     let block_rules_id = host.register(Box::new(BlockRulesPlugin::new()))?;
     host.enable(&block_rules_id)?;
+
+    // The greeter sample exercises the event surface: greet on join, filter a
+    // banned chat word (Deny), and observe move/interact.
+    let greeter_id = host.register(Box::new(GreeterPlugin::new()))?;
+    host.enable(&greeter_id)?;
 
     let permissions = PermissionRegistry::from_bypass_names(&config.spawn_protect_bypass)?;
     let ops = config

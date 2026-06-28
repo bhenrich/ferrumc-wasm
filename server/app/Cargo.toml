@@ -55,6 +55,9 @@ ferrumc-plugin-spawn-protect = { workspace = true }
 # The block-rules sample plugin (deny bedrock, glass -> tinted glass), driven
 # in-process to prove the Deny + Replace decision outcomes.
 ferrumc-plugin-block-rules = { workspace = true }
+# The greeter sample plugin, driven in-process to exercise the new event surface:
+# greet on join, filter a banned chat word (Deny), and observe move/interact.
+ferrumc-plugin-greeter = { workspace = true }
 # Packet tracing + the metric registry / server clock wired into the connection
 # and driver hot paths; the app is the only crate that can fire those hooks.
 ferrumc-observability = { workspace = true }

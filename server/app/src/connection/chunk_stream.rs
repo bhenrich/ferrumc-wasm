@@ -63,6 +63,11 @@ pub(super) struct ChunkStream {
     /// persist where the player was standing when they leave. `None` until the
     /// first move packet, in which case the join position is persisted instead.
     last_position: Option<Vec3>,
+    /// The integer block the player was last reported standing in, used to throttle
+    /// the `PlayerMove` plugin event to block granularity. `None` until the first
+    /// reported position establishes a baseline (so the very first packet only seeds
+    /// it and does not fire), see [`block_crossing`](ChunkStream::block_crossing).
+    last_move_block: Option<BlockPos>,
 }
 
 impl ChunkStream {
@@ -75,6 +80,7 @@ impl ChunkStream {
             loaded: ctx.join_kit.chunk_positions().collect(),
             pending_position: None,
             last_position: None,
+            last_move_block: None,
         }
     }
 
@@ -88,6 +94,30 @@ impl ChunkStream {
     /// (in which case the caller persists the join position).
     pub(super) fn last_position(&self) -> Option<Vec3> {
         self.last_position
+    }
+
+    /// Records `position` and returns the `(from, to)` block crossing if the player
+    /// entered a *new* integer block since the last reported crossing, else `None`.
+    ///
+    /// This throttles the `PlayerMove` plugin event to block granularity: many
+    /// sub-block movement packets within one block collapse to no event, and the
+    /// event fires once per block the player enters. The first call after join only
+    /// seeds the baseline (there is no prior block to report a crossing *from*), so
+    /// it returns `None`. Coordinates are floored to block space (matching vanilla:
+    /// block `x = -0.5` is block `-1`).
+    pub(super) fn block_crossing(&mut self, position: Vec3) -> Option<(BlockPos, BlockPos)> {
+        let to = BlockPos::new(
+            position.x.floor() as i32,
+            position.y.floor() as i32,
+            position.z.floor() as i32,
+        );
+        let crossing = match self.last_move_block {
+            Some(from) if from == to => None,
+            Some(from) => Some((from, to)),
+            None => None,
+        };
+        self.last_move_block = Some(to);
+        crossing
     }
 
     /// Records `position` as the persistence mirror *without* recentering the
@@ -380,5 +410,51 @@ mod tests {
         );
         // 441 desired - 25 seeded = 416 columns, in bounded batches of 16 -> 26 pumps.
         assert_eq!(iterations, 26);
+    }
+
+    /// Builds a bare [`ChunkStream`] for the block-crossing test without a
+    /// [`ConnContext`](super::super::context::ConnContext): only `last_move_block`
+    /// matters here, so the rest is seeded empty.
+    fn bare_stream() -> super::ChunkStream {
+        use std::collections::BTreeSet;
+
+        use ferrumc_math::ChunkPos;
+
+        super::ChunkStream {
+            center: ChunkPos::ORIGIN,
+            view_distance: 0,
+            loaded: BTreeSet::new(),
+            pending_position: None,
+            last_position: None,
+            last_move_block: None,
+        }
+    }
+
+    #[test]
+    fn block_crossing_fires_only_on_a_new_block() {
+        use ferrumc_math::{BlockPos, Vec3};
+
+        let mut stream = bare_stream();
+
+        // The first reported position only seeds the baseline; there is no prior
+        // block to report a crossing from.
+        assert_eq!(stream.block_crossing(Vec3::new(0.5, 64.0, 0.5)), None);
+
+        // Sub-block jitter within the same block does not refire.
+        assert_eq!(stream.block_crossing(Vec3::new(0.9, 64.2, 0.1)), None);
+
+        // Stepping into the next block fires exactly one crossing.
+        assert_eq!(
+            stream.block_crossing(Vec3::new(1.1, 64.0, 0.5)),
+            Some((BlockPos::new(0, 64, 0), BlockPos::new(1, 64, 0)))
+        );
+        // Staying put after the crossing does not refire.
+        assert_eq!(stream.block_crossing(Vec3::new(1.4, 64.0, 0.6)), None);
+
+        // Negative coordinates floor toward -inf (vanilla block space).
+        assert_eq!(
+            stream.block_crossing(Vec3::new(-0.1, 64.0, 0.5)),
+            Some((BlockPos::new(1, 64, 0), BlockPos::new(-1, 64, 0)))
+        );
     }
 }
