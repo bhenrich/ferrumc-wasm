@@ -17,9 +17,9 @@
 //!   [`ferrumc_math::LocalBlockPos`].
 //! - [`Chunk`] — a full-height stack of [`SECTION_COUNT`] sections spanning the
 //!   overworld, addressed by absolute [`ferrumc_math::BlockPos`], with
-//!   [`DirtySections`] tracking, a per-column [`Heightmap`], and documented
-//!   placeholders for lighting ([`ChunkLight`]) and block entities
-//!   ([`BlockEntity`]).
+//!   [`DirtySections`] tracking, a per-column [`Heightmap`], a bounded
+//!   [`BlockEntity`] map (signs, ...), and a documented lighting placeholder
+//!   ([`ChunkLight`]).
 //! - [`FlatWorldGenerator`] — deterministically fills a [`Chunk`] with a flat
 //!   overworld profile (bedrock floor, stone fill, dirt, grass surface, air).
 //!
@@ -28,6 +28,7 @@
 //! [`pack_motion_blocking_heightmap`] for the heightmap long array, and
 //! [`ChunkLightData`] for the light masks and full-bright sky arrays.
 
+mod block_entity;
 mod block_state;
 mod chunk;
 mod chunk_section;
@@ -39,8 +40,9 @@ mod network;
 mod packed_array;
 mod paletted_container;
 
+pub use block_entity::{sign_kind_for_state, BlockEntity, Sign, SignFace, SignKind, SIGN_LINES};
 pub use block_state::BlockStateId;
-pub use chunk::{BlockEntity, Chunk, ChunkLight, SECTION_COUNT};
+pub use chunk::{Chunk, ChunkLight, MAX_BLOCK_ENTITIES, SECTION_COUNT};
 pub use chunk_section::{ChunkSection, SECTION_VOLUME};
 pub use dirty::DirtySections;
 pub use error::WorldError;

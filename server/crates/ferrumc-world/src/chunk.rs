@@ -1,8 +1,11 @@
 //! A full-height chunk: a vertical stack of [`ChunkSection`]s.
 
+use std::collections::BTreeMap;
+
 use ferrumc_math::{BlockPos, ChunkPos, LocalBlockPos};
 use ferrumc_registry::dimension;
 
+use crate::block_entity::BlockEntity;
 use crate::block_state::BlockStateId;
 use crate::chunk_section::ChunkSection;
 use crate::dirty::DirtySections;
@@ -67,15 +70,16 @@ pub(crate) fn section_base_y(section_index: usize) -> Option<i32> {
 #[non_exhaustive]
 pub struct ChunkLight {}
 
-/// Placeholder for a chunk's block entities (chests, signs, spawners, ...).
+/// Maximum number of [`BlockEntity`]s a single chunk may hold.
 ///
-/// Block-entity NBT modelling is a later milestone, so a chunk has none for now
-/// and [`Chunk::block_entities`] always returns an empty slice. This type
-/// reserves a stable element type for that collection and cannot be constructed
-/// outside this crate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct BlockEntity {}
+/// Block entities are keyed by a unique [`BlockPos`] within the chunk, so the map
+/// is already bounded by the chunk's block count; this far-lower cap is a
+/// defensive ceiling so a hostile or buggy edit stream cannot grow it toward that
+/// (~98k) maximum. A chunk realistically holds a handful of signs/chests, so a
+/// well-behaved server never approaches it. Inserting at a key already present
+/// still succeeds past the cap (it replaces in place); only a brand-new position
+/// is rejected with [`WorldError::TooManyBlockEntities`].
+pub const MAX_BLOCK_ENTITIES: usize = 4096;
 
 /// A full-height chunk column: [`SECTION_COUNT`] (24) stacked [`ChunkSection`]s
 /// spanning the overworld from `MIN_Y` (`-64`) to `MIN_Y + HEIGHT - 1` (`319`).
@@ -88,8 +92,9 @@ pub struct BlockEntity {}
 ///
 /// A chunk tracks which sections have been modified (see
 /// [`Chunk::dirty_sections`]) so the persistence and network layers can flush
-/// only what changed. Lighting and block entities are present as documented
-/// placeholders (see [`ChunkLight`] and [`BlockEntity`]).
+/// only what changed. Lighting is a documented placeholder (see [`ChunkLight`]);
+/// block entities (signs, ...) are owned in a bounded map keyed by
+/// [`BlockPos`] (see [`Chunk::block_entities`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     /// The column this chunk occupies.
@@ -110,9 +115,10 @@ pub struct Chunk {
     persist_dirty: DirtySections,
     /// Placeholder lighting; always `None` until the lighting milestone.
     light: Option<ChunkLight>,
-    /// Placeholder block entities; always empty until the block-entity
-    /// milestone.
-    block_entities: Vec<BlockEntity>,
+    /// Block entities (signs, ...) keyed by their absolute [`BlockPos`], bounded
+    /// by [`MAX_BLOCK_ENTITIES`]. A [`BTreeMap`] keeps iteration order
+    /// deterministic (by position) so chunk-enter sends and snapshots are stable.
+    block_entities: BTreeMap<BlockPos, BlockEntity>,
 }
 
 impl Chunk {
@@ -126,7 +132,7 @@ impl Chunk {
             dirty: DirtySections::new(),
             persist_dirty: DirtySections::new(),
             light: None,
-            block_entities: Vec::new(),
+            block_entities: BTreeMap::new(),
         }
     }
 
@@ -245,11 +251,65 @@ impl Chunk {
         self.light.as_ref()
     }
 
-    /// Returns the chunk's block entities, currently always empty (see
-    /// [`BlockEntity`]).
+    /// Returns the block entity at `pos`, or `None` if there is none there.
     #[must_use]
-    pub fn block_entities(&self) -> &[BlockEntity] {
-        &self.block_entities
+    pub fn block_entity(&self, pos: BlockPos) -> Option<&BlockEntity> {
+        self.block_entities.get(&pos)
+    }
+
+    /// Returns a mutable handle to the block entity at `pos`, or `None` if there
+    /// is none there.
+    pub fn block_entity_mut(&mut self, pos: BlockPos) -> Option<&mut BlockEntity> {
+        self.block_entities.get_mut(&pos)
+    }
+
+    /// Iterates the chunk's block entities as `(position, entity)` pairs, in
+    /// ascending [`BlockPos`] order (deterministic).
+    pub fn block_entities(&self) -> impl Iterator<Item = (BlockPos, &BlockEntity)> {
+        self.block_entities.iter().map(|(pos, be)| (*pos, be))
+    }
+
+    /// Returns the number of block entities the chunk holds.
+    #[must_use]
+    pub fn block_entity_count(&self) -> usize {
+        self.block_entities.len()
+    }
+
+    /// Inserts or replaces the block entity at `pos`, returning the previous one.
+    ///
+    /// # Errors
+    ///
+    /// - [`WorldError::BlockOutsideChunk`] if `pos` is not in this chunk's column
+    ///   or its `y` is outside the buildable range.
+    /// - [`WorldError::TooManyBlockEntities`] if the map is at
+    ///   [`MAX_BLOCK_ENTITIES`] and `pos` is not already present (replacing an
+    ///   existing position never overflows).
+    ///
+    /// Block entities are tracked independently of the block-state dirty masks:
+    /// this does not mark the section network- or persist-dirty. The simulation
+    /// drives any persistence signal explicitly.
+    pub fn set_block_entity(
+        &mut self,
+        pos: BlockPos,
+        entity: BlockEntity,
+    ) -> Result<Option<BlockEntity>, WorldError> {
+        if self.resolve(pos).is_none() {
+            return Err(WorldError::BlockOutsideChunk { pos });
+        }
+        if self.block_entities.len() >= MAX_BLOCK_ENTITIES
+            && !self.block_entities.contains_key(&pos)
+        {
+            return Err(WorldError::TooManyBlockEntities {
+                capacity: MAX_BLOCK_ENTITIES,
+            });
+        }
+        Ok(self.block_entities.insert(pos, entity))
+    }
+
+    /// Removes and returns the block entity at `pos`, or `None` if there was
+    /// none.
+    pub fn remove_block_entity(&mut self, pos: BlockPos) -> Option<BlockEntity> {
+        self.block_entities.remove(&pos)
     }
 
     /// Sets a block by pre-resolved `(section index, local position)`, marking
@@ -288,7 +348,10 @@ impl Chunk {
 
 #[cfg(test)]
 mod tests {
-    use super::{section_base_y, section_of, Chunk, MIN_Y, SECTION_COUNT, WORLD_HEIGHT};
+    use super::{
+        section_base_y, section_of, Chunk, MAX_BLOCK_ENTITIES, MIN_Y, SECTION_COUNT, WORLD_HEIGHT,
+    };
+    use crate::block_entity::{BlockEntity, Sign, SignKind};
     use crate::block_state::BlockStateId;
     use crate::heightmap::HeightmapKind;
     use ferrumc_math::{BlockPos, ChunkPos};
@@ -350,7 +413,8 @@ mod tests {
         assert_eq!(chunk.sections().len(), SECTION_COUNT);
         assert!(!chunk.dirty_sections().any());
         assert!(chunk.light().is_none());
-        assert!(chunk.block_entities().is_empty());
+        assert_eq!(chunk.block_entity_count(), 0);
+        assert!(chunk.block_entities().next().is_none());
         // Representative reads across the height range are all air.
         let base = chunk.pos().origin_block(0);
         for y in [MIN_Y, MIN_Y + 100, 0, max_y()] {
@@ -466,6 +530,90 @@ mod tests {
             chunk.set_block(foreign, BlockStateId::new(1)),
             Err(crate::WorldError::BlockOutsideChunk { .. })
         ));
+    }
+
+    #[test]
+    fn block_entity_set_get_and_remove_round_trip() {
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        let pos = BlockPos::new(3, 64, 9);
+        assert!(chunk.block_entity(pos).is_none());
+
+        let sign = BlockEntity::Sign(Sign::new(SignKind::Sign));
+        assert_eq!(chunk.set_block_entity(pos, sign.clone()), Ok(None));
+        assert_eq!(chunk.block_entity(pos), Some(&sign));
+        assert_eq!(chunk.block_entity_count(), 1);
+        assert_eq!(chunk.block_entities().count(), 1);
+
+        // Setting block entities must not touch the block-state dirty masks.
+        assert!(!chunk.dirty_sections().any());
+        assert!(!chunk.persist_dirty_sections().any());
+
+        // Re-inserting at the same position replaces and returns the previous.
+        let replaced = chunk
+            .set_block_entity(pos, BlockEntity::Sign(Sign::new(SignKind::Hanging)))
+            .expect("replace in range");
+        assert_eq!(replaced, Some(sign));
+
+        assert!(chunk.remove_block_entity(pos).is_some());
+        assert!(chunk.block_entity(pos).is_none());
+        assert_eq!(chunk.block_entity_count(), 0);
+    }
+
+    #[test]
+    fn block_entity_outside_chunk_is_rejected() {
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        // A different column.
+        let foreign = BlockPos::new(16, 64, 0);
+        assert!(matches!(
+            chunk.set_block_entity(foreign, BlockEntity::Sign(Sign::new(SignKind::Sign))),
+            Err(crate::WorldError::BlockOutsideChunk { pos }) if pos == foreign
+        ));
+        // Out-of-range y.
+        let below = BlockPos::new(0, MIN_Y - 1, 0);
+        assert!(matches!(
+            chunk.set_block_entity(below, BlockEntity::Sign(Sign::new(SignKind::Sign))),
+            Err(crate::WorldError::BlockOutsideChunk { .. })
+        ));
+        assert_eq!(chunk.block_entity_count(), 0);
+    }
+
+    #[test]
+    fn block_entity_map_is_bounded() {
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        // Fill the map to its cap with distinct in-chunk positions. The chunk is
+        // 16x16 columns over 384 y, so MAX_BLOCK_ENTITIES distinct positions fit.
+        let mut filled = 0usize;
+        'outer: for y in MIN_Y..(MIN_Y + 384) {
+            for z in 0..16i32 {
+                for x in 0..16i32 {
+                    if filled == MAX_BLOCK_ENTITIES {
+                        break 'outer;
+                    }
+                    chunk
+                        .set_block_entity(
+                            BlockPos::new(x, y, z),
+                            BlockEntity::Sign(Sign::new(SignKind::Sign)),
+                        )
+                        .expect("under cap");
+                    filled += 1;
+                }
+            }
+        }
+        assert_eq!(chunk.block_entity_count(), MAX_BLOCK_ENTITIES);
+
+        // A brand-new position past the cap is rejected...
+        let overflow = BlockPos::new(0, MIN_Y + 300, 0);
+        assert!(chunk.block_entity(overflow).is_none());
+        assert!(matches!(
+            chunk.set_block_entity(overflow, BlockEntity::Sign(Sign::new(SignKind::Sign))),
+            Err(crate::WorldError::TooManyBlockEntities { capacity }) if capacity == MAX_BLOCK_ENTITIES
+        ));
+        // ...but replacing an existing key still succeeds at the cap.
+        let existing = BlockPos::new(0, MIN_Y, 0);
+        assert!(chunk
+            .set_block_entity(existing, BlockEntity::Sign(Sign::new(SignKind::Hanging)))
+            .is_ok());
+        assert_eq!(chunk.block_entity_count(), MAX_BLOCK_ENTITIES);
     }
 
     #[test]

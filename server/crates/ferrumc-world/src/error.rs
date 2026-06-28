@@ -55,4 +55,16 @@ pub enum WorldError {
         /// The offending block position.
         pos: ferrumc_math::BlockPos,
     },
+
+    /// A [`crate::Chunk`]'s block-entity map is already at its capacity and a new
+    /// position cannot be inserted.
+    ///
+    /// The map is bounded so a hostile or buggy edit stream cannot grow it
+    /// without limit; an insert at an *existing* key still succeeds (it replaces
+    /// in place), so this only rejects brand-new positions past the cap.
+    #[error("chunk block-entity map is full (capacity {capacity})")]
+    TooManyBlockEntities {
+        /// The map's fixed capacity (the count at which new keys are rejected).
+        capacity: usize,
+    },
 }
