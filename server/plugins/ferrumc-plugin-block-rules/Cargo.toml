@@ -22,6 +22,11 @@ ferrumc-core = { workspace = true }
 # surface (before_* hooks + `PluginBlockDecision`), the capability manifest, and
 # the narrow C ABI the cdylib exports.
 ferrumc-plugin-api = { workspace = true }
+# Generated named block-state / item id constants (`block_state::ids`,
+# `item::ids`) so the deny/rewrite rules reference names (BEDROCK, GLASS,
+# TINTED_GLASS) instead of magic numbers. Registry is a leaf data crate that
+# never depends on plugins, so plugin -> registry keeps the dep direction clean.
+ferrumc-registry = { workspace = true }
 
 [dev-dependencies]
 # Typed coordinates the unit tests use to build block attempts and the WorldView
@@ -29,10 +34,6 @@ ferrumc-plugin-api = { workspace = true }
 ferrumc-math = { workspace = true }
 # Permission node/resolution types for the permission-facade stub.
 ferrumc-permission = { workspace = true }
-# The block-state registry the constant-pinning tests cross-check against, so a
-# future drift back to demo ids (or a registry change) fails the build rather than
-# silently breaking the rule at runtime.
-ferrumc-registry = { workspace = true }
 
 # This crate cannot inherit the workspace `forbid(unsafe_code)`: exporting the
 # `#[no_mangle]` C entrypoint counts as unsafe code under modern rustc. We

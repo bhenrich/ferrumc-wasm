@@ -32,26 +32,28 @@ pub const PLUGIN_NAME: &str = "Block Rules";
 
 /// Default block-state id the plugin refuses to let players place.
 ///
-/// `85` is `minecraft:bedrock` in the vendored 1.21.8 snapshot (the same constant
-/// `ferrumc-registry` exposes as `block_state::BEDROCK`).
-pub const DENIED_BLOCK_STATE_ID: u32 = 85;
+/// Sourced from `ferrumc_registry::block_state::ids::BEDROCK` — the default state
+/// of `minecraft:bedrock` in the pinned 1.21.8 registry — so it tracks the
+/// generated registry constant instead of hardcoding a raw id.
+pub const DENIED_BLOCK_STATE_ID: u32 = ferrumc_registry::block_state::ids::BEDROCK;
 
 /// Default block-state id the plugin rewrites on placement.
 ///
-/// `562` is `minecraft:glass`'s block-state in the vendored 1.21.8 snapshot — the
-/// state `ferrumc_registry::item::item_to_block_state(195)` resolves the glass item
-/// to. The exact number is load-bearing: `before_block_place` receives the *resolved
-/// block-state* (not the item id), so this must equal the runtime block-state a glass
-/// placement produces or the [`Replace`](PluginBlockDecision::Replace) rule never
-/// fires. A deployment may still override it via [`BlockRulesPlugin::with_blocks`].
-pub const GLASS_BLOCK_STATE_ID: u32 = 562;
+/// Sourced from `ferrumc_registry::block_state::ids::GLASS` (`minecraft:glass`'s
+/// default state). The exact value is load-bearing: `before_block_place` receives
+/// the *resolved block-state* (not the item id), so this must equal the runtime
+/// block-state a glass placement produces — i.e. what
+/// `ferrumc_registry::item::item_to_block_state(item::ids::GLASS)` resolves to — or
+/// the [`Replace`](PluginBlockDecision::Replace) rule never fires. A deployment may
+/// still override it via [`BlockRulesPlugin::with_blocks`].
+pub const GLASS_BLOCK_STATE_ID: u32 = ferrumc_registry::block_state::ids::GLASS;
 
 /// Default block-state id glass placements are rewritten to.
 ///
-/// `23377` is `minecraft:tinted_glass`'s block-state in the vendored 1.21.8 snapshot
-/// (`ferrumc_registry::item::item_to_block_state(196)`); see [`GLASS_BLOCK_STATE_ID`]
-/// for why the exact value matters.
-pub const TINTED_GLASS_BLOCK_STATE_ID: u32 = 23377;
+/// Sourced from `ferrumc_registry::block_state::ids::TINTED_GLASS`
+/// (`minecraft:tinted_glass`'s default state); see [`GLASS_BLOCK_STATE_ID`] for
+/// why the exact value matters.
+pub const TINTED_GLASS_BLOCK_STATE_ID: u32 = ferrumc_registry::block_state::ids::TINTED_GLASS;
 
 /// The message shown to a player whose placement of the denied block is rejected.
 const DENIED_MESSAGE: &str = "You cannot place that block here.";
@@ -260,8 +262,11 @@ mod tests {
     #[test]
     fn placing_any_other_block_is_allowed() {
         let mut plugin = BlockRulesPlugin::new();
-        // `1` is `minecraft:stone`: not configured, so it passes through.
-        assert_eq!(decide_place(&mut plugin, 1), PluginBlockDecision::Allow);
+        // `minecraft:stone` is not configured, so it passes through.
+        assert_eq!(
+            decide_place(&mut plugin, ferrumc_registry::block_state::ids::STONE),
+            PluginBlockDecision::Allow
+        );
     }
 
     #[test]
@@ -287,6 +292,8 @@ mod tests {
 
     #[test]
     fn custom_block_ids_are_honoured() {
+        // 100/200/300 are arbitrary override ids, not real registry values: this
+        // exercises the override path, so any unconfigured state must pass through.
         let mut plugin = BlockRulesPlugin::with_blocks(100, 200, 300);
         assert!(decide_place(&mut plugin, 100).is_deny());
         assert_eq!(
@@ -295,33 +302,34 @@ mod tests {
                 block_state_id: 300
             }
         );
-        assert_eq!(decide_place(&mut plugin, 85), PluginBlockDecision::Allow);
+        // The default-denied bedrock state is not configured here, so it allows.
+        assert_eq!(
+            decide_place(&mut plugin, ferrumc_registry::block_state::ids::BEDROCK),
+            PluginBlockDecision::Allow
+        );
     }
 
     #[test]
     fn default_block_state_ids_match_the_real_registry() {
-        // These are NOT free-choice demo values. `before_block_place` receives a
-        // *resolved block-state* (not an item id), so each default must equal the
-        // real 1.21.8 block-state a placement produces or the rule never fires at
-        // runtime. Pin the literals and cross-check the registry so a future drift
-        // back to demo ids (or a registry change) fails the build rather than
-        // silently breaking the rule (the bug the demo ids 199/9279 caused).
-        assert_eq!(GLASS_BLOCK_STATE_ID, 562);
-        assert_eq!(TINTED_GLASS_BLOCK_STATE_ID, 23377);
-        assert_eq!(DENIED_BLOCK_STATE_ID, 85);
-
-        // The glass item (195) and tinted_glass item (196) place exactly these
-        // states, and the bedrock item (58) places the denied state.
+        // The defaults are sourced from `ferrumc_registry::block_state::ids`, not
+        // free-choice demo values. `before_block_place` receives a *resolved
+        // block-state* (not an item id), so each default must equal the real
+        // 1.21.8 block-state a placement produces or the rule never fires at
+        // runtime. Cross-check that the glass / tinted glass / bedrock *items*
+        // place exactly these states (via named item ids), so a future item<->block
+        // mapping change fails here rather than silently breaking the rule (the bug
+        // the demo ids 199/9279 caused).
+        use ferrumc_registry::item;
         assert_eq!(
-            ferrumc_registry::item::item_to_block_state(195),
+            item::item_to_block_state(item::ids::GLASS),
             Some(GLASS_BLOCK_STATE_ID)
         );
         assert_eq!(
-            ferrumc_registry::item::item_to_block_state(196),
+            item::item_to_block_state(item::ids::TINTED_GLASS),
             Some(TINTED_GLASS_BLOCK_STATE_ID)
         );
         assert_eq!(
-            ferrumc_registry::item::item_to_block_state(58),
+            item::item_to_block_state(item::ids::BEDROCK),
             Some(DENIED_BLOCK_STATE_ID)
         );
     }
