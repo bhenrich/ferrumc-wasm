@@ -51,6 +51,7 @@ mod join;
 mod outbound;
 mod play;
 mod rate_limiter;
+mod serverbound_budget;
 
 pub(crate) use context::{build_status_response, ConnContext};
 

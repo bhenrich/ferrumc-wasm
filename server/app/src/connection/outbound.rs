@@ -146,7 +146,16 @@ pub(super) fn enqueue_traced(
 /// session debug recorder (which already funnels every traced packet), so no new
 /// per-packet bookkeeping is added; the hub merges these into the per-tick
 /// `ServerSnapshot` and prunes the session when the connection disconnects.
-pub(super) fn observe_queue_len(debug: &mut SessionDebug, ctx: &ConnContext, writer: &PlayWriter) {
+///
+/// `over_budget` is the serverbound packet budget's running over-budget tally for
+/// this connection (the reader's counter, not the writer's), surfaced per player
+/// so the dashboard reflects a throttled/flooding client.
+pub(super) fn observe_queue_len(
+    debug: &mut SessionDebug,
+    ctx: &ConnContext,
+    writer: &PlayWriter,
+    over_budget: u64,
+) {
     let depth = writer.total_queued();
     debug.observe_outbound_queue_len(depth);
     ctx.metrics.observe_outbound_queue_len(depth);
@@ -162,7 +171,7 @@ pub(super) fn observe_queue_len(debug: &mut SessionDebug, ctx: &ConnContext, wri
         bytes_in: debug.inbound_bytes(),
         frames_out: metrics.frames_encoded(),
         bytes_out: metrics.bytes_out(),
-        over_budget: metrics.over_budget(),
+        over_budget,
         dropped,
         queue_depth: depth as u64,
         inbound: debug.inbound_tally().clone(),

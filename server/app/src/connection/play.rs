@@ -33,6 +33,7 @@ use super::outbound::{
     observe_queue_len,
 };
 use super::rate_limiter::ChatRateLimiter;
+use super::serverbound_budget::ServerboundBudget;
 use super::{Connection, READ_CHUNK};
 
 /// Joins the simulation and replays the join kit, then pumps the play link until
@@ -118,6 +119,18 @@ pub(super) async fn enter_play(
     // never touched by the sim/session deterministic tick path.
     let mut chat_limiter = ChatRateLimiter::new(ctx.clock.now());
 
+    // Per-connection serverbound packet budget: a token bucket (~300 frames/sec
+    // sustained, 600 burst by default) charged one token per serverbound play
+    // frame. A sustained flood drains the bucket and the connection is dropped with
+    // `BudgetExceeded`, so a hostile client cannot exhaust the server by spamming
+    // play packets. Like the chat limiter, it lives in the connection task (allowed
+    // a non-deterministic clock) and never touches the deterministic tick path.
+    let mut budget = ServerboundBudget::new(
+        std::time::Instant::now(),
+        ctx.budget.sustained_rate,
+        ctx.budget.burst,
+    );
+
     // Make the sim's authoritative mode match the restored (or default-creative)
     // mode so the creative-slot gate accepts this player and later enforcement
     // (creative no-decrement, break speed, flight) reads the right mode.
@@ -156,6 +169,7 @@ pub(super) async fn enter_play(
         &mut writer,
         &mut chunk_stream,
         &mut chat_limiter,
+        &mut budget,
         &mut inventory,
         &mut player_yaw,
         &mut player_pitch,
@@ -163,7 +177,7 @@ pub(super) async fn enter_play(
     )
     .await?;
     flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await?;
-    observe_queue_len(&mut debug, ctx, &writer);
+    observe_queue_len(&mut debug, ctx, &writer, budget.over_budget());
 
     // Keep Alive: a real client disconnects if it hears nothing for 20 s. Ping on
     // an interval; the client echoes with a serverbound Keep Alive the play pump
@@ -210,7 +224,7 @@ pub(super) async fn enter_play(
                 if let Err(err) = flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
                     break Err(err);
                 }
-                observe_queue_len(&mut debug, ctx, &writer);
+                observe_queue_len(&mut debug, ctx, &writer, budget.over_budget());
             }
             _ = chunk_pump.tick() => {
                 // Advance the view one bounded batch toward full view distance from
@@ -224,7 +238,7 @@ pub(super) async fn enter_play(
                 if let Err(err) = flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
                     break Err(err);
                 }
-                observe_queue_len(&mut debug, ctx, &writer);
+                observe_queue_len(&mut debug, ctx, &writer, budget.over_budget());
             }
             outbound = handle.recv() => match outbound {
                 // Clientbound simulation output: queue and flush to the socket.
@@ -271,7 +285,7 @@ pub(super) async fn enter_play(
                     if let Err(err) = flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
                         break Err(err);
                     }
-                    observe_queue_len(&mut debug, ctx, &writer);
+                    observe_queue_len(&mut debug, ctx, &writer, budget.over_budget());
                 }
                 // The router dropped the session.
                 None => break Ok(()),
@@ -291,6 +305,7 @@ pub(super) async fn enter_play(
                         &mut stream,
                         &mut chunk_stream,
                         &mut chat_limiter,
+                        &mut budget,
                         &mut inventory,
                         &mut player_yaw,
                         &mut player_pitch,
@@ -308,7 +323,7 @@ pub(super) async fn enter_play(
     // The play link has ended (clean close, EOF, shutdown, or error). Sample the
     // final outbound queue depth and dump the retained traces (acceptance:
     // disconnect).
-    observe_queue_len(&mut debug, ctx, &writer);
+    observe_queue_len(&mut debug, ctx, &writer, budget.over_budget());
     debug.dump("disconnect");
 
     // Persist this player's state BEFORE releasing their chunk tickets, mirroring
@@ -395,6 +410,7 @@ async fn read_and_pump(
     stream: &mut TcpStream,
     chunk_stream: &mut ChunkStream,
     chat_limiter: &mut ChatRateLimiter,
+    budget: &mut ServerboundBudget,
     inventory: &mut PlayerInventory,
     player_yaw: &mut f32,
     player_pitch: &mut f32,
@@ -411,6 +427,7 @@ async fn read_and_pump(
         writer,
         chunk_stream,
         chat_limiter,
+        budget,
         inventory,
         player_yaw,
         player_pitch,
@@ -438,11 +455,18 @@ async fn pump_serverbound(
     writer: &mut PlayWriter,
     chunk_stream: &mut ChunkStream,
     chat_limiter: &mut ChatRateLimiter,
+    budget: &mut ServerboundBudget,
     inventory: &mut PlayerInventory,
     player_yaw: &mut f32,
     player_pitch: &mut f32,
     debug: &mut SessionDebug,
 ) -> anyhow::Result<()> {
+    // One real-time reading for the whole drained batch: every frame buffered from
+    // this read is charged against the budget at the same instant, so a single
+    // flood read deterministically drains the bucket regardless of wall-clock
+    // jitter. `std::time::Instant` (not the `tokio::time::Instant` alias in scope)
+    // is what the token bucket expects.
+    let now = std::time::Instant::now();
     loop {
         let next = match decoder.next_packet_compressed(ConnectionState::Play, compression) {
             Ok(next) => next,
@@ -464,6 +488,21 @@ async fn pump_serverbound(
         let InboundPacket::Play(body) = packet else {
             anyhow::bail!("non-play frame received in the play phase");
         };
+        // Charge this serverbound frame against the per-connection packet budget
+        // BEFORE handling it. Once the burst is drained and the sustained rate is
+        // exceeded, the connection is dropped (`BudgetExceeded`) rather than left to
+        // process an unbounded flood, so a hostile client cannot exhaust the server.
+        if let Err(reason) = budget.admit(now) {
+            tracing::warn!(
+                player = name,
+                ?reason,
+                "serverbound packet budget exceeded; dropping connection"
+            );
+            debug.dump("play_budget_exceeded");
+            return Err(anyhow::anyhow!(
+                "serverbound packet budget exceeded ({reason:?})"
+            ));
+        }
         handle_play_body(
             ctx,
             player,

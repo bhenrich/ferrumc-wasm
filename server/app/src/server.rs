@@ -280,6 +280,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         clock,
         net_telemetry,
         access,
+        budget: config.budget,
     };
 
     let accept_task = tokio::spawn(accept_loop(

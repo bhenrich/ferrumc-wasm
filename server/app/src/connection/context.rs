@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use ferrumc_codec::BoundedString;
-use ferrumc_config::{LoginDecision, ResolvedAccess};
+use ferrumc_config::{LoginDecision, PacketBudgetConfig, ResolvedAccess};
 use ferrumc_net::{offline_uuid, ConnectionLimits, OutboundPacket, StatusInfo};
 use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock};
 use ferrumc_proto::generated::login::{ClientboundLoginPacket, LoginDisconnect};
@@ -97,6 +97,11 @@ pub(crate) struct ConnContext {
     /// [`login_denial`](Self::login_denial); the IP-level checks run in the accept
     /// loop before a task is spawned.
     pub(crate) access: Arc<ResolvedAccess>,
+    /// The serverbound packet budget (token-bucket sustained rate and burst) each
+    /// play connection builds its own [`PacketBudget`](ferrumc_net::PacketBudget)
+    /// from. Plain `Copy` config, not shared mutable state: every connection owns a
+    /// private bucket so one peer's flood never affects another's headroom.
+    pub(crate) budget: PacketBudgetConfig,
 }
 
 impl ConnContext {

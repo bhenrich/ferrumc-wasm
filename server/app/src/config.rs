@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ferrumc_config::AccessConfig;
+use ferrumc_config::{AccessConfig, PacketBudgetConfig};
 use ferrumc_math::Vec3;
 use serde::Deserialize;
 
@@ -143,6 +143,10 @@ pub struct AppConfig {
     /// ban list, and the optional whitelist. Resolved (files read, entries
     /// classified) at startup; see [`ferrumc_config::AccessConfig::resolve`].
     pub access: AccessConfig,
+    /// Per-connection serverbound packet budget (token-bucket sustained rate and
+    /// burst) that throttles a flooding client: a sustained over-budget peer is
+    /// dropped with `BudgetExceeded`. Validated at startup.
+    pub budget: PacketBudgetConfig,
 }
 
 impl AppConfig {
@@ -197,6 +201,7 @@ impl Default for AppConfig {
             dashboard_enabled: DEFAULT_DASHBOARD_ENABLED,
             dashboard_bind: DEFAULT_DASHBOARD_BIND,
             access: AccessConfig::default(),
+            budget: PacketBudgetConfig::default(),
         }
     }
 }
@@ -250,6 +255,9 @@ struct RawConfig {
     /// The `[access]` table. Carries its own per-field defaults, so an omitted
     /// table (or any omitted field within it) falls back to the safe defaults.
     access: AccessConfig,
+    /// The `[budget]` table. Carries its own per-field defaults (300/600), so an
+    /// omitted table falls back to the safe serverbound packet budget.
+    budget: PacketBudgetConfig,
 }
 
 impl RawConfig {
@@ -280,6 +288,10 @@ impl RawConfig {
                 .map_err(|err| anyhow::anyhow!("invalid dashboard_bind address {text:?}: {err}"))?,
             None => defaults.dashboard_bind,
         };
+
+        // Reject a degenerate packet budget at startup: a non-positive rate would
+        // silently disconnect every client rather than surface as a config error.
+        self.budget.validate()?;
 
         Ok(AppConfig {
             bind,
@@ -320,12 +332,17 @@ impl RawConfig {
             dashboard_enabled: self.dashboard_enabled.unwrap_or(defaults.dashboard_enabled),
             dashboard_bind,
             access: self.access,
+            budget: self.budget,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    // The budget rate/burst under test are exact, representable literals, so exact
+    // float comparison is intentional here.
+    #![allow(clippy::float_cmp)]
+
     use super::*;
 
     #[test]
@@ -445,6 +462,39 @@ mod tests {
     #[test]
     fn access_unknown_field_is_rejected() {
         assert!(AppConfig::from_toml_str("[access]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn packet_budget_defaults_to_three_hundred_over_six_hundred() {
+        let parsed = AppConfig::from_toml_str("").expect("empty config is valid");
+        assert_eq!(parsed.budget, PacketBudgetConfig::default());
+        assert_eq!(parsed.budget.sustained_rate, 300.0);
+        assert_eq!(parsed.budget.burst, 600.0);
+    }
+
+    #[test]
+    fn budget_table_overrides_parse() {
+        let toml = "\
+            bind = \"127.0.0.1:0\"\n\
+            [budget]\n\
+            sustained_rate = 150.0\n\
+            burst = 450.0\n\
+        ";
+        let parsed = AppConfig::from_toml_str(toml).expect("valid budget config");
+        assert_eq!(parsed.budget.sustained_rate, 150.0);
+        assert_eq!(parsed.budget.burst, 450.0);
+    }
+
+    #[test]
+    fn a_degenerate_budget_is_rejected_at_startup() {
+        let err = AppConfig::from_toml_str("[budget]\nsustained_rate = 0.0")
+            .expect_err("a zero sustained rate must be rejected");
+        assert!(err.to_string().contains("sustained_rate"));
+    }
+
+    #[test]
+    fn budget_unknown_field_is_rejected() {
+        assert!(AppConfig::from_toml_str("[budget]\nbogus = 1").is_err());
     }
 
     #[test]
