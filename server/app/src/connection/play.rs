@@ -22,7 +22,9 @@ use crate::inventory::PlayerInventory;
 use crate::observe;
 use crate::player_data::PlayerData;
 
-use super::chunk_stream::{apply_chunk_stream, pump_chunk_stream, ChunkStream};
+use super::chunk_stream::{
+    apply_chunk_stream, mirror_server_teleport, pump_chunk_stream, ChunkStream,
+};
 use super::context::ConnContext;
 use super::handlers::handle_play_body;
 use super::join::send_join_kit;
@@ -239,6 +241,20 @@ pub(super) async fn enter_play(
                     let criticality = msg.criticality();
                     let priority = msg.priority();
                     let packet = msg.into_packet();
+                    // A server-driven absolute teleport (a router `Teleport` intent or
+                    // an anti-cheat `PlayerPositionCorrected`) reaches this client
+                    // through its outbound channel. Mirror it into the persistence
+                    // state so a leave-save with no follow-up client move still saves
+                    // where the server actually put the player, not the stale
+                    // pre-teleport position/look the mirror last held.
+                    if let ClientboundPlayPacket::SynchronizePlayerPosition(sync) = &packet {
+                        mirror_server_teleport(
+                            &mut chunk_stream,
+                            &mut player_yaw,
+                            &mut player_pitch,
+                            sync,
+                        );
+                    }
                     let outcome =
                         enqueue_traced(&mut writer, &mut debug, &compression, &ctx.clock, priority, packet);
                     if is_mandatory_overflow(criticality, outcome) {

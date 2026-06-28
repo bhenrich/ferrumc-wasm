@@ -26,7 +26,7 @@ use crate::inventory::{PlayerInventory, SLOT_COUNT, WINDOW_ID};
 use crate::observe;
 use crate::plugins::PermissionFacade;
 
-use super::chunk_stream::ChunkStream;
+use super::chunk_stream::{mirror_server_teleport, ChunkStream};
 use super::context::ConnContext;
 use super::outbound::{ack_sequence, enqueue_traced_classified, send_mandatory};
 use super::rate_limiter::ChatRateLimiter;
@@ -116,7 +116,10 @@ pub(super) async fn handle_play_body(
                 player,
                 name,
                 writer,
+                chunk_stream,
                 inventory,
+                player_yaw,
+                player_pitch,
                 &command,
                 debug,
                 compression,
@@ -548,7 +551,10 @@ async fn handle_command(
     player: PlayerId,
     name: &str,
     writer: &mut PlayWriter,
+    chunk_stream: &mut ChunkStream,
     inventory: &mut PlayerInventory,
+    player_yaw: &mut f32,
+    player_pitch: &mut f32,
     command: &str,
     debug: &mut SessionDebug,
     compression: &CompressionState,
@@ -600,17 +606,19 @@ async fn handle_command(
     let first_token = command.split_whitespace().next();
     if first_token == Some(SPAWN_COMMAND) {
         let spawn = policy.spawn();
+        // Snap the player to spawn at their CURRENT look: the previous `0.0/0.0`
+        // reset them to facing south and level on every `/spawn`.
+        let sync = spawn_sync(JOIN_TELEPORT_ID, spawn, *player_yaw, *player_pitch);
+        // Mirror this server-driven teleport into the persistence state so a
+        // leave-save before the client confirms and reports a follow-up move still
+        // captures the spawn position, not the pre-`/spawn` one.
+        mirror_server_teleport(chunk_stream, player_yaw, player_pitch, &sync);
         enqueue_traced_classified(
             writer,
             debug,
             compression,
             &ctx.clock,
-            ClientboundPlayPacket::SynchronizePlayerPosition(spawn_sync(
-                JOIN_TELEPORT_ID,
-                spawn,
-                0.0,
-                0.0,
-            )),
+            ClientboundPlayPacket::SynchronizePlayerPosition(sync),
         );
         let move_event = NetEvent::play(
             player,

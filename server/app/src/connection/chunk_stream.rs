@@ -8,7 +8,9 @@ use tokio::sync::oneshot;
 use ferrumc_math::{BlockPos, ChunkPos, Vec3};
 use ferrumc_net::{CompressionState, OutboundPriority, PlayWriter};
 use ferrumc_observability::SessionDebug;
-use ferrumc_proto::generated::play::{ClientboundPlayPacket, SetCenterChunk, UnloadChunk};
+use ferrumc_proto::generated::play::{
+    ClientboundPlayPacket, SetCenterChunk, SynchronizePlayerPosition, UnloadChunk,
+};
 
 use crate::driver::SimCommand;
 
@@ -87,6 +89,43 @@ impl ChunkStream {
     pub(super) fn last_position(&self) -> Option<Vec3> {
         self.last_position
     }
+
+    /// Records `position` as the persistence mirror *without* recentering the
+    /// streamed view.
+    ///
+    /// Unlike [`observe`](Self::observe), this advances only `last_position` (what a
+    /// leave-save persists), not `pending_position` (what the stream recenters on):
+    /// a server-driven teleport must immediately become the position a leave-save
+    /// captures, while the view still recentres off the client's own follow-up
+    /// movement like any other move.
+    pub(super) fn mirror_teleport(&mut self, position: Vec3) {
+        self.last_position = Some(position);
+    }
+}
+
+/// Mirrors a server-driven absolute teleport into the persistence state so a later
+/// leave-save captures the teleported position and look, not the stale
+/// client-reported one.
+///
+/// The server snaps a player with an authoritative `SynchronizePlayerPosition` for
+/// `/spawn`, a routed plugin `Teleport`, or an anti-cheat correction. The mirror is
+/// otherwise advanced only by the client's own movement packets, so a player who
+/// disconnects after such a teleport but before reporting a move would be saved at
+/// their pre-teleport spot. Only fully-absolute syncs (`flags == 0`, the only kind
+/// the server emits) are mirrored; a partially-relative sync is left untouched
+/// because its absolute target cannot be reconstructed here.
+pub(super) fn mirror_server_teleport(
+    chunk_stream: &mut ChunkStream,
+    player_yaw: &mut f32,
+    player_pitch: &mut f32,
+    sync: &SynchronizePlayerPosition,
+) {
+    if sync.flags() != 0 {
+        return;
+    }
+    chunk_stream.mirror_teleport(Vec3::new(sync.x(), sync.y(), sync.z()));
+    *player_yaw = sync.yaw();
+    *player_pitch = sync.pitch();
 }
 
 /// Streams chunks to follow the client's latest reported position, then advances
