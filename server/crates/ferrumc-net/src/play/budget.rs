@@ -3,6 +3,8 @@
 
 use std::time::Instant;
 
+use super::disconnect::DisconnectReason;
+
 /// Default sustained serverbound play-frame rate, in frames per second.
 ///
 /// Mirrors the networking model's 300 frames/sec budget: a well-behaved client
@@ -133,6 +135,28 @@ impl PacketBudget {
             BudgetStatus::OverBudget
         }
     }
+
+    /// Charges one serverbound play frame and reports whether the connection must
+    /// be torn down for sustained over-budget abuse.
+    ///
+    /// Refills for the elapsed time, then charges a single token: the v1 uniform
+    /// per-frame cost. Every serverbound frame is weighed equally — there is no
+    /// per-packet criticality discount, so the policy is trivial to reason about.
+    /// Returns `Ok(())` while the peer stays within its [`burst`](Self::burst) and
+    /// sustained budget, or `Err(`[`DisconnectReason::BudgetExceeded`]`)` the moment
+    /// the bucket cannot cover the frame, letting the caller drop a flooding client
+    /// deterministically.
+    ///
+    /// The default `600`-token burst (twice the sustained rate) leaves ample
+    /// headroom for the mandatory frames of normal play — keep-alive echoes and
+    /// teleport confirms — so a well-behaved client never trips this; only a
+    /// sustained flood beyond the rate drains the bucket.
+    pub fn admit_frame(&mut self, now: Instant) -> Result<(), DisconnectReason> {
+        match self.charge(now, 1) {
+            BudgetStatus::WithinBudget => Ok(()),
+            BudgetStatus::OverBudget => Err(DisconnectReason::BudgetExceeded),
+        }
+    }
 }
 
 /// Clamps a configured rate/burst to a finite, non-negative value.
@@ -231,5 +255,49 @@ mod tests {
         assert_eq!(budget.rate_per_sec(), 0.0);
         assert_eq!(budget.burst(), 0.0);
         assert_eq!(budget.charge(now, 1), BudgetStatus::OverBudget);
+    }
+
+    #[test]
+    fn admit_frame_passes_a_full_burst_within_budget() {
+        let now = Instant::now();
+        let mut budget = PacketBudget::new(now, 300.0, 600.0);
+        // The whole burst, charged at one instant, is admitted without a disconnect.
+        for _ in 0..600 {
+            assert_eq!(budget.admit_frame(now), Ok(()));
+        }
+    }
+
+    #[test]
+    fn admit_frame_disconnects_once_the_burst_is_drained() {
+        let now = Instant::now();
+        // A 5-token burst with no refill window: a flood past it trips the budget.
+        let mut budget = PacketBudget::new(now, 300.0, 5.0);
+        for _ in 0..5 {
+            assert_eq!(budget.admit_frame(now), Ok(()));
+        }
+        assert_eq!(
+            budget.admit_frame(now),
+            Err(DisconnectReason::BudgetExceeded)
+        );
+        // Still over budget while the bucket stays empty.
+        assert_eq!(
+            budget.admit_frame(now),
+            Err(DisconnectReason::BudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn admit_frame_recovers_after_refill() {
+        let t0 = Instant::now();
+        let mut budget = PacketBudget::new(t0, 300.0, 1.0);
+        assert_eq!(budget.admit_frame(t0), Ok(()));
+        assert_eq!(
+            budget.admit_frame(t0),
+            Err(DisconnectReason::BudgetExceeded)
+        );
+        // ~4 ms later (> 1/300 s) a single token has refilled, so a paced client
+        // that respected the rate is admitted again rather than dropped.
+        let t1 = t0 + Duration::from_millis(4);
+        assert_eq!(budget.admit_frame(t1), Ok(()));
     }
 }
