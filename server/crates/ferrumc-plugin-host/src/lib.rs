@@ -62,6 +62,9 @@ mod storage;
 pub use budget::{BudgetOutcome, CallBudget};
 pub use dynamic::{DirLoadReport, LoadError, PluginLoader};
 pub use error::HostError;
-pub use host::{DispatchReport, HostConfig, PluginHost, ResolvedBlockDecision, ResolvedDecision};
+pub use host::{
+    DispatchReport, HostConfig, PluginDecisionReport, PluginHost, ResolvedBlockDecision,
+    ResolvedDecision,
+};
 pub use state::{DisableReason, PluginState, PluginStats};
 pub use storage::{InMemoryPluginStorage, PluginStorageBackend};

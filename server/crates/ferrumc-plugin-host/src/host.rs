@@ -126,6 +126,26 @@ impl DispatchReport {
     }
 }
 
+/// A per-plugin tally of block-edit decisions, for observability.
+///
+/// One row per registered plugin: its display name plus the cumulative count of
+/// edits it allowed, vetoed, rewrote, or panicked on across its lifetime. Read
+/// through [`PluginHost::plugin_decision_reports`]. Fields are public because this
+/// is an inert reporting DTO carrying no invariants.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginDecisionReport {
+    /// The plugin's display name.
+    pub name: String,
+    /// Edits the plugin allowed (or emitted intents alongside).
+    pub allow: u64,
+    /// Edits the plugin vetoed.
+    pub deny: u64,
+    /// Edits the plugin rewrote.
+    pub replace: u64,
+    /// Times the plugin panicked in a decision hook (each fails safe to a deny).
+    pub panic: u64,
+}
+
 /// The combined verdict on a block edit after every consulted plugin has voted.
 ///
 /// Produced by folding each plugin's [`PluginBlockDecision`] (see
@@ -589,12 +609,17 @@ impl PluginHost {
 
             match plugin_decision {
                 PluginBlockDecision::Deny { message } => {
+                    slot.stats.deny = slot.stats.deny.saturating_add(1);
                     decision = ResolvedDecision::Deny { message };
                 }
                 PluginBlockDecision::Replace { block_state_id } => {
+                    slot.stats.replace = slot.stats.replace.saturating_add(1);
                     decision = ResolvedDecision::Replace { block_state_id };
                 }
                 PluginBlockDecision::EmitIntents(intents) => {
+                    // Emitting intents lets the original edit proceed, so it counts
+                    // as an allow for the per-plugin decision tally.
+                    slot.stats.allow = slot.stats.allow.saturating_add(1);
                     for intent in intents {
                         if emitted.len() >= MAX_EMITTED_INTENTS {
                             tracing::warn!(
@@ -609,8 +634,10 @@ impl PluginHost {
                 }
                 // `PluginBlockDecision::Allow` (no-op) and — since the enum is
                 // `#[non_exhaustive]` — any unknown future variant leave the fold
-                // unchanged.
-                _ => {}
+                // unchanged, and count as an allow (the edit was not vetoed).
+                _ => {
+                    slot.stats.allow = slot.stats.allow.saturating_add(1);
+                }
             }
         }
 
@@ -664,6 +691,25 @@ impl PluginHost {
     /// Returns the accumulated statistics for the plugin with id `id`.
     pub fn stats(&self, id: &PluginId) -> Option<PluginStats> {
         self.slot(id).map(|slot| slot.stats)
+    }
+
+    /// Returns a per-plugin block-edit decision report for every registered
+    /// plugin, in registration order.
+    ///
+    /// A cheap, bounded read (one row per plugin, capped at
+    /// [`HostConfig::max_plugins`]) the host or its embedder can fold into a
+    /// metrics snapshot each tick without touching the decision hot path.
+    pub fn plugin_decision_reports(&self) -> Vec<PluginDecisionReport> {
+        self.plugins
+            .iter()
+            .map(|slot| PluginDecisionReport {
+                name: slot.metadata.name().to_string(),
+                allow: slot.stats.allow(),
+                deny: slot.stats.deny(),
+                replace: slot.stats.replace(),
+                panic: u64::from(slot.stats.panics()),
+            })
+            .collect()
     }
 
     /// Returns whether the plugin with id `id` is subscribed to `kind`.
@@ -1190,6 +1236,47 @@ mod tests {
         );
         assert_eq!(resolved.decision(), &ResolvedDecision::Allow);
         assert_eq!(resolved.report().delivered(), 0);
+    }
+
+    #[test]
+    fn decision_reports_tally_allow_deny_replace_panic_per_plugin() {
+        let mut host = PluginHost::in_memory();
+        let allower = host
+            .register(DecisionPlugin::boxed("allower", PluginBlockDecision::Allow))
+            .expect("registers allower");
+        let replacer = host
+            .register(DecisionPlugin::boxed(
+                "replacer",
+                PluginBlockDecision::Replace { block_state_id: 9 },
+            ))
+            .expect("registers replacer");
+        let boom = host
+            .register(Box::new(PanicDecisionPlugin { id: "boom" }))
+            .expect("registers boom");
+        enable_all(&mut host, &[&allower, &replacer, &boom]);
+
+        let mut sink = RecordingSink::default();
+        // Two placements. Registration order is allower, replacer, boom; only a
+        // Deny is absorbing, so a Replace never short-circuits the panicking plugin.
+        // Round 1: allower allows, replacer rewrites, boom panics (disabled after).
+        // Round 2: boom is disabled and skipped; allower and replacer run again.
+        for _ in 0..2 {
+            let _ = host.dispatch_block_place_decision(
+                &place_attempt(1),
+                &NullWorld,
+                &mut sink,
+                &NullPermissions,
+            );
+        }
+
+        let reports = host.plugin_decision_reports();
+        let by_name: std::collections::BTreeMap<&str, &PluginDecisionReport> =
+            reports.iter().map(|r| (r.name.as_str(), r)).collect();
+        assert_eq!(by_name["allower"].allow, 2);
+        assert_eq!(by_name["replacer"].replace, 2);
+        // boom panics once then is disabled, contributing a single panic and no deny.
+        assert_eq!(by_name["boom"].panic, 1);
+        assert_eq!(by_name["boom"].deny, 0);
     }
 
     #[test]
