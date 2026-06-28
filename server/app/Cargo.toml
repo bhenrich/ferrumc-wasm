@@ -37,6 +37,9 @@ ferrumc-session = { workspace = true }
 ferrumc-sim = { workspace = true }
 # The flat-world generator and the in-memory chunk model.
 ferrumc-world = { workspace = true }
+# Vanilla Anvil region (.mca) import: reads a prebuilt map's chunks into the
+# world model at startup when `[world].anvil_import_dir` is configured.
+ferrumc-anvil = { workspace = true }
 # The `WorldStore` trait plus the in-memory backend the slice runs against.
 ferrumc-storage = { workspace = true }
 # Command tree powering /spawn and /gamemode.

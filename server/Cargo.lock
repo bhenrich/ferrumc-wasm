@@ -321,6 +321,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "ferrumc-anvil",
  "ferrumc-codec",
  "ferrumc-command",
  "ferrumc-config",

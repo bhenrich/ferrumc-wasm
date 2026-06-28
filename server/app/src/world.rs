@@ -16,15 +16,21 @@
 //! block another player placed in a spawn chunk is reflected on every (re)join —
 //! a cached snapshot would replay the stale pre-edit terrain instead.
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use ferrumc_anvil::{region_pos_from_path, Region};
 use ferrumc_codec::{BoundedBytes, BoundedString};
+use ferrumc_core::{DimensionId, WorldId};
 use ferrumc_math::{BlockPos, ChunkPos};
 use ferrumc_proto::generated::play::{ChunkDataAndLight, Heightmap, JoinGame, SpawnInfo};
 use ferrumc_proto::types::BlockPosition;
 use ferrumc_registry::dimension;
-use std::sync::Arc;
 
 use ferrumc_sim::{RegionLimits, SimShard, SpawnChunkTickets};
-use ferrumc_storage::{InMemoryStore, PlayerStore, RedbStore, WorldStore};
+use ferrumc_storage::{
+    ChunkKey, ChunkRecord, InMemoryStore, PlayerStore, RedbStore, SchemaVersion, WorldStore,
+};
 use ferrumc_world::{
     encode_chunk_section_data, pack_motion_blocking_heightmap, Chunk, ChunkLightData,
     FlatWorldGenerator,
@@ -57,6 +63,16 @@ const NO_PREVIOUS_GAMEMODE: u8 = u8::MAX;
 /// The 1.21.5+ array-form heightmap is keyed by numeric type; `4` selects
 /// `MOTION_BLOCKING` (the highest block that blocks motion or contains a fluid).
 const MOTION_BLOCKING_HEIGHTMAP: i32 = 4;
+
+/// Maximum number of imported chunks buffered before a flush to the store during
+/// an Anvil import.
+///
+/// The import streams region files one at a time and writes the decoded chunks to
+/// the store in batches of this size. It bounds the peak save-batch allocation —
+/// comfortably under [`ferrumc_storage::MAX_SAVE_BATCH`] (4096) — so a large
+/// multi-region map never forces a single giant write nor materialises the whole
+/// world in one buffer.
+const ANVIL_IMPORT_BATCH: usize = 256;
 
 /// The shared join payload replayed to every player the instant they reach play.
 ///
@@ -180,6 +196,31 @@ pub(crate) async fn build_world(
         // operator-facing volume + undo caps are configurable.
         ..RegionLimits::default()
     });
+
+    // If a prebuilt Anvil map is configured, import its region files into the
+    // store BEFORE the spawn area is acquired, so the spawn chunks (and any later
+    // streamed chunks) come from the loaded map instead of flat terrain. The
+    // import keys chunks for the shard's own world/dimension and stamps them with
+    // its chunk schema version, so the load-or-generate flow finds them. A
+    // missing/empty/malformed map aborts startup here (before connections), rather
+    // than silently serving flat terrain.
+    if let Some(region_dir) = config.world.anvil_import_dir() {
+        let loaded = shard.loaded_chunks();
+        let imported = import_anvil_world(
+            &*store,
+            region_dir,
+            loaded.world(),
+            loaded.dimension(),
+            loaded.schema_version(),
+        )
+        .await?;
+        tracing::info!(
+            chunks = imported,
+            dir = %region_dir.display(),
+            "imported Anvil world into the store",
+        );
+    }
+
     shard
         .loaded_chunks_mut()
         .acquire_spawn(&*store, &generator, &spawn)
@@ -240,6 +281,116 @@ fn opened_store<T: WorldStore + PlayerStore + 'static>(store: Arc<T>) -> OpenedS
         store: Arc::clone(&store) as Arc<dyn WorldStore>,
         player_store: store as Arc<dyn PlayerStore>,
     }
+}
+
+/// Imports every chunk from every `r.<x>.<z>.mca` region file in `region_dir`
+/// into `store`, keyed for `world`/`dimension` and stamped with `schema_version`.
+///
+/// Returns the number of chunks imported.
+///
+/// # Bounded memory
+///
+/// The import is bounded so a large map cannot exhaust memory: region files are
+/// processed one at a time, each read, decompressed, and NBT-parsed off the async
+/// runtime via [`tokio::task::spawn_blocking`] (the work is blocking file I/O plus
+/// CPU-bound parsing, which must never run on a Tokio worker), and the decoded
+/// chunks are written to `store` in [`ANVIL_IMPORT_BATCH`]-sized batches. Peak
+/// memory is therefore roughly one region's decoded chunks plus one save batch,
+/// never the whole world. The Anvil reader itself caps each region file's on-disk
+/// size and each chunk's decompressed size (see `ferrumc_anvil::AnvilLimits`).
+///
+/// # Errors
+///
+/// Returns an error if `region_dir` cannot be read, if it holds no region files,
+/// if a region file is malformed (truncated, bad compression, corrupt NBT, …), or
+/// if a store write fails. A malformed map aborts startup rather than silently
+/// serving partial or flat terrain.
+async fn import_anvil_world(
+    store: &dyn WorldStore,
+    region_dir: &Path,
+    world: WorldId,
+    dimension: DimensionId,
+    schema_version: SchemaVersion,
+) -> anyhow::Result<usize> {
+    let region_paths = collect_region_paths(region_dir)?;
+    if region_paths.is_empty() {
+        anyhow::bail!(
+            "anvil import directory {} contains no r.<x>.<z>.mca region files",
+            region_dir.display()
+        );
+    }
+
+    let mut imported = 0usize;
+    let mut batch: Vec<(ChunkKey, ChunkRecord)> = Vec::with_capacity(ANVIL_IMPORT_BATCH);
+    for path in region_paths {
+        // Read + decompress + NBT-parse the whole region off the async runtime:
+        // blocking file I/O and CPU-bound work, never run on a Tokio worker.
+        let chunks =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<(ChunkPos, Chunk)>> {
+                let region = Region::open(&path)
+                    .map_err(|err| anyhow::anyhow!("opening region {}: {err}", path.display()))?;
+                region
+                    .iter_chunks()
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|err| anyhow::anyhow!("decoding region {}: {err}", path.display()))
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("anvil import task panicked: {err}"))??;
+
+        for (pos, chunk) in chunks {
+            batch.push((
+                ChunkKey::new(world, dimension, pos),
+                ChunkRecord::new(schema_version, chunk),
+            ));
+            imported += 1;
+            // Flush in bounded batches so one large map never forces a giant write.
+            if batch.len() >= ANVIL_IMPORT_BATCH {
+                let full = std::mem::replace(&mut batch, Vec::with_capacity(ANVIL_IMPORT_BATCH));
+                store
+                    .save_chunks(full)
+                    .await
+                    .map_err(|err| anyhow::anyhow!("saving imported chunks: {err}"))?;
+            }
+        }
+    }
+    if !batch.is_empty() {
+        store
+            .save_chunks(batch)
+            .await
+            .map_err(|err| anyhow::anyhow!("saving imported chunks: {err}"))?;
+    }
+    Ok(imported)
+}
+
+/// Collects the paths of every `r.<x>.<z>.mca` region file in `region_dir`, in a
+/// deterministic (sorted) order.
+///
+/// Non-region entries (`level.dat`, a `data/` subdirectory, …) are skipped.
+///
+/// # Errors
+///
+/// Returns an error if `region_dir` cannot be read (for example, it does not
+/// exist) — the configured-but-missing case that must fail startup loudly.
+fn collect_region_paths(region_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let read_err = |err: std::io::Error| {
+        anyhow::anyhow!(
+            "reading anvil import directory {}: {err}",
+            region_dir.display()
+        )
+    };
+    let entries = std::fs::read_dir(region_dir).map_err(read_err)?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(read_err)?.path();
+        // Only r.<x>.<z>.mca region files; everything else in the directory is
+        // ignored so a real world folder (level.dat, data/, …) imports cleanly.
+        if region_pos_from_path(&path).is_ok() {
+            paths.push(path);
+        }
+    }
+    // Deterministic import order regardless of directory iteration order.
+    paths.sort();
+    Ok(paths)
 }
 
 /// Assembles the shared [`JoinKit`] framing.
@@ -345,10 +496,147 @@ pub(crate) fn chunk_packet(pos: ChunkPos, chunk: &Chunk) -> anyhow::Result<Chunk
 
 #[cfg(test)]
 mod tests {
+    use ferrumc_config::WorldConfig;
     use ferrumc_math::ShardPos;
+    use ferrumc_world::BlockStateId;
 
     use super::*;
     use crate::config::AppConfig;
+
+    /// The committed Anvil fixture directory (one `r.0.0.mca` region holding the
+    /// single real vanilla chunk `(0, 0)`), reused from the `ferrumc-anvil` crate.
+    fn anvil_fixtures_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../crates/ferrumc-anvil/tests/fixtures")
+    }
+
+    /// Reads chunk `(0, 0)` straight from the fixture via the Anvil reader: the
+    /// source-of-truth terrain to compare the imported/loaded chunk against.
+    fn fixture_chunk() -> Chunk {
+        Region::open(anvil_fixtures_dir().join("r.0.0.mca"))
+            .expect("region opens")
+            .read_chunk(0, 0)
+            .expect("chunk reads")
+            .expect("chunk (0, 0) is present")
+    }
+
+    /// Asserts two chunks hold identical blocks across the full buildable column
+    /// range. Compares block data only (not dirty masks), so it is robust to the
+    /// store round-trip clearing dirty state.
+    fn assert_same_blocks(actual: &Chunk, expected: &Chunk) {
+        for y in -64..320 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    let pos = BlockPos::new(x, y, z);
+                    assert_eq!(
+                        actual.get_block(pos),
+                        expected.get_block(pos),
+                        "block mismatch at {pos:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn import_anvil_world_persists_fixture_chunks() {
+        let store = InMemoryStore::new();
+        let world = WorldId::new(0);
+        let dimension = DimensionId::new(0);
+
+        let imported = import_anvil_world(
+            &store,
+            &anvil_fixtures_dir(),
+            world,
+            dimension,
+            ferrumc_sim::CHUNK_SCHEMA_VERSION,
+        )
+        .await
+        .expect("fixture imports");
+        // The fixture region holds exactly one present chunk, at (0, 0).
+        assert_eq!(imported, 1);
+
+        let loaded = store
+            .load_chunk(ChunkKey::new(world, dimension, ChunkPos::new(0, 0)))
+            .await
+            .expect("load succeeds")
+            .expect("chunk (0, 0) was imported")
+            .into_chunk();
+
+        // The store-loaded chunk matches the chunk the Anvil reader produces
+        // directly from the same file: the startup path persisted the real
+        // imported terrain, not flat generation.
+        assert_same_blocks(&loaded, &fixture_chunk());
+
+        // Explicit known-block spot check: a 1.18+ overworld has a full bedrock
+        // floor at y == -64.
+        let bedrock = BlockStateId::from_name("bedrock").expect("bedrock is known");
+        for z in 0..16 {
+            for x in 0..16 {
+                assert_eq!(loaded.get_block(BlockPos::new(x, -64, z)), Some(bedrock));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn import_anvil_world_rejects_a_missing_directory() {
+        let store = InMemoryStore::new();
+        let missing = anvil_fixtures_dir().join("does-not-exist");
+        let err = import_anvil_world(
+            &store,
+            &missing,
+            WorldId::new(0),
+            DimensionId::new(0),
+            ferrumc_sim::CHUNK_SCHEMA_VERSION,
+        )
+        .await
+        .expect_err("a missing import directory must abort startup");
+        assert!(
+            err.to_string().contains("anvil import directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_world_imports_configured_anvil_map() {
+        let config = AppConfig {
+            world: WorldConfig {
+                anvil_import_dir: Some(anvil_fixtures_dir()),
+            },
+            ..AppConfig::default()
+        };
+        let setup = build_world(&config, ShardPos::new(0, 0))
+            .await
+            .expect("world builds with anvil import");
+
+        // Spawn radius 2 -> a 5x5 resident square around chunk (0, 0).
+        let expected_resident = (2 * usize::from(config.spawn_chunk_radius) + 1).pow(2);
+        assert_eq!(
+            setup.shard.loaded_chunks().loaded_count(),
+            expected_resident
+        );
+
+        // Chunk (0, 0) is present in the fixture, so the resident spawn chunk is
+        // the imported vanilla terrain rather than flat generation.
+        let resident = setup
+            .shard
+            .loaded_chunks()
+            .get(ChunkPos::new(0, 0))
+            .expect("spawn chunk (0, 0) resident");
+        assert_same_blocks(resident, &fixture_chunk());
+
+        // A neighbouring spawn chunk absent from the fixture falls back to flat
+        // generation: chunk (2, 2) keeps the flat grass surface at y = 63.
+        let flat = setup
+            .shard
+            .loaded_chunks()
+            .get(ChunkPos::new(2, 2))
+            .expect("neighbour spawn chunk resident");
+        let grass = BlockStateId::from_name("grass_block").expect("grass_block is known");
+        assert_eq!(
+            flat.get_block(ChunkPos::new(2, 2).origin_block(63)),
+            Some(grass)
+        );
+    }
 
     #[tokio::test]
     async fn build_world_loads_spawn_and_builds_kit() {

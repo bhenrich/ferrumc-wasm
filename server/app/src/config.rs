@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use ferrumc_config::{AccessConfig, PacketBudgetConfig};
+use ferrumc_config::{AccessConfig, PacketBudgetConfig, WorldConfig};
 use ferrumc_math::Vec3;
 use serde::Deserialize;
 
@@ -164,6 +164,14 @@ pub struct AppConfig {
     /// burst) that throttles a flooding client: a sustained over-budget peer is
     /// dropped with `BudgetExceeded`. Validated at startup.
     pub budget: PacketBudgetConfig,
+    /// World-content configuration: the source of the world's initial terrain.
+    ///
+    /// Defaults to the built-in flat world. When
+    /// [`anvil_import_dir`](WorldConfig::anvil_import_dir) is set, a vanilla Anvil
+    /// `region/` directory is imported into the world store at startup. This is
+    /// separate from [`world_dir`](Self::world_dir), which is the *persistence*
+    /// location; `[world]` selects the *initial content*.
+    pub world: WorldConfig,
 }
 
 impl AppConfig {
@@ -221,6 +229,8 @@ impl Default for AppConfig {
             dashboard_bind: DEFAULT_DASHBOARD_BIND,
             access: AccessConfig::default(),
             budget: PacketBudgetConfig::default(),
+            // No Anvil import by default: the server generates its flat world.
+            world: WorldConfig::default(),
         }
     }
 }
@@ -281,6 +291,9 @@ struct RawConfig {
     /// The `[budget]` table. Carries its own per-field defaults (300/600), so an
     /// omitted table falls back to the safe serverbound packet budget.
     budget: PacketBudgetConfig,
+    /// The `[world]` table. Carries its own defaults (no Anvil import), so an
+    /// omitted table leaves the server on its built-in flat world.
+    world: WorldConfig,
 }
 
 impl RawConfig {
@@ -362,6 +375,7 @@ impl RawConfig {
             dashboard_bind,
             access: self.access,
             budget: self.budget,
+            world: self.world,
         })
     }
 }
@@ -535,6 +549,32 @@ mod tests {
     #[test]
     fn budget_unknown_field_is_rejected() {
         assert!(AppConfig::from_toml_str("[budget]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn world_defaults_to_no_anvil_import() {
+        let parsed = AppConfig::from_toml_str("").expect("empty config is valid");
+        assert_eq!(parsed.world, WorldConfig::default());
+        assert_eq!(parsed.world.anvil_import_dir(), None);
+    }
+
+    #[test]
+    fn world_table_overrides_parse() {
+        let toml = "\
+            bind = \"127.0.0.1:0\"\n\
+            [world]\n\
+            anvil_import_dir = \"/srv/maps/spawn/region\"\n\
+        ";
+        let parsed = AppConfig::from_toml_str(toml).expect("valid world config");
+        assert_eq!(
+            parsed.world.anvil_import_dir(),
+            Some(std::path::Path::new("/srv/maps/spawn/region"))
+        );
+    }
+
+    #[test]
+    fn world_unknown_field_is_rejected() {
+        assert!(AppConfig::from_toml_str("[world]\nbogus = 1").is_err());
     }
 
     #[test]

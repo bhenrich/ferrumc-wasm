@@ -98,6 +98,22 @@
 # off-host unless you change this deliberately.
 # dashboard_bind = "127.0.0.1:9090"
 
+# --- World content ---
+#
+# Where the world's INITIAL terrain comes from. By default the server generates
+# its built-in flat world. This is a TOML table, so it must stay BELOW every
+# top-level key above. Note this is separate from `world_dir` above: `world_dir`
+# is the save/persistence location; `[world]` selects the initial content.
+[world]
+
+# Optional path to a vanilla Anvil `region/` directory (the folder holding the
+# r.<x>.<z>.mca files). When set, every region file in it is imported into the
+# world store at startup, BEFORE the server accepts connections, so a prebuilt map
+# populates the world. Leave commented to keep the built-in flat world. A missing
+# directory, one with no region files, or a malformed region file aborts startup
+# with a clear error (fail fast) rather than silently serving flat terrain.
+# anvil_import_dir = "world/region"
+
 # --- Access control ---
 #
 # Gates for a public-facing server: a per-IP connection limit, a ban list, and an
