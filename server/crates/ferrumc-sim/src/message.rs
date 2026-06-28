@@ -79,6 +79,34 @@ pub enum GameInput {
         /// resolved upstream from the player's selected hotbar slot.
         state: BlockStateId,
     },
+    /// Request a resync + acknowledgement for a block edit that was refused
+    /// *upstream* of the simulation (a plugin `Deny`, spawn-protection veto, etc.)
+    /// without ever mutating the world.
+    ///
+    /// The upstream layers (net/app) have no world access, so they cannot read the
+    /// authoritative block state to heal the actor's optimistic prediction. They
+    /// route the refusal here instead: at the tick boundary the shard reads the
+    /// authoritative state at `position` from the resident chunk and emits a
+    /// [`GameOutput::BlockChangeRejected`] — the same ack + mandatory resync funnel
+    /// an in-sim rejection (out of reach, unloaded chunk) already uses — so every
+    /// rejection site heals the client identically. No chunk write and no journal
+    /// entry are produced; the handler only *reads* chunk state, keeping the tick
+    /// deterministic.
+    RejectBlockEdit {
+        /// Identity of the player whose predicted edit must be undone.
+        player: PlayerId,
+        /// Absolute position of the refused edit (where the authoritative state is
+        /// read to heal the client).
+        position: BlockPos,
+        /// The block-action sequence the client stamped on the originating edit,
+        /// echoed back in an `AcknowledgeBlockChange` so its pending prediction
+        /// ends.
+        sequence: i32,
+        /// The state the client optimistically predicted (air for a refused break,
+        /// the held block for a refused place); used only to classify the metric,
+        /// never applied.
+        requested_state: BlockStateId,
+    },
     /// Set the authoritative server-side game mode of a player.
     ///
     /// Produced by the app's `/gamemode` command path (in addition to the

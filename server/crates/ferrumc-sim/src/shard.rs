@@ -421,6 +421,26 @@ impl SimShard {
                         outputs.push(output);
                     }
                 }
+                GameInput::RejectBlockEdit {
+                    player,
+                    position,
+                    sequence,
+                    requested_state,
+                } => {
+                    // An edit refused upstream (plugin Deny / veto): the world is
+                    // never touched. Read the authoritative state at the target and
+                    // emit the same rejection output an in-sim refusal produces, so
+                    // the actor is healed (mandatory resync + ack) through one
+                    // funnel. Read-only: no `set_block`, no journal entry, so the
+                    // tick stays deterministic.
+                    outputs.push(GameOutput::BlockChangeRejected {
+                        player,
+                        position,
+                        sequence,
+                        requested_state,
+                        authoritative_state: self.authoritative_state(position),
+                    });
+                }
             }
         }
 
@@ -1197,6 +1217,85 @@ mod tests {
                 authoritative_state: BlockStateId::AIR,
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn reject_block_edit_for_a_place_resyncs_air_without_mutating() {
+        // A place refused upstream (plugin Deny): the client predicted the held
+        // block at an empty cell. RejectBlockEdit reads the authoritative state
+        // (air — the cell is empty) and emits a BlockChangeRejected healing the
+        // actor to air, writing nothing to the chunk.
+        let chunk = ChunkPos::new(0, 0);
+        let mut s = shard_with_loaded_chunk(chunk).await;
+        let p = player("denied-placer");
+        let target = BlockPos::new(8, 65, 8); // air just above the surface
+        let glass = BlockStateId::new(562);
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: spawn(),
+        })
+        .expect("room");
+        let _ = s.run_tick();
+        assert_eq!(block_at(&s, target), Some(BlockStateId::AIR));
+
+        s.enqueue(GameInput::RejectBlockEdit {
+            player: p,
+            position: target,
+            sequence: 7,
+            requested_state: glass,
+        })
+        .expect("room");
+        assert_eq!(
+            s.run_tick(),
+            vec![GameOutput::BlockChangeRejected {
+                player: p,
+                position: target,
+                sequence: 7,
+                requested_state: glass,
+                authoritative_state: BlockStateId::AIR,
+            }]
+        );
+        // The world was never touched.
+        assert_eq!(block_at(&s, target), Some(BlockStateId::AIR));
+    }
+
+    #[tokio::test]
+    async fn reject_block_edit_for_a_break_resyncs_the_surface_without_mutating() {
+        // A break refused upstream: the client predicted air at the surface.
+        // RejectBlockEdit reads the authoritative surface block and emits a
+        // BlockChangeRejected healing the actor back to it, writing nothing.
+        let chunk = ChunkPos::new(0, 0);
+        let mut s = shard_with_loaded_chunk(chunk).await;
+        let p = player("denied-breaker");
+        let target = BlockPos::new(8, 63, 8); // flat-world grass surface
+        let authoritative = block_at(&s, target).expect("resident surface block");
+        assert_ne!(authoritative, BlockStateId::AIR);
+        s.enqueue(GameInput::PlayerJoin {
+            player: p,
+            position: spawn(),
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
+        s.enqueue(GameInput::RejectBlockEdit {
+            player: p,
+            position: target,
+            sequence: 3,
+            requested_state: BlockStateId::AIR,
+        })
+        .expect("room");
+        assert_eq!(
+            s.run_tick(),
+            vec![GameOutput::BlockChangeRejected {
+                player: p,
+                position: target,
+                sequence: 3,
+                requested_state: BlockStateId::AIR,
+                authoritative_state: authoritative,
+            }]
+        );
+        // The surface block is untouched.
+        assert_eq!(block_at(&s, target), Some(authoritative));
     }
 
     #[test]

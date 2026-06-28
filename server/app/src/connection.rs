@@ -34,9 +34,7 @@ use ferrumc_net::{
     DisconnectReason, EnqueueOutcome, FrameDecodeError, InboundDecoder, InboundPacket,
     OutboundEncoder, OutboundPacket, OutboundPriority, PlayWriter, StatusInfo,
 };
-use ferrumc_observability::{
-    CounterRegistry, MutationKind, MutationResult, PacketState, ServerClock, SessionDebug,
-};
+use ferrumc_observability::{CounterRegistry, PacketState, ServerClock, SessionDebug};
 use ferrumc_plugin_api::{BlockBreakAttempt, BlockPlaceAttempt};
 use ferrumc_plugin_host::ResolvedDecision;
 use ferrumc_proto::generated::configuration::{
@@ -1603,14 +1601,15 @@ fn next_chunk_batch(
 /// decision:
 ///
 /// - [`Deny`](ResolvedDecision::Deny): the edit is dropped (the world is never
-///   modified), the rejected mutation is counted, and the actor's optimistic
-///   client-side prediction is healed with an `AcknowledgeBlockChange` for the
-///   edit's sequence (`endPredictionsUpTo`, which reverts the ghost block). If the
-///   decision carries a message it is delivered as a system chat. (No authoritative
-///   `BlockUpdate` is authored here: the net layer must not read world state, and a
-///   veto changed nothing, so the pre-prediction state is already authoritative —
-///   the ack alone is protocol-correct. A true sim-routed resync is a documented
-///   follow-up.)
+///   modified) and the actor's optimistic client-side prediction is healed through
+///   the single reject funnel ([`reject_block_edit`]) — a [`SimCommand::RejectBlockEdit`]
+///   to the block's owning shard, which reads the authoritative state and emits the
+///   actor's mandatory resync `BlockUpdate` + `AcknowledgeBlockChange` (the same
+///   path a sim-side rejection uses, so a Deny no longer leaves a ghost block). The
+///   refused break heals to the block the client predicted removing
+///   ([`BlockStateId::AIR`] is the predicted state passed for metric classification).
+///   The rejection is counted once, on the sim's resulting `BlockChangeRejected`. If
+///   the decision carries a message it is delivered as a system chat.
 /// - [`Replace`](ResolvedDecision::Replace): the broken block is set to the
 ///   replacement state instead of air, by routing a [`SimCommand::PlaceBlock`] at
 ///   the break position.
@@ -1637,9 +1636,11 @@ async fn handle_block_break(
 
     match decision {
         ResolvedDecision::Deny { message } => {
-            ctx.metrics
-                .record_block_mutation(MutationKind::Break, MutationResult::Rejected);
-            ack_sequence(writer, debug, compression, &ctx.clock, sequence)?;
+            // Heal the actor through the single reject funnel: the sim reads the
+            // authoritative state and sends the mandatory resync + ack (no ghost).
+            // The predicted state for a break is air. The metric is counted on the
+            // resulting BlockChangeRejected, so it is NOT recorded here too.
+            reject_block_edit(ctx, player, position, sequence, BlockStateId::AIR).await?;
             deliver_deny_message(ctx, writer, debug, compression, message);
             route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression)
                 .await?;
@@ -1690,15 +1691,58 @@ fn deliver_deny_message(
     }
 }
 
+/// The single funnel that heals a block edit refused at the connection (a plugin
+/// `Deny` / spawn-protection veto).
+///
+/// The net layer has no world access, so it cannot read the authoritative block
+/// state needed to undo the client's optimistic prediction. Instead of authoring an
+/// ack-only heal (which leaves a ghost block, since a `BlockUpdate` is swallowed
+/// while a prediction is pending and an ack alone heals to the *predicted* state),
+/// it routes a [`SimCommand::RejectBlockEdit`] to the block's owning shard. The
+/// shard reads the authoritative state and emits a `BlockChangeRejected`, which the
+/// router turns into the actor's mandatory resync `BlockUpdate` + `AcknowledgeBlockChange`
+/// — the exact same path a sim-side rejection (out of reach, unloaded chunk) uses.
+///
+/// `requested_state` is the state the client predicted (air for a refused break,
+/// the held block for a refused place); it is used only to classify the block-edit
+/// metric on the resulting rejection, never applied to the world.
+///
+/// The heal is best-effort under overload: the [`SimCommand`] send is awaited (so it
+/// backpressures rather than drops), but the driver's onward route to the block's
+/// owning shard can still fail if that shard's inbox is saturated, in which case the
+/// rejection is dropped and the ghost persists until the client's next interaction —
+/// the same behaviour the original `BlockBreak` / `BlockPlace` inputs exhibit under
+/// the same sustained backpressure.
+async fn reject_block_edit(
+    ctx: &ConnContext,
+    player: PlayerId,
+    position: BlockPos,
+    sequence: i32,
+    requested_state: BlockStateId,
+) -> anyhow::Result<()> {
+    ctx.commands
+        .send(SimCommand::RejectBlockEdit {
+            player,
+            position,
+            sequence,
+            requested_state,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
+}
+
 /// Routes the [`WorldIntent`]s a plugin emitted from a block decision (or an
 /// after-* notification).
 ///
 /// Mapping (best-effort; the emitted-intent surface is dev-only and bounded):
 /// - [`WorldIntent::SetBlock`] -> [`SimCommand::PlaceBlock`] by the acting player.
 /// - [`WorldIntent::Message`] -> a system chat to the acting player's own writer
-///   when it targets them, otherwise a server-wide broadcast (the connection task
-///   cannot reach another player's outbound channel directly).
-/// - [`WorldIntent::Teleport`] -> not yet routed (logged); a documented follow-up.
+///   when it targets them, otherwise a targeted [`SimCommand::SendSystemChat`] to
+///   the named recipient (the connection task cannot reach another player's
+///   outbound channel directly, so the driver-owned router delivers it).
+/// - [`WorldIntent::Teleport`] -> a [`SimCommand::TeleportPlayer`], which the
+///   driver-owned router fulfils (snap the target's client + route an
+///   authoritative move).
 async fn route_emitted_intents(
     ctx: &ConnContext,
     actor: PlayerId,
@@ -1726,6 +1770,7 @@ async fn route_emitted_intents(
             }
             WorldIntent::Message { player, message } => {
                 if player == actor {
+                    // The actor is this connection: write straight to its socket.
                     enqueue_traced_classified(
                         writer,
                         debug,
@@ -1734,14 +1779,26 @@ async fn route_emitted_intents(
                         ferrumc_session::system_chat(&message, false),
                     );
                 } else {
+                    // A different recipient: route a TARGETED chat through the
+                    // driver-owned router (only it holds other players' channels).
                     ctx.commands
-                        .send(SimCommand::BroadcastSystemChat {
+                        .send(SimCommand::SendSystemChat {
+                            player,
                             content: message,
                             overlay: false,
                         })
                         .await
                         .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
                 }
+            }
+            WorldIntent::Teleport { player, position } => {
+                // The connection cannot reach another player's channel; the
+                // driver-owned router snaps the target and routes the authoritative
+                // move.
+                ctx.commands
+                    .send(SimCommand::TeleportPlayer { player, position })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
             }
             _ => {
                 tracing::debug!("plugin emitted an intent with no connection-side route; skipping");
@@ -1876,9 +1933,12 @@ async fn handle_command(
 /// block is offered to the plugins' `before_block_place` hooks (off the tick); the
 /// combined decision is then resolved:
 ///
-/// - [`Deny`](ResolvedDecision::Deny): nothing is placed, the rejection is
-///   counted, the sequence is acked (healing the prediction), and any Deny message
-///   is delivered as a system chat.
+/// - [`Deny`](ResolvedDecision::Deny): nothing is placed; the actor is healed
+///   through the single reject funnel ([`reject_block_edit`]) — the sim reads the
+///   authoritative state at the target (usually air) and sends the mandatory resync
+///   and ack, so no ghost block remains — and any Deny message is delivered as a
+///   system chat. The rejection is counted on the sim's resulting
+///   `BlockChangeRejected`.
 /// - [`Replace`](ResolvedDecision::Replace): the replacement block-state is placed
 ///   instead of the held one.
 /// - [`Allow`](ResolvedDecision::Allow): the held block is placed (creative never
@@ -1918,9 +1978,19 @@ async fn handle_use_item_on(
     // The state actually placed (the held block, or a plugin's replacement).
     let placed_state = match decision {
         ResolvedDecision::Deny { message } => {
-            ctx.metrics
-                .record_block_mutation(MutationKind::Place, MutationResult::Rejected);
-            ack_sequence(writer, debug, compression, &ctx.clock, sequence)?;
+            // Heal the actor through the single reject funnel: the sim reads the
+            // authoritative state at the target (usually air) and sends the
+            // mandatory resync + ack (no ghost). The predicted state for a place is
+            // the held block; it heals the target back to its current block. The
+            // metric is counted on the resulting BlockChangeRejected, not here.
+            reject_block_edit(
+                ctx,
+                player,
+                position,
+                sequence,
+                BlockStateId::new(held_state),
+            )
+            .await?;
             deliver_deny_message(ctx, writer, debug, compression, message);
             route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression)
                 .await?;

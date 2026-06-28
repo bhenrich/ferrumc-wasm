@@ -297,6 +297,7 @@ dependencies = [
  "ferrumc-math",
  "ferrumc-permission",
  "ferrumc-plugin-api",
+ "ferrumc-registry",
 ]
 
 [[package]]

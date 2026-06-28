@@ -137,6 +137,55 @@ pub(crate) enum SimCommand {
         /// The block-state the held item places.
         state: BlockStateId,
     },
+    /// Resync + acknowledge a block edit refused at the connection (a plugin
+    /// `Deny` / spawn-protection veto) without mutating the world.
+    ///
+    /// The connection (net layer) has no world access, so it cannot read the
+    /// authoritative block state needed to heal the actor's optimistic prediction.
+    /// It routes the refusal here as a [`GameInput::RejectBlockEdit`] to the
+    /// block's owning shard, which reads the authoritative state and emits the same
+    /// ack + mandatory resync a sim-side rejection (out of reach, unloaded chunk)
+    /// already produces — one funnel for every rejection site, so a Deny no longer
+    /// leaves a ghost block. The block-edit metric is counted once, on the
+    /// resulting [`GameOutput::BlockChangeRejected`] in [`run_tick`].
+    RejectBlockEdit {
+        /// The player whose predicted edit must be healed.
+        player: PlayerId,
+        /// The block position of the refused edit.
+        position: BlockPos,
+        /// The block-action sequence to acknowledge so the prediction ends.
+        sequence: i32,
+        /// The state the client predicted (air for a break, the held block for a
+        /// place); used only to classify the metric.
+        requested_state: BlockStateId,
+    },
+    /// Teleport `player` to `position`.
+    ///
+    /// Fulfils a plugin's `Teleport` intent: the connection task cannot reach
+    /// another player's outbound channel, so it routes the teleport here and the
+    /// driver-owned [`SessionRouter`] snaps the target's client (mandatory
+    /// `SynchronizePlayerPosition`) and routes an authoritative move so viewers and
+    /// simulation state follow.
+    TeleportPlayer {
+        /// The player to move.
+        player: PlayerId,
+        /// The destination position.
+        position: Vec3,
+    },
+    /// Send a System Chat Message to a single `player`.
+    ///
+    /// Fulfils a plugin's `Message` intent aimed at a player other than the acting
+    /// connection: the connection cannot reach another player's outbound channel,
+    /// so the targeted delivery routes through the driver-owned [`SessionRouter`].
+    /// `overlay = true` renders the message on the action bar.
+    SendSystemChat {
+        /// The recipient.
+        player: PlayerId,
+        /// The message to render, as a structured text component.
+        content: TextComponent,
+        /// Whether to render above the hotbar (action bar) rather than the chat box.
+        overlay: bool,
+    },
 }
 
 /// Runs the driver loop until `shutdown` flips or every command sender drops.
@@ -392,6 +441,44 @@ async fn handle_command(
                 tracing::trace!(%err, "dropping block place");
             }
         }
+        SimCommand::RejectBlockEdit {
+            player,
+            position,
+            sequence,
+            requested_state,
+        } => {
+            // Route the refusal to the block's owning shard, which reads the
+            // authoritative state and emits a BlockChangeRejected (the actor's
+            // mandatory resync + ack). A gone player has no shard to route to.
+            // Best-effort: if the shard inbox is saturated the rejection is dropped
+            // (the ghost then persists until the client's next interaction), exactly
+            // as the original BlockBreak/BlockPlace inputs behave under the same load.
+            if let Err(err) = router.route_game_input(
+                player,
+                GameInput::RejectBlockEdit {
+                    player,
+                    position,
+                    sequence,
+                    requested_state,
+                },
+            ) {
+                tracing::trace!(%err, "dropping block-edit rejection");
+            }
+        }
+        SimCommand::TeleportPlayer { player, position } => {
+            // Snap the target's client and route an authoritative move. A gone
+            // player simply has no session to teleport.
+            if let Err(err) = router.teleport_player(player, position) {
+                tracing::trace!(%err, "dropping teleport");
+            }
+        }
+        SimCommand::SendSystemChat {
+            player,
+            content,
+            overlay,
+        } => {
+            router.send_system_chat_to(player, &content, overlay);
+        }
     }
 }
 
@@ -554,9 +641,10 @@ fn run_tick(
     for output in &outputs {
         // Classify the block-edit metric from the requested/new state: air means a
         // break, any other state a place. An accepted edit surfaces as BlockChanged;
-        // a sim-side rejection (out of reach, etc.) now surfaces as
-        // BlockChangeRejected and is counted here too (spawn-protect vetoes are
-        // still counted at the connection veto site, before the sim ever sees them).
+        // every rejection surfaces as BlockChangeRejected and is counted here — both
+        // sim-side refusals (out of reach, unloaded chunk) and edits refused upstream
+        // (plugin Deny / spawn-protection veto), which now route through the sim's
+        // RejectBlockEdit path rather than being counted at the connection.
         match output {
             GameOutput::BlockChanged { state, .. } => {
                 let kind = if state.is_air() {

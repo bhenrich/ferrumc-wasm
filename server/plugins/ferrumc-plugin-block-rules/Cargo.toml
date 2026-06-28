@@ -29,6 +29,10 @@ ferrumc-plugin-api = { workspace = true }
 ferrumc-math = { workspace = true }
 # Permission node/resolution types for the permission-facade stub.
 ferrumc-permission = { workspace = true }
+# The block-state registry the constant-pinning tests cross-check against, so a
+# future drift back to demo ids (or a registry change) fails the build rather than
+# silently breaking the rule at runtime.
+ferrumc-registry = { workspace = true }
 
 # This crate cannot inherit the workspace `forbid(unsafe_code)`: exporting the
 # `#[no_mangle]` C entrypoint counts as unsafe code under modern rustc. We

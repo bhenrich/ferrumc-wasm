@@ -6,8 +6,9 @@
 //! - join sends a `SetContainerContent` for window 0 (state id 1) carrying the
 //!   starter hotbar kit (stone in slot 36, glass in slot 39);
 //! - selecting a hotbar slot (`Set Held Item`) then placing (`UseItemOn`) writes
-//!   the *held* block — glass (block-state 562), not the old hardcoded stone — and
-//!   acks the sequence;
+//!   the *held* block — glass (block-state 562), not the old hardcoded stone —
+//!   which the active block-rules plugin then rewrites to tinted glass (23377), the
+//!   state that lands and is broadcast; and acks the sequence;
 //! - a hostile `Set Creative Slot` (oversized count + a dangerous nested-item
 //!   component) is normalized (count clamped, component stripped) and echoed back
 //!   as a `Set Container Slot`;
@@ -49,6 +50,11 @@ const GLASS_SLOT: usize = 39;
 /// Protocol item id of `minecraft:glass` and the block-state it places.
 const GLASS_ITEM: i32 = 195;
 const GLASS_STATE: i32 = 562;
+
+/// Block-state of `minecraft:tinted_glass`: the state the active block-rules
+/// plugin rewrites a glass placement (`GLASS_STATE`) to, so the block that
+/// actually lands — and is broadcast — is tinted glass, not plain glass.
+const TINTED_GLASS_STATE: i32 = 23377;
 
 /// Protocol item id of `minecraft:stone`.
 const STONE_ITEM: i32 = 1;
@@ -219,8 +225,15 @@ async fn join_kit_flow(addr: SocketAddr) -> anyhow::Result<()> {
     // Select the glass hotbar slot (index 3 -> inventory slot 39), then place.
     send_held_item(&mut builder, 3).await?;
     send_place_on_top(&mut builder, (9, 63, 8), 7).await?;
-    // The placed block must be the HELD glass (562), not the old stone default (1).
-    expect_block_update(&mut viewer, (9, 64, 8), GLASS_STATE).await?;
+    // The held item must resolve to glass (562), not the old stone default (1):
+    // proven end to end because the active block-rules plugin only rewrites a glass
+    // placement, so the block that lands and is broadcast is tinted glass (23377).
+    // A wrong held-resolution (or the old default) would never trigger the rewrite.
+    assert_ne!(
+        GLASS_STATE, TINTED_GLASS_STATE,
+        "the rewrite must change the placed state"
+    );
+    expect_block_update(&mut viewer, (9, 64, 8), TINTED_GLASS_STATE).await?;
     expect_ack(&mut builder, 7).await?;
 
     Ok(())

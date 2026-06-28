@@ -38,17 +38,20 @@ pub const DENIED_BLOCK_STATE_ID: u32 = 85;
 
 /// Default block-state id the plugin rewrites on placement.
 ///
-/// A configured demonstration value standing in for `minecraft:glass`; only the
-/// decision *logic* (watch this id, rewrite to [`TINTED_GLASS_BLOCK_STATE_ID`]) is
-/// load-bearing, not the exact protocol number, which a deployment overrides via
-/// [`BlockRulesPlugin::with_blocks`].
-pub const GLASS_BLOCK_STATE_ID: u32 = 199;
+/// `562` is `minecraft:glass`'s block-state in the vendored 1.21.8 snapshot — the
+/// state `ferrumc_registry::item::item_to_block_state(195)` resolves the glass item
+/// to. The exact number is load-bearing: `before_block_place` receives the *resolved
+/// block-state* (not the item id), so this must equal the runtime block-state a glass
+/// placement produces or the [`Replace`](PluginBlockDecision::Replace) rule never
+/// fires. A deployment may still override it via [`BlockRulesPlugin::with_blocks`].
+pub const GLASS_BLOCK_STATE_ID: u32 = 562;
 
 /// Default block-state id glass placements are rewritten to.
 ///
-/// A configured demonstration value standing in for `minecraft:tinted_glass`; see
-/// [`GLASS_BLOCK_STATE_ID`].
-pub const TINTED_GLASS_BLOCK_STATE_ID: u32 = 9279;
+/// `23377` is `minecraft:tinted_glass`'s block-state in the vendored 1.21.8 snapshot
+/// (`ferrumc_registry::item::item_to_block_state(196)`); see [`GLASS_BLOCK_STATE_ID`]
+/// for why the exact value matters.
+pub const TINTED_GLASS_BLOCK_STATE_ID: u32 = 23377;
 
 /// The message shown to a player whose placement of the denied block is rejected.
 const DENIED_MESSAGE: &str = "You cannot place that block here.";
@@ -293,5 +296,33 @@ mod tests {
             }
         );
         assert_eq!(decide_place(&mut plugin, 85), PluginBlockDecision::Allow);
+    }
+
+    #[test]
+    fn default_block_state_ids_match_the_real_registry() {
+        // These are NOT free-choice demo values. `before_block_place` receives a
+        // *resolved block-state* (not an item id), so each default must equal the
+        // real 1.21.8 block-state a placement produces or the rule never fires at
+        // runtime. Pin the literals and cross-check the registry so a future drift
+        // back to demo ids (or a registry change) fails the build rather than
+        // silently breaking the rule (the bug the demo ids 199/9279 caused).
+        assert_eq!(GLASS_BLOCK_STATE_ID, 562);
+        assert_eq!(TINTED_GLASS_BLOCK_STATE_ID, 23377);
+        assert_eq!(DENIED_BLOCK_STATE_ID, 85);
+
+        // The glass item (195) and tinted_glass item (196) place exactly these
+        // states, and the bedrock item (58) places the denied state.
+        assert_eq!(
+            ferrumc_registry::item::item_to_block_state(195),
+            Some(GLASS_BLOCK_STATE_ID)
+        );
+        assert_eq!(
+            ferrumc_registry::item::item_to_block_state(196),
+            Some(TINTED_GLASS_BLOCK_STATE_ID)
+        );
+        assert_eq!(
+            ferrumc_registry::item::item_to_block_state(58),
+            Some(DENIED_BLOCK_STATE_ID)
+        );
     }
 }

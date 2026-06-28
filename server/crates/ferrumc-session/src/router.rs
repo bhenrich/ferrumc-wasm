@@ -990,6 +990,78 @@ impl SessionRouter {
         }
     }
 
+    /// Sends a System Chat Message carrying `component` to a single `player`.
+    ///
+    /// The targeted counterpart to
+    /// [`broadcast_system_chat`](Self::broadcast_system_chat): used to deliver a
+    /// plugin's `Message` intent to its named recipient (rather than every player)
+    /// when that recipient is not the acting connection. An unknown player is a
+    /// silent no-op. `overlay = true` renders the message above the hotbar (action
+    /// bar); `overlay = false` renders it in the chat box.
+    ///
+    /// # Backpressure
+    ///
+    /// Best-effort and lossy, like
+    /// [`broadcast_system_chat`](Self::broadcast_system_chat): a recipient whose
+    /// outbound channel is *full* or *closed* simply misses the message. A dropped
+    /// chat line never stalls the driver, so this never blocks and never fails.
+    pub fn send_system_chat_to(&self, player: PlayerId, component: &TextComponent, overlay: bool) {
+        if let Some(entry) = self.players.get(&player) {
+            let packet = crate::system_chat(component, overlay);
+            let _ = entry.outbound.try_send(OutboundMessage::droppable(packet));
+        }
+    }
+
+    /// Teleports `player` to `position`: snaps the target's own client to the new
+    /// position and updates authoritative simulation state.
+    ///
+    /// Two effects, both required. A **mandatory** `SynchronizePlayerPosition` is
+    /// sent to the target's own channel — the sim's `PlayerMoved` only broadcasts to
+    /// *other* viewers, so without this the target itself would never move — and a
+    /// [`GameInput::PlayerMove`] is routed to the target's shard so the
+    /// authoritative position updates and in-range viewers see the move at the next
+    /// tick. Used to fulfil a plugin's `Teleport` intent, which the connection task
+    /// cannot satisfy directly (it cannot reach another player's outbound channel).
+    ///
+    /// The position-sync is mandatory: a target that cannot accept it — *full* or
+    /// *closed* — is disconnected (the slow-client policy), exactly like a
+    /// [`GameOutput::PlayerPositionCorrected`].
+    ///
+    /// The authoritative [`GameInput::PlayerMove`] routes to the player's *current*
+    /// owning shard, not the destination chunk's shard, so a teleport that crosses a
+    /// shard boundary leaves the player simulated by the origin shard while standing
+    /// in another shard's region (no cross-shard entity transfer is performed — that
+    /// is out of scope for this milestone). Viewer visibility is unaffected because
+    /// moves broadcast off the router's global position cache, not per-shard; this is
+    /// flagged for the eventual cross-shard-transfer work.
+    ///
+    /// # Errors
+    ///
+    /// - [`SessionError::UnknownPlayer`] if `player` has no session.
+    /// - [`SessionError::ShardInboxFull`] / [`SessionError::ShardClosed`] if the
+    ///   authoritative move could not be delivered to the shard.
+    pub fn teleport_player(
+        &mut self,
+        player: PlayerId,
+        position: Vec3,
+    ) -> Result<(), SessionError> {
+        let mut to_disconnect = Vec::new();
+        match self.players.get(&player) {
+            Some(entry) => {
+                Self::send_mandatory(entry, move_shell(position), player, &mut to_disconnect);
+            }
+            None => return Err(SessionError::UnknownPlayer { player }),
+        }
+        // Update authoritative position and let in-range viewers see the move via
+        // the simulation at the next tick.
+        let routed = self.route_game_input(player, GameInput::PlayerMove { player, position });
+        // A target that overflowed the mandatory position-sync is torn down.
+        for victim in to_disconnect {
+            let _ = self.disconnect_player(victim);
+        }
+        routed
+    }
+
     /// Routes an already-translated input to the shard that should apply it.
     ///
     /// A block edit is routed by the *block's* chunk (see
@@ -1001,7 +1073,9 @@ impl SessionRouter {
             .get(&player)
             .ok_or(SessionError::UnknownPlayer { player })?;
         let shard = match &input {
-            GameInput::BlockBreak { position, .. } | GameInput::BlockPlace { position, .. } => {
+            GameInput::BlockBreak { position, .. }
+            | GameInput::BlockPlace { position, .. }
+            | GameInput::RejectBlockEdit { position, .. } => {
                 self.shard_for_block(*position, entry.shard)
             }
             _ => entry.shard,
@@ -1517,6 +1591,96 @@ mod tests {
                 "chat relay targets the chat box, not the action bar"
             );
         }
+    }
+
+    #[test]
+    fn send_system_chat_to_targets_only_the_named_player() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let a = player("aaa");
+        let b = player("bbb");
+        let mut a_handle = router.join_player(a, "aaa", spawn_pos()).expect("a join");
+        let mut b_handle = router.join_player(b, "bbb", spawn_pos()).expect("b join");
+        // Drain the mutual join-visibility packets so only the chat remains.
+        let a_eid = router.player_entity_id(a).expect("a entity id");
+        let b_eid = router.player_entity_id(b).expect("b entity id");
+        assert_player_info_add(&mut a_handle, b);
+        assert_entity_spawn(&mut a_handle, b, b_eid, spawn_pos());
+        assert_player_info_add(&mut b_handle, a);
+        assert_entity_spawn(&mut b_handle, a, a_eid, spawn_pos());
+
+        let message = TextComponent::text("psst, just for you");
+        router.send_system_chat_to(b, &message, false);
+
+        // Only b receives the chat; a's queue stays empty.
+        let ClientboundPlayPacket::SystemChat(chat) = b_handle
+            .try_recv()
+            .expect("a system chat packet")
+            .into_packet()
+        else {
+            panic!("expected a SystemChat");
+        };
+        assert!(!chat.overlay());
+        assert!(
+            a_handle.try_recv().is_none(),
+            "a targeted message must not reach a non-target"
+        );
+    }
+
+    #[test]
+    fn send_system_chat_to_unknown_player_is_a_no_op() {
+        let router = SessionRouter::new();
+        // No panic, nothing to deliver: an unknown recipient is silently ignored.
+        router.send_system_chat_to(player("ghost"), &TextComponent::text("hi"), false);
+    }
+
+    #[test]
+    fn teleport_player_syncs_the_target_and_routes_an_authoritative_move() {
+        let mut router = SessionRouter::new();
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let p = player("tptarget");
+        let mut handle = router
+            .join_player(p, "tptarget", spawn_pos())
+            .expect("join");
+        // Drain the join input the shard received so only the teleport remains.
+        assert_eq!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerJoin {
+                player: p,
+                position: spawn_pos(),
+            })
+        );
+
+        let dest = Vec3::new(40.0, 70.0, 24.0);
+        router.teleport_player(p, dest).expect("teleport");
+
+        // The target's own client is snapped to the destination.
+        let ClientboundPlayPacket::SynchronizePlayerPosition(sync) =
+            handle.try_recv().expect("a sync packet").into_packet()
+        else {
+            panic!("expected a SynchronizePlayerPosition packet");
+        };
+        assert_eq!((sync.x(), sync.y(), sync.z()), (40.0, 70.0, 24.0));
+
+        // The shard receives an authoritative move so state and viewers follow.
+        assert_eq!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerMove {
+                player: p,
+                position: dest,
+            })
+        );
+    }
+
+    #[test]
+    fn teleport_player_for_unknown_player_is_rejected() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let p = player("nobody");
+        let err = router
+            .teleport_player(p, spawn_pos())
+            .expect_err("no session");
+        assert_eq!(err, SessionError::UnknownPlayer { player: p });
     }
 
     #[test]
