@@ -16,31 +16,59 @@
 //!
 //! ## Scope
 //!
-//! Single-state placements only — every rule resolves the held item to exactly
-//! one block-state at the one caller-chosen position. Covered families:
+//! Most rules are *single-state, single-position*: they resolve the held item to
+//! one block-state at the one caller-chosen position. The two **merge** rules
+//! (double-slab and candle stacking) instead *relocate* the write onto the clicked
+//! cell via [`PlacementResult::place_at`]. Covered families:
 //!
-//! - Logs/wood — `axis` from the clicked face.
-//! - Slabs — `type` (top/bottom) from the clicked face + cursor height.
+//! - Logs/wood & chains — `axis` from the clicked face.
+//! - Slabs — `type` (top/bottom) from the clicked face + cursor height; placing a
+//!   matching half-slab onto its empty half merges to the `double` state.
 //! - Stairs — `facing` from yaw, `half` from the face + cursor, and the vanilla
 //!   auto-corner `shape` (`inner_left`/`inner_right`/`outer_left`/`outer_right`)
 //!   derived from neighbouring stairs.
 //! - Torches — floor vs wall (wall variant `facing` = the clicked face).
 //! - Fences — cardinal connectivity via the [`NeighborQuery`].
+//! - Walls — `north`/`south`/`east`/`west` connection height (`none`/`low`/`tall`)
+//!   plus the `up` post, derived from neighbours like fences.
+//! - Glass panes & iron bars — cardinal `north`/`south`/`east`/`west` connectivity.
 //! - Trapdoors — `facing` (clicked side, else player yaw) + `half` from the
 //!   face/cursor; `open`/`powered` inherit `false`.
 //! - Fence gates — `facing` from yaw, `in_wall` when flanked by walls.
 //! - Buttons & levers — `face` (floor/wall/ceiling) + `facing`.
 //! - Anvils — `facing` perpendicular (clockwise) to the player.
-//! - End rods — 6-way `facing` from the clicked face.
+//! - End rods & amethyst clusters/buds — 6-way `facing` from the clicked face.
+//! - Ladders — `facing` from the clicked wall face.
+//! - Lanterns — `hanging` from an under-face (ceiling) click.
+//! - Pointed dripstone — `vertical_direction` from the clicked face (always a
+//!   fresh `tip`).
+//! - Candles — a fresh placement is one candle; placing onto a matching candle
+//!   increments `candles` (`1..=4`), keeping `lit`.
 //! - Horizontal facers — the furnace family, carved pumpkins, and observers
 //!   (`facing` toward the player).
 //! - Simple full cubes — placed unchanged.
 //!
-//! Out of scope (placed as the default/simple state): waterlogging, rails,
-//! signs, banners, redstone wiring, and fluids. Out of *reach* of this engine
-//! entirely — they need a multi-position placement path, not just a richer state
-//! rule — are doors (upper+lower), beds (head+foot), and double-slab merging (a
-//! write relocated onto the clicked slab); see [`PlacementResult`].
+//! **Waterlogging** is a cross-cutting post-step: any placed block that carries a
+//! `waterlogged` property and lands in a water *source* becomes
+//! `waterlogged=true`. It is bound to the property only — there is no fluid-flow
+//! simulation. See [`compute_placement`] for the input it reads and the
+//! [crate-level note](#waterlogging-input) on what full fidelity still needs.
+//!
+//! Out of scope (placed as the default/simple state): rails, banners, and
+//! redstone wiring. Out of *reach* of this engine entirely — they need a
+//! *multi-cell* placement path, not just a relocated single write — are doors
+//! (upper+lower) and beds (head+foot).
+//!
+//! ## Waterlogging input
+//!
+//! The waterlogging post-step reads [`NeighborQuery::block_state_at`] at the
+//! placement position and waterlogs when that cell holds a water *source*
+//! (`water` with `level=0`). For this to fire in practice the host must (a) treat
+//! a water-source cell as replaceable so a waterloggable item can be placed *into*
+//! it, and (b) report that source through `block_state_at` at the placement cell.
+//! Not yet detected (would need richer fluid state than a block-state id):
+//! water-bearing plants (kelp, seagrass, bubble columns) and flowing water — the
+//! latter correctly never waterlogs.
 
 use std::collections::BTreeMap;
 
@@ -70,12 +98,13 @@ pub struct PlacementContext {
 
 /// The outcome of [`compute_placement`].
 ///
-/// A result is intentionally *single-state, single-position*: it names one
-/// block-state for the one position the caller already chose. Families that need
-/// to write a second block (doors' upper half, beds' foot) or to *relocate* the
-/// write onto the clicked cell (double-slab merging) cannot be expressed here —
-/// they require the consumer's placement→mutation path to carry more than one
-/// target, which is a deliberately out-of-scope change.
+/// A result names one block-state and (via [`place_at`](PlacementResult::place_at))
+/// the one cell it belongs in. Most rules write at the caller-chosen
+/// `ctx.position`; the **merge** rules (double-slab, candle stacking) instead set
+/// `place_at` to *relocate* the write onto the clicked cell, replacing the block
+/// already there. Families that need to write *two* blocks (doors' upper half,
+/// beds' foot) still cannot be expressed here — that needs a multi-cell mutation
+/// path, a deliberately out-of-scope change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlacementResult {
     /// The computed block-state id to write to the world.
@@ -85,6 +114,15 @@ pub struct PlacementResult {
     pub requested_state: u32,
     /// The rule that produced [`state_id`](PlacementResult::state_id).
     pub rule: PlacementRule,
+    /// Where to write [`state_id`](PlacementResult::state_id).
+    ///
+    /// `None` for the common case — write at the `ctx.position` the caller chose.
+    /// `Some(pos)` only for the merge rules, which *replace* the block at `pos`
+    /// (the clicked cell) instead of occupying `ctx.position`: a half-slab becomes
+    /// a `double`, a candle gains a wick. A host that does not honour `place_at`
+    /// will still write a valid block — just at `ctx.position` — so the merge
+    /// silently degrades to a normal placement rather than corrupting the world.
+    pub place_at: Option<BlockPos>,
 }
 
 /// Which placement rule produced a [`PlacementResult`].
@@ -120,8 +158,28 @@ pub enum PlacementRule {
     FaceAttached,
     /// An anvil: `facing` perpendicular (clockwise) to the player's yaw.
     AnvilFacing,
-    /// An end rod: 6-way `facing` taken from the clicked face.
+    /// An end rod or amethyst cluster/bud: 6-way `facing` taken from the clicked
+    /// face, so it grows out of the surface it was placed against.
     EndRod,
+    /// A wall: per-cardinal connection height (`none`/`low`/`tall`) and the `up`
+    /// post, resolved from neighbours via the [`NeighborQuery`].
+    Wall,
+    /// A glass pane or iron bars: cardinal `north`/`south`/`east`/`west`
+    /// connectivity resolved via the [`NeighborQuery`].
+    Pane,
+    /// A ladder: `facing` taken from the clicked (horizontal) wall face.
+    Ladder,
+    /// A lantern: `hanging` when placed against a block's under-face (ceiling).
+    Lantern,
+    /// Pointed dripstone: `vertical_direction` from the clicked face, placed as a
+    /// fresh `tip`.
+    Dripstone,
+    /// A slab merged onto its matching half to form the `double` state; the write
+    /// is relocated onto the clicked cell (see [`PlacementResult::place_at`]).
+    DoubleSlab,
+    /// A candle stacked onto a matching candle, incrementing `candles`; the write
+    /// is relocated onto the clicked cell (see [`PlacementResult::place_at`]).
+    CandleStack,
 }
 
 /// Queries neighbouring blocks for fence connectivity.
@@ -172,7 +230,18 @@ enum Class {
     /// Buttons and levers — `face` (floor/wall/ceiling) plus `facing`.
     FaceAttached,
     Anvil,
+    /// End rods and amethyst clusters/buds — 6-way `facing` from the clicked face.
     EndRod,
+    /// Walls — cardinal connection height plus the `up` post.
+    Wall,
+    /// Glass panes and iron bars — cardinal connectivity.
+    Pane,
+    /// Ladders — `facing` from the clicked wall face.
+    Ladder,
+    /// Lanterns — `hanging` from an under-face click.
+    Lantern,
+    /// Pointed dripstone — `vertical_direction` from the clicked face.
+    Dripstone,
 }
 
 /// Floor-torch base names that switch to a wall variant on a side click.
@@ -195,6 +264,17 @@ const HORIZONTAL_FACING: [&str; 6] = [
     "jack_o_lantern",
     "observer",
 ];
+
+/// The `waterlogged` boolean property shared by every waterloggable block.
+const WATERLOGGED: &str = "waterlogged";
+/// The string a boolean property takes when set; bools encode as
+/// `["true", "false"]` (index `0` = `true`).
+const BOOL_TRUE: &str = "true";
+/// The resource name of the fluid block whose source state drives waterlogging.
+const WATER_BLOCK: &str = "water";
+/// The `level` value of a water *source* (a still, full block); flowing water has
+/// a non-zero level and never waterlogs.
+const WATER_SOURCE_LEVEL: &str = "0";
 
 /// Returns the wall-torch variant name for a floor torch, or `None`.
 fn wall_torch_variant(name: &str) -> Option<&'static str> {
@@ -219,14 +299,27 @@ fn classify(name: &str) -> Class {
         Class::Stair
     } else if name.ends_with("_button") {
         Class::FaceAttached
+    } else if name.ends_with("_wall") {
+        // Checked before `_fence`; no wall name ends with `_fence`, and the
+        // `wall_torch`/`*_wall_sign` blocks are claimed by earlier arms / a
+        // `_sign` suffix, so `_wall` here only matches true `*_wall` blocks.
+        Class::Wall
     } else if name.ends_with("_fence") {
         Class::Fence
+    } else if is_pane_or_bars(name) {
+        Class::Pane
     } else if name == "lever" {
         Class::FaceAttached
     } else if is_anvil(name) {
         Class::Anvil
-    } else if name == "end_rod" {
+    } else if name == "end_rod" || is_amethyst(name) {
         Class::EndRod
+    } else if name == "ladder" {
+        Class::Ladder
+    } else if name == "lantern" || name == "soul_lantern" {
+        Class::Lantern
+    } else if name == "pointed_dripstone" {
+        Class::Dripstone
     } else if is_axis_block(name) {
         Class::Axis
     } else if HORIZONTAL_FACING.contains(&name) {
@@ -236,13 +329,34 @@ fn classify(name: &str) -> Class {
     }
 }
 
+/// Returns `true` for a glass pane (clear or stained) or iron bars — the thin
+/// connecting blocks that share a cardinal `north`/`south`/`east`/`west` shape.
+fn is_pane_or_bars(name: &str) -> bool {
+    name == "glass_pane" || name.ends_with("_glass_pane") || name == "iron_bars"
+}
+
+/// Returns `true` for an amethyst cluster or one of its three bud stages, which
+/// grow out of the clicked face exactly like an end rod (6-way `facing`).
+fn is_amethyst(name: &str) -> bool {
+    name == "amethyst_cluster" || name.ends_with("_amethyst_bud")
+}
+
+/// Returns `true` for a candle (plain or dyed), the family that stacks 1..=4
+/// candles into one cell. Excludes `*_candle_cake`, which ends with `_cake`.
+fn is_candle(name: &str) -> bool {
+    name == "candle" || name.ends_with("_candle")
+}
+
 /// Returns `true` for log/wood-style blocks that rotate via an `axis` property.
+///
+/// Chains share the same `axis` (`x`/`y`/`z`) mechanic, so they ride this rule too.
 fn is_axis_block(name: &str) -> bool {
     // Stripped variants also end with these suffixes (e.g. `stripped_oak_log`).
     name.ends_with("_log")
         || name.ends_with("_wood")
         || name.ends_with("_stem")
         || name.ends_with("_hyphae")
+        || name == "chain"
 }
 
 /// Returns `true` for the three anvil damage variants, which share a single
@@ -387,6 +501,45 @@ fn state_property(state_id: u32, prop: &str) -> Option<&'static str> {
     meta.properties[pi].values.get(digit as usize).copied()
 }
 
+/// Overrides a single property `prop` of `state_id` to `value`, returning the new
+/// state id — the in-place counterpart of [`state_property`].
+///
+/// Unlike [`compute_state_id`] (which starts from a block's *default* state), this
+/// edits an arbitrary existing state, preserving every other property's digit. The
+/// linear encoding is separable, so replacing one property's digit never disturbs
+/// another's. Returns `None` if `state_id` is not a registry block, the block has
+/// no such property, or `value` is not one of that property's values. Used to set
+/// `waterlogged=true` on an already-computed state and to bump a candle's count.
+fn set_state_property(state_id: u32, prop: &str, value: &str) -> Option<u32> {
+    let meta = block_metadata(state_id_to_block_name(state_id)?)?;
+    let pi = meta.properties.iter().position(|p| p.name == prop)?;
+    let later: u32 = meta.properties[pi + 1..]
+        .iter()
+        .map(|p| p.cardinality as u32)
+        .product();
+    let card = meta.properties[pi].cardinality as u32;
+    let new_index = meta.properties[pi]
+        .values
+        .iter()
+        .position(|v| *v == value)? as u32;
+    let old_index = ((state_id - meta.min_state) / later) % card;
+    Some(state_id - old_index * later + new_index * later)
+}
+
+/// Returns `true` if the block named `name` carries a property called `prop`.
+fn block_has_property(name: &str, prop: &str) -> bool {
+    block_metadata(name).is_some_and(|m| m.properties.iter().any(|p| p.name == prop))
+}
+
+/// Returns `true` if `state` is a water *source* block (still `water` at
+/// `level=0`). Flowing water and every other block — including `None` (air or an
+/// unreadable cell) — return `false`.
+fn is_water_source(state: Option<u32>) -> bool {
+    let Some(state) = state else { return false };
+    state_id_to_block_name(state) == Some(WATER_BLOCK)
+        && state_property(state, "level") == Some(WATER_SOURCE_LEVEL)
+}
+
 /// Resolves the stair at `position` into its `(facing, half)`, or `None` when the
 /// neighbour is absent, not a stair, or missing a cardinal `facing`.
 fn neighbor_stair(
@@ -514,6 +667,132 @@ pub fn compute_fence_connection_state(
     compute_state_id(fence_name, &props)
 }
 
+/// The four cardinal directions, in the order the connection rules scan them.
+const CARDINALS: [Direction; 4] = [
+    Direction::North,
+    Direction::South,
+    Direction::East,
+    Direction::West,
+];
+
+/// Returns `true` if the block at `position` connects to a wall: another wall, a
+/// fence gate, a pane/bars, or any solid full cube. Air, unreadable, and other
+/// non-connectable neighbours return `false`.
+fn wall_connects(neighbors: &dyn NeighborQuery, position: BlockPos) -> bool {
+    let Some(name) = neighbors
+        .block_state_at(position)
+        .and_then(state_id_to_block_name)
+    else {
+        return false;
+    };
+    name.ends_with("_wall")
+        || name.ends_with("_fence_gate")
+        || is_pane_or_bars(name)
+        || block_metadata(name).is_some_and(|m| m.is_solid_cube)
+}
+
+/// Returns `true` if the block at `position` connects to a pane or bars: another
+/// pane/bars, a wall, or any solid full cube.
+fn pane_connects(neighbors: &dyn NeighborQuery, position: BlockPos) -> bool {
+    let Some(name) = neighbors
+        .block_state_at(position)
+        .and_then(state_id_to_block_name)
+    else {
+        return false;
+    };
+    is_pane_or_bars(name)
+        || name.ends_with("_wall")
+        || block_metadata(name).is_some_and(|m| m.is_solid_cube)
+}
+
+/// Returns `true` if the block at `position` would raise a wall's connections to
+/// full (`tall`) height — a solid full cube or another wall sitting there.
+fn raises_wall(neighbors: &dyn NeighborQuery, position: BlockPos) -> bool {
+    neighbors
+        .block_state_at(position)
+        .and_then(state_id_to_block_name)
+        .is_some_and(|name| {
+            name.ends_with("_wall") || block_metadata(name).is_some_and(|m| m.is_solid_cube)
+        })
+}
+
+/// Resolves a wall's connection shape into a concrete state id.
+///
+/// Each cardinal neighbour the [`NeighborQuery`] reports as connectable sets that
+/// side to `low`, raised to `tall` when a solid block (or wall) sits directly
+/// above. The `up` centre post is shown unless the wall is a straight run on a
+/// single axis (exactly two opposite connections and nothing else) with no block
+/// above — mirroring vanilla's `WallBlock`. `waterlogged` inherits its `false`
+/// default (the waterlogging post-step sets it). Returns `None` only if
+/// `wall_name` is not a registry block.
+///
+/// The per-connection `tall`/`low` here is a deliberate simplification: vanilla
+/// also raises a side when the *neighbour's* collision shape is tall, which a bare
+/// block-state id cannot express. The common cases (straight runs, corners, posts,
+/// covered walls) match.
+#[must_use]
+pub fn compute_wall_connection_state(
+    wall_name: &str,
+    position: BlockPos,
+    neighbors: &dyn NeighborQuery,
+) -> Option<u32> {
+    let above_raises = raises_wall(neighbors, position.offset(Direction::Up));
+    let height = if above_raises { "tall" } else { "low" };
+
+    let mut props: BTreeMap<&str, &str> = BTreeMap::new();
+    let connected = |dir| wall_connects(neighbors, position.offset(dir));
+    let (n, s, e, w) = (
+        connected(Direction::North),
+        connected(Direction::South),
+        connected(Direction::East),
+        connected(Direction::West),
+    );
+    for (dir, on) in [
+        (Direction::North, n),
+        (Direction::South, s),
+        (Direction::East, e),
+        (Direction::West, w),
+    ] {
+        if on {
+            props.insert(facing_string(dir), height);
+        }
+    }
+
+    // The post is dropped only for a straight, single-axis run with nothing above.
+    let straight = (n && s && !e && !w) || (e && w && !n && !s);
+    props.insert(
+        "up",
+        if !straight || above_raises {
+            "true"
+        } else {
+            "false"
+        },
+    );
+
+    compute_state_id(wall_name, &props)
+}
+
+/// Resolves a glass pane's or iron bars' cardinal connectivity into a concrete
+/// state id.
+///
+/// Each cardinal neighbour [`pane_connects`] accepts sets that direction's boolean
+/// `true`; unset directions and `waterlogged` inherit the (all-false) default.
+/// Returns `None` only if `pane_name` is not a registry block.
+#[must_use]
+pub fn compute_pane_connection_state(
+    pane_name: &str,
+    position: BlockPos,
+    neighbors: &dyn NeighborQuery,
+) -> Option<u32> {
+    let mut props: BTreeMap<&str, &str> = BTreeMap::new();
+    for dir in CARDINALS {
+        if pane_connects(neighbors, position.offset(dir)) {
+            props.insert(facing_string(dir), "true");
+        }
+    }
+    compute_state_id(pane_name, &props)
+}
+
 /// Computes the block-state id to place for `ctx`, applying the rule for the held
 /// block's family.
 ///
@@ -548,6 +827,13 @@ pub fn compute_placement(
     let name = state_id_to_block_name(ctx.item_block_state)?;
     let fallback = ctx.item_block_state;
 
+    // Merge rules relocate the write onto the clicked cell, so they are resolved
+    // before the position-keyed family rules (and skip the waterlogging step: a
+    // double slab expels its water, a stacked candle keeps the existing state's).
+    if let Some(merged) = try_merge(name, ctx, neighbors) {
+        return Some(merged);
+    }
+
     let (state_id, rule) = match classify(name) {
         Class::SimpleCube => (fallback, PlacementRule::SimpleCube),
         Class::Axis => place_axis(name, fallback, ctx),
@@ -559,17 +845,112 @@ pub fn compute_placement(
             compute_fence_connection_state(name, ctx.position, neighbors).unwrap_or(fallback),
             PlacementRule::FenceLike,
         ),
+        Class::Wall => (
+            compute_wall_connection_state(name, ctx.position, neighbors).unwrap_or(fallback),
+            PlacementRule::Wall,
+        ),
+        Class::Pane => (
+            compute_pane_connection_state(name, ctx.position, neighbors).unwrap_or(fallback),
+            PlacementRule::Pane,
+        ),
         Class::Trapdoor => place_trapdoor(name, fallback, ctx),
         Class::FenceGate => place_fence_gate(name, fallback, ctx, neighbors),
         Class::FaceAttached => place_face_attached(name, fallback, ctx),
         Class::Anvil => place_anvil(name, fallback, ctx),
         Class::EndRod => place_end_rod(name, fallback, ctx),
+        Class::Ladder => place_ladder(name, fallback, ctx),
+        Class::Lantern => place_lantern(name, fallback, ctx),
+        Class::Dripstone => place_dripstone(name, fallback, ctx),
+    };
+
+    // Waterlogging post-step: any placed block that carries a `waterlogged`
+    // property and lands in a water source becomes waterlogged. Keyed off the
+    // *placed* block (a side-clicked torch becomes `wall_torch`, which has no such
+    // property), so it composes with every family rule above.
+    let placed_name = state_id_to_block_name(state_id).unwrap_or(name);
+    let state_id = if block_has_property(placed_name, WATERLOGGED)
+        && is_water_source(neighbors.block_state_at(ctx.position))
+    {
+        set_state_property(state_id, WATERLOGGED, BOOL_TRUE).unwrap_or(state_id)
+    } else {
+        state_id
     };
 
     Some(PlacementResult {
         state_id,
         requested_state: ctx.item_block_state,
         rule,
+        place_at: None,
+    })
+}
+
+/// Resolves a slab→`double` or candle-stack merge, or `None` when the click is not
+/// a merge.
+///
+/// A merge fires only when the block already in the **clicked** cell
+/// (`ctx.position` stepped back along the clicked face) is the *same* block as the
+/// held item and the click completes it. Its [`PlacementResult::place_at`] is the
+/// clicked cell, so the host replaces that block instead of writing at
+/// `ctx.position`.
+fn try_merge(
+    name: &str,
+    ctx: &PlacementContext,
+    neighbors: &dyn NeighborQuery,
+) -> Option<PlacementResult> {
+    let is_slab = name.ends_with("_slab");
+    if !is_slab && !is_candle(name) {
+        return None;
+    }
+    // The clicked cell is one step back along the clicked face from the placement
+    // cell (the host steps the placement off the clicked face).
+    let clicked = ctx.position.offset(ctx.clicked_face.opposite());
+    let existing = neighbors.block_state_at(clicked)?;
+    if state_id_to_block_name(existing) != Some(name) {
+        return None;
+    }
+
+    let (state_id, rule) = if is_slab {
+        let completes = match state_property(existing, "type")? {
+            // A bottom slab is completed from above (top face) or by aiming at the
+            // upper half of a side; a top slab, the mirror. A `double` is full.
+            "bottom" => {
+                ctx.clicked_face == Direction::Up
+                    || (is_horizontal(ctx.clicked_face) && ctx.cursor_position.y > 0.5)
+            }
+            "top" => {
+                ctx.clicked_face == Direction::Down
+                    || (is_horizontal(ctx.clicked_face) && ctx.cursor_position.y < 0.5)
+            }
+            _ => false,
+        };
+        if !completes {
+            return None;
+        }
+        // Build `double` from the block default, so the merged slab is dry
+        // (vanilla expels the water a half-slab may have held).
+        let mut props = BTreeMap::new();
+        props.insert("type", "double");
+        (encode(name, &props, existing), PlacementRule::DoubleSlab)
+    } else {
+        // Candles stack up to four; bump the existing state in place so its `lit`
+        // and `waterlogged` carry over.
+        let next = match state_property(existing, "candles")? {
+            "1" => "2",
+            "2" => "3",
+            "3" => "4",
+            _ => return None,
+        };
+        (
+            set_state_property(existing, "candles", next)?,
+            PlacementRule::CandleStack,
+        )
+    };
+
+    Some(PlacementResult {
+        state_id,
+        requested_state: ctx.item_block_state,
+        rule,
+        place_at: Some(clicked),
     })
 }
 
@@ -701,12 +1082,59 @@ fn place_anvil(name: &str, fallback: u32, ctx: &PlacementContext) -> (u32, Place
     (encode(name, &props, fallback), PlacementRule::AnvilFacing)
 }
 
-/// An end rod: 6-way `facing` taken directly from the clicked face, so it points
-/// out of the surface it was placed against.
+/// An end rod or amethyst cluster/bud: 6-way `facing` taken directly from the
+/// clicked face, so it points out of the surface it was placed against.
 fn place_end_rod(name: &str, fallback: u32, ctx: &PlacementContext) -> (u32, PlacementRule) {
     let mut props = BTreeMap::new();
     props.insert("facing", facing_string(ctx.clicked_face));
     (encode(name, &props, fallback), PlacementRule::EndRod)
+}
+
+/// A ladder: `facing` is the clicked (horizontal) wall face, so the ladder hangs
+/// on that wall facing outward. A top/bottom click cannot attach to a wall here
+/// (vanilla searches for a nearby wall, which needs more than the clicked face), so
+/// it degrades to the held default.
+fn place_ladder(name: &str, fallback: u32, ctx: &PlacementContext) -> (u32, PlacementRule) {
+    if is_horizontal(ctx.clicked_face) {
+        let mut props = BTreeMap::new();
+        props.insert("facing", facing_string(ctx.clicked_face));
+        (encode(name, &props, fallback), PlacementRule::Ladder)
+    } else {
+        (fallback, PlacementRule::Ladder)
+    }
+}
+
+/// A lantern: `hanging` when placed against a block's under-face (the clicked
+/// `Down` face), otherwise standing. `waterlogged` inherits its default (set by
+/// the waterlogging post-step).
+fn place_lantern(name: &str, fallback: u32, ctx: &PlacementContext) -> (u32, PlacementRule) {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "hanging",
+        if ctx.clicked_face == Direction::Down {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    (encode(name, &props, fallback), PlacementRule::Lantern)
+}
+
+/// Pointed dripstone: `vertical_direction` points `down` when hung from a ceiling
+/// (the clicked `Down` face) and `up` otherwise; always a fresh `tip` (vanilla
+/// merges/thickens via neighbour scans this engine does not run).
+fn place_dripstone(name: &str, fallback: u32, ctx: &PlacementContext) -> (u32, PlacementRule) {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "vertical_direction",
+        if ctx.clicked_face == Direction::Down {
+            "down"
+        } else {
+            "up"
+        },
+    );
+    props.insert("thickness", "tip");
+    (encode(name, &props, fallback), PlacementRule::Dripstone)
 }
 
 #[cfg(test)]
@@ -760,6 +1188,23 @@ mod tests {
     const OBSERVER: u32 = 13578;
     const CARVED_PUMPKIN: u32 = 6045;
     const COBBLESTONE_WALL: u32 = 8706;
+
+    // Round-2 families (default states unless suffixed).
+    const WATER_SOURCE: u32 = 86; // water level=0
+    const FLOWING_WATER: u32 = 87; // water level=1
+    const OAK_SLAB_TOP: u32 = 12052;
+    const STONE_SLAB: u32 = 12120;
+    const GLASS_PANE: u32 = 7053;
+    const IRON_BARS: u32 = 7015;
+    const LADDER: u32 = 4751; // facing=north
+    const CHAIN: u32 = 7019; // axis=y
+    const LANTERN: u32 = 19561; // hanging=false
+    const SOUL_LANTERN: u32 = 19565;
+    const AMETHYST_CLUSTER: u32 = 22102; // facing=up
+    const POINTED_DRIPSTONE: u32 = 25813; // tip, up
+    const CANDLE: u32 = 21788; // candles=1, lit=false
+    const CANDLE_LIT: u32 = 21786; // candles=1, lit=true
+    const CANDLE_FULL: u32 = 21800; // candles=4
 
     /// Bottom-half oak stairs facing a given cardinal (`shape=straight`), used as
     /// neighbours when testing corner-shape derivation.
@@ -1121,5 +1566,319 @@ mod tests {
                 .state_id,
             6048 // faces east
         );
+    }
+
+    /// A neighbour query with a single block-state at the placement cell — the
+    /// input the waterlogging post-step reads.
+    fn target_state(state: u32) -> MockNeighbors {
+        MockNeighbors {
+            states: vec![(BlockPos::new(0, 64, 0), state)],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn waterlogging_sets_the_property_in_a_water_source() {
+        let water = target_state(WATER_SOURCE);
+        // Every waterloggable family flips `waterlogged` (subtracting its place
+        // value from the dry state) when placed into a still water source.
+        let slab = compute_placement(&ctx(OAK_SLAB, Direction::Up, 0.5, 0.0), &water).unwrap();
+        assert_eq!(slab.state_id, 12053); // bottom + waterlogged
+        assert_eq!(slab.rule, PlacementRule::Slab);
+        let stairs =
+            compute_placement(&ctx(OAK_STAIRS, Direction::Up, 0.0, 180.0), &water).unwrap();
+        assert_eq!(stairs.state_id, 2948); // north/bottom/straight + waterlogged
+        let fence = compute_placement(&ctx(OAK_FENCE, Direction::Up, 0.5, 0.0), &water).unwrap();
+        assert_eq!(fence.state_id, 6025); // isolated + waterlogged
+        let pane = compute_placement(&ctx(GLASS_PANE, Direction::Up, 0.5, 0.0), &water).unwrap();
+        assert_eq!(pane.state_id, 7051); // isolated + waterlogged
+        let bars = compute_placement(&ctx(IRON_BARS, Direction::Up, 0.5, 0.0), &water).unwrap();
+        assert_eq!(bars.state_id, 7013);
+        let trap = compute_placement(&ctx(OAK_TRAPDOOR, Direction::Up, 0.5, 0.0), &water).unwrap();
+        assert_eq!(trap.state_id, 6154); // north/bottom + waterlogged
+        let wall =
+            compute_placement(&ctx(COBBLESTONE_WALL, Direction::Up, 0.5, 0.0), &water).unwrap();
+        assert_eq!(wall.state_id, 8703); // default post + waterlogged
+        let ladder = compute_placement(&ctx(LADDER, Direction::North, 0.5, 0.0), &water).unwrap();
+        assert_eq!(ladder.state_id, 4750); // facing north + waterlogged
+    }
+
+    #[test]
+    fn flowing_water_dry_air_and_non_waterloggable_do_not_waterlog() {
+        // Flowing water (level != 0) is not a source -> dry.
+        let flowing = target_state(FLOWING_WATER);
+        let slab = compute_placement(&ctx(OAK_SLAB, Direction::Up, 0.5, 0.0), &flowing).unwrap();
+        assert_eq!(slab.state_id, 12054); // bottom, NOT waterlogged
+                                          // No fluid reported at all -> dry.
+        let dry = compute_placement(&ctx(OAK_SLAB, Direction::Up, 0.5, 0.0), &NoNeighbors).unwrap();
+        assert_eq!(dry.state_id, 12054);
+        // A block with no `waterlogged` property is untouched even in a source.
+        let stone = compute_placement(
+            &ctx(STONE, Direction::Up, 0.5, 0.0),
+            &target_state(WATER_SOURCE),
+        )
+        .unwrap();
+        assert_eq!(stone.state_id, 1);
+    }
+
+    #[test]
+    fn slab_merges_into_a_double() {
+        // Top-face click on a bottom slab -> double at the clicked cell below.
+        let below = MockNeighbors {
+            states: vec![(BlockPos::new(0, 63, 0), OAK_SLAB)],
+            ..Default::default()
+        };
+        let merged = compute_placement(&ctx(OAK_SLAB, Direction::Up, 0.5, 0.0), &below).unwrap();
+        assert_eq!(merged.state_id, 12056); // double
+        assert_eq!(merged.rule, PlacementRule::DoubleSlab);
+        assert_eq!(merged.place_at, Some(BlockPos::new(0, 63, 0)));
+
+        // Bottom-face click on a top slab -> double at the clicked cell above.
+        let above = MockNeighbors {
+            states: vec![(BlockPos::new(0, 65, 0), OAK_SLAB_TOP)],
+            ..Default::default()
+        };
+        let merged_top =
+            compute_placement(&ctx(OAK_SLAB, Direction::Down, 0.5, 0.0), &above).unwrap();
+        assert_eq!(merged_top.state_id, 12056);
+        assert_eq!(merged_top.place_at, Some(BlockPos::new(0, 65, 0)));
+
+        // A side click at the upper half of a bottom slab completes it too.
+        let side = MockNeighbors {
+            states: vec![(BlockPos::new(0, 64, 1), OAK_SLAB)],
+            ..Default::default()
+        };
+        let merged_side =
+            compute_placement(&ctx(OAK_SLAB, Direction::North, 0.8, 0.0), &side).unwrap();
+        assert_eq!(merged_side.state_id, 12056);
+        assert_eq!(merged_side.place_at, Some(BlockPos::new(0, 64, 1)));
+    }
+
+    #[test]
+    fn slab_does_not_merge_on_a_wrong_click_or_mismatched_material() {
+        // Bottom-face click on a bottom slab does not complete it: a plain top slab
+        // is placed at the (stepped) position instead, with no relocation.
+        let bottom_above = MockNeighbors {
+            states: vec![(BlockPos::new(0, 65, 0), OAK_SLAB)],
+            ..Default::default()
+        };
+        let nope =
+            compute_placement(&ctx(OAK_SLAB, Direction::Down, 0.5, 0.0), &bottom_above).unwrap();
+        assert_eq!(nope.rule, PlacementRule::Slab);
+        assert_eq!(nope.state_id, 12052); // top
+        assert_eq!(nope.place_at, None);
+
+        // A different slab material never merges.
+        let stone_below = MockNeighbors {
+            states: vec![(BlockPos::new(0, 63, 0), STONE_SLAB)],
+            ..Default::default()
+        };
+        let diff =
+            compute_placement(&ctx(OAK_SLAB, Direction::Up, 0.5, 0.0), &stone_below).unwrap();
+        assert_eq!(diff.rule, PlacementRule::Slab);
+        assert_eq!(diff.state_id, 12054); // a fresh bottom oak slab
+        assert_eq!(diff.place_at, None);
+    }
+
+    #[test]
+    fn candle_stacks_up_to_four_keeping_lit() {
+        // A fresh candle on the ground is one (unlit) candle, no relocation.
+        let fresh = compute_placement(&ctx(CANDLE, Direction::Up, 0.5, 0.0), &NoNeighbors).unwrap();
+        assert_eq!(fresh.state_id, CANDLE); // candles=1
+        assert_eq!(fresh.rule, PlacementRule::SimpleCube);
+        assert_eq!(fresh.place_at, None);
+
+        // Clicking a 1-candle cell adds a second, relocated onto that cell.
+        let one = MockNeighbors {
+            states: vec![(BlockPos::new(0, 63, 0), CANDLE)],
+            ..Default::default()
+        };
+        let two = compute_placement(&ctx(CANDLE, Direction::Up, 0.5, 0.0), &one).unwrap();
+        assert_eq!(two.state_id, 21792); // candles=2, lit=false
+        assert_eq!(two.rule, PlacementRule::CandleStack);
+        assert_eq!(two.place_at, Some(BlockPos::new(0, 63, 0)));
+
+        // Stacking onto a lit candle keeps it lit.
+        let lit = MockNeighbors {
+            states: vec![(BlockPos::new(0, 63, 0), CANDLE_LIT)],
+            ..Default::default()
+        };
+        let lit_two = compute_placement(&ctx(CANDLE, Direction::Up, 0.5, 0.0), &lit).unwrap();
+        assert_eq!(lit_two.state_id, 21790); // candles=2, lit=true
+
+        // A full (4-candle) cell does not stack; a fresh candle is placed instead.
+        let full = MockNeighbors {
+            states: vec![(BlockPos::new(0, 63, 0), CANDLE_FULL)],
+            ..Default::default()
+        };
+        let blocked = compute_placement(&ctx(CANDLE, Direction::Up, 0.5, 0.0), &full).unwrap();
+        assert_eq!(blocked.rule, PlacementRule::SimpleCube);
+        assert_eq!(blocked.state_id, CANDLE);
+    }
+
+    #[test]
+    fn wall_connection_shape_from_neighbors() {
+        // Isolated wall: just the post (up=true), default state.
+        let isolated = compute_placement(
+            &ctx(COBBLESTONE_WALL, Direction::Up, 0.5, 0.0),
+            &NoNeighbors,
+        )
+        .unwrap();
+        assert_eq!(isolated.state_id, 8706);
+        assert_eq!(isolated.rule, PlacementRule::Wall);
+
+        // A single solid neighbour to the north -> north=low, post kept.
+        let north = MockNeighbors {
+            states: vec![(BlockPos::new(0, 64, -1), STONE)],
+            ..Default::default()
+        };
+        let one =
+            compute_placement(&ctx(COBBLESTONE_WALL, Direction::Up, 0.5, 0.0), &north).unwrap();
+        assert_eq!(one.state_id, 8742); // north=low, up=true
+
+        // A straight north-south run drops the post.
+        let straight = MockNeighbors {
+            states: vec![
+                (BlockPos::new(0, 64, -1), STONE),
+                (BlockPos::new(0, 64, 1), STONE),
+            ],
+            ..Default::default()
+        };
+        let through =
+            compute_placement(&ctx(COBBLESTONE_WALL, Direction::Up, 0.5, 0.0), &straight).unwrap();
+        assert_eq!(through.state_id, 8760); // north=low, south=low, up=false
+
+        // A corner (north + east) keeps the post.
+        let corner = MockNeighbors {
+            states: vec![
+                (BlockPos::new(0, 64, -1), STONE),
+                (BlockPos::new(1, 64, 0), STONE),
+            ],
+            ..Default::default()
+        };
+        let bent =
+            compute_placement(&ctx(COBBLESTONE_WALL, Direction::Up, 0.5, 0.0), &corner).unwrap();
+        assert_eq!(bent.state_id, 8850); // north=low, east=low, up=true
+
+        // A solid block above raises the connection to tall and forces the post.
+        let covered = MockNeighbors {
+            states: vec![
+                (BlockPos::new(0, 64, -1), STONE),
+                (BlockPos::new(0, 64, 1), STONE),
+                (BlockPos::new(0, 65, 0), STONE),
+            ],
+            ..Default::default()
+        };
+        let tall =
+            compute_placement(&ctx(COBBLESTONE_WALL, Direction::Up, 0.5, 0.0), &covered).unwrap();
+        assert_eq!(tall.state_id, 8802); // north=tall, south=tall, up=true (block above)
+    }
+
+    #[test]
+    fn pane_and_bars_connect_to_neighbors() {
+        // Isolated glass pane / iron bars: all-false default.
+        let pane =
+            compute_placement(&ctx(GLASS_PANE, Direction::Up, 0.5, 0.0), &NoNeighbors).unwrap();
+        assert_eq!(pane.state_id, 7053);
+        assert_eq!(pane.rule, PlacementRule::Pane);
+
+        // North solid neighbour -> north connection.
+        let north = MockNeighbors {
+            states: vec![(BlockPos::new(0, 64, -1), STONE)],
+            ..Default::default()
+        };
+        let one = compute_placement(&ctx(GLASS_PANE, Direction::Up, 0.5, 0.0), &north).unwrap();
+        assert_eq!(one.state_id, 7045);
+
+        // North + east.
+        let north_east = MockNeighbors {
+            states: vec![
+                (BlockPos::new(0, 64, -1), STONE),
+                (BlockPos::new(1, 64, 0), STONE),
+            ],
+            ..Default::default()
+        };
+        let two =
+            compute_placement(&ctx(GLASS_PANE, Direction::Up, 0.5, 0.0), &north_east).unwrap();
+        assert_eq!(two.state_id, 7029);
+
+        // A pane connects to another pane neighbour, not just solid cubes.
+        let pane_neighbor = MockNeighbors {
+            states: vec![(BlockPos::new(0, 64, -1), GLASS_PANE)],
+            ..Default::default()
+        };
+        let linked =
+            compute_placement(&ctx(GLASS_PANE, Direction::Up, 0.5, 0.0), &pane_neighbor).unwrap();
+        assert_eq!(linked.state_id, 7045);
+
+        // Iron bars: north + south.
+        let ns = MockNeighbors {
+            states: vec![
+                (BlockPos::new(0, 64, -1), STONE),
+                (BlockPos::new(0, 64, 1), STONE),
+            ],
+            ..Default::default()
+        };
+        let bars = compute_placement(&ctx(IRON_BARS, Direction::Up, 0.5, 0.0), &ns).unwrap();
+        assert_eq!(bars.state_id, 7003);
+    }
+
+    #[test]
+    fn ladder_faces_the_clicked_wall() {
+        let place = |face| compute_placement(&ctx(LADDER, face, 0.5, 0.0), &NoNeighbors).unwrap();
+        assert_eq!(place(Direction::North).state_id, 4751); // default
+        assert_eq!(place(Direction::North).rule, PlacementRule::Ladder);
+        assert_eq!(place(Direction::South).state_id, 4753);
+        assert_eq!(place(Direction::West).state_id, 4755);
+        assert_eq!(place(Direction::East).state_id, 4757);
+        // A vertical click cannot attach to a wall -> the held default.
+        assert_eq!(place(Direction::Up).state_id, 4751);
+        assert_eq!(place(Direction::Down).state_id, 4751);
+    }
+
+    #[test]
+    fn chain_takes_axis_from_face() {
+        let place = |face| compute_placement(&ctx(CHAIN, face, 0.5, 0.0), &NoNeighbors).unwrap();
+        assert_eq!(place(Direction::Up).state_id, 7019); // y (default)
+        assert_eq!(place(Direction::Up).rule, PlacementRule::AxisFromFace);
+        assert_eq!(place(Direction::North).state_id, 7021); // z
+        assert_eq!(place(Direction::East).state_id, 7017); // x
+    }
+
+    #[test]
+    fn lantern_hangs_from_a_ceiling_click() {
+        let place =
+            |item, face| compute_placement(&ctx(item, face, 0.5, 0.0), &NoNeighbors).unwrap();
+        // Floor (up) and side clicks stand; an under-face (down) click hangs.
+        assert_eq!(place(LANTERN, Direction::Up).state_id, 19561); // standing (default)
+        assert_eq!(place(LANTERN, Direction::Up).rule, PlacementRule::Lantern);
+        assert_eq!(place(LANTERN, Direction::North).state_id, 19561); // standing
+        assert_eq!(place(LANTERN, Direction::Down).state_id, 19559); // hanging
+        assert_eq!(place(SOUL_LANTERN, Direction::Down).state_id, 19563); // hanging
+    }
+
+    #[test]
+    fn amethyst_cluster_grows_out_of_the_clicked_face() {
+        let place =
+            |face| compute_placement(&ctx(AMETHYST_CLUSTER, face, 0.5, 0.0), &NoNeighbors).unwrap();
+        assert_eq!(place(Direction::Up).state_id, 22102); // up (default)
+        assert_eq!(place(Direction::Up).rule, PlacementRule::EndRod);
+        assert_eq!(place(Direction::Down).state_id, 22104);
+        assert_eq!(place(Direction::North).state_id, 22094);
+        assert_eq!(place(Direction::East).state_id, 22096);
+        assert_eq!(place(Direction::South).state_id, 22098);
+        assert_eq!(place(Direction::West).state_id, 22100);
+    }
+
+    #[test]
+    fn pointed_dripstone_orients_from_the_clicked_face() {
+        let place = |face| {
+            compute_placement(&ctx(POINTED_DRIPSTONE, face, 0.5, 0.0), &NoNeighbors).unwrap()
+        };
+        // Floor click points up (default tip); ceiling (down) click points down.
+        assert_eq!(place(Direction::Up).state_id, 25813); // up/tip (default)
+        assert_eq!(place(Direction::Up).rule, PlacementRule::Dripstone);
+        assert_eq!(place(Direction::Down).state_id, 25815); // down/tip
+        assert_eq!(place(Direction::North).state_id, 25813); // horizontal -> up/tip
     }
 }
