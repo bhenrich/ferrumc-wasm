@@ -4,6 +4,7 @@
 pub mod biome;
 pub mod block_state;
 pub mod dimension;
+pub mod item;
 
 /// Human-readable Minecraft release this registry data targets.
 pub const MINECRAFT_VERSION: &str = "1.21.8";

@@ -4,10 +4,12 @@ Pinned Minecraft 1.21.8 registry data for the server, exposed as deterministic,
 hardcoded runtime constants.
 
 The runtime is dependency-free and does no I/O or JSON parsing at startup: every
-value is a `const` baked at compile time. The vendored upstream snapshots
-(`fixtures/protocol/1_21_8/`) are used only by `#[cfg(test)]` drift guards that
-re-parse the real data and assert the constants still match, so a re-pin to a
-newer data version cannot silently desync them.
+value is either a `const` baked at compile time (block/biome/dimension) or a
+`static` array generated at build time from a vendored snapshot (items). The
+vendored upstream snapshots (`fixtures/protocol/1_21_8/` and this crate's
+`data/`) are parsed only by `build.rs` (item tables) and by `#[cfg(test)]` drift
+guards that re-parse the real data and assert the generated tables still match,
+so a re-pin to a newer data version cannot silently desync them.
 
 ## What it provides
 
@@ -16,6 +18,9 @@ newer data version cannot silently desync them.
 - `default_block_state_id(name)` — resource-location → default state id lookup.
 - `dimension` — overworld geometry constants (`OVERWORLD`, `MIN_Y`, `HEIGHT`).
 - `biome` — biome resource-location constants (`PLAINS`).
+- `item` — item lookups: `lookup_item_protocol_id`, `lookup_item_name`,
+  `item_max_stack`, `item_to_block_state` (generated from `data/items.json` +
+  `data/item_to_block_mapping.json`).
 
 ## Data provenance
 

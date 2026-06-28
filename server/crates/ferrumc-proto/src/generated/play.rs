@@ -863,6 +863,85 @@ impl PlayerAction {
     }
 }
 
+/// `ServerboundSetHeldItem`: the play serverbound packet (wire id `0x34`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerboundSetHeldItem {
+    slot: i16,
+}
+
+impl ServerboundSetHeldItem {
+    /// The wire packet id for `ServerboundSetHeldItem`.
+    pub const PACKET_ID: i32 = 0x34;
+
+    /// Creates a new `ServerboundSetHeldItem` from its wire fields.
+    pub fn new(slot: i16) -> Self {
+        Self { slot }
+    }
+
+    /// Returns the `slot` field.
+    pub fn slot(&self) -> i16 {
+        self.slot
+    }
+
+    /// Decodes a `ServerboundSetHeldItem` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let slot = reader.read_i16()?;
+        Ok(Self { slot })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        wire::write_i16(buf, self.slot);
+        Ok(())
+    }
+}
+
+/// `SetCreativeSlot`: the play serverbound packet (wire id `0x37`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetCreativeSlot {
+    slot: i16,
+    item: Vec<u8>,
+}
+
+impl SetCreativeSlot {
+    /// The wire packet id for `SetCreativeSlot`.
+    pub const PACKET_ID: i32 = 0x37;
+
+    /// Creates a new `SetCreativeSlot` from its wire fields.
+    pub fn new(slot: i16, item: Vec<u8>) -> Self {
+        Self { slot, item }
+    }
+
+    /// Returns the `slot` field.
+    pub fn slot(&self) -> i16 {
+        self.slot
+    }
+
+    /// Returns the `item` field.
+    pub fn item(&self) -> &[u8] {
+        &self.item
+    }
+
+    /// Decodes a `SetCreativeSlot` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let slot = reader.read_i16()?;
+        let item = {
+            let remaining = reader.remaining();
+            reader.read_bytes(remaining)?.to_vec()
+        };
+        Ok(Self { slot, item })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        wire::write_i16(buf, self.slot);
+        wire::write_raw(buf, &self.item);
+        Ok(())
+    }
+}
+
 /// `UseItemOn`: the play serverbound packet (wire id `0x3f`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UseItemOn {
@@ -1347,6 +1426,138 @@ impl Commands {
     pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
         ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
         wire::write_raw(buf, &self.payload);
+        Ok(())
+    }
+}
+
+/// `SetContainerContent`: the play clientbound packet (wire id `0x12`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetContainerContent {
+    window_id: i32,
+    state_id: i32,
+    payload: Vec<u8>,
+}
+
+impl SetContainerContent {
+    /// The wire packet id for `SetContainerContent`.
+    pub const PACKET_ID: i32 = 0x12;
+
+    /// Creates a new `SetContainerContent` from its wire fields.
+    pub fn new(window_id: i32, state_id: i32, payload: Vec<u8>) -> Self {
+        Self {
+            window_id,
+            state_id,
+            payload,
+        }
+    }
+
+    /// Returns the `window_id` field.
+    pub fn window_id(&self) -> i32 {
+        self.window_id
+    }
+
+    /// Returns the `state_id` field.
+    pub fn state_id(&self) -> i32 {
+        self.state_id
+    }
+
+    /// Returns the `payload` field.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Decodes a `SetContainerContent` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let window_id = reader.read_var_int()?;
+        let state_id = reader.read_var_int()?;
+        let payload = {
+            let remaining = reader.remaining();
+            reader.read_bytes(remaining)?.to_vec()
+        };
+        Ok(Self {
+            window_id,
+            state_id,
+            payload,
+        })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        ferrumc_codec::write_var_int(buf, self.window_id);
+        ferrumc_codec::write_var_int(buf, self.state_id);
+        wire::write_raw(buf, &self.payload);
+        Ok(())
+    }
+}
+
+/// `SetContainerSlot`: the play clientbound packet (wire id `0x14`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetContainerSlot {
+    window_id: i32,
+    state_id: i32,
+    slot: i16,
+    item: Vec<u8>,
+}
+
+impl SetContainerSlot {
+    /// The wire packet id for `SetContainerSlot`.
+    pub const PACKET_ID: i32 = 0x14;
+
+    /// Creates a new `SetContainerSlot` from its wire fields.
+    pub fn new(window_id: i32, state_id: i32, slot: i16, item: Vec<u8>) -> Self {
+        Self {
+            window_id,
+            state_id,
+            slot,
+            item,
+        }
+    }
+
+    /// Returns the `window_id` field.
+    pub fn window_id(&self) -> i32 {
+        self.window_id
+    }
+
+    /// Returns the `state_id` field.
+    pub fn state_id(&self) -> i32 {
+        self.state_id
+    }
+
+    /// Returns the `slot` field.
+    pub fn slot(&self) -> i16 {
+        self.slot
+    }
+
+    /// Returns the `item` field.
+    pub fn item(&self) -> &[u8] {
+        &self.item
+    }
+
+    /// Decodes a `SetContainerSlot` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let window_id = reader.read_var_int()?;
+        let state_id = reader.read_var_int()?;
+        let slot = reader.read_i16()?;
+        let item = {
+            let remaining = reader.remaining();
+            reader.read_bytes(remaining)?.to_vec()
+        };
+        Ok(Self {
+            window_id,
+            state_id,
+            slot,
+            item,
+        })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        ferrumc_codec::write_var_int(buf, self.window_id);
+        ferrumc_codec::write_var_int(buf, self.state_id);
+        wire::write_i16(buf, self.slot);
+        wire::write_raw(buf, &self.item);
         Ok(())
     }
 }
@@ -2675,6 +2886,40 @@ impl SetDefaultSpawnPosition {
     }
 }
 
+/// `ClientboundSetHeldItem`: the play clientbound packet (wire id `0x62`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundSetHeldItem {
+    slot: i32,
+}
+
+impl ClientboundSetHeldItem {
+    /// The wire packet id for `ClientboundSetHeldItem`.
+    pub const PACKET_ID: i32 = 0x62;
+
+    /// Creates a new `ClientboundSetHeldItem` from its wire fields.
+    pub fn new(slot: i32) -> Self {
+        Self { slot }
+    }
+
+    /// Returns the `slot` field.
+    pub fn slot(&self) -> i32 {
+        self.slot
+    }
+
+    /// Decodes a `ClientboundSetHeldItem` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let slot = reader.read_var_int()?;
+        Ok(Self { slot })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        ferrumc_codec::write_var_int(buf, self.slot);
+        Ok(())
+    }
+}
+
 /// `SystemChat`: the play clientbound packet (wire id `0x72`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SystemChat {
@@ -2749,6 +2994,10 @@ pub enum ServerboundPlayPacket {
     SetPlayerPositionAndRotation(SetPlayerPositionAndRotation),
     /// The `PlayerAction` packet.
     PlayerAction(PlayerAction),
+    /// The `ServerboundSetHeldItem` packet.
+    ServerboundSetHeldItem(ServerboundSetHeldItem),
+    /// The `SetCreativeSlot` packet.
+    SetCreativeSlot(SetCreativeSlot),
     /// The `UseItemOn` packet.
     UseItemOn(UseItemOn),
 }
@@ -2775,6 +3024,12 @@ impl ServerboundPlayPacket {
                 SetPlayerPositionAndRotation::decode(reader)?,
             )),
             PlayerAction::PACKET_ID => Ok(Self::PlayerAction(PlayerAction::decode(reader)?)),
+            ServerboundSetHeldItem::PACKET_ID => Ok(Self::ServerboundSetHeldItem(
+                ServerboundSetHeldItem::decode(reader)?,
+            )),
+            SetCreativeSlot::PACKET_ID => {
+                Ok(Self::SetCreativeSlot(SetCreativeSlot::decode(reader)?))
+            }
             UseItemOn::PACKET_ID => Ok(Self::UseItemOn(UseItemOn::decode(reader)?)),
             other => Err(ProtoError::UnknownPacketId {
                 state: State::Play,
@@ -2795,6 +3050,8 @@ impl ServerboundPlayPacket {
             Self::SetPlayerPosition(_) => SetPlayerPosition::PACKET_ID,
             Self::SetPlayerPositionAndRotation(_) => SetPlayerPositionAndRotation::PACKET_ID,
             Self::PlayerAction(_) => PlayerAction::PACKET_ID,
+            Self::ServerboundSetHeldItem(_) => ServerboundSetHeldItem::PACKET_ID,
+            Self::SetCreativeSlot(_) => SetCreativeSlot::PACKET_ID,
             Self::UseItemOn(_) => UseItemOn::PACKET_ID,
         }
     }
@@ -2810,6 +3067,8 @@ impl ServerboundPlayPacket {
             Self::SetPlayerPosition(packet) => packet.encode(buf),
             Self::SetPlayerPositionAndRotation(packet) => packet.encode(buf),
             Self::PlayerAction(packet) => packet.encode(buf),
+            Self::ServerboundSetHeldItem(packet) => packet.encode(buf),
+            Self::SetCreativeSlot(packet) => packet.encode(buf),
             Self::UseItemOn(packet) => packet.encode(buf),
         }
     }
@@ -2828,6 +3087,10 @@ pub enum ClientboundPlayPacket {
     TabCompleteResponse(TabCompleteResponse),
     /// The `Commands` packet.
     Commands(Commands),
+    /// The `SetContainerContent` packet.
+    SetContainerContent(SetContainerContent),
+    /// The `SetContainerSlot` packet.
+    SetContainerSlot(SetContainerSlot),
     /// The `EntityTeleport` packet.
     EntityTeleport(EntityTeleport),
     /// The `UnloadChunk` packet.
@@ -2860,6 +3123,8 @@ pub enum ClientboundPlayPacket {
     SetCenterChunk(SetCenterChunk),
     /// The `SetDefaultSpawnPosition` packet.
     SetDefaultSpawnPosition(SetDefaultSpawnPosition),
+    /// The `ClientboundSetHeldItem` packet.
+    ClientboundSetHeldItem(ClientboundSetHeldItem),
     /// The `SystemChat` packet.
     SystemChat(SystemChat),
 }
@@ -2877,6 +3142,12 @@ impl ClientboundPlayPacket {
                 TabCompleteResponse::decode(reader)?,
             )),
             Commands::PACKET_ID => Ok(Self::Commands(Commands::decode(reader)?)),
+            SetContainerContent::PACKET_ID => Ok(Self::SetContainerContent(
+                SetContainerContent::decode(reader)?,
+            )),
+            SetContainerSlot::PACKET_ID => {
+                Ok(Self::SetContainerSlot(SetContainerSlot::decode(reader)?))
+            }
             EntityTeleport::PACKET_ID => Ok(Self::EntityTeleport(EntityTeleport::decode(reader)?)),
             UnloadChunk::PACKET_ID => Ok(Self::UnloadChunk(UnloadChunk::decode(reader)?)),
             GameEvent::PACKET_ID => Ok(Self::GameEvent(GameEvent::decode(reader)?)),
@@ -2915,6 +3186,9 @@ impl ClientboundPlayPacket {
             SetDefaultSpawnPosition::PACKET_ID => Ok(Self::SetDefaultSpawnPosition(
                 SetDefaultSpawnPosition::decode(reader)?,
             )),
+            ClientboundSetHeldItem::PACKET_ID => Ok(Self::ClientboundSetHeldItem(
+                ClientboundSetHeldItem::decode(reader)?,
+            )),
             SystemChat::PACKET_ID => Ok(Self::SystemChat(SystemChat::decode(reader)?)),
             other => Err(ProtoError::UnknownPacketId {
                 state: State::Play,
@@ -2932,6 +3206,8 @@ impl ClientboundPlayPacket {
             Self::BlockUpdate(_) => BlockUpdate::PACKET_ID,
             Self::TabCompleteResponse(_) => TabCompleteResponse::PACKET_ID,
             Self::Commands(_) => Commands::PACKET_ID,
+            Self::SetContainerContent(_) => SetContainerContent::PACKET_ID,
+            Self::SetContainerSlot(_) => SetContainerSlot::PACKET_ID,
             Self::EntityTeleport(_) => EntityTeleport::PACKET_ID,
             Self::UnloadChunk(_) => UnloadChunk::PACKET_ID,
             Self::GameEvent(_) => GameEvent::PACKET_ID,
@@ -2948,6 +3224,7 @@ impl ClientboundPlayPacket {
             Self::SetHeadRotation(_) => SetHeadRotation::PACKET_ID,
             Self::SetCenterChunk(_) => SetCenterChunk::PACKET_ID,
             Self::SetDefaultSpawnPosition(_) => SetDefaultSpawnPosition::PACKET_ID,
+            Self::ClientboundSetHeldItem(_) => ClientboundSetHeldItem::PACKET_ID,
             Self::SystemChat(_) => SystemChat::PACKET_ID,
         }
     }
@@ -2960,6 +3237,8 @@ impl ClientboundPlayPacket {
             Self::BlockUpdate(packet) => packet.encode(buf),
             Self::TabCompleteResponse(packet) => packet.encode(buf),
             Self::Commands(packet) => packet.encode(buf),
+            Self::SetContainerContent(packet) => packet.encode(buf),
+            Self::SetContainerSlot(packet) => packet.encode(buf),
             Self::EntityTeleport(packet) => packet.encode(buf),
             Self::UnloadChunk(packet) => packet.encode(buf),
             Self::GameEvent(packet) => packet.encode(buf),
@@ -2976,6 +3255,7 @@ impl ClientboundPlayPacket {
             Self::SetHeadRotation(packet) => packet.encode(buf),
             Self::SetCenterChunk(packet) => packet.encode(buf),
             Self::SetDefaultSpawnPosition(packet) => packet.encode(buf),
+            Self::ClientboundSetHeldItem(packet) => packet.encode(buf),
             Self::SystemChat(packet) => packet.encode(buf),
         }
     }

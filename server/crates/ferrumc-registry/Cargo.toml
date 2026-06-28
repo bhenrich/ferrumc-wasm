@@ -7,7 +7,15 @@ repository.workspace = true
 
 [dependencies]
 # Runtime is intentionally dependency-free: all registry data is hardcoded as
-# deterministic constants with zero boot cost (no JSON parsing at startup).
+# deterministic constants (block/biome/dimension) or build-time-generated static
+# arrays (items) with zero boot cost (no JSON parsing at startup).
+
+[build-dependencies]
+# Build-time only: the item registry tables are generated from the vendored
+# data/*.json snapshots in build.rs and emitted as static arrays, so the runtime
+# never parses JSON. These do not link into the runtime crate.
+serde = { workspace = true }       # derive Deserialize for the items.json schema
+serde_json = { workspace = true }  # parse the vendored items/mapping snapshots
 
 [dev-dependencies]
 # Drift guards only: parse the vendored minecraft-data snapshots and assert the

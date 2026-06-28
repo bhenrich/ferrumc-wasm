@@ -11,8 +11,15 @@
 
 ## Crate-Specific
 
-- The runtime is dependency-free and does no I/O or parsing: all registry data is
-  hardcoded as `const`. JSON/TOML parsing exists only under `#[cfg(test)]`.
+- The runtime is dependency-free and does no I/O or parsing. Block/biome/dimension
+  data is hardcoded as `const`; item data is generated at **build time** by
+  `build.rs` from the vendored `data/*.json` snapshots into static arrays emitted
+  to `OUT_DIR`. Either way the runtime never parses JSON and pays zero boot cost
+  (no `OnceCell`/`lazy_static`). JSON/TOML parsing exists only in `build.rs` and
+  under `#[cfg(test)]`.
+- `build.rs` MUST assert the item data's structural invariants (contiguous ids
+  `0..=N`, every item carries a `u8`-sized `max_stack_size`) and panic loudly on
+  drift, so a botched re-vendor fails the build instead of shipping wrong tables.
 - Block-state ids are fixed protocol constants and MUST equal the default state
   of the corresponding block in the vendored `blocks.json` at the pinned commit.
   The drift-guard tests enforce this; do not change a constant without re-pinning

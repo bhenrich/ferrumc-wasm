@@ -216,6 +216,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrumc-items"
+version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-codec",
+ "ferrumc-nbt",
+ "ferrumc-registry",
+ "thiserror",
+]
+
+[[package]]
 name = "ferrumc-math"
 version = "0.2.0-dev"
 dependencies = [

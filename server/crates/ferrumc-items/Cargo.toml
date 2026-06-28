@@ -1,0 +1,17 @@
+[package]
+name = "ferrumc-items"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The shared item model sits below the proto/sim lanes: it owns the slot wire
+# codec and hostile-input normalization, reusing the existing bounded primitives.
+ferrumc-codec = { workspace = true }    # VarInt + BoundedReader/BoundedBytes bounds
+ferrumc-nbt = { workspace = true }      # NbtTag + NbtLimits for NBT component data
+ferrumc-registry = { workspace = true } # item id/name/max-stack/block-state lookups
+thiserror = { workspace = true }        # classified ItemValidationError variants
+
+[lints]
+workspace = true

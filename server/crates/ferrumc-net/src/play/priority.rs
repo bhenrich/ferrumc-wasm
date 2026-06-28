@@ -142,6 +142,12 @@ impl OutboundPriority {
             // Both ride the State class.
             | ClientboundPlayPacket::Commands(_)
             | ClientboundPlayPacket::TabCompleteResponse(_)
+            // Inventory and held-item updates are authoritative state the client
+            // must reliably apply; dropping one desyncs its inventory view, so
+            // they ride the State class (not droppable World traffic).
+            | ClientboundPlayPacket::SetContainerContent(_)
+            | ClientboundPlayPacket::SetContainerSlot(_)
+            | ClientboundPlayPacket::ClientboundSetHeldItem(_)
             | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::State,
             ClientboundPlayPacket::BlockUpdate(_)
             | ClientboundPlayPacket::ChunkDataAndLight(_)
@@ -227,6 +233,12 @@ impl Criticality {
             // unrecoverable (later moves for an unknown entity id are ignored
             // client-side), so SpawnEntity is mandatory alongside the despawns.
             | ClientboundPlayPacket::SpawnEntity(_)
+            // Inventory/held-item updates are authoritative state: dropping one
+            // leaves the client's view of its inventory desynced until the next
+            // full container resync, so they are mandatory, not droppable.
+            | ClientboundPlayPacket::SetContainerContent(_)
+            | ClientboundPlayPacket::SetContainerSlot(_)
+            | ClientboundPlayPacket::ClientboundSetHeldItem(_)
             | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::Mandatory,
             ClientboundPlayPacket::BlockUpdate(_)
             | ClientboundPlayPacket::ChunkDataAndLight(_)

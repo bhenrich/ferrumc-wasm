@@ -9,6 +9,7 @@ members = [
     "crates/ferrumc-nbt",
     "crates/ferrumc-observability",
     "crates/ferrumc-registry",
+    "crates/ferrumc-items",
     "crates/ferrumc-proto",
     "crates/ferrumc-proto-gen",
     "crates/ferrumc-net",
@@ -98,6 +99,7 @@ ferrumc-codec = { path = "crates/ferrumc-codec" }
 ferrumc-nbt = { path = "crates/ferrumc-nbt" }
 ferrumc-observability = { path = "crates/ferrumc-observability" }
 ferrumc-registry = { path = "crates/ferrumc-registry" }
+ferrumc-items = { path = "crates/ferrumc-items" }
 ferrumc-proto = { path = "crates/ferrumc-proto" }
 ferrumc-proto-gen = { path = "crates/ferrumc-proto-gen" }
 ferrumc-net = { path = "crates/ferrumc-net" }

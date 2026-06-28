@@ -759,3 +759,79 @@ fields = [
     { name = "length", type = "varint" },
     { name = "matches", type = "prefixed_array<CommandSuggestionMatch>" },
 ]
+
+# --- Inventory / held item (data-component item slots) --------------------------
+#
+# Ids verified against fixtures/protocol/1_21_8/protocol.json (protocol 772):
+# serverbound set_creative_slot 0x37, held_item_slot 0x34; clientbound
+# window_items 0x12, set_slot 0x14, held_item_slot 0x62.
+#
+# Every slot-bearing field is carried as opaque `remaining_bytes` and hand-encoded
+# / decoded by the `ferrumc-items` crate. The real Slot/UntrustedSlot wire form is
+# count-first (itemCount varint; if non-zero, itemId + a type-id-keyed component
+# switch/byte-array) — a tagged union the closed packets.toml grammar cannot
+# express — so it follows the same opaque-bytes precedent as the Commands packet.
+# `remaining_bytes` must be a packet's final field, which is why SetContainerContent
+# folds its items array AND the carried item into one `payload`, and SetCreativeSlot
+# / SetContainerSlot put the slot `item` last.
+
+# minecraft-data: play.toServer.set_creative_slot ("Set Creative Mode Slot"). The
+# `item` is an UntrustedSlot, decoded + validated by ferrumc-items::UntrustedItemStack.
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "SetCreativeSlot"
+id = 0x37
+fields = [
+    { name = "slot", type = "i16" },
+    { name = "item", type = "remaining_bytes" },
+]
+
+# minecraft-data: play.toServer.held_item_slot ("Set Held Item"). NOTE: the
+# serverbound form is a fixed i16 slotId (the clientbound form below is a varint);
+# the two directions differ, so they are direction-prefixed.
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "ServerboundSetHeldItem"
+id = 0x34
+fields = [{ name = "slot", type = "i16" }]
+
+# minecraft-data: play.toClient.window_items ("Set Container Content"). `payload`
+# is the whole trusted body after the state id: a varint slot count, each slot,
+# then the carried (cursor) slot — built by
+# ferrumc-items::encode_container_content_payload. windowId is a ContainerID (varint).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SetContainerContent"
+id = 0x12
+fields = [
+    { name = "window_id", type = "varint" },
+    { name = "state_id", type = "varint" },
+    { name = "payload", type = "remaining_bytes" },
+]
+
+# minecraft-data: play.toClient.set_slot ("Set Container Slot"). `item` is a single
+# trusted Slot, encoded by ferrumc-items::ItemStack::encode_slot. windowId is a
+# ContainerID (varint).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SetContainerSlot"
+id = 0x14
+fields = [
+    { name = "window_id", type = "varint" },
+    { name = "state_id", type = "varint" },
+    { name = "slot", type = "i16" },
+    { name = "item", type = "remaining_bytes" },
+]
+
+# minecraft-data: play.toClient.held_item_slot ("Set Held Item"). The clientbound
+# form is a varint slot (the serverbound form above is an i16); direction-prefixed.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "ClientboundSetHeldItem"
+id = 0x62
+fields = [{ name = "slot", type = "varint" }]
