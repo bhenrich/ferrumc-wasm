@@ -19,9 +19,10 @@
 use ferrumc_command::{
     argument, literal, ArgumentType, CommandBuilder, CommandResult, CommandTree,
 };
-use ferrumc_core::{GameMode, TextColor, TextComponent};
-use ferrumc_math::Vec3;
+use ferrumc_core::{GameMode, PlayerId, TextColor, TextComponent};
+use ferrumc_math::{BlockPos, Cuboid, Vec3};
 use ferrumc_proto::generated::play::ClientboundPlayPacket;
+use ferrumc_registry::block_state::block_default_state;
 use ferrumc_session::{
     action_bar, boss_bar_add, boss_bar_remove, boss_bar_update_health, boss_bar_update_style,
     boss_bar_update_title, display_objective, objective_create, objective_remove, play_sound,
@@ -33,7 +34,10 @@ use ferrumc_session::{
     SOUND_EXPERIENCE_ORB_PICKUP, SOUND_NOTE_BLOCK_HARP, SOUND_PLAYER_LEVELUP,
     SOUND_UI_BUTTON_CLICK,
 };
+use ferrumc_sim::{BlockStateId, RegionOp};
 use uuid::Uuid;
+
+use crate::driver::SimCommand;
 
 /// The literal name of the teleport-to-spawn command.
 pub const SPAWN_COMMAND: &str = "spawn";
@@ -70,6 +74,30 @@ pub const BOSSBAR_COMMAND: &str = "bossbar";
 /// Permission *level* required to run the scoreboard/team/boss-bar commands
 /// (operator-tier, matching [`GAMEMODE_LEVEL`]).
 pub const SCOREBOARD_LEVEL: u8 = 2;
+
+/// The literal name of the region-fill command.
+pub const FILL_COMMAND: &str = "fill";
+/// The literal name of the region-replace command.
+pub const REPLACE_COMMAND: &str = "replace";
+/// The literal name of the undo-last-region-edit command.
+pub const UNDO_COMMAND: &str = "undo";
+
+/// Permission *level* required to run the region build commands (operator-tier,
+/// matching [`GAMEMODE_LEVEL`]). These mutate the world wholesale, so they are
+/// gated like every other powerful command.
+pub const REGION_EDIT_LEVEL: u8 = 2;
+
+/// Default ceiling on the number of blocks a single `/fill` or `/replace` may
+/// affect, used by the arg-less [`build_command_tree`]. Mirrors the configuration
+/// default `max_region_fill_volume` and `ferrumc_sim`'s built-in region cap; the
+/// running server threads its configured value through
+/// [`build_command_tree_with_limits`].
+pub const DEFAULT_REGION_VOLUME_CAP: u64 = 32_768;
+
+/// Usage shown when `/fill` arguments do not parse.
+const FILL_USAGE: &str = "usage: /fill <x1> <y1> <z1> <x2> <y2> <z2> <block>";
+/// Usage shown when `/replace` arguments do not parse.
+const REPLACE_USAGE: &str = "usage: /replace <x1> <y1> <z1> <x2> <y2> <z2> <from_block> <to_block>";
 
 /// Usage shown when `/scoreboard` arguments do not parse.
 const SCOREBOARD_USAGE: &str = "usage: /scoreboard objective add|remove <name> | \
@@ -111,13 +139,30 @@ const PARTICLE_COUNT: i32 = 1;
 /// colour argument in this slice.
 const DUST_DEFAULT_COLOR: (f32, f32, f32, f32) = (1.0, 0.0, 0.0, 1.0);
 
-/// Builds the application's [`CommandTree`], wiring `/spawn` and `/gamemode`.
+/// Builds the application's [`CommandTree`] with the default region-edit volume
+/// cap ([`DEFAULT_REGION_VOLUME_CAP`]).
+///
+/// A convenience wrapper over [`build_command_tree_with_limits`] for tests and
+/// any caller that does not thread configuration; the running server passes its
+/// configured cap. See that function for the full command set.
+pub fn build_command_tree() -> CommandTree {
+    build_command_tree_with_limits(DEFAULT_REGION_VOLUME_CAP)
+}
+
+/// Builds the application's [`CommandTree`], wiring `/spawn`, `/gamemode`, the
+/// presentation and scoreboard commands, and the region build commands
+/// (`/fill`, `/replace`, `/undo`).
 ///
 /// `/spawn` always succeeds (its teleport side effect is applied by the
 /// connection on a successful dispatch). `/gamemode <mode>` takes an integer in
 /// `0..=3`, range-checked by the argument type and mapped to a [`GameMode`];
 /// it requires permission level [`GAMEMODE_LEVEL`].
-pub fn build_command_tree() -> CommandTree {
+///
+/// `region_volume_cap` bounds `/fill` and `/replace`: a cuboid larger than it is
+/// rejected with a clear command error (the user-facing gate). The simulation
+/// re-checks the cap defensively. The block mutations are routed to the
+/// simulation by [`region_commands`] on a successful dispatch.
+pub fn build_command_tree_with_limits(region_volume_cap: u64) -> CommandTree {
     let mut tree = CommandTree::new();
 
     tree.register(literal(SPAWN_COMMAND).executes(|ctx| {
@@ -207,6 +252,21 @@ pub fn build_command_tree() -> CommandTree {
     tree.register(greedy_command(BOSSBAR_COMMAND, BOSSBAR_USAGE, |args| {
         parse_bossbar(args).map(|a| a.feedback())
     }));
+
+    // Region build commands. `/fill` and `/replace` validate their cuboid against
+    // `region_volume_cap` (captured by the executor) and report a clear error when
+    // it is exceeded; the block mutations themselves are routed to the simulation
+    // by `region_commands` on a successful dispatch. `/undo` takes no arguments —
+    // the simulation no-ops when the issuer has no recorded edit.
+    tree.register(region_fill_command(region_volume_cap));
+    tree.register(region_replace_command(region_volume_cap));
+    tree.register(
+        literal(UNDO_COMMAND)
+            .requires_level(REGION_EDIT_LEVEL)
+            .executes(|_| {
+                CommandResult::success(TextComponent::text("Undoing your last region edit"))
+            }),
+    );
 
     tree
 }
@@ -795,6 +855,151 @@ fn particle_by_name(name: &str) -> Option<ParticleChoice> {
     Some(choice)
 }
 
+// ---------------------------------------------------------------------------
+// /fill, /replace, /undo — region build commands
+// ---------------------------------------------------------------------------
+
+/// Builds the `/fill <x1> <y1> <z1> <x2> <y2> <z2> <block>` command.
+///
+/// The executor parses the cuboid and block name, then reports success or a
+/// clear over-cap error; `cap` (the configured volume limit) is captured so the
+/// feedback is generated where the user sees it. The block mutations are applied
+/// by [`region_commands`] on success.
+fn region_fill_command(cap: u64) -> CommandBuilder {
+    literal(FILL_COMMAND)
+        .requires_level(REGION_EDIT_LEVEL)
+        .then(
+            argument("args", ArgumentType::GreedyString).executes(move |ctx| {
+                let args = ctx.string("args").unwrap_or_default();
+                match parse_fill_args(args) {
+                    Some((region, _)) => {
+                        bounded_feedback(region, cap, format!("Filled {} blocks", region.volume()))
+                    }
+                    None => CommandResult::failure(TextComponent::text(FILL_USAGE)),
+                }
+            }),
+        )
+}
+
+/// Builds the `/replace <x1> <y1> <z1> <x2> <y2> <z2> <from> <to>` command. As
+/// with [`region_fill_command`], the executor validates and reports feedback and
+/// [`region_commands`] applies the change on success.
+fn region_replace_command(cap: u64) -> CommandBuilder {
+    literal(REPLACE_COMMAND)
+        .requires_level(REGION_EDIT_LEVEL)
+        .then(
+            argument("args", ArgumentType::GreedyString).executes(move |ctx| {
+                let args = ctx.string("args").unwrap_or_default();
+                match parse_replace_args(args) {
+                    Some((region, _, _)) => bounded_feedback(
+                        region,
+                        cap,
+                        format!("Replacing blocks across a {}-block region", region.volume()),
+                    ),
+                    None => CommandResult::failure(TextComponent::text(REPLACE_USAGE)),
+                }
+            }),
+        )
+}
+
+/// Reports a region command's success, or a clear failure when the cuboid's
+/// volume exceeds `cap` — the denial-of-service gate that stops one command from
+/// addressing an unbounded number of blocks.
+fn bounded_feedback(region: Cuboid, cap: u64, success: String) -> CommandResult {
+    let volume = region.volume();
+    if volume > cap {
+        CommandResult::failure(TextComponent::text(format!(
+            "region too large: {volume} blocks exceeds the {cap}-block limit"
+        )))
+    } else {
+        CommandResult::success(TextComponent::text(success))
+    }
+}
+
+/// Builds the [`SimCommand`]s a successfully dispatched region command produces,
+/// or an empty vector for any other command.
+///
+/// Mirrors [`presentation_packets`]/[`scoreboard_packets`]: the connection calls
+/// this after a successful dispatch and sends each command to the simulation
+/// driver, which routes it to the issuer's shard as a region edit/undo applied
+/// through the shard-owned block funnel. `player` is the issuer (the edit's actor
+/// and the key for its undo history). Re-parses the same arguments the executor
+/// validated; an over-cap region never reaches here (the executor already
+/// rejected it), and the simulation re-checks the cap defensively regardless.
+pub(crate) fn region_commands(command: &str, player: PlayerId) -> Vec<SimCommand> {
+    let Some(name) = command.split_whitespace().next() else {
+        return Vec::new();
+    };
+    let args = command_args(command);
+    match name {
+        FILL_COMMAND => match parse_fill_args(args) {
+            Some((region, state)) => vec![SimCommand::RegionEdit {
+                player,
+                region,
+                op: RegionOp::Fill { state },
+            }],
+            None => Vec::new(),
+        },
+        REPLACE_COMMAND => match parse_replace_args(args) {
+            Some((region, from, to)) => vec![SimCommand::RegionEdit {
+                player,
+                region,
+                op: RegionOp::Replace { from, to },
+            }],
+            None => Vec::new(),
+        },
+        // `/undo` takes no arguments; a trailing token makes it a parse miss.
+        UNDO_COMMAND if args.is_empty() => vec![SimCommand::RegionUndo { player }],
+        _ => Vec::new(),
+    }
+}
+
+/// Parses a `/fill` argument tail (`<x1> <y1> <z1> <x2> <y2> <z2> <block>`) into
+/// its cuboid and fill block-state, or `None` if it is malformed (bad
+/// coordinate, unknown block, or trailing tokens).
+fn parse_fill_args(args: &str) -> Option<(Cuboid, BlockStateId)> {
+    let mut tokens = args.split_whitespace();
+    let region = parse_cuboid(&mut tokens)?;
+    let state = block_state_by_name(tokens.next()?)?;
+    only((), tokens)?;
+    Some((region, state))
+}
+
+/// Parses a `/replace` argument tail
+/// (`<x1> <y1> <z1> <x2> <y2> <z2> <from> <to>`) into its cuboid and the from/to
+/// block-states, or `None` if it is malformed.
+fn parse_replace_args(args: &str) -> Option<(Cuboid, BlockStateId, BlockStateId)> {
+    let mut tokens = args.split_whitespace();
+    let region = parse_cuboid(&mut tokens)?;
+    let from = block_state_by_name(tokens.next()?)?;
+    let to = block_state_by_name(tokens.next()?)?;
+    only((), tokens)?;
+    Some((region, from, to))
+}
+
+/// Reads six whitespace-separated `i32` coordinates (`x1 y1 z1 x2 y2 z2`) from
+/// `tokens` and builds the inclusive [`Cuboid`] they bound, or `None` if a
+/// coordinate is missing or not an integer.
+fn parse_cuboid<'a>(tokens: &mut impl Iterator<Item = &'a str>) -> Option<Cuboid> {
+    let x1: i32 = tokens.next()?.parse().ok()?;
+    let y1: i32 = tokens.next()?.parse().ok()?;
+    let z1: i32 = tokens.next()?.parse().ok()?;
+    let x2: i32 = tokens.next()?.parse().ok()?;
+    let y2: i32 = tokens.next()?.parse().ok()?;
+    let z2: i32 = tokens.next()?.parse().ok()?;
+    Some(Cuboid::new(
+        BlockPos::new(x1, y1, z1),
+        BlockPos::new(x2, y2, z2),
+    ))
+}
+
+/// Resolves a block resource location (`"minecraft:stone"` or the bare
+/// `"stone"`) to its default block-state id via the registry, or `None` for an
+/// unknown block.
+fn block_state_by_name(name: &str) -> Option<BlockStateId> {
+    block_default_state(name).map(BlockStateId::new)
+}
+
 #[cfg(test)]
 mod tests {
     use ferrumc_command::{CommandError, CommandSource};
@@ -1216,5 +1421,136 @@ mod tests {
             .expect("no error")
             .is_empty());
         assert!(scoreboard_packets("", ISSUER).expect("no error").is_empty());
+    }
+
+    /// The operator-level player used as the issuer in region-command tests.
+    fn region_player() -> PlayerId {
+        PlayerId::offline("Builder")
+    }
+
+    #[test]
+    fn region_commands_require_operator_level() {
+        let tree = build_command_tree();
+        let member = CommandSource::for_player(PlayerId::offline("Joe"), "Joe", 0);
+        for cmd in [
+            "fill 0 64 0 2 65 2 stone",
+            "replace 0 64 0 2 65 2 stone dirt",
+            "undo",
+        ] {
+            let err = tree.dispatch(cmd, &member).expect_err("member lacks level");
+            assert!(matches!(err, CommandError::PermissionDenied(_)), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn fill_dispatches_and_builds_a_region_fill() {
+        let tree = build_command_tree();
+        let cmd = "fill 0 64 0 2 65 2 stone";
+        assert!(tree.dispatch(cmd, &op()).expect("dispatches").is_success());
+
+        let player = region_player();
+        let cmds = region_commands(cmd, player);
+        let [SimCommand::RegionEdit {
+            player: p,
+            region,
+            op,
+        }] = cmds.as_slice()
+        else {
+            panic!("/fill builds one RegionEdit");
+        };
+        assert_eq!(*p, player);
+        assert_eq!(
+            *region,
+            Cuboid::new(BlockPos::new(0, 64, 0), BlockPos::new(2, 65, 2))
+        );
+        assert!(matches!(op, RegionOp::Fill { state } if *state == BlockStateId::new(1)));
+    }
+
+    #[test]
+    fn fill_accepts_a_namespaced_block_name() {
+        let cmds = region_commands("fill 0 0 0 0 0 0 minecraft:stone", region_player());
+        let [SimCommand::RegionEdit { op, .. }] = cmds.as_slice() else {
+            panic!("expected a RegionEdit");
+        };
+        assert!(matches!(op, RegionOp::Fill { state } if *state == BlockStateId::new(1)));
+    }
+
+    #[test]
+    fn replace_dispatches_and_builds_a_region_replace() {
+        let tree = build_command_tree();
+        let cmd = "replace 0 64 0 2 65 2 stone dirt";
+        assert!(tree.dispatch(cmd, &op()).expect("dispatches").is_success());
+
+        let cmds = region_commands(cmd, region_player());
+        let [SimCommand::RegionEdit { region, op, .. }] = cmds.as_slice() else {
+            panic!("/replace builds one RegionEdit");
+        };
+        assert_eq!(
+            *region,
+            Cuboid::new(BlockPos::new(0, 64, 0), BlockPos::new(2, 65, 2))
+        );
+        assert!(matches!(
+            op,
+            RegionOp::Replace { from, to }
+                if *from == BlockStateId::new(1) && *to == BlockStateId::new(10)
+        ));
+    }
+
+    #[test]
+    fn undo_dispatches_and_builds_a_region_undo() {
+        let tree = build_command_tree();
+        assert!(tree
+            .dispatch("undo", &op())
+            .expect("dispatches")
+            .is_success());
+        let player = region_player();
+        assert!(matches!(
+            region_commands("undo", player).as_slice(),
+            [SimCommand::RegionUndo { player: p }] if *p == player
+        ));
+        // A trailing token makes /undo a parse miss for the side effect.
+        assert!(region_commands("undo now", player).is_empty());
+    }
+
+    #[test]
+    fn fill_over_the_volume_cap_is_rejected_with_a_clear_error() {
+        // Cap of 8 blocks; a 5x1x5 = 25-block region is rejected.
+        let tree = build_command_tree_with_limits(8);
+        let result = tree
+            .dispatch("fill 0 64 0 4 64 4 stone", &op())
+            .expect("reaches the handler");
+        assert!(!result.is_success());
+        assert!(result
+            .feedback()
+            .to_plain_string()
+            .contains("region too large"));
+    }
+
+    #[test]
+    fn fill_rejects_malformed_arguments() {
+        let tree = build_command_tree();
+        for cmd in [
+            "fill 0 64 0 2 65 stone",         // missing a coordinate
+            "fill 0 64 0 2 65 2 notablock",   // unknown block
+            "fill 0 64 0 2 65 2 stone extra", // trailing token
+            "fill a b c d e f stone",         // non-integer coordinates
+        ] {
+            assert!(
+                !tree
+                    .dispatch(cmd, &op())
+                    .expect("reaches handler")
+                    .is_success(),
+                "{cmd}"
+            );
+            assert!(region_commands(cmd, region_player()).is_empty(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn region_commands_ignore_other_commands() {
+        let player = region_player();
+        assert!(region_commands("spawn", player).is_empty());
+        assert!(region_commands("gamemode 1", player).is_empty());
+        assert!(region_commands("", player).is_empty());
     }
 }

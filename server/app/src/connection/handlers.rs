@@ -611,6 +611,18 @@ async fn handle_command(
         enqueue_traced_classified(writer, debug, compression, &ctx.clock, packet);
     }
 
+    // Region build commands (/fill, /replace, /undo) carry their effect as block
+    // mutations the simulation owns; route each to the issuer's shard through the
+    // block-mutation funnel (the same path single edits use). `region_commands`
+    // returns empty for every other command — and for an over-cap region, which
+    // the executor already rejected above with a clear error.
+    for sim_command in crate::command::region_commands(command, player) {
+        ctx.commands
+            .send(sim_command)
+            .await
+            .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+    }
+
     let first_token = command.split_whitespace().next();
     if first_token == Some(SPAWN_COMMAND) {
         let spawn = policy.spawn();

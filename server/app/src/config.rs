@@ -53,6 +53,16 @@ const DEFAULT_TICKS_PER_SECOND: u32 = 20;
 /// entirely, which is the default so an unconfigured server protects nothing.
 const DEFAULT_SPAWN_PROTECT_RADIUS: i32 = 0;
 
+/// Default ceiling on the number of blocks a single `/fill` or `/replace` may
+/// affect. `32_768` is a 32x32x32 cube — generous for shaping terrain on camera
+/// while bounding the per-tick work one command can demand. Mirrors the built-in
+/// default of [`ferrumc_sim::RegionLimits`].
+const DEFAULT_MAX_REGION_FILL_VOLUME: u64 = 32_768;
+
+/// Default number of undoable region edits retained per player before the oldest
+/// is evicted. Bounds per-player `/undo` memory together with the volume cap.
+const DEFAULT_REGION_UNDO_HISTORY: usize = 16;
+
 /// Default play-phase keep-alive interval, in milliseconds.
 ///
 /// A vanilla client disconnects if it hears no Keep Alive for 20 s, so the server
@@ -110,6 +120,13 @@ pub struct AppConfig {
     pub spawn_protect_radius: i32,
     /// Names of players granted the spawn-protection bypass permission.
     pub spawn_protect_bypass: Vec<String>,
+    /// Maximum number of blocks a single `/fill` or `/replace` command may affect.
+    /// A larger region is rejected with a command error, bounding the per-tick work
+    /// (and undo memory) one operator command can demand.
+    pub max_region_fill_volume: u64,
+    /// Number of undoable region edits retained per player before the oldest is
+    /// evicted (the `/undo` history depth).
+    pub region_undo_history: usize,
     /// Interval between clientbound play-phase Keep Alive pings.
     pub keep_alive_interval: Duration,
     /// How often a standing player's view is pumped toward the full advertised
@@ -190,6 +207,8 @@ impl Default for AppConfig {
             plugins_dir: None,
             spawn_protect_radius: DEFAULT_SPAWN_PROTECT_RADIUS,
             spawn_protect_bypass: Vec::new(),
+            max_region_fill_volume: DEFAULT_MAX_REGION_FILL_VOLUME,
+            region_undo_history: DEFAULT_REGION_UNDO_HISTORY,
             keep_alive_interval: Duration::from_millis(DEFAULT_KEEP_ALIVE_INTERVAL_MS),
             chunk_stream_interval: Duration::from_millis(DEFAULT_CHUNK_STREAM_INTERVAL_MS),
             ops: Vec::new(),
@@ -237,6 +256,10 @@ struct RawConfig {
     spawn_protect_radius: Option<i32>,
     /// Override for [`AppConfig::spawn_protect_bypass`].
     spawn_protect_bypass: Option<Vec<String>>,
+    /// Override for [`AppConfig::max_region_fill_volume`].
+    max_region_fill_volume: Option<u64>,
+    /// Override for [`AppConfig::region_undo_history`].
+    region_undo_history: Option<usize>,
     /// Override for [`AppConfig::keep_alive_interval`], expressed in milliseconds.
     keep_alive_interval_ms: Option<u64>,
     /// Override for [`AppConfig::chunk_stream_interval`], expressed in milliseconds.
@@ -318,6 +341,12 @@ impl RawConfig {
             spawn_protect_bypass: self
                 .spawn_protect_bypass
                 .unwrap_or(defaults.spawn_protect_bypass),
+            max_region_fill_volume: self
+                .max_region_fill_volume
+                .unwrap_or(defaults.max_region_fill_volume),
+            region_undo_history: self
+                .region_undo_history
+                .unwrap_or(defaults.region_undo_history),
             keep_alive_interval: self
                 .keep_alive_interval_ms
                 .map_or(defaults.keep_alive_interval, Duration::from_millis),
@@ -366,6 +395,8 @@ mod tests {
             plugins_dir = "/srv/plugins"
             spawn_protect_radius = 12
             spawn_protect_bypass = ["Admin", "Mod"]
+            max_region_fill_volume = 4096
+            region_undo_history = 3
             keep_alive_interval_ms = 250
             chunk_stream_interval_ms = 33
             ops = ["Admin"]
@@ -387,6 +418,8 @@ mod tests {
         assert_eq!(parsed.plugins_dir, Some(PathBuf::from("/srv/plugins")));
         assert_eq!(parsed.spawn_protect_radius, 12);
         assert_eq!(parsed.spawn_protect_bypass, vec!["Admin", "Mod"]);
+        assert_eq!(parsed.max_region_fill_volume, 4096);
+        assert_eq!(parsed.region_undo_history, 3);
         assert_eq!(parsed.keep_alive_interval, Duration::from_millis(250));
         assert_eq!(parsed.chunk_stream_interval, Duration::from_millis(33));
         assert_eq!(parsed.ops, vec!["Admin"]);
@@ -423,6 +456,13 @@ mod tests {
         assert_eq!(parsed.spawn_protect_radius, 0);
         assert!(parsed.spawn_protect_bypass.is_empty());
         assert_eq!(parsed.plugins_dir, None);
+    }
+
+    #[test]
+    fn region_edit_limits_default_to_a_32x32x32_cube_and_16_undos() {
+        let parsed = AppConfig::from_toml_str("").expect("empty config is valid");
+        assert_eq!(parsed.max_region_fill_volume, 32_768);
+        assert_eq!(parsed.region_undo_history, 16);
     }
 
     #[test]

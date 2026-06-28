@@ -50,7 +50,7 @@ use ferrumc_plugin_host::{
 };
 use ferrumc_plugin_spawn_protect::{bypass_node, SpawnProtect, SpawnProtectPlugin, CONFIG_KEY};
 
-use crate::command::build_command_tree;
+use crate::command::build_command_tree_with_limits;
 use crate::config::AppConfig;
 
 /// Permission *level* granted to a configured operator.
@@ -477,7 +477,7 @@ pub(crate) fn build_play_policy(
     let policy = PlayPolicy {
         guard,
         permissions,
-        command_tree: build_command_tree(),
+        command_tree: build_command_tree_with_limits(config.max_region_fill_volume),
         spawn: config.spawn,
         ops,
         default_permission_level: config.default_permission_level,

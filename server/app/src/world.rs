@@ -23,7 +23,7 @@ use ferrumc_proto::types::BlockPosition;
 use ferrumc_registry::dimension;
 use std::sync::Arc;
 
-use ferrumc_sim::{SimShard, SpawnChunkTickets};
+use ferrumc_sim::{RegionLimits, SimShard, SpawnChunkTickets};
 use ferrumc_storage::{InMemoryStore, PlayerStore, RedbStore, WorldStore};
 use ferrumc_world::{
     encode_chunk_section_data, pack_motion_blocking_heightmap, Chunk, ChunkLightData,
@@ -171,6 +171,12 @@ pub(crate) async fn build_world(
     let spawn = SpawnChunkTickets::new(spawn_center_chunk(config), config.spawn_chunk_radius);
 
     let mut shard = SimShard::new(shard_pos);
+    // Bound the region build commands (/fill, /replace, /undo) with the operator's
+    // configured caps; the shard re-checks these defensively on every region edit.
+    shard.set_region_limits(RegionLimits {
+        max_volume: config.max_region_fill_volume,
+        max_undo_entries: config.region_undo_history,
+    });
     shard
         .loaded_chunks_mut()
         .acquire_spawn(&*store, &generator, &spawn)

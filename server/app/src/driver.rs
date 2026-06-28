@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
 use ferrumc_core::{GameMode, PlayerId, TextComponent, Tick};
-use ferrumc_math::{BlockPos, ChunkPos, Direction, Vec3};
+use ferrumc_math::{BlockPos, ChunkPos, Cuboid, Direction, Vec3};
 use ferrumc_observability::{
     ChunkPosSnapshot, CounterRegistry, MutationKind, MutationResult, NetTelemetryHub,
     PlayerSnapshot, ServerClock, ServerSnapshotParts, SnapshotPublisher, TickMetrics, Vec3Snapshot,
@@ -34,8 +34,8 @@ use ferrumc_observability::{
 use ferrumc_proto::generated::play::ChunkDataAndLight;
 use ferrumc_session::{NetEvent, PlayerSessionHandle, SessionError, SessionRouter};
 use ferrumc_sim::{
-    BlockStateId, ChunkTicket, GameInput, GameOutput, MutationCause, PendingMutation, SimShard,
-    TicketReason,
+    BlockStateId, ChunkTicket, GameInput, GameOutput, MutationCause, PendingMutation, RegionOp,
+    SimShard, TicketReason,
 };
 use ferrumc_storage::{
     BlockMutationLogRecord, MutationActor, MutationLogCause, SchemaVersion, WorldStore,
@@ -270,6 +270,31 @@ pub(crate) enum SimCommand {
         sequence: i32,
         /// The exact block-state to write, applied verbatim.
         state: BlockStateId,
+    },
+    /// Apply a region (cuboid) block edit on behalf of `player` — the `/fill` and
+    /// `/replace` commands.
+    ///
+    /// Routed to the player's shard as a single [`GameInput::RegionEdit`], so the
+    /// whole cuboid is applied at one tick boundary through the shard-owned
+    /// block-edit funnel (persist + broadcast, no ack), capturing the prior states
+    /// for `/undo`. The region is bounded: the command layer rejects an over-cap
+    /// cuboid before this is ever sent, and the shard re-checks defensively.
+    RegionEdit {
+        /// The player on whose behalf the edit is applied (keys the undo history).
+        player: PlayerId,
+        /// The cuboid of blocks the edit addresses.
+        region: Cuboid,
+        /// How every block in the cuboid changes.
+        op: RegionOp,
+    },
+    /// Undo `player`'s most recent region edit — the `/undo` command.
+    ///
+    /// Routed to the player's shard as a [`GameInput::RegionUndo`], which restores
+    /// the prior block-states the last edit captured. A no-op if the player has no
+    /// recorded edits.
+    RegionUndo {
+        /// The player whose most recent region edit is undone.
+        player: PlayerId,
     },
     /// Resync + acknowledge a block edit refused at the connection (a plugin
     /// `Deny` / spawn-protection veto) without mutating the world.
@@ -650,6 +675,23 @@ async fn handle_command(
                 },
             ) {
                 tracing::trace!(%err, "dropping exact block set");
+            }
+        }
+        SimCommand::RegionEdit { player, region, op } => {
+            // Route the whole cuboid as one input so it applies at a single tick
+            // boundary (and never blows the bounded shard inbox). A gone player has
+            // no shard to route to.
+            if let Err(err) =
+                router.route_game_input(player, GameInput::RegionEdit { player, region, op })
+            {
+                tracing::trace!(%err, "dropping region edit");
+            }
+        }
+        SimCommand::RegionUndo { player } => {
+            // Route the undo to the player's shard, which restores the prior states
+            // its last region edit captured. A gone player has no shard to route to.
+            if let Err(err) = router.route_game_input(player, GameInput::RegionUndo { player }) {
+                tracing::trace!(%err, "dropping region undo");
             }
         }
         SimCommand::RejectBlockEdit {
