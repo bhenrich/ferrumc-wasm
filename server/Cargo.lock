@@ -390,6 +390,12 @@ dependencies = [
 [[package]]
 name = "ferrumc-config"
 version = "0.2.0-dev"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
 
 [[package]]
 name = "ferrumc-core"

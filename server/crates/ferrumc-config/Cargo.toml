@@ -6,9 +6,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Add workspace dependencies as needed
+# Declarative config shapes are deserialized straight from the operator's TOML.
+serde = { workspace = true }
+# Classifying, structured error variants for config resolution failures (e.g. an
+# unreadable whitelist/ban file) instead of opaque strings.
+thiserror = { workspace = true }
+# Whitelist/ban entries may be UUIDs; parsing and matching them needs the Uuid type.
+uuid = { workspace = true }
 
 [dev-dependencies]
+# Drives the whitelist/ban *file* resolution tests against throwaway on-disk files
+# without polluting the working tree.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
