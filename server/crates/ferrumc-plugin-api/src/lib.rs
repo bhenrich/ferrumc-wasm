@@ -57,8 +57,9 @@ pub use command::CommandRegistrar;
 pub use context::{EventContext, SetupContext, TeardownContext};
 pub use error::{CapabilityError, IntentError, PluginError, StorageError};
 pub use event::{
-    BlockBreakAttempt, BlockPlaceAttempt, EventKind, EventRegistrar, PluginBlockDecision,
-    PluginEvent, MAX_EMITTED_INTENTS,
+    BlockBreakAttempt, BlockPlaceAttempt, ChatAttempt, EventKind, EventRegistrar, InteractAttempt,
+    InteractHand, InteractTarget, PluginBlockDecision, PluginEvent, PluginEventDecision,
+    MAX_EMITTED_INTENTS,
 };
 pub use metadata::PluginMetadata;
 pub use permission::PermissionApi;

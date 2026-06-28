@@ -2,7 +2,10 @@
 
 use crate::context::{EventContext, SetupContext, TeardownContext};
 use crate::error::PluginError;
-use crate::event::{BlockBreakAttempt, BlockPlaceAttempt, PluginBlockDecision, PluginEvent};
+use crate::event::{
+    BlockBreakAttempt, BlockPlaceAttempt, ChatAttempt, InteractAttempt, PluginBlockDecision,
+    PluginEvent, PluginEventDecision,
+};
 use crate::metadata::PluginMetadata;
 
 /// An in-process plugin: a Rust type the host owns and drives through its
@@ -101,6 +104,46 @@ pub trait Plugin: Send {
     ) -> PluginBlockDecision {
         let _ = (ev, ctx);
         PluginBlockDecision::Allow
+    }
+
+    /// Decides whether a pending chat message proceeds, at the intent boundary —
+    /// before the line is broadcast.
+    ///
+    /// Gated behind the [`VetoEvents`](crate::Capability::VetoEvents) capability:
+    /// the host only consults plugins that hold it. The default implementation
+    /// returns [`PluginEventDecision::Allow`], so a plugin opts in only by
+    /// overriding this. Returning [`Deny`](PluginEventDecision::Deny) drops the
+    /// line (a chat filter) and optionally shows the sender a reason.
+    ///
+    /// # Isolation and fail-safe
+    ///
+    /// Runs with the same panic isolation as every other hook. If it panics, the
+    /// host catches it, disables the plugin, and treats the contribution as
+    /// [`Deny`](PluginEventDecision::Deny) so a broken filter fails closed.
+    ///
+    /// UNSTABLE / dev-only: part of the in-development event-decision surface; its
+    /// shape may change without a compatibility guarantee.
+    fn before_chat(&mut self, ev: &ChatAttempt, ctx: &mut EventContext<'_>) -> PluginEventDecision {
+        let _ = (ev, ctx);
+        PluginEventDecision::Allow
+    }
+
+    /// Decides whether a pending interaction (a right-click on a block, the air, or
+    /// an entity) proceeds, at the intent boundary — before it is acted on.
+    ///
+    /// The interaction counterpart of [`Plugin::before_chat`]; the same
+    /// [`VetoEvents`](crate::Capability::VetoEvents) gate, panic isolation, and
+    /// fail-safe-to-[`Deny`](PluginEventDecision::Deny) rules apply. The default
+    /// implementation returns [`PluginEventDecision::Allow`].
+    ///
+    /// UNSTABLE / dev-only: part of the in-development event-decision surface.
+    fn before_interact(
+        &mut self,
+        ev: &InteractAttempt,
+        ctx: &mut EventContext<'_>,
+    ) -> PluginEventDecision {
+        let _ = (ev, ctx);
+        PluginEventDecision::Allow
     }
 
     /// Called once when the plugin is disabled.
