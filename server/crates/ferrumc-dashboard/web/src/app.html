@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en" data-theme="forge">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="FerrumC live server observability console" />
+    <title>FerrumC · console</title>
+    <style>
+      /* Paint the forge-dark base before the bundle loads to avoid a white flash. */
+      html { background: #0b0c0e; }
+    </style>
+    %sveltekit.head%
+  </head>
+  <body data-sveltekit-preload-data="hover">
+    <noscript>
+      <div style="font-family: ui-monospace, monospace; color: #c4ccd6; background: #0b0c0e; padding: 24px;">
+        The FerrumC console needs JavaScript. Raw telemetry is still available at
+        <a style="color:#e8731f" href="/api/snapshot">/api/snapshot</a>.
+      </div>
+    </noscript>
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>

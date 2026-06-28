@@ -16,6 +16,10 @@ tokio = { workspace = true }
 serde = { workspace = true }
 # JSON rendering for the dashboard's data endpoints.
 serde_json = { workspace = true }
+# `stream::unfold` builds the `/events` SSE body from a tokio interval + the
+# snapshot publisher. Already compiled in-tree (a transitive dependency of axum),
+# so this adds no new crate to the build graph — only the dependency edge.
+futures-util = "0.3"
 # Service abstraction underlying the axum middleware stack.
 tower = { workspace = true }
 # Static-asset serving (`ServeDir` for the htmx page) and request tracing for the

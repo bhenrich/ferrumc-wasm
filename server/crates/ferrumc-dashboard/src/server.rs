@@ -1,10 +1,12 @@
-//! The axum router and the read-only method guard.
+//! The axum router, the read-only method guard, and the static SPA service.
 //!
-//! The router carries the [`SnapshotPublisher`] as shared state and exposes one
-//! `GET` route per page. A [`from_fn`](axum::middleware::from_fn) layer rejects
-//! any method other than `GET`/`HEAD` with `405 Method Not Allowed`, so the
-//! dashboard is read-only by construction: there is no route that mutates server
-//! state, and non-read methods never reach a handler.
+//! The router carries the [`SnapshotPublisher`] as shared state and exposes the
+//! two read-only data endpoints ([`api::snapshot`], [`api::events`]) plus a
+//! [`ServeDir`] static service for the built single-page app. A
+//! [`from_fn`](axum::middleware::from_fn) layer rejects any method other than
+//! `GET`/`HEAD` with `405 Method Not Allowed`, so the dashboard stays read-only by
+//! construction: there is no route that mutates server state, and non-read methods
+//! never reach a handler or the file service.
 
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
@@ -13,29 +15,43 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use ferrumc_observability::SnapshotPublisher;
+use tower_http::services::{ServeDir, ServeFile};
 
-use crate::pages;
+use crate::api;
+
+/// Absolute path to the committed SPA build output (`dist/`), resolved at compile
+/// time from the crate root so the binary serves the right directory regardless of
+/// the working directory it is launched from.
+const DIST_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/dist");
 
 /// Builds the dashboard router over `snapshots`.
 ///
+/// Routes:
+/// - `GET /api/snapshot` — one-shot JSON snapshot.
+/// - `GET /events` — Server-Sent Events live snapshot stream.
+/// - everything else — the static SPA from `dist/`, with `index.html` as the
+///   not-found fallback so client-side navigation survives a hard refresh.
+///
 /// Every route is a `GET`; the method-guard layer turns any other verb into a
-/// `405` before a handler runs.
+/// `405` before a handler or the file service runs.
 pub fn router(snapshots: SnapshotPublisher) -> Router {
+    // Serve built assets; fall back to the SPA shell so a refresh on any client
+    // route still loads the app rather than 404ing.
+    let spa = ServeDir::new(DIST_DIR)
+        .append_index_html_on_directories(true)
+        .fallback(ServeFile::new(format!("{DIST_DIR}/index.html")));
+
     Router::new()
-        .route("/", get(pages::overview))
-        .route("/players", get(pages::players))
-        .route("/world", get(pages::world))
-        .route("/packet-trace", get(pages::packet_trace))
-        .route("/backpressure", get(pages::backpressure))
-        .route("/plugins", get(pages::plugins))
-        .route("/persistence", get(pages::persistence))
-        .route("/checklist", get(pages::checklist))
+        .route("/api/snapshot", get(api::snapshot))
+        .route("/events", get(api::events))
+        .fallback_service(spa)
         .layer(middleware::from_fn(reject_non_get))
         .with_state(snapshots)
 }
 
 /// Rejects any method other than `GET`/`HEAD` with `405`, enforcing the
-/// dashboard's read-only contract.
+/// dashboard's read-only contract across both the data endpoints and the static
+/// file service.
 async fn reject_non_get(request: Request, next: Next) -> Response {
     if *request.method() == Method::GET || *request.method() == Method::HEAD {
         next.run(request).await
@@ -53,6 +69,7 @@ mod tests {
     use super::*;
 
     use axum::body::{to_bytes, Body};
+    use axum::http::header::CONTENT_TYPE;
     use axum::http::Request as HttpRequest;
     use ferrumc_observability::{
         CounterRegistry, PlayerSnapshot, ServerSnapshotParts, SnapshotPublisher,
@@ -84,60 +101,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_overview_returns_200() {
+    async fn snapshot_endpoint_returns_json() {
         let app = router(publisher_with_player());
         let response = app
             .oneshot(
                 HttpRequest::builder()
                     .method(Method::GET)
-                    .uri("/")
+                    .uri("/api/snapshot")
                     .body(Body::empty())
                     .expect("request"),
             )
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content_type.starts_with("application/json"));
         let body = body_string(response).await;
-        assert!(body.contains("Overview"));
-        assert!(body.contains("FerrumC"));
-    }
-
-    #[tokio::test]
-    async fn get_players_lists_the_player() {
-        let app = router(publisher_with_player());
-        let response = app
-            .oneshot(
-                HttpRequest::builder()
-                    .method(Method::GET)
-                    .uri("/players")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = body_string(response).await;
+        assert!(body.contains("\"build\":\"ferrumc test\""));
         assert!(body.contains("Notch"));
     }
 
     #[tokio::test]
-    async fn partial_request_omits_the_chrome() {
+    async fn events_endpoint_is_an_sse_stream() {
         let app = router(publisher_with_player());
         let response = app
             .oneshot(
                 HttpRequest::builder()
                     .method(Method::GET)
-                    .uri("/?partial=1")
+                    .uri("/events")
                     .body(Body::empty())
                     .expect("request"),
             )
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        let body = body_string(response).await;
-        // The fragment carries the page body but not the surrounding document.
-        assert!(body.contains("Overview"));
-        assert!(!body.contains("<!doctype html>"));
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content_type.starts_with("text/event-stream"));
     }
 
     #[tokio::test]
@@ -147,12 +156,32 @@ mod tests {
             .oneshot(
                 HttpRequest::builder()
                     .method(Method::POST)
-                    .uri("/")
+                    .uri("/api/snapshot")
                     .body(Body::empty())
                     .expect("request"),
             )
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn unknown_path_falls_back_to_the_spa_shell() {
+        // A deep client-route path is not a file on disk; ServeDir's fallback must
+        // serve the committed index.html so a hard refresh still boots the app.
+        let app = router(publisher_with_player());
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method(Method::GET)
+                    .uri("/some/client/route")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        assert!(body.contains("<!doctype html>") || body.contains("<!DOCTYPE html>"));
     }
 }

@@ -1,21 +1,24 @@
 #![forbid(unsafe_code)]
 
-//! Read-only localhost observability dashboard (axum + htmx).
+//! Read-only localhost observability dashboard (axum + a static Svelte SPA).
 //!
-//! The dashboard renders the latest [`ServerSnapshot`] published by the
-//! application driver through a [`SnapshotPublisher`]. It is read-only by
-//! construction: every route is a `GET`, a method-guard layer rejects anything
-//! else with `405`, and the server refuses to bind anything but a loopback
-//! address (loopback is enforced at bind time by [`run`], so the ops console —
-//! which exposes player names/positions and packet traces — is never reachable
-//! off-host). Pages are server-rendered HTML built inline with `format!`/string
-//! literals; htmx is loaded from a CDN to refresh each page's content region once
-//! a second. There is no frontend build and no static asset directory.
+//! The dashboard serves a single-page app (committed under `dist/`) that renders
+//! the latest [`ServerSnapshot`] published by the application driver through a
+//! [`SnapshotPublisher`]. The SPA seeds itself from `GET /api/snapshot` and then
+//! streams live updates over `GET /events` (Server-Sent Events), falling back to
+//! polling the JSON endpoint when `EventSource` is unavailable.
+//!
+//! It is read-only by construction: every route is a `GET` (the JSON endpoint, the
+//! SSE stream, and the static file service are all reads), a method-guard layer
+//! rejects anything else with `405`, and the server refuses to bind anything but a
+//! loopback address (loopback is enforced at bind time by [`run`], so the ops
+//! console — which exposes player names/positions and packet traces — is never
+//! reachable off-host).
 //!
 //! [`ServerSnapshot`]: ferrumc_observability::ServerSnapshot
 //! [`SnapshotPublisher`]: ferrumc_observability::SnapshotPublisher
 
-mod pages;
+mod api;
 mod server;
 
 use std::fmt;

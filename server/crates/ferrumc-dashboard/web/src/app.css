@@ -1,0 +1,217 @@
+@import 'tailwindcss';
+
+/* Bundled, offline-capable typefaces (the console may run with no network).
+   Latin subsets only — keeps the committed font payload small. */
+@import '@fontsource-variable/space-grotesk';
+@import '@fontsource/jetbrains-mono/latin-400.css';
+@import '@fontsource/jetbrains-mono/latin-500.css';
+@import '@fontsource/jetbrains-mono/latin-700.css';
+@import 'uplot/dist/uPlot.min.css';
+
+/* ── Forge token system ───────────────────────────────────────────────── */
+@theme {
+  --color-base: #0b0c0e;
+  --color-iron-900: #131519;
+  --color-iron-850: #16191f;
+  --color-iron-800: #1a1d23;
+  --color-iron-700: #262b33;
+  --color-iron-600: #353b45;
+  --color-iron-500: #4b525d;
+  --color-iron-400: #6b727e;
+  --color-iron-300: #98a0ab;
+  --color-iron-200: #c4ccd6;
+  --color-iron-100: #e3e8ee;
+
+  --color-ember: #e8731f;
+  --color-ember-bright: #ff8a3d;
+  --color-ember-deep: #b5530f;
+
+  --color-heat-ok: #3fb950;
+  --color-heat-warn: #d29922;
+  --color-heat-bad: #f04438;
+  --color-slag: #4aa8c0;
+
+  --font-display: 'Space Grotesk Variable', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* ── Base ─────────────────────────────────────────────────────────────── */
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-base);
+  color: var(--color-iron-200);
+  font-family: var(--font-mono);
+  font-feature-settings: 'tnum' 1, 'cv01' 1;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* The signature: a faint forge-grate packet grid laid behind everything,
+     warmed by an ember bloom that sits roughly under the header/overview. */
+  background-image:
+    radial-gradient(900px 520px at 78% -8%, rgba(232, 115, 31, 0.1), transparent 60%),
+    linear-gradient(rgba(38, 43, 51, 0.42) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(38, 43, 51, 0.42) 1px, transparent 1px);
+  background-size:
+    100% 100%,
+    34px 34px,
+    34px 34px;
+  background-attachment: fixed;
+}
+
+h1,
+h2,
+h3,
+.font-display {
+  font-family: var(--font-display);
+}
+
+/* Numerals are the star: tabular, lined up, monospace. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-iron-700);
+  border-radius: 10px;
+  border: 2px solid var(--color-base);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-iron-600);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-ember);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ── Reusable forge primitives ────────────────────────────────────────── */
+.panel {
+  background: linear-gradient(180deg, var(--color-iron-850), var(--color-iron-900));
+  border: 1px solid var(--color-iron-700);
+  border-radius: 12px;
+}
+
+.panel-pad {
+  padding: 18px 20px;
+}
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--color-iron-400);
+}
+
+.metric {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1;
+  color: var(--color-iron-100);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  border: 1px solid var(--color-iron-700);
+  background: rgba(38, 43, 51, 0.45);
+  color: var(--color-iron-300);
+}
+
+.heat-ok {
+  color: var(--color-heat-ok);
+}
+.heat-warn {
+  color: var(--color-heat-warn);
+}
+.heat-bad {
+  color: var(--color-heat-bad);
+}
+.ember {
+  color: var(--color-ember);
+}
+.muted {
+  color: var(--color-iron-400);
+}
+
+/* A subtle ember underglow used on live numerals; the strength is driven from
+   components via the --glow custom property (0 = cold, 1 = molten). */
+.glow {
+  text-shadow: 0 0 calc(18px * var(--glow, 0)) rgba(232, 115, 31, calc(0.55 * var(--glow, 0)));
+}
+
+/* Awaiting-telemetry placeholder so un-wired panels never look broken. */
+.awaiting {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-iron-500);
+  font-size: 12px;
+}
+.awaiting::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--color-iron-500);
+  animation: breathe 2.4s ease-in-out infinite;
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+/* Ember pulse reserved for genuine alarms (plugin Deny / Panic). */
+@keyframes ember-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(240, 68, 56, 0);
+  }
+  50% {
+    box-shadow: 0 0 18px 1px rgba(240, 68, 56, 0.5);
+  }
+}
+.alarm {
+  animation: ember-pulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
