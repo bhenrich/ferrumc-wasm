@@ -10,6 +10,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use ferrumc_config::AccessConfig;
 use ferrumc_math::Vec3;
 use serde::Deserialize;
 
@@ -138,6 +139,10 @@ pub struct AppConfig {
     /// The socket address the read-only dashboard binds to. Defaults to a loopback
     /// address so the dashboard is not reachable off-host unless reconfigured.
     pub dashboard_bind: SocketAddr,
+    /// Access control for a public-facing server: the per-IP connection limit, the
+    /// ban list, and the optional whitelist. Resolved (files read, entries
+    /// classified) at startup; see [`ferrumc_config::AccessConfig::resolve`].
+    pub access: AccessConfig,
 }
 
 impl AppConfig {
@@ -191,6 +196,7 @@ impl Default for AppConfig {
             world_dir: None,
             dashboard_enabled: DEFAULT_DASHBOARD_ENABLED,
             dashboard_bind: DEFAULT_DASHBOARD_BIND,
+            access: AccessConfig::default(),
         }
     }
 }
@@ -241,6 +247,9 @@ struct RawConfig {
     dashboard_enabled: Option<bool>,
     /// Override for [`AppConfig::dashboard_bind`], as a parseable socket address.
     dashboard_bind: Option<String>,
+    /// The `[access]` table. Carries its own per-field defaults, so an omitted
+    /// table (or any omitted field within it) falls back to the safe defaults.
+    access: AccessConfig,
 }
 
 impl RawConfig {
@@ -310,6 +319,7 @@ impl RawConfig {
             world_dir: self.world_dir.map(PathBuf::from).or(defaults.world_dir),
             dashboard_enabled: self.dashboard_enabled.unwrap_or(defaults.dashboard_enabled),
             dashboard_bind,
+            access: self.access,
         })
     }
 }
@@ -403,6 +413,38 @@ mod tests {
         let parsed = AppConfig::from_toml_str("").expect("empty config is valid");
         assert!(parsed.ops.is_empty());
         assert_eq!(parsed.default_permission_level, 0);
+    }
+
+    #[test]
+    fn access_defaults_to_open_with_per_ip_three() {
+        let parsed = AppConfig::from_toml_str("").expect("empty config is valid");
+        assert_eq!(parsed.access, AccessConfig::default());
+        assert_eq!(parsed.access.per_ip_connection_limit, 3);
+        assert!(!parsed.access.whitelist_enabled);
+        assert!(parsed.access.whitelist.is_empty());
+        assert!(parsed.access.bans.is_empty());
+    }
+
+    #[test]
+    fn access_table_overrides_parse() {
+        let toml = "\
+            bind = \"127.0.0.1:0\"\n\
+            [access]\n\
+            per_ip_connection_limit = 5\n\
+            whitelist_enabled = true\n\
+            whitelist = [\"Saad\"]\n\
+            bans = [\"Griefer\", \"10.0.0.5\"]\n\
+        ";
+        let parsed = AppConfig::from_toml_str(toml).expect("valid access config");
+        assert_eq!(parsed.access.per_ip_connection_limit, 5);
+        assert!(parsed.access.whitelist_enabled);
+        assert_eq!(parsed.access.whitelist, vec!["Saad"]);
+        assert_eq!(parsed.access.bans, vec!["Griefer", "10.0.0.5"]);
+    }
+
+    #[test]
+    fn access_unknown_field_is_rejected() {
+        assert!(AppConfig::from_toml_str("[access]\nbogus = 1").is_err());
     }
 
     #[test]

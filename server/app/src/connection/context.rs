@@ -6,8 +6,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use ferrumc_codec::BoundedString;
-use ferrumc_net::{ConnectionLimits, OutboundPacket, StatusInfo};
+use ferrumc_config::{LoginDecision, ResolvedAccess};
+use ferrumc_net::{offline_uuid, ConnectionLimits, OutboundPacket, StatusInfo};
 use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock};
+use ferrumc_proto::generated::login::{ClientboundLoginPacket, LoginDisconnect};
 use ferrumc_proto::generated::status::{ClientboundStatusPacket, StatusResponse};
 
 use crate::driver::SimCommand;
@@ -83,6 +85,11 @@ pub(crate) struct ConnContext {
     /// outbound queue-depth sample (off the per-packet hot path); the driver
     /// folds every session's snapshot into the per-tick `ServerSnapshot`.
     pub(crate) net_telemetry: Arc<NetTelemetryHub>,
+    /// Resolved access control (per-IP limit, bans, whitelist), shared across the
+    /// acceptor and every connection task. Consulted at login by
+    /// [`login_denial`](Self::login_denial); the IP-level checks run in the accept
+    /// loop before a task is spawned.
+    pub(crate) access: Arc<ResolvedAccess>,
 }
 
 impl ConnContext {
@@ -91,6 +98,40 @@ impl ConnContext {
         self.compression_threshold
             .filter(|threshold| *threshold >= 0)
     }
+
+    /// Decides whether the player named `name` may complete login, returning the
+    /// clientbound Login Disconnect packet to send when they may not.
+    ///
+    /// `Ok(None)` means the login is allowed; `Ok(Some(packet))` means it is
+    /// rejected (banned or not whitelisted) and the caller should send `packet`
+    /// and close. The offline-mode UUID is derived from the name, so a UUID-based
+    /// ban or whitelist entry matches even though the client only sends a name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the (controlled, short) kick reason cannot be
+    /// encoded into the wire string bound — effectively impossible in practice.
+    pub(super) fn login_denial(&self, name: &str) -> anyhow::Result<Option<OutboundPacket>> {
+        let uuid = offline_uuid(name);
+        match self.access.login_decision(name, uuid) {
+            LoginDecision::Allow => Ok(None),
+            LoginDecision::Deny(reason) => Ok(Some(login_disconnect(reason.message())?)),
+        }
+    }
+}
+
+/// Builds a clientbound Login Disconnect carrying `message` as a legacy JSON chat
+/// component (the login-state disconnect wire format).
+///
+/// `message` is a controlled, short, static kick reason with no JSON-special
+/// characters, so it is wrapped directly into `{"text":"..."}`.
+fn login_disconnect(message: &str) -> anyhow::Result<OutboundPacket> {
+    let json = format!("{{\"text\":\"{message}\"}}");
+    let reason = BoundedString::<262_144>::new(json)
+        .map_err(|err| anyhow::anyhow!("login disconnect reason exceeds the wire bound: {err}"))?;
+    Ok(OutboundPacket::Login(
+        ClientboundLoginPacket::LoginDisconnect(LoginDisconnect::new(reason)),
+    ))
 }
 
 /// Builds the server-list status response advertised to clients that handshake

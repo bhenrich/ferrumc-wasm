@@ -97,3 +97,38 @@
 # Socket address the dashboard binds to. Loopback by design so it is not reachable
 # off-host unless you change this deliberately.
 # dashboard_bind = "127.0.0.1:9090"
+
+# --- Access control ---
+#
+# Gates for a public-facing server: a per-IP connection limit, a ban list, and an
+# optional whitelist. This is a TOML table, so it must stay BELOW every top-level
+# key above. Whitelist/ban file paths are resolved relative to the server's working
+# directory; a configured-but-missing file is a startup error (fail fast).
+[access]
+
+# Maximum concurrent connections allowed from a single source IP. Stops one host
+# from exhausting the global connection budget. 0 disables the per-IP limit.
+# per_ip_connection_limit = 3
+
+# When true, only whitelisted players may complete login; everyone else is kicked
+# with a reason. Default false: a local/alpha server is open. Turn this on before
+# exposing the server publicly.
+# whitelist_enabled = false
+
+# Inline allow-list of player names and/or UUIDs (a token that parses as a UUID is
+# matched by UUID, otherwise by name; names are case-insensitive). Only consulted
+# when whitelist_enabled = true. Merged with whitelist_file below.
+# whitelist = ["Saad", "069a79f4-44e9-4726-a5be-fca90e38aaf5"]
+
+# Optional path to a newline-delimited allow-list file (one name or UUID per line;
+# blank lines and lines starting with # are ignored). Merged with the inline list.
+# whitelist_file = "whitelist.txt"
+
+# Deny-list of player names, UUIDs, and/or IP addresses. Always enforced (it wins
+# over the whitelist). Name/UUID bans are rejected at login with a reason; IP bans
+# are rejected at the accept loop before login. Merged with ban_file below.
+# bans = ["Griefer123", "069a79f4-44e9-4726-a5be-fca90e38aaf5", "203.0.113.7"]
+
+# Optional path to a newline-delimited deny-list file (one name, UUID, or IP per
+# line; blank lines and # comments ignored). Merged with the inline bans list.
+# ban_file = "bans.txt"

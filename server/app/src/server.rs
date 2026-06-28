@@ -8,13 +8,15 @@
 //! winds down cleanly.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 
-use ferrumc_net::ConnectionLimits;
+use ferrumc_config::ResolvedAccess;
+use ferrumc_net::{ConnectionLimits, PerIpConnections};
 use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock, SnapshotPublisher};
 use ferrumc_session::{shard_for_position, SessionRouter};
 
@@ -248,6 +250,9 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     let max_players = u32::try_from(config.max_connections).unwrap_or(u32::MAX);
     let status_response = Arc::new(build_status_response(max_players)?);
 
+    // Resolve access control once at startup and build the per-IP limiter from it.
+    let (access, per_ip) = build_access(config)?;
+
     let ctx = ConnContext {
         limits: ConnectionLimits::default(),
         io_timeout: config.io_timeout,
@@ -264,12 +269,14 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         metrics: Arc::clone(&metrics),
         clock,
         net_telemetry,
+        access,
     };
 
     let accept_task = tokio::spawn(accept_loop(
         listener,
         ctx,
         config.max_connections,
+        per_ip,
         shutdown_rx,
     ));
 
@@ -284,11 +291,38 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     })
 }
 
+/// Resolves the access-control config into the shared runtime state: the resolved
+/// bans/whitelist and the per-IP connection limiter built from its per-IP cap.
+///
+/// Whitelist/ban file paths are read relative to the working directory; an
+/// unreadable configured file is a fatal startup error.
+fn build_access(
+    config: &AppConfig,
+) -> anyhow::Result<(Arc<ResolvedAccess>, Arc<PerIpConnections>)> {
+    let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let access = Arc::new(
+        config
+            .access
+            .resolve(&base_dir)
+            .map_err(|err| anyhow::anyhow!("resolving access control: {err}"))?,
+    );
+    // The per-IP limiter is the per-IP counterpart to the global connection
+    // semaphore; the acceptor consults it before spawning a task.
+    let per_ip = Arc::new(PerIpConnections::new(access.per_ip_connection_limit()));
+    Ok((access, per_ip))
+}
+
 /// Accepts connections until shutdown, spawning one bounded task per socket.
+///
+/// Three gates bound a new connection, in order: a banned source IP is rejected
+/// before any slot is reserved; the global [`Semaphore`] caps total concurrency;
+/// and `per_ip` caps concurrent connections from a single source IP. Login-time
+/// name/UUID bans and the whitelist are enforced later, in the login handler.
 async fn accept_loop(
     listener: TcpListener,
     ctx: ConnContext,
     max_connections: usize,
+    per_ip: Arc<PerIpConnections>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let limiter = Arc::new(Semaphore::new(max_connections.max(1)));
@@ -297,21 +331,42 @@ async fn accept_loop(
             biased;
             _ = shutdown.changed() => break,
             accepted = listener.accept() => {
-                let (stream, _addr) = match accepted {
+                let (stream, addr) = match accepted {
                     Ok(pair) => pair,
                     Err(err) => {
                         tracing::warn!(%err, "accept failed");
                         continue;
                     }
                 };
-                // Hold a permit for the connection's lifetime to bound concurrency.
+                let ip = addr.ip();
+
+                // Drop banned IPs before reserving any slot — cheapest rejection.
+                if ctx.access.is_ip_banned(ip) {
+                    tracing::debug!(%ip, "rejecting connection from banned IP");
+                    drop(stream);
+                    continue;
+                }
+
+                // Hold a global permit for the connection's lifetime to bound total concurrency.
                 let Ok(permit) = Arc::clone(&limiter).acquire_owned().await else {
                     break;
                 };
+
+                // Enforce the per-IP cap; over it, drop the socket now (the `permit`
+                // and the absent IP guard are released as this iteration's scope ends).
+                let Some(ip_guard) = per_ip.try_acquire(ip) else {
+                    tracing::debug!(%ip, "rejecting connection over the per-IP limit");
+                    drop(stream);
+                    continue;
+                };
+
                 let ctx = ctx.clone();
                 let conn_shutdown = shutdown.clone();
                 tokio::spawn(async move {
+                    // Both guards live for the connection's lifetime and free their
+                    // slots (global + per-IP) when the task ends.
                     let _permit = permit;
+                    let _ip_guard = ip_guard;
                     if let Err(err) = handle_connection(stream, &ctx, conn_shutdown).await {
                         tracing::debug!(%err, "connection ended with an error");
                     }

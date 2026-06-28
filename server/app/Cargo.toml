@@ -13,6 +13,9 @@ path = "src/main.rs"
 # Shared identity / coordinate types crossing every layer boundary.
 ferrumc-core = { workspace = true }
 ferrumc-math = { workspace = true }
+# Access-control config (per-IP connection limit, ban list, whitelist) embedded
+# as the AppConfig `[access]` section and resolved into runtime lookup sets.
+ferrumc-config = { workspace = true }
 # Bounded readers / writers and the wire string + blob newtypes used to drive
 # the protocol by hand at the app layer.
 ferrumc-codec = { workspace = true }

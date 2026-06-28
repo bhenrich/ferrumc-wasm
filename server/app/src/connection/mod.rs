@@ -373,6 +373,12 @@ async fn advance(
         }
         (LoginPhase::Login, InboundPacket::Login(ServerboundLoginPacket::LoginStart(start))) => {
             let player_name = start.name().clone();
+            // Beta-gate: reject banned / non-whitelisted players before login
+            // completes (single additive access check; see ConnContext::login_denial).
+            if let Some(disconnect) = conn.ctx.login_denial(player_name.as_str())? {
+                conn.send(&disconnect).await?;
+                return Ok(LoginProgress::Close);
+            }
             conn.send_login_success(&player_name).await?;
             *name = Some(player_name);
             *phase = LoginPhase::AwaitingLoginAck;

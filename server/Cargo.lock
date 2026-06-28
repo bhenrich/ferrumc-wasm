@@ -323,6 +323,7 @@ dependencies = [
  "clap",
  "ferrumc-codec",
  "ferrumc-command",
+ "ferrumc-config",
  "ferrumc-core",
  "ferrumc-dashboard",
  "ferrumc-items",
