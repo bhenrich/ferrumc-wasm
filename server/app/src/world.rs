@@ -176,6 +176,9 @@ pub(crate) async fn build_world(
     shard.set_region_limits(RegionLimits {
         max_volume: config.max_region_fill_volume,
         max_undo_entries: config.region_undo_history,
+        // The per-tick application budget keeps its built-in default; only the
+        // operator-facing volume + undo caps are configurable.
+        ..RegionLimits::default()
     });
     shard
         .loaded_chunks_mut()
