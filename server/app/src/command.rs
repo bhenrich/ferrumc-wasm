@@ -49,6 +49,26 @@ pub const GAMEMODE_COMMAND: &str = "gamemode";
 /// vanilla). `/spawn` requires no special level.
 pub const GAMEMODE_LEVEL: u8 = 2;
 
+/// The literal name of the teleport command.
+pub const TP_COMMAND: &str = "tp";
+/// Permission *level* required to run `/tp` (operator-tier, matching
+/// [`GAMEMODE_LEVEL`]).
+pub const TP_LEVEL: u8 = 2;
+
+/// The literal name of the weather command.
+pub const WEATHER_COMMAND: &str = "weather";
+/// Permission *level* required to run `/weather` (operator-tier, matching
+/// [`GAMEMODE_LEVEL`]).
+pub const WEATHER_LEVEL: u8 = 2;
+
+/// Usage shown when `/tp` arguments do not parse.
+const TP_USAGE: &str = "usage: /tp <x> <y> <z> | /tp <player>";
+/// Usage shown when `/gamemode` arguments do not parse.
+const GAMEMODE_USAGE: &str =
+    "usage: /gamemode <survival|creative|adventure|spectator|0-3> [player]";
+/// Usage shown when `/weather` arguments do not parse.
+const WEATHER_USAGE: &str = "usage: /weather <clear|rain> [duration]";
+
 /// The literal name of the `/title` command.
 pub const TITLE_COMMAND: &str = "title";
 /// The literal name of the `/subtitle` command.
@@ -172,21 +192,12 @@ pub fn build_command_tree_with_limits(region_volume_cap: u64) -> CommandTree {
         )))
     }));
 
-    tree.register(
-        literal(GAMEMODE_COMMAND)
-            .requires_level(GAMEMODE_LEVEL)
-            .then(
-                argument("mode", ArgumentType::integer(0, 3)).executes(|ctx| {
-                    let id = ctx.integer("mode").unwrap_or_default();
-                    match u8::try_from(id).ok().and_then(GameMode::from_id) {
-                        Some(mode) => CommandResult::success(TextComponent::text(format!(
-                            "Game mode set to {mode:?}"
-                        ))),
-                        None => CommandResult::failure(TextComponent::text("invalid game mode")),
-                    }
-                }),
-            ),
-    );
+    // `/gamemode <mode> [player]` (self or targeted), `/tp <x y z>|<player>`, and
+    // `/weather <clear|rain> [duration]` — built by dedicated helpers to keep this
+    // registration function readable.
+    tree.register(gamemode_command());
+    tree.register(tp_command());
+    tree.register(weather_command());
 
     // `/title`, `/subtitle`, `/actionbar` take greedy free text; the clientbound
     // title/action-bar packets are applied on success by `presentation_packets`.
@@ -291,6 +302,70 @@ fn greedy_command(
     )
 }
 
+/// Builds the `/gamemode <mode> [player]` command.
+///
+/// `mode` is a [`ArgumentType::Word`] (a name like `creative` or a `0..=3` id,
+/// both resolved by [`gamemode_by_name`]), so it accepts more than a bare integer.
+/// The bare `/gamemode <mode>` form retargets the issuer (its `GameEvent` plus
+/// authoritative `SetGameMode` are applied by the connection via
+/// [`parse_gamemode`]); the `/gamemode <mode> <player>` form retargets the named
+/// online player and is routed to the simulation by [`region_commands`].
+fn gamemode_command() -> CommandBuilder {
+    literal(GAMEMODE_COMMAND)
+        .requires_level(GAMEMODE_LEVEL)
+        .then(
+            argument("mode", ArgumentType::Word)
+                .executes(|ctx| gamemode_feedback(ctx.string("mode").unwrap_or_default(), None))
+                .then(argument("target", ArgumentType::Word).executes(|ctx| {
+                    gamemode_feedback(
+                        ctx.string("mode").unwrap_or_default(),
+                        Some(ctx.string("target").unwrap_or_default()),
+                    )
+                })),
+        )
+}
+
+/// Builds the `/tp <x> <y> <z>` (teleport to coordinates) and `/tp <player>`
+/// (teleport to an online player) command.
+///
+/// Both forms parse from a greedy tail and are routed to the simulation by
+/// [`region_commands`]; the issuer's client is snapped via the existing teleport
+/// path the driver owns.
+fn tp_command() -> CommandBuilder {
+    literal(TP_COMMAND).requires_level(TP_LEVEL).then(
+        argument("args", ArgumentType::GreedyString).executes(|ctx| {
+            let args = ctx.string("args").unwrap_or_default();
+            match parse_tp(args) {
+                Some(TpTarget::Coords(pos)) => CommandResult::success(TextComponent::text(
+                    format!("Teleported to {} {} {}", pos.x, pos.y, pos.z),
+                )),
+                Some(TpTarget::Player(name)) => {
+                    CommandResult::success(TextComponent::text(format!("Teleporting to {name}")))
+                }
+                None => CommandResult::failure(TextComponent::text(TP_USAGE)),
+            }
+        }),
+    )
+}
+
+/// Builds the `/weather <clear|rain> [duration]` command: a server-wide weather
+/// toggle broadcast to every player as a `GameEvent` by the driver (no rain
+/// simulation in this slice). The optional duration is accepted but unused beyond
+/// the feedback.
+fn weather_command() -> CommandBuilder {
+    literal(WEATHER_COMMAND).requires_level(WEATHER_LEVEL).then(
+        argument("args", ArgumentType::GreedyString).executes(|ctx| {
+            let args = ctx.string("args").unwrap_or_default();
+            match parse_weather(args) {
+                Some((kind, duration)) => {
+                    CommandResult::success(TextComponent::text(weather_feedback(kind, duration)))
+                }
+                None => CommandResult::failure(TextComponent::text(WEATHER_USAGE)),
+            }
+        }),
+    )
+}
+
 /// Builds a presentation text command (`/title`, `/subtitle`, `/actionbar`):
 /// a level-gated literal taking one greedy free-text argument whose handler
 /// reports `feedback`. The clientbound packet is built by [`presentation_packets`]
@@ -304,20 +379,133 @@ fn text_command(name: &'static str, feedback: &'static str) -> CommandBuilder {
     )
 }
 
-/// Parses the [`GameMode`] a `/gamemode <id>` command selects, or `None` if
-/// `command` is not a `/gamemode` invocation or its mode argument is missing or
-/// out of range.
+/// Parses the [`GameMode`] a *self-targeted* `/gamemode <mode>` command selects,
+/// or `None` if `command` is not a `/gamemode` invocation, its mode argument is
+/// missing or invalid, **or** it names another player (the `/gamemode <mode>
+/// <player>` form).
 ///
-/// The connection uses this after a successful dispatch to apply the game-mode
-/// change side effect (a clientbound `GameEvent`), parsing the same argument the
-/// handler validated so the two agree on the selected mode.
+/// The connection uses this after a successful dispatch to apply the issuer's own
+/// game-mode change side effect (a clientbound `GameEvent` plus the authoritative
+/// `SetGameMode`), parsing the same argument the handler validated so the two
+/// agree on the selected mode. The targeted form returns `None` here so that side
+/// effect is suppressed for the issuer; it is routed to the named player by
+/// [`region_commands`] instead.
 pub fn parse_gamemode(command: &str) -> Option<GameMode> {
     let mut tokens = command.split_whitespace();
     if tokens.next() != Some(GAMEMODE_COMMAND) {
         return None;
     }
-    let id: i64 = tokens.next()?.parse().ok()?;
-    u8::try_from(id).ok().and_then(GameMode::from_id)
+    let mode = gamemode_by_name(tokens.next()?)?;
+    // A trailing token names another player: that case is not self-targeted.
+    only(mode, tokens)
+}
+
+/// Parses the targeted `/gamemode <mode> <player>` form into its mode and target
+/// player name, or `None` if `command` is not a `/gamemode` invocation, omits the
+/// player, has an invalid mode, or carries trailing tokens.
+///
+/// [`region_commands`] uses this to route the change to the named online player
+/// (resolved against the live roster by the driver); the self-targeted form
+/// (no player) returns `None` here and is handled via [`parse_gamemode`].
+fn parse_gamemode_target(args: &str) -> Option<(GameMode, String)> {
+    let mut tokens = args.split_whitespace();
+    let mode = gamemode_by_name(tokens.next()?)?;
+    let target = tokens.next()?.to_owned();
+    only((), tokens)?;
+    Some((mode, target))
+}
+
+/// Resolves a `/gamemode` mode token — a name (`survival`, `creative`,
+/// `adventure`, `spectator`) or its `0..=3` id — to a [`GameMode`], or `None` for
+/// any other token.
+fn gamemode_by_name(token: &str) -> Option<GameMode> {
+    let mode = match token {
+        "survival" | "0" => GameMode::Survival,
+        "creative" | "1" => GameMode::Creative,
+        "adventure" | "2" => GameMode::Adventure,
+        "spectator" | "3" => GameMode::Spectator,
+        _ => return None,
+    };
+    Some(mode)
+}
+
+/// Builds the `/gamemode` command feedback for a validated `mode` token, naming
+/// `target` when the change retargets another player, or the usage error when the
+/// mode token is invalid.
+fn gamemode_feedback(mode: &str, target: Option<&str>) -> CommandResult {
+    match gamemode_by_name(mode) {
+        Some(mode) => CommandResult::success(TextComponent::text(match target {
+            Some(player) => format!("Set {player}'s game mode to {mode:?}"),
+            None => format!("Game mode set to {mode:?}"),
+        })),
+        None => CommandResult::failure(TextComponent::text(GAMEMODE_USAGE)),
+    }
+}
+
+/// A parsed `/tp` destination: explicit coordinates or another player to teleport
+/// to.
+enum TpTarget {
+    /// `/tp <x> <y> <z>` — absolute coordinates.
+    Coords(Vec3),
+    /// `/tp <player>` — the named online player's current position.
+    Player(String),
+}
+
+/// Parses a `/tp` argument tail: a single token is a player name, exactly three
+/// tokens are `f64` coordinates, and anything else (zero, two, or 4+ tokens, or a
+/// non-numeric coordinate) is `None`.
+fn parse_tp(args: &str) -> Option<TpTarget> {
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    match tokens.as_slice() {
+        [name] => Some(TpTarget::Player((*name).to_owned())),
+        [x, y, z] => Some(TpTarget::Coords(Vec3::new(
+            x.parse().ok()?,
+            y.parse().ok()?,
+            z.parse().ok()?,
+        ))),
+        _ => None,
+    }
+}
+
+/// A parsed `/weather` selection: the two client-visible weather states this
+/// slice toggles.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WeatherKind {
+    /// `clear` — stop raining.
+    Clear,
+    /// `rain` — start raining.
+    Rain,
+}
+
+/// Parses a `/weather` argument tail (`<clear|rain> [duration]`) into its weather
+/// kind and optional duration (seconds), or `None` on an unknown kind, a
+/// non-integer duration, or trailing tokens. The duration is cosmetic in this
+/// slice (no rain simulation), surfaced only in the command feedback.
+fn parse_weather(args: &str) -> Option<(WeatherKind, Option<u32>)> {
+    let mut tokens = args.split_whitespace();
+    let kind = match tokens.next()? {
+        "clear" => WeatherKind::Clear,
+        "rain" => WeatherKind::Rain,
+        _ => return None,
+    };
+    let duration = match tokens.next() {
+        Some(token) => Some(token.parse().ok()?),
+        None => None,
+    };
+    only((), tokens)?;
+    Some((kind, duration))
+}
+
+/// Builds the `/weather` command feedback for a validated selection.
+fn weather_feedback(kind: WeatherKind, duration: Option<u32>) -> String {
+    let label = match kind {
+        WeatherKind::Clear => "clear",
+        WeatherKind::Rain => "rain",
+    };
+    match duration {
+        Some(secs) => format!("Set the weather to {label} for {secs}s"),
+        None => format!("Set the weather to {label}"),
+    }
 }
 
 /// Builds the clientbound packets a successfully dispatched presentation command
@@ -916,16 +1104,26 @@ fn bounded_feedback(region: Cuboid, cap: u64, success: String) -> CommandResult 
     }
 }
 
-/// Builds the [`SimCommand`]s a successfully dispatched region command produces,
-/// or an empty vector for any other command.
+/// Builds the [`SimCommand`]s a successfully dispatched command produces that the
+/// simulation must apply, or an empty vector for any command with no such effect.
 ///
-/// Mirrors [`presentation_packets`]/[`scoreboard_packets`]: the connection calls
-/// this after a successful dispatch and sends each command to the simulation
-/// driver, which routes it to the issuer's shard as a region edit/undo applied
-/// through the shard-owned block funnel. `player` is the issuer (the edit's actor
-/// and the key for its undo history). Re-parses the same arguments the executor
-/// validated; an over-cap region never reaches here (the executor already
-/// rejected it), and the simulation re-checks the cap defensively regardless.
+/// This is the generic command→[`SimCommand`] hook: the connection calls it after
+/// a successful dispatch and sends each returned command to the simulation driver
+/// (the only side that may reach the shard and other players' channels). `player`
+/// is the issuer. It re-parses the same arguments the executor validated. Covered
+/// commands:
+///
+/// - `/fill`, `/replace`, `/undo` — region edits applied through the shard-owned
+///   block funnel (an over-cap region never reaches here; the executor rejected it
+///   and the simulation re-checks the cap defensively regardless).
+/// - `/tp <x> <y> <z>` — a [`SimCommand::TeleportPlayer`] snapping the issuer.
+/// - `/tp <player>` — a [`SimCommand::TeleportToPlayer`]; the driver resolves the
+///   named player against the live roster and snaps the issuer to their position.
+/// - `/gamemode <mode> <player>` — a [`SimCommand::SetGameModeFor`] retargeting the
+///   named online player (the self-targeted form carries no command here; the
+///   connection applies it via [`parse_gamemode`]).
+/// - `/weather <clear|rain>` — a [`SimCommand::SetWeather`] the driver broadcasts
+///   to every player as a `GameEvent`.
 pub(crate) fn region_commands(command: &str, player: PlayerId) -> Vec<SimCommand> {
     let Some(name) = command.split_whitespace().next() else {
         return Vec::new();
@@ -950,6 +1148,25 @@ pub(crate) fn region_commands(command: &str, player: PlayerId) -> Vec<SimCommand
         },
         // `/undo` takes no arguments; a trailing token makes it a parse miss.
         UNDO_COMMAND if args.is_empty() => vec![SimCommand::RegionUndo { player }],
+        TP_COMMAND => match parse_tp(args) {
+            Some(TpTarget::Coords(position)) => {
+                vec![SimCommand::TeleportPlayer { player, position }]
+            }
+            Some(TpTarget::Player(target)) => vec![SimCommand::TeleportToPlayer { player, target }],
+            None => Vec::new(),
+        },
+        // Only the targeted form routes here; the self form is applied by the
+        // connection via `parse_gamemode`.
+        GAMEMODE_COMMAND => match parse_gamemode_target(args) {
+            Some((mode, target)) => vec![SimCommand::SetGameModeFor { target, mode }],
+            None => Vec::new(),
+        },
+        WEATHER_COMMAND => match parse_weather(args) {
+            Some((kind, _duration)) => vec![SimCommand::SetWeather {
+                raining: kind == WeatherKind::Rain,
+            }],
+            None => Vec::new(),
+        },
         _ => Vec::new(),
     }
 }
@@ -1031,19 +1248,56 @@ mod tests {
     }
 
     #[test]
-    fn gamemode_rejects_out_of_range_mode() {
+    fn gamemode_accepts_named_mode_for_an_operator() {
         let tree = build_command_tree();
-        let err = tree
-            .dispatch("gamemode 9", &op())
-            .expect_err("9 is out of range");
-        assert!(matches!(err, CommandError::IntegerOutOfRange { .. }));
+        let result = tree
+            .dispatch("gamemode creative", &op())
+            .expect("dispatches");
+        assert!(result.is_success());
+        assert_eq!(
+            result.feedback().to_plain_string(),
+            "Game mode set to Creative"
+        );
     }
 
     #[test]
-    fn parse_gamemode_extracts_a_valid_mode() {
+    fn gamemode_rejects_invalid_mode() {
+        // A `Word` mode arg always dispatches; an unrecognised mode (out-of-range
+        // id or a typo'd name) is reported by the handler as a usage failure.
+        let tree = build_command_tree();
+        for cmd in ["gamemode 9", "gamemode creativ"] {
+            let result = tree.dispatch(cmd, &op()).expect("reaches the handler");
+            assert!(!result.is_success(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn gamemode_targets_another_player() {
+        let tree = build_command_tree();
+        let result = tree
+            .dispatch("gamemode creative Joe", &op())
+            .expect("dispatches");
+        assert!(result.is_success());
+        assert_eq!(
+            result.feedback().to_plain_string(),
+            "Set Joe's game mode to Creative"
+        );
+    }
+
+    #[test]
+    fn parse_gamemode_extracts_a_valid_self_mode() {
+        // Both id and name forms resolve for the self-targeted command.
         assert_eq!(parse_gamemode("gamemode 0"), Some(GameMode::Survival));
         assert_eq!(parse_gamemode("gamemode 1"), Some(GameMode::Creative));
         assert_eq!(parse_gamemode("gamemode 3"), Some(GameMode::Spectator));
+        assert_eq!(
+            parse_gamemode("gamemode survival"),
+            Some(GameMode::Survival)
+        );
+        assert_eq!(
+            parse_gamemode("gamemode spectator"),
+            Some(GameMode::Spectator)
+        );
     }
 
     #[test]
@@ -1052,6 +1306,24 @@ mod tests {
         assert_eq!(parse_gamemode("gamemode"), None);
         assert_eq!(parse_gamemode("gamemode 9"), None);
         assert_eq!(parse_gamemode("gamemode x"), None);
+        // The targeted form is NOT self-targeted, so the connection's self side
+        // effect is suppressed (it routes through `region_commands` instead).
+        assert_eq!(parse_gamemode("gamemode 1 Joe"), None);
+        assert_eq!(parse_gamemode("gamemode creative Joe"), None);
+    }
+
+    #[test]
+    fn gamemode_target_routes_a_set_game_mode_for() {
+        // The targeted form builds a SetGameModeFor; the self form builds nothing
+        // here (the connection applies it via parse_gamemode).
+        let player = PlayerId::offline("Op");
+        let cmds = region_commands("gamemode creative Joe", player);
+        let [SimCommand::SetGameModeFor { target, mode }] = cmds.as_slice() else {
+            panic!("/gamemode <mode> <player> builds one SetGameModeFor");
+        };
+        assert_eq!(target, "Joe");
+        assert_eq!(*mode, GameMode::Creative);
+        assert!(region_commands("gamemode creative", player).is_empty());
     }
 
     #[test]
@@ -1081,9 +1353,10 @@ mod tests {
             .iter()
             .find(|n| n.name() == Some("mode"))
             .expect("mode node");
+        // `mode` is a `Word` argument, which lowers to brigadier:string (parser 5).
         assert!(matches!(
             mode.extra(),
-            BrigadierExtra::Argument { parser_id: 3, .. }
+            BrigadierExtra::Argument { parser_id: 5, .. }
         ));
 
         // A level-0 player sees only `/spawn`; the gated `/gamemode` subtree is gone.
@@ -1552,5 +1825,122 @@ mod tests {
         assert!(region_commands("spawn", player).is_empty());
         assert!(region_commands("gamemode 1", player).is_empty());
         assert!(region_commands("", player).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // /tp, /weather
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tp_and_weather_require_operator_level() {
+        let tree = build_command_tree();
+        let member = CommandSource::for_player(PlayerId::offline("Joe"), "Joe", 0);
+        for cmd in ["tp 1 2 3", "tp Joe", "weather rain"] {
+            let err = tree.dispatch(cmd, &member).expect_err("member lacks level");
+            assert!(matches!(err, CommandError::PermissionDenied(_)), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn tp_to_coords_dispatches_and_teleports_the_issuer() {
+        let tree = build_command_tree();
+        assert!(tree
+            .dispatch("tp 1 64 -3", &op())
+            .expect("dispatches")
+            .is_success());
+
+        let player = PlayerId::offline("Op");
+        let cmds = region_commands("tp 1 64 -3", player);
+        let [SimCommand::TeleportPlayer {
+            player: p,
+            position,
+        }] = cmds.as_slice()
+        else {
+            panic!("/tp <x y z> builds one TeleportPlayer");
+        };
+        assert_eq!(*p, player);
+        assert_eq!(*position, Vec3::new(1.0, 64.0, -3.0));
+    }
+
+    #[test]
+    fn tp_to_player_dispatches_and_builds_a_teleport_to_player() {
+        let tree = build_command_tree();
+        assert!(tree
+            .dispatch("tp Joe", &op())
+            .expect("dispatches")
+            .is_success());
+
+        let player = PlayerId::offline("Op");
+        let cmds = region_commands("tp Joe", player);
+        let [SimCommand::TeleportToPlayer { player: p, target }] = cmds.as_slice() else {
+            panic!("/tp <player> builds one TeleportToPlayer");
+        };
+        assert_eq!(*p, player);
+        assert_eq!(target, "Joe");
+    }
+
+    #[test]
+    fn tp_rejects_malformed_arguments() {
+        let tree = build_command_tree();
+        for cmd in [
+            "tp 1 2",     // partial coordinate triple
+            "tp 1 2 x",   // non-numeric coordinate
+            "tp 1 2 3 4", // too many tokens
+        ] {
+            assert!(
+                !tree
+                    .dispatch(cmd, &op())
+                    .expect("reaches the handler")
+                    .is_success(),
+                "{cmd}"
+            );
+            assert!(region_commands(cmd, region_player()).is_empty(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn weather_dispatches_and_builds_a_set_weather() {
+        let tree = build_command_tree();
+        for (cmd, raining) in [
+            ("weather rain", true),
+            ("weather clear", false),
+            ("weather rain 600", true),
+        ] {
+            assert!(
+                tree.dispatch(cmd, &op()).expect("dispatches").is_success(),
+                "{cmd}"
+            );
+            let cmds = region_commands(cmd, region_player());
+            let [SimCommand::SetWeather { raining: r }] = cmds.as_slice() else {
+                panic!("{cmd} builds one SetWeather");
+            };
+            assert_eq!(*r, raining, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn weather_rejects_malformed_arguments() {
+        let tree = build_command_tree();
+        // A bare `/weather` is missing its required greedy argument, so it fails at
+        // dispatch rather than reaching the handler.
+        assert!(matches!(
+            tree.dispatch("weather", &op()),
+            Err(CommandError::MissingArgument(_))
+        ));
+        // These reach the handler with an unparsable tail and report a usage failure.
+        for cmd in [
+            "weather snow",      // unknown kind
+            "weather rain fast", // non-integer duration
+            "weather rain 1 2",  // trailing token
+        ] {
+            assert!(
+                !tree
+                    .dispatch(cmd, &op())
+                    .expect("reaches the handler")
+                    .is_success(),
+                "{cmd}"
+            );
+            assert!(region_commands(cmd, region_player()).is_empty(), "{cmd}");
+        }
     }
 }

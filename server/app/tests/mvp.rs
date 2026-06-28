@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use ferrumc_app::{build_command_tree, load_plugins, AppConfig};
 use ferrumc_codec::{BoundedReader, BoundedString};
-use ferrumc_command::{CommandError, CommandSource};
+use ferrumc_command::CommandSource;
 use ferrumc_core::PlayerId;
 use ferrumc_proto::generated::handshake::Handshake;
 use ferrumc_proto::generated::play::{
@@ -482,10 +482,12 @@ async fn mvp_end_to_end() {
         .dispatch("gamemode 1", &op)
         .expect("gamemode dispatches")
         .is_success());
-    assert!(matches!(
-        tree.dispatch("gamemode 9", &op),
-        Err(CommandError::IntegerOutOfRange { .. })
-    ));
+    // An out-of-range mode now dispatches (the `mode` arg is a word, accepting
+    // names too) but the handler reports a usage failure rather than succeeding.
+    assert!(!tree
+        .dispatch("gamemode 9", &op)
+        .expect("gamemode 9 reaches the handler")
+        .is_success());
 
     // A radius-1 spawn keeps the resident area small; spawn protection is on with
     // the admin granted bypass.

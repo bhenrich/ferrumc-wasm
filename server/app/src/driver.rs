@@ -31,7 +31,7 @@ use ferrumc_observability::{
     PlayerSnapshot, ServerClock, ServerSnapshotParts, SnapshotPublisher, TickMetrics, Vec3Snapshot,
     DEFAULT_TOP_N,
 };
-use ferrumc_proto::generated::play::{ChunkDataAndLight, ClientboundPlayPacket};
+use ferrumc_proto::generated::play::{ChunkDataAndLight, ClientboundPlayPacket, GameEvent};
 use ferrumc_session::{
     sign_block_entity_data, NetEvent, PlayerSessionHandle, SessionError, SessionRouter,
 };
@@ -53,6 +53,21 @@ use crate::world::chunk_packet;
 /// Independent of the chunk/overlay record versions (the journal is its own
 /// versioned format), per the versioned-record rule.
 const MUTATION_LOG_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+
+/// `GameEvent` reason for `change_game_mode` (clientbound Game Event, protocol
+/// 772): the recipient's own game mode switches to the carried mode id. Sent to a
+/// `/gamemode <mode> <player>` target — the issuer's own switch is sent by the
+/// connection.
+const GAME_EVENT_CHANGE_GAMEMODE: u8 = 3;
+/// `GameEvent` reason for `start_raining` — begins the client-visible rain a
+/// `/weather rain` broadcasts.
+const GAME_EVENT_START_RAINING: u8 = 1;
+/// `GameEvent` reason for `stop_raining` — clears the weather a `/weather clear`
+/// broadcasts.
+const GAME_EVENT_STOP_RAINING: u8 = 2;
+/// The `GameEvent` `value` field carried by the weather toggles, which use no
+/// value (unlike `change_game_mode`, whose value is the mode id).
+const GAME_EVENT_WEATHER_VALUE: f32 = 0.0;
 
 /// Upper bound on the number of recent tick timestamps the effective-TPS window
 /// retains. At 20 TPS only ~21 fall inside the one-second window, so this is
@@ -130,6 +145,20 @@ impl SnapshotCtx {
         }
         self.tps_window.len() as f64
     }
+}
+
+/// Resolves an online player by display `name` against the driver-owned roster,
+/// returning their [`PlayerId`], or `None` if no connected player matches.
+///
+/// Names are matched exactly (case-sensitive, as Minecraft names are). Used to
+/// resolve the `<player>` argument of `/tp <player>` and `/gamemode <mode>
+/// <player>` — the connection has no roster, so name resolution happens here on
+/// the driver, which owns it.
+fn resolve_online_player(roster: &BTreeMap<PlayerId, String>, name: &str) -> Option<PlayerId> {
+    roster
+        .iter()
+        .find(|(_, display)| display.as_str() == name)
+        .map(|(id, _)| *id)
 }
 
 /// Maps a [`GameMode`] onto its lowercase protocol label for the snapshot.
@@ -335,6 +364,48 @@ pub(crate) enum SimCommand {
         player: PlayerId,
         /// The destination position.
         position: Vec3,
+    },
+    /// Teleport `player` to the current position of the online player named
+    /// `target` — the `/tp <player>` command.
+    ///
+    /// The connection (net layer) has no roster or world access, so it cannot
+    /// resolve a player name or read a position. It routes the name here and the
+    /// driver resolves `target` against the live roster, reads that player's
+    /// authoritative position (sim, then the router's join-seeded fallback), and
+    /// reuses [`SimCommand::TeleportPlayer`]'s path to snap `player`. An unknown or
+    /// position-less target is a logged no-op.
+    TeleportToPlayer {
+        /// The player to move (the command issuer).
+        player: PlayerId,
+        /// The display name of the online player to teleport to.
+        target: String,
+    },
+    /// Set the authoritative game mode of the online player named `target` and
+    /// switch their client — the `/gamemode <mode> <player>` command.
+    ///
+    /// The targeted counterpart to [`SimCommand::SetGameMode`] (which the
+    /// connection uses for the issuer's own mode). The connection cannot resolve a
+    /// name or reach another player's channel, so the driver resolves `target`
+    /// against the live roster, routes a [`GameInput::SetGameMode`] to that
+    /// player's shard (the authoritative state), and sends them a clientbound
+    /// `GameEvent` (`change_game_mode`) so their client switches. An unknown target
+    /// is a logged no-op.
+    SetGameModeFor {
+        /// The display name of the online player whose mode changes.
+        target: String,
+        /// The new game mode.
+        mode: GameMode,
+    },
+    /// Broadcast a weather change to every connected player — the `/weather`
+    /// command.
+    ///
+    /// Sent server-wide as a clientbound `GameEvent` (`start_raining` /
+    /// `stop_raining`); only the driver-owned [`SessionRouter`] can reach every
+    /// player's channel. No rain is simulated in this slice — this toggles the
+    /// client-visible weather state only.
+    SetWeather {
+        /// `true` begins rain (`start_raining`); `false` clears it (`stop_raining`).
+        raining: bool,
     },
     /// Send a System Chat Message to a single `player`.
     ///
@@ -777,6 +848,65 @@ async fn handle_command(
                 tracing::trace!(%err, "dropping teleport");
             }
         }
+        SimCommand::TeleportToPlayer { player, target } => {
+            // Resolve the destination player by name against the live roster, read
+            // their authoritative position (sim first, then the router's
+            // join-seeded fallback for the tick before the join applies), and reuse
+            // the teleport path to snap the issuer. An offline or position-less
+            // target is a logged no-op (the issuer already saw optimistic feedback).
+            let Some(target_id) = resolve_online_player(player_roster, &target) else {
+                tracing::trace!(%target, "tp target is not online");
+                return;
+            };
+            let Some(position) = shard
+                .player_position(target_id)
+                .or_else(|| router.player_position(target_id))
+            else {
+                tracing::trace!(%target, "tp target has no known position");
+                return;
+            };
+            if let Err(err) = router.teleport_player(player, position) {
+                tracing::trace!(%err, "dropping teleport-to-player");
+            }
+        }
+        SimCommand::SetGameModeFor { target, mode } => {
+            // Resolve the target by name, route the authoritative mode change to
+            // their shard, then switch their client with a GameEvent. An offline
+            // target is a logged no-op.
+            let Some(target_id) = resolve_online_player(player_roster, &target) else {
+                tracing::trace!(%target, "gamemode target is not online");
+                return;
+            };
+            if let Err(err) = router.route_game_input(
+                target_id,
+                GameInput::SetGameMode {
+                    player: target_id,
+                    mode,
+                },
+            ) {
+                tracing::trace!(%err, "dropping targeted set-game-mode");
+            }
+            router.send_play_packet_to(
+                target_id,
+                ClientboundPlayPacket::GameEvent(GameEvent::new(
+                    GAME_EVENT_CHANGE_GAMEMODE,
+                    f32::from(mode.as_id()),
+                )),
+            );
+        }
+        SimCommand::SetWeather { raining } => {
+            // Server-wide, client-visible weather toggle (no rain simulation in this
+            // slice): broadcast the matching GameEvent to every connected player.
+            let reason = if raining {
+                GAME_EVENT_START_RAINING
+            } else {
+                GAME_EVENT_STOP_RAINING
+            };
+            router.broadcast_play_packet(&ClientboundPlayPacket::GameEvent(GameEvent::new(
+                reason,
+                GAME_EVENT_WEATHER_VALUE,
+            )));
+        }
         SimCommand::SendSystemChat {
             player,
             content,
@@ -1140,17 +1270,41 @@ fn publish_snapshot(
 
 #[cfg(test)]
 mod tests {
+    // Teleport/weather assertions compare exact, representable shell coordinates
+    // and game-event values, so exact float comparison is intentional here.
+    #![allow(clippy::float_cmp)]
+    // The test setup pairs a `router` with a `roster`; the names are deliberately
+    // close, mirroring the production `player_roster`.
+    #![allow(clippy::similar_names)]
+
     use std::collections::BTreeMap;
 
-    use ferrumc_core::{PlayerId, Tick};
+    use ferrumc_core::{GameMode, PlayerId, Tick};
     use ferrumc_math::{BlockPos, Direction, ShardPos, Vec3};
-    use ferrumc_session::SessionRouter;
-    use ferrumc_sim::{BlockStateId, SimShard};
+    use ferrumc_proto::generated::play::ClientboundPlayPacket;
+    use ferrumc_session::{PlayerSessionHandle, SessionRouter};
+    use ferrumc_sim::{BlockStateId, GameInput, SimShard};
     use ferrumc_storage::InMemoryStore;
     use ferrumc_world::FlatWorldGenerator;
     use tokio::sync::{mpsc, oneshot};
 
     use super::{handle_command, SimCommand};
+
+    /// Drains every queued outbound packet on `handle` (used to discard
+    /// join-visibility traffic before asserting on a command's effect).
+    fn drain(handle: &mut PlayerSessionHandle) {
+        while handle.try_recv().is_some() {}
+    }
+
+    /// The `(reason, value)` of the next outbound `GameEvent` on `handle`.
+    fn next_game_event(handle: &mut PlayerSessionHandle) -> (u8, f32) {
+        let ClientboundPlayPacket::GameEvent(event) =
+            handle.try_recv().expect("a queued packet").into_packet()
+        else {
+            panic!("expected a GameEvent");
+        };
+        (event.reason(), event.value())
+    }
 
     #[tokio::test]
     async fn place_block_command_replies_with_the_refined_state() {
@@ -1196,5 +1350,147 @@ mod tests {
                 .expect("driver replied with the computed state"),
             Some(BlockStateId::new(136)),
         );
+    }
+
+    /// A fixed in-shard spawn used by the teleport/weather/gamemode driver tests.
+    fn spawn() -> Vec3 {
+        Vec3::new(8.0, 64.0, 8.0)
+    }
+
+    #[tokio::test]
+    async fn weather_command_broadcasts_a_game_event_to_everyone() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let mut a = router
+            .join_player(PlayerId::offline("a"), "a", spawn())
+            .expect("join a");
+        let mut b = router
+            .join_player(PlayerId::offline("b"), "b", spawn())
+            .expect("join b");
+        drain(&mut a);
+        drain(&mut b);
+
+        let mut shard = SimShard::new(ShardPos::new(0, 0));
+        let store = InMemoryStore::new();
+        let generator = FlatWorldGenerator::new();
+        let (storage_tx, _storage_rx) = mpsc::channel(1);
+        let mut next_mutation_id = 0u64;
+        let mut roster = BTreeMap::new();
+
+        handle_command(
+            &mut router,
+            &mut shard,
+            &store,
+            &generator,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &mut roster,
+            SimCommand::SetWeather { raining: true },
+        )
+        .await;
+
+        // Both players receive start_raining (reason 1, no value). clear would be 2.
+        assert_eq!(next_game_event(&mut a), (1, 0.0));
+        assert_eq!(next_game_event(&mut b), (1, 0.0));
+    }
+
+    #[tokio::test]
+    async fn set_game_mode_for_routes_authoritative_change_and_notifies_target() {
+        let mut router = SessionRouter::new();
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let issuer = PlayerId::offline("Op");
+        let target = PlayerId::offline("Joe");
+        let _op = router.join_player(issuer, "Op", spawn()).expect("join op");
+        let mut joe = router
+            .join_player(target, "Joe", spawn())
+            .expect("join joe");
+        drain(&mut joe);
+        // Discard the PlayerJoin inputs so the inbox below only holds the command.
+        while inbox.try_recv().is_ok() {}
+
+        let mut shard = SimShard::new(ShardPos::new(0, 0));
+        let store = InMemoryStore::new();
+        let generator = FlatWorldGenerator::new();
+        let (storage_tx, _storage_rx) = mpsc::channel(1);
+        let mut next_mutation_id = 0u64;
+        let mut roster = BTreeMap::new();
+        roster.insert(target, "Joe".to_string());
+
+        handle_command(
+            &mut router,
+            &mut shard,
+            &store,
+            &generator,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &mut roster,
+            SimCommand::SetGameModeFor {
+                target: "Joe".to_string(),
+                mode: GameMode::Creative,
+            },
+        )
+        .await;
+
+        // The authoritative change is routed to the target's shard ...
+        assert_eq!(
+            inbox.try_recv(),
+            Ok(GameInput::SetGameMode {
+                player: target,
+                mode: GameMode::Creative,
+            })
+        );
+        // ... and the target's client is switched with change_game_mode (reason 3)
+        // carrying creative (1.0).
+        assert_eq!(next_game_event(&mut joe), (3, 1.0));
+    }
+
+    #[tokio::test]
+    async fn teleport_to_player_snaps_the_issuer_to_the_target() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let issuer = PlayerId::offline("Op");
+        let target = PlayerId::offline("Joe");
+        let mut op = router.join_player(issuer, "Op", spawn()).expect("join op");
+        // Inside shard (0, 0) (chunks 0..8 on each axis) so the join is accepted.
+        let target_pos = Vec3::new(20.0, 70.0, 40.0);
+        let _joe = router
+            .join_player(target, "Joe", target_pos)
+            .expect("join joe");
+        drain(&mut op);
+
+        let mut shard = SimShard::new(ShardPos::new(0, 0));
+        let store = InMemoryStore::new();
+        let generator = FlatWorldGenerator::new();
+        let (storage_tx, _storage_rx) = mpsc::channel(1);
+        let mut next_mutation_id = 0u64;
+        let mut roster = BTreeMap::new();
+        roster.insert(target, "Joe".to_string());
+
+        handle_command(
+            &mut router,
+            &mut shard,
+            &store,
+            &generator,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &mut roster,
+            SimCommand::TeleportToPlayer {
+                player: issuer,
+                target: "Joe".to_string(),
+            },
+        )
+        .await;
+
+        // The issuer's client is snapped to the target's position (the sim has not
+        // ticked the join, so resolution falls back to the router's seeded pos).
+        let ClientboundPlayPacket::SynchronizePlayerPosition(sync) =
+            op.try_recv().expect("a teleport sync").into_packet()
+        else {
+            panic!("expected a SynchronizePlayerPosition");
+        };
+        assert_eq!((sync.x(), sync.y(), sync.z()), (20.0, 70.0, 40.0));
     }
 }
