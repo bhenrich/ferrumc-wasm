@@ -80,6 +80,16 @@ pub enum SessionError {
         /// The player whose outbound channel is closed.
         player: PlayerId,
     },
+
+    /// A string field of a clientbound packet (an objective, team, or entity
+    /// name) exceeded the protocol's length cap while being built.
+    #[error("packet string field too long: {0}")]
+    StringField(#[from] ferrumc_codec::CodecError),
+
+    /// A text component could not be encoded as network NBT for a packet body
+    /// (it exceeded the NBT depth or size limits).
+    #[error("failed to encode text component to NBT: {0}")]
+    TextEncode(#[from] ferrumc_nbt::NbtError),
 }
 
 impl From<SessionError> for ServerError {
@@ -111,6 +121,12 @@ impl From<SessionError> for ServerError {
             )),
             SessionError::OutboundFull { player } => {
                 ServerError::capacity(format!("player {player} outbound channel full"))
+            }
+            SessionError::StringField(err) => {
+                ServerError::invalid_state(format!("packet string field too long: {err}"))
+            }
+            SessionError::TextEncode(err) => {
+                ServerError::invalid_state(format!("text component NBT encode failed: {err}"))
             }
         }
     }

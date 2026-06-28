@@ -46,6 +46,7 @@ mod event;
 mod outbound;
 mod presentation;
 mod router;
+mod scoreboard;
 mod text;
 mod translate;
 
@@ -63,6 +64,16 @@ pub use presentation::{
 pub use router::{
     PlayerSessionHandle, SessionRouter, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_SHARD_INPUT_CAPACITY,
     DEFAULT_VIEW_DISTANCE,
+};
+pub use scoreboard::{
+    boss_bar_add, boss_bar_remove, boss_bar_update_flags, boss_bar_update_health,
+    boss_bar_update_style, boss_bar_update_title, display_objective, objective_create,
+    objective_remove, score_set, team_add_entities, team_create, team_remove, team_remove_entities,
+    team_update, BossBarColor, BossBarDivision, ObjectiveRender, BOSS_BAR_FLAG_CREATE_FOG,
+    BOSS_BAR_FLAG_DARKEN_SKY, BOSS_BAR_FLAG_PLAY_MUSIC, DISPLAY_SLOT_BELOW_NAME, DISPLAY_SLOT_LIST,
+    DISPLAY_SLOT_SIDEBAR, OBJECTIVE_MODE_CREATE, OBJECTIVE_MODE_REMOVE, OBJECTIVE_MODE_UPDATE,
+    TEAM_FLAG_FRIENDLY_FIRE, TEAM_FLAG_SEE_FRIENDLY_INVISIBLE, TEAM_METHOD_ADD_ENTITIES,
+    TEAM_METHOD_CREATE, TEAM_METHOD_REMOVE, TEAM_METHOD_REMOVE_ENTITIES, TEAM_METHOD_UPDATE,
 };
 pub use text::system_chat;
 pub use translate::{
