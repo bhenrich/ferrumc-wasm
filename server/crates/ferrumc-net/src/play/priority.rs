@@ -102,9 +102,11 @@ impl OutboundPriority {
     ///
     /// This is a starting policy, not a hard rule: a caller that knows better
     /// (for example, flagging a specific chunk send as cosmetic) may still
-    /// enqueue at an explicit priority. No generated clientbound packet currently
-    /// maps to [`Cosmetic`](Self::Cosmetic); that class is reserved for the
-    /// particle and sound packets a later milestone adds.
+    /// enqueue at an explicit priority. The reserved title / particle / sound
+    /// packets map to [`Cosmetic`](Self::Cosmetic); the scoreboard, team, and
+    /// boss-bar UI packets ride [`State`](Self::State) (a dropped update would
+    /// leave stale on-screen UI), and inline block-entity data rides
+    /// [`World`](Self::World) with the rest of the bulk world content.
     pub fn for_packet(packet: &ClientboundPlayPacket) -> Self {
         match packet {
             ClientboundPlayPacket::ClientboundKeepAlive(_) => Self::Critical,
@@ -151,10 +153,24 @@ impl OutboundPriority {
             // Player Abilities is join-handshake state (flight + instabuild flags);
             // the client must reliably apply it, so it rides State.
             | ClientboundPlayPacket::PlayerAbilities(_)
+            // Scoreboard, team, and boss-bar packets carry persistent on-screen
+            // UI: a dropped update leaves the sidebar/tab-color/health bar stale
+            // until the next one, so they ride State (ahead of bulk world), not
+            // droppable Cosmetic. OpenSignEditor is the direct response that opens
+            // the sign-edit GUI after a placement, so it too rides State.
+            | ClientboundPlayPacket::UpdateObjectives(_)
+            | ClientboundPlayPacket::DisplayObjective(_)
+            | ClientboundPlayPacket::UpdateScore(_)
+            | ClientboundPlayPacket::SetPlayerTeam(_)
+            | ClientboundPlayPacket::BossBar(_)
+            | ClientboundPlayPacket::OpenSignEditor(_)
             | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::State,
             ClientboundPlayPacket::BlockUpdate(_)
             | ClientboundPlayPacket::ChunkDataAndLight(_)
             | ClientboundPlayPacket::UnloadChunk(_)
+            // Inline block-entity data (sign text, banner patterns, …) is bulk
+            // world content alongside block updates and chunk data.
+            | ClientboundPlayPacket::BlockEntityData(_)
             // Entity movement is bulk position traffic, droppable under load (a
             // later move or the next teleport supersedes a dropped one). The spawn
             // (SpawnEntity) and despawn (RemoveEntities) are deliberately NOT here —
@@ -168,6 +184,16 @@ impl OutboundPriority {
             // Equipment (held item) is cosmetic viewer state: a later update or the
             // next spawn supersedes a dropped one, so it rides droppable World.
             | ClientboundPlayPacket::SetEquipment(_) => Self::World,
+            // Purely visual / audio overlays, safely shed under congestion: the
+            // title stack (title / subtitle / action bar / animation times), world
+            // particles, and the positional / entity sound effects.
+            ClientboundPlayPacket::SetTitleText(_)
+            | ClientboundPlayPacket::SetSubtitleText(_)
+            | ClientboundPlayPacket::SetActionBarText(_)
+            | ClientboundPlayPacket::SetTitleAnimationTimes(_)
+            | ClientboundPlayPacket::Particle(_)
+            | ClientboundPlayPacket::SoundEffect(_)
+            | ClientboundPlayPacket::EntitySoundEffect(_) => Self::Cosmetic,
         }
     }
 }
@@ -262,7 +288,27 @@ impl Criticality {
             | ClientboundPlayPacket::SetEquipment(_)
             | ClientboundPlayPacket::SystemChat(_)
             | ClientboundPlayPacket::Commands(_)
-            | ClientboundPlayPacket::TabCompleteResponse(_) => Self::Droppable,
+            | ClientboundPlayPacket::TabCompleteResponse(_)
+            // The reserved title / particle / sound / scoreboard / team / boss-bar
+            // / block-entity / sign packets default to droppable: a drop leaves a
+            // missed visual or a stale UI element that the next update heals, never
+            // corrupting later client state. A lane that needs an exception (e.g. a
+            // boss-bar *remove*, which would otherwise ghost) passes the criticality
+            // explicitly at the send site, exactly like a BlockUpdate resync.
+            | ClientboundPlayPacket::SetTitleText(_)
+            | ClientboundPlayPacket::SetSubtitleText(_)
+            | ClientboundPlayPacket::SetActionBarText(_)
+            | ClientboundPlayPacket::SetTitleAnimationTimes(_)
+            | ClientboundPlayPacket::Particle(_)
+            | ClientboundPlayPacket::SoundEffect(_)
+            | ClientboundPlayPacket::EntitySoundEffect(_)
+            | ClientboundPlayPacket::UpdateObjectives(_)
+            | ClientboundPlayPacket::DisplayObjective(_)
+            | ClientboundPlayPacket::UpdateScore(_)
+            | ClientboundPlayPacket::SetPlayerTeam(_)
+            | ClientboundPlayPacket::BossBar(_)
+            | ClientboundPlayPacket::BlockEntityData(_)
+            | ClientboundPlayPacket::OpenSignEditor(_) => Self::Droppable,
         }
     }
 }
@@ -399,6 +445,51 @@ mod tests {
         let despawn = ClientboundPlayPacket::RemoveEntities(RemoveEntities::new(vec![2]));
         assert_eq!(Criticality::for_packet(&ack), Criticality::Mandatory);
         assert_eq!(Criticality::for_packet(&despawn), Criticality::Mandatory);
+    }
+
+    #[test]
+    fn reserved_visual_packets_are_cosmetic_and_droppable() {
+        use ferrumc_proto::generated::play::{Particle, SoundEffect};
+        // Particles and sounds are visual/audio-only and safely shed under
+        // congestion (the title/action-bar overlays share this Cosmetic arm).
+        let particle = ClientboundPlayPacket::Particle(Particle::new(
+            false,
+            false,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1,
+            0,
+            Vec::new(),
+        ));
+        let sound = ClientboundPlayPacket::SoundEffect(SoundEffect::new(Vec::new()));
+        for packet in [&particle, &sound] {
+            assert_eq!(
+                OutboundPriority::for_packet(packet),
+                OutboundPriority::Cosmetic
+            );
+            assert_eq!(Criticality::for_packet(packet), Criticality::Droppable);
+        }
+    }
+
+    #[test]
+    fn reserved_ui_packets_ride_state() {
+        use ferrumc_codec::BoundedString;
+        use ferrumc_proto::generated::play::DisplayObjective;
+        // Persistent on-screen UI (here a sidebar objective) must not be
+        // tail-dropped behind bulk World chunk traffic.
+        let display = ClientboundPlayPacket::DisplayObjective(DisplayObjective::new(
+            1,
+            BoundedString::<32_767>::new("health".to_string()).unwrap(),
+        ));
+        assert_eq!(
+            OutboundPriority::for_packet(&display),
+            OutboundPriority::State
+        );
     }
 
     #[test]

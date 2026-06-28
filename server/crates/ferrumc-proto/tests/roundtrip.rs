@@ -17,13 +17,16 @@ use ferrumc_proto::generated::login::{
     SetCompression,
 };
 use ferrumc_proto::generated::play::{
-    BlockUpdate, ChatCommand, ChunkBlockEntity, ChunkDataAndLight, ClientboundKeepAlive,
-    ClientboundPlayPacket, ConfirmTeleportation, DeathLocation, EntityTeleport, EntityVelocity,
-    GameEvent, Heightmap, JoinGame, PlayerAction, PlayerInfoUpdate, RemoveEntities,
-    RemovePlayerInfo, ServerboundKeepAlive, ServerboundPlayPacket, SetCenterChunk,
-    SetDefaultSpawnPosition, SetHeadRotation, SetPlayerPosition, SetPlayerPositionAndRotation,
-    SpawnEntity, SpawnInfo, SynchronizePlayerPosition, UnloadChunk, UpdateEntityPosition,
-    UpdateEntityPositionAndRotation, UpdateEntityRotation, UseItemOn,
+    BlockEntityData, BlockUpdate, BossBar, ChatCommand, ChunkBlockEntity, ChunkDataAndLight,
+    ClientboundKeepAlive, ClientboundPlayPacket, ConfirmTeleportation, DeathLocation,
+    DisplayObjective, EntitySoundEffect, EntityTeleport, EntityVelocity, GameEvent, Heightmap,
+    JoinGame, OpenSignEditor, Particle, PlayerAction, PlayerInfoUpdate, RemoveEntities,
+    RemovePlayerInfo, ServerboundKeepAlive, ServerboundPlayPacket, SetActionBarText,
+    SetCenterChunk, SetDefaultSpawnPosition, SetHeadRotation, SetPlayerPosition,
+    SetPlayerPositionAndRotation, SetPlayerTeam, SetSubtitleText, SetTitleAnimationTimes,
+    SetTitleText, SoundEffect, SpawnEntity, SpawnInfo, SynchronizePlayerPosition, UnloadChunk,
+    UpdateEntityPosition, UpdateEntityPositionAndRotation, UpdateEntityRotation, UpdateObjectives,
+    UpdateScore, UpdateSign, UseItemOn,
 };
 use ferrumc_proto::generated::status::{
     PingRequest, PongResponse, ServerboundStatusPacket, StatusRequest, StatusResponse,
@@ -672,4 +675,161 @@ fn set_default_spawn_position_truncated_is_codec_error() {
     let mut reader = BoundedReader::new(&buf);
     let err = SetDefaultSpawnPosition::decode(&mut reader).expect_err("truncated position");
     assert!(matches!(err, ProtoError::Codec(_)));
+}
+
+// --- Reserved play packets (title / sound / particle / scoreboard / team /
+// boss bar / block entity / sign) ---------------------------------------------
+
+/// Builds a network-form text component (an anonymous-root NBT compound with a
+/// single `text` string), the shape the title / action-bar packets carry.
+fn text_component(text: &str) -> NbtTag {
+    let mut compound = NbtCompound::new();
+    compound.push("text", NbtTag::String(text.to_owned()));
+    NbtTag::Compound(compound)
+}
+
+/// Round-trips the fully-typed reserved packets: the title / action-bar text
+/// components, the title animation times, the block-entity NBT payload, and the
+/// sign open/update packets.
+#[test]
+fn play_reserved_typed_packets_round_trip() {
+    roundtrip(
+        &SetTitleText::new(text_component("Welcome")),
+        SetTitleText::encode,
+        SetTitleText::decode,
+        SetTitleText::PACKET_ID,
+    );
+    roundtrip(
+        &SetSubtitleText::new(text_component("to the server")),
+        SetSubtitleText::encode,
+        SetSubtitleText::decode,
+        SetSubtitleText::PACKET_ID,
+    );
+    roundtrip(
+        &SetActionBarText::new(text_component("low on health")),
+        SetActionBarText::encode,
+        SetActionBarText::decode,
+        SetActionBarText::PACKET_ID,
+    );
+    roundtrip(
+        &SetTitleAnimationTimes::new(10, 70, 20),
+        SetTitleAnimationTimes::encode,
+        SetTitleAnimationTimes::decode,
+        SetTitleAnimationTimes::PACKET_ID,
+    );
+
+    // Display Objective: slot 1 = sidebar.
+    roundtrip(
+        &DisplayObjective::new(1, s::<32_767>("health")),
+        DisplayObjective::encode,
+        DisplayObjective::decode,
+        DisplayObjective::PACKET_ID,
+    );
+
+    let mut be_nbt = NbtCompound::new();
+    be_nbt.push("id", NbtTag::String("minecraft:sign".to_owned()));
+    roundtrip(
+        &BlockEntityData::new(BlockPosition::new(1, 64, -3), 7, NbtTag::Compound(be_nbt)),
+        BlockEntityData::encode,
+        BlockEntityData::decode,
+        BlockEntityData::PACKET_ID,
+    );
+
+    roundtrip(
+        &OpenSignEditor::new(BlockPosition::new(8, 65, 8), true),
+        OpenSignEditor::encode,
+        OpenSignEditor::decode,
+        OpenSignEditor::PACKET_ID,
+    );
+    roundtrip(
+        &UpdateSign::new(
+            BlockPosition::new(8, 65, 8),
+            true,
+            s::<384>("line one"),
+            s::<384>("line two"),
+            s::<384>(""),
+            s::<384>(""),
+        ),
+        UpdateSign::encode,
+        UpdateSign::decode,
+        UpdateSign::PACKET_ID,
+    );
+}
+
+/// Round-trips the reserved opaque-tail / opaque-body packets, mirroring the
+/// `PlayerInfoUpdate` precedent: the stable leading fields are typed and the
+/// variant tail (or, for the sound packets, the whole body) is an opaque blob the
+/// feature lane hand-encodes.
+#[test]
+fn play_reserved_opaque_packets_round_trip() {
+    // Sound / Entity Sound: the leading ItemSoundHolder union forces the whole
+    // body opaque.
+    roundtrip(
+        &SoundEffect::new(vec![0x01, 0x02, 0x03, 0x04]),
+        SoundEffect::encode,
+        SoundEffect::decode,
+        SoundEffect::PACKET_ID,
+    );
+    roundtrip(
+        &EntitySoundEffect::new(vec![0xAA, 0xBB]),
+        EntitySoundEffect::encode,
+        EntitySoundEffect::decode,
+        EntitySoundEffect::PACKET_ID,
+    );
+
+    // Particle: typed leading fields, then a typed particle id and an opaque
+    // per-type data tail.
+    roundtrip(
+        &Particle::new(
+            true,
+            false,
+            1.0,
+            2.0,
+            3.0,
+            0.1,
+            0.2,
+            0.3,
+            0.5,
+            64,
+            13, // dust
+            vec![0xDE, 0xAD, 0xBE, 0xEF],
+        ),
+        Particle::encode,
+        Particle::decode,
+        Particle::PACKET_ID,
+    );
+
+    // Update Objectives: mode 0 (create) with an opaque display-data tail.
+    roundtrip(
+        &UpdateObjectives::new(s::<32_767>("health"), 0, vec![0x00, 0x01]),
+        UpdateObjectives::encode,
+        UpdateObjectives::decode,
+        UpdateObjectives::PACKET_ID,
+    );
+    // Update Score: typed names + value, two `false` flag bytes as the tail.
+    roundtrip(
+        &UpdateScore::new(
+            s::<32_767>("Notch"),
+            s::<32_767>("health"),
+            20,
+            vec![0x00, 0x00],
+        ),
+        UpdateScore::encode,
+        UpdateScore::decode,
+        UpdateScore::PACKET_ID,
+    );
+    // Set Player Team: method 1 (remove) carries no tail.
+    roundtrip(
+        &SetPlayerTeam::new(s::<32_767>("red"), 1, vec![]),
+        SetPlayerTeam::encode,
+        SetPlayerTeam::decode,
+        SetPlayerTeam::PACKET_ID,
+    );
+    // Boss Bar: action 1 (remove) carries no tail.
+    roundtrip(
+        &BossBar::new(Uuid::from_u128(0xfeed_face), 1, vec![]),
+        BossBar::encode,
+        BossBar::decode,
+        BossBar::PACKET_ID,
+    );
 }

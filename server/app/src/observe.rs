@@ -139,6 +139,20 @@ pub(crate) fn clientbound_play_name(packet: &ClientboundPlayPacket) -> &'static 
         ClientboundPlayPacket::ClientboundSetHeldItem(_) => "clientbound_set_held_item",
         ClientboundPlayPacket::PlayerAbilities(_) => "player_abilities",
         ClientboundPlayPacket::SetEquipment(_) => "set_equipment",
+        ClientboundPlayPacket::SetTitleText(_) => "set_title_text",
+        ClientboundPlayPacket::SetSubtitleText(_) => "set_subtitle_text",
+        ClientboundPlayPacket::SetActionBarText(_) => "set_action_bar_text",
+        ClientboundPlayPacket::SetTitleAnimationTimes(_) => "set_title_animation_times",
+        ClientboundPlayPacket::SoundEffect(_) => "sound_effect",
+        ClientboundPlayPacket::EntitySoundEffect(_) => "entity_sound_effect",
+        ClientboundPlayPacket::Particle(_) => "particle",
+        ClientboundPlayPacket::UpdateObjectives(_) => "update_objectives",
+        ClientboundPlayPacket::DisplayObjective(_) => "display_objective",
+        ClientboundPlayPacket::UpdateScore(_) => "update_score",
+        ClientboundPlayPacket::SetPlayerTeam(_) => "set_player_team",
+        ClientboundPlayPacket::BossBar(_) => "boss_bar",
+        ClientboundPlayPacket::BlockEntityData(_) => "block_entity_data",
+        ClientboundPlayPacket::OpenSignEditor(_) => "open_sign_editor",
     }
 }
 
@@ -160,6 +174,7 @@ fn serverbound_play_name(packet: &ServerboundPlayPacket) -> &'static str {
         ServerboundPlayPacket::ServerboundSetHeldItem(_) => "serverbound_set_held_item",
         ServerboundPlayPacket::SetCreativeSlot(_) => "set_creative_slot",
         ServerboundPlayPacket::WindowClick(_) => "window_click",
+        ServerboundPlayPacket::UpdateSign(_) => "update_sign",
     }
 }
 

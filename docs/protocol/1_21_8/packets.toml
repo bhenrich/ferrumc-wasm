@@ -907,3 +907,267 @@ fields = [
     { name = "state_id", type = "varint" },
     { name = "rest", type = "remaining_bytes" },
 ]
+
+# --- Title / action bar (pre-reserved for the title feature lane) ----------------
+#
+# Ids verified against fixtures/protocol/1_21_8/protocol.json (protocol 772):
+# set_title_text 0x6B, set_title_subtitle 0x69, action_bar 0x50, set_title_time
+# 0x6C. The three text packets each carry one text component as network
+# (anonymous-root) NBT — the same `nbt` modeling as SystemChat (built by the
+# session crate from a TextComponent via ferrumc_nbt::write_network_root). These
+# are fully typed; no deviation.
+
+# minecraft-data: play.toClient.set_title_text ("Set Title Text").
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SetTitleText"
+id = 0x6B
+fields = [{ name = "text", type = "nbt" }]
+
+# minecraft-data: play.toClient.set_title_subtitle ("Set Subtitle Text").
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SetSubtitleText"
+id = 0x69
+fields = [{ name = "text", type = "nbt" }]
+
+# minecraft-data: play.toClient.action_bar ("Set Action Bar Text"). Distinct from
+# SystemChat with overlay=true: this is the dedicated action-bar packet.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SetActionBarText"
+id = 0x50
+fields = [{ name = "text", type = "nbt" }]
+
+# minecraft-data: play.toClient.set_title_time ("Set Title Animation Times"). The
+# three durations are big-endian 4-byte ints (ticks), not VarInts.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SetTitleAnimationTimes"
+id = 0x6C
+fields = [
+    { name = "fade_in", type = "i32" },
+    { name = "stay", type = "i32" },
+    { name = "fade_out", type = "i32" },
+]
+
+# --- Sound effects (pre-reserved for the sound feature lane) ---------------------
+#
+# Ids verified against fixtures/protocol/1_21_8/protocol.json (protocol 772):
+# sound_effect 0x6E, entity_sound_effect 0x6D.
+#
+# DEVIATION: both packets LEAD with `sound`, an `ItemSoundHolder` — a
+# registry-id-or-inline union (a VarInt id; if 0, an inline SoundEvent =
+# identifier + optional fixed-range f32). Because that variable-length union is
+# the FIRST field, nothing after it (sound category, coords/entity, volume,
+# pitch, seed) can be modeled typed without expressing the union itself, which the
+# closed packets.toml grammar cannot do. So — exactly like the Commands packet —
+# the WHOLE body is carried as one opaque `payload` (`remaining_bytes`). The sound
+# feature lane hand-encodes the full body (sound holder + soundSource VarInt +
+# i32 x/y/z [or entity_id VarInt] + f32 volume + f32 pitch + i64 seed) and is
+# covered by golden-byte tests. Clientbound-only; the generated decode is never
+# exercised at runtime.
+
+# minecraft-data: play.toClient.sound_effect ("Sound Effect").
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SoundEffect"
+id = 0x6E
+fields = [{ name = "payload", type = "remaining_bytes" }]
+
+# minecraft-data: play.toClient.entity_sound_effect ("Entity Sound Effect").
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "EntitySoundEffect"
+id = 0x6D
+fields = [{ name = "payload", type = "remaining_bytes" }]
+
+# --- Particles (pre-reserved for the particle feature lane) ----------------------
+#
+# Id verified against fixtures/protocol/1_21_8/protocol.json (protocol 772):
+# world_particles 0x29.
+#
+# DEVIATION: the leading fields (flags, position, per-axis offset, max speed,
+# particle count) are fixed-width and modeled typed. The trailing particle is a
+# tagged union — a VarInt particle-type id (`kind`) followed by a per-type data
+# payload (e.g. block state for `block`, RGB + scale for `dust`, an item Slot for
+# `item`) that the closed grammar cannot express. `kind` (the VarInt type id) is
+# typed; the per-type data is carried as opaque `data` (`remaining_bytes`),
+# hand-encoded by the particle feature lane per type id and covered by golden-byte
+# tests. (`kind`/`data` follow the Heightmap naming; a `particle_*` prefix would
+# trip clippy's struct_field_names on the generated struct.) Clientbound-only; the
+# generated decode is never exercised at runtime.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "Particle"
+id = 0x29
+fields = [
+    { name = "long_distance", type = "bool" },
+    { name = "always_show", type = "bool" },
+    { name = "x", type = "f64" },
+    { name = "y", type = "f64" },
+    { name = "z", type = "f64" },
+    { name = "offset_x", type = "f32" },
+    { name = "offset_y", type = "f32" },
+    { name = "offset_z", type = "f32" },
+    { name = "max_speed", type = "f32" },
+    { name = "count", type = "i32" },
+    { name = "kind", type = "varint" },
+    { name = "data", type = "remaining_bytes" },
+]
+
+# --- Scoreboard / teams / boss bar (pre-reserved for the scoreboard lane) --------
+#
+# Ids verified against fixtures/protocol/1_21_8/protocol.json (protocol 772):
+# scoreboard_objective 0x63, scoreboard_display_objective 0x5B, scoreboard_score
+# 0x67, teams 0x66, boss_bar 0x09.
+
+# minecraft-data: play.toClient.scoreboard_objective ("Update Objectives").
+# DEVIATION: `name` + `mode` (0 create / 1 remove / 2 update) are typed and stable;
+# `mode` is a signed Byte (i8), NOT a VarInt. For create/update the tail carries a
+# display-name text component (NBT), a render-type VarInt, and an optional number
+# format whose styling branch is itself NBT — a mode-keyed, nested switch the
+# closed grammar cannot express, so it is carried as opaque `rest`
+# (`remaining_bytes`), hand-encoded by the scoreboard lane (empty for mode 1).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "UpdateObjectives"
+id = 0x63
+fields = [
+    { name = "name", type = "string(32767)" },
+    { name = "mode", type = "i8" },
+    { name = "rest", type = "remaining_bytes" },
+]
+
+# minecraft-data: play.toClient.scoreboard_display_objective ("Display Objective").
+# Fully typed: `position` is the display-slot VarInt (0 list / 1 sidebar / 2 below
+# name / 3..18 team-colored sidebars); `name` is the objective name. No deviation.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "DisplayObjective"
+id = 0x5B
+fields = [
+    { name = "position", type = "varint" },
+    { name = "name", type = "string(32767)" },
+]
+
+# minecraft-data: play.toClient.scoreboard_score ("Update Score"). NOTE: this is
+# the SET form (0x67); score REMOVAL is the separate reset_score packet (0x48),
+# not modeled here.
+# DEVIATION: `entity_name` (score holder), `objective_name`, and `value` (VarInt)
+# are typed and stable. The tail is an optional display-name text component (NBT)
+# and an optional number format whose styling branch is NBT — carried as opaque
+# `rest` (`remaining_bytes`), hand-encoded by the scoreboard lane (the minimal
+# form is two `false` flag bytes).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "UpdateScore"
+id = 0x67
+fields = [
+    { name = "entity_name", type = "string(32767)" },
+    { name = "objective_name", type = "string(32767)" },
+    { name = "value", type = "varint" },
+    { name = "rest", type = "remaining_bytes" },
+]
+
+# minecraft-data: play.toClient.teams ("Set Player Team").
+# DEVIATION: `name` (team name) + `method` (0 create / 1 remove / 2 update info /
+# 3 add players / 4 remove players) are typed and stable; `method` is a signed
+# Byte (i8), NOT a VarInt. The method-keyed tail — for create/update an inline
+# team-info container (display name NBT, friendly flags bitfield, name-tag
+# visibility + collision-rule enums, color VarInt, prefix/suffix NBT) and for
+# create/add/remove a player-name string array — is a tagged union the closed
+# grammar cannot express, so it is carried as opaque `rest` (`remaining_bytes`),
+# hand-encoded by the team lane per method.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "SetPlayerTeam"
+id = 0x66
+fields = [
+    { name = "name", type = "string(32767)" },
+    { name = "method", type = "i8" },
+    { name = "rest", type = "remaining_bytes" },
+]
+
+# minecraft-data: play.toClient.boss_bar ("Boss Bar").
+# DEVIATION: `uuid` (the bar identity) + `action` (0 add / 1 remove / 2 update
+# health / 3 update title / 4 update style / 5 update flags, a VarInt) are typed
+# and stable. The action-keyed tail — add: title NBT + health f32 + color/division
+# VarInts + flags u8; update-health: f32; update-title: NBT; update-style: two
+# VarInts; update-flags: u8; remove: empty — is a tagged union the closed grammar
+# cannot express, so it is carried as opaque `rest` (`remaining_bytes`),
+# hand-encoded by the boss-bar lane per action (empty for action 1).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "BossBar"
+id = 0x09
+fields = [
+    { name = "uuid", type = "uuid" },
+    { name = "action", type = "varint" },
+    { name = "rest", type = "remaining_bytes" },
+]
+
+# --- Block entities / signs (pre-reserved for the block-entity & sign lanes) -----
+#
+# Ids verified against fixtures/protocol/1_21_8/protocol.json (protocol 772):
+# tile_entity_data 0x06, open_sign_entity 0x35 (clientbound); update_sign 0x3B
+# (serverbound).
+
+# minecraft-data: play.toClient.tile_entity_data ("Block Entity Data"). Fully
+# typed: the packed BlockPos, the `block_entity_type` registry id (VarInt), and
+# the `data` NBT compound. `data` follows the ChunkBlockEntity precedent —
+# modeled as a present network-form `nbt` value; the degenerate TAG_End "absent"
+# sentinel (protocol.json's anonOptionalNbt empty case) is not modeled.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "BlockEntityData"
+id = 0x06
+fields = [
+    { name = "location", type = "position" },
+    { name = "block_entity_type", type = "varint" },
+    { name = "data", type = "nbt" },
+]
+
+# minecraft-data: play.toClient.open_sign_entity ("Open Sign Editor"). Fully
+# typed: the sign's packed BlockPos and whether the front (true) or back (false)
+# text face is being edited.
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "OpenSignEditor"
+id = 0x35
+fields = [
+    { name = "location", type = "position" },
+    { name = "is_front_text", type = "bool" },
+]
+
+# minecraft-data: play.toServer.update_sign ("Update Sign"). Fully typed: the
+# packed BlockPos, the edited face (front/back), and the four text lines. Each
+# line is a plain string capped at 384 UTF-16 code units (the vanilla sign-line
+# limit), NOT a text component.
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "UpdateSign"
+id = 0x3B
+fields = [
+    { name = "location", type = "position" },
+    { name = "is_front_text", type = "bool" },
+    { name = "line_1", type = "string(384)" },
+    { name = "line_2", type = "string(384)" },
+    { name = "line_3", type = "string(384)" },
+    { name = "line_4", type = "string(384)" },
+]
