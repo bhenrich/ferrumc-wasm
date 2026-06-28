@@ -1278,6 +1278,45 @@ impl SessionRouter {
         }
     }
 
+    /// Broadcasts a clientbound play `packet` to every connected player.
+    ///
+    /// The generic counterpart to
+    /// [`broadcast_system_chat`](Self::broadcast_system_chat) for a server-wide
+    /// packet the driver builds at the app layer — e.g. the `GameEvent` a
+    /// `/weather` command toggles. Only the router holds every player's outbound
+    /// channel, so a server-wide send must route through here.
+    ///
+    /// # Backpressure
+    ///
+    /// Best-effort and lossy, exactly like the visibility/chat broadcasts: a
+    /// recipient whose outbound channel is *full* or *closed* simply misses the
+    /// packet. This never blocks and never fails.
+    pub fn broadcast_play_packet(&self, packet: &ClientboundPlayPacket) {
+        for entry in self.players.values() {
+            let _ = entry
+                .outbound
+                .try_send(OutboundMessage::droppable(packet.clone()));
+        }
+    }
+
+    /// Sends a clientbound play `packet` to a single `player`. An unknown player is
+    /// a silent no-op.
+    ///
+    /// The targeted counterpart to [`broadcast_play_packet`](Self::broadcast_play_packet),
+    /// for a packet the driver builds at the app layer and aims at one player the
+    /// connection cannot reach directly — e.g. the `change_game_mode` `GameEvent`
+    /// sent to a `/gamemode <mode> <player>` target.
+    ///
+    /// # Backpressure
+    ///
+    /// Best-effort and lossy: a recipient whose outbound channel is *full* or
+    /// *closed* simply misses the packet. This never blocks and never fails.
+    pub fn send_play_packet_to(&self, player: PlayerId, packet: ClientboundPlayPacket) {
+        if let Some(entry) = self.players.get(&player) {
+            let _ = entry.outbound.try_send(OutboundMessage::droppable(packet));
+        }
+    }
+
     /// Teleports `player` to `position`: snaps the target's own client to the new
     /// position and updates authoritative simulation state.
     ///
@@ -1440,7 +1479,7 @@ mod tests {
     #![allow(clippy::float_cmp)]
 
     use ferrumc_net::DisconnectReason;
-    use ferrumc_proto::generated::play::{ServerboundKeepAlive, ServerboundPlayPacket};
+    use ferrumc_proto::generated::play::{GameEvent, ServerboundKeepAlive, ServerboundPlayPacket};
     use ferrumc_sim::{Sign, SignKind};
 
     use super::*;
@@ -1477,6 +1516,72 @@ mod tests {
                 player: p,
                 position: spawn_pos(),
             })
+        );
+    }
+
+    /// Extracts the `GameEvent` `(reason, value)` from the next outbound packet on
+    /// `handle`, panicking if it is not a `GameEvent`.
+    fn next_game_event(handle: &mut PlayerSessionHandle) -> (u8, f32) {
+        let ClientboundPlayPacket::GameEvent(event) =
+            handle.try_recv().expect("a queued packet").into_packet()
+        else {
+            panic!("expected a GameEvent");
+        };
+        (event.reason(), event.value())
+    }
+
+    #[test]
+    fn broadcast_play_packet_reaches_every_player() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let mut a = router
+            .join_player(player("a"), "a", spawn_pos())
+            .expect("join a");
+        let mut b = router
+            .join_player(player("b"), "b", spawn_pos())
+            .expect("join b");
+        // Drain the join-visibility traffic so only the broadcast remains.
+        while a.try_recv().is_some() {}
+        while b.try_recv().is_some() {}
+
+        router.broadcast_play_packet(&ClientboundPlayPacket::GameEvent(GameEvent::new(1, 0.0)));
+
+        // Both players receive the same start_raining (reason 1) GameEvent.
+        assert_eq!(next_game_event(&mut a), (1, 0.0));
+        assert_eq!(next_game_event(&mut b), (1, 0.0));
+    }
+
+    #[test]
+    fn send_play_packet_to_reaches_only_the_target() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let mut a = router
+            .join_player(player("a"), "a", spawn_pos())
+            .expect("join a");
+        let mut b = router
+            .join_player(player("b"), "b", spawn_pos())
+            .expect("join b");
+        while a.try_recv().is_some() {}
+        while b.try_recv().is_some() {}
+
+        // change_game_mode (reason 3) carrying creative (1.0), aimed at b only.
+        router.send_play_packet_to(
+            player("b"),
+            ClientboundPlayPacket::GameEvent(GameEvent::new(3, 1.0)),
+        );
+
+        assert_eq!(next_game_event(&mut b), (3, 1.0));
+        assert!(a.try_recv().is_none(), "a is not the target");
+    }
+
+    #[test]
+    fn send_play_packet_to_unknown_player_is_a_no_op() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        // No panic, no effect: there is simply no such session.
+        router.send_play_packet_to(
+            player("ghost"),
+            ClientboundPlayPacket::GameEvent(GameEvent::new(3, 0.0)),
         );
     }
 
