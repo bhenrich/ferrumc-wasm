@@ -33,6 +33,7 @@
 mod aabb;
 mod block_pos;
 mod chunk_pos;
+mod cuboid;
 mod direction;
 mod intent;
 mod local_block_pos;
@@ -44,6 +45,7 @@ mod vec3;
 pub use aabb::Aabb;
 pub use block_pos::BlockPos;
 pub use chunk_pos::ChunkPos;
+pub use cuboid::Cuboid;
 pub use direction::Direction;
 pub use intent::WorldIntent;
 pub use local_block_pos::LocalBlockPos;
