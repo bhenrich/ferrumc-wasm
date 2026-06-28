@@ -22,6 +22,8 @@ members = [
     "crates/ferrumc-plugin-api",
     "crates/ferrumc-plugin-host",
     "crates/ferrumc-anvil",
+    "crates/ferrumc-placement",
+    "crates/ferrumc-dashboard",
     "crates/ferrumc-testkit",
     "plugins/ferrumc-plugin-fixture",
     "plugins/ferrumc-plugin-spawn-protect",
@@ -52,6 +54,14 @@ toml = "0.8"
 
 # === Async runtime ===
 tokio = { version = "1", features = ["full"] }
+
+# === Web (read-only observability dashboard) ===
+# axum is the HTTP router/server for the localhost dashboard; tower/tower-http
+# provide the service abstraction and static-asset serving (htmx page) + request
+# tracing. All on http 1.x / tower 0.5, kept read-only by construction.
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.7", features = ["fs", "trace"] }
 
 # === Byte manipulation ===
 bytes = "1"
@@ -113,6 +123,8 @@ ferrumc-permission = { path = "crates/ferrumc-permission" }
 ferrumc-plugin-api = { path = "crates/ferrumc-plugin-api" }
 ferrumc-plugin-host = { path = "crates/ferrumc-plugin-host" }
 ferrumc-anvil = { path = "crates/ferrumc-anvil" }
+ferrumc-placement = { path = "crates/ferrumc-placement" }
+ferrumc-dashboard = { path = "crates/ferrumc-dashboard" }
 ferrumc-testkit = { path = "crates/ferrumc-testkit" }
 ferrumc-plugin-fixture = { path = "plugins/ferrumc-plugin-fixture" }
 ferrumc-plugin-spawn-protect = { path = "plugins/ferrumc-plugin-spawn-protect" }

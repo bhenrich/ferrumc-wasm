@@ -1,0 +1,28 @@
+[package]
+name = "ferrumc-dashboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Source of the metrics/snapshot data the dashboard renders read-only.
+ferrumc-observability = { workspace = true }
+# HTTP router/server for the localhost dashboard (htmx fragments + JSON).
+axum = { workspace = true }
+# Async runtime hosting the server task (workspace pins the "full" feature set).
+tokio = { workspace = true }
+# `derive(Serialize)` on the read-only response DTOs.
+serde = { workspace = true }
+# JSON rendering for the dashboard's data endpoints.
+serde_json = { workspace = true }
+# Service abstraction underlying the axum middleware stack.
+tower = { workspace = true }
+# Static-asset serving (`ServeDir` for the htmx page) and request tracing for the
+# read-only web server.
+tower-http = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "ferrumc-placement"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Shared identity/error types (`BlockStateId`, `ServerError`, `Result`) that the
+# placement rules classify and return.
+ferrumc-core = { workspace = true }
+# Typed coordinates and facing geometry (`BlockPos`, directions) the rotation /
+# facing / half rules operate on — never raw tuples.
+ferrumc-math = { workspace = true }
+# Block registry data: placement rules are keyed off the generated block/state
+# tables rather than hardcoded ids.
+ferrumc-registry = { workspace = true }
+
+[dev-dependencies]
+
+[lints]
+workspace = true
