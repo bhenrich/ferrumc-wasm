@@ -83,6 +83,9 @@ toml = { workspace = true }
 # CLI arg parsing (--config/--port/--bind/--version/--help) for the ferrumc
 # binary, replacing the old argv[1]-as-config-path footgun.
 clap = { workspace = true }
+# Derives a stable boss-bar UUID from its friendly id so `/bossbar` updates target
+# the bar `/bossbar add` created, with no server-side mapping to persist.
+uuid = { workspace = true }
 
 [dev-dependencies]
 # The integration test drives a real socket using the same proto encoders and

@@ -603,6 +603,14 @@ async fn handle_command(
         enqueue_traced_classified(writer, debug, compression, &ctx.clock, packet);
     }
 
+    // Scoreboard/team/boss-bar commands likewise carry their clientbound effect as
+    // one or more packets, built (and NBT-encoded) here; `scoreboard_packets`
+    // returns empty for every other command. `name` is the issuer, the default
+    // target of `/team join`.
+    for packet in crate::command::scoreboard_packets(command, name)? {
+        enqueue_traced_classified(writer, debug, compression, &ctx.clock, packet);
+    }
+
     let first_token = command.split_whitespace().next();
     if first_token == Some(SPAWN_COMMAND) {
         let spawn = policy.spawn();
