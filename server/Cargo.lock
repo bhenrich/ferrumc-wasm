@@ -442,6 +442,7 @@ dependencies = [
  "ferrumc-codec",
  "ferrumc-proto",
  "flate2",
+ "proptest",
  "sha1",
  "thiserror",
  "tokio",

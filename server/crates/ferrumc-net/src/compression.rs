@@ -140,8 +140,14 @@ impl CompressionState {
             return Ok(());
         };
 
-        if packet.len() < threshold {
-            // Below threshold: a zero marker, then the raw packet.
+        // A `data_length` of 0 is reserved to mark an *uncompressed* packet, so a
+        // compressed packet must declare a non-zero size. An empty packet can
+        // never satisfy that, so it is always sent uncompressed — even at
+        // threshold 0, which would otherwise route it through the compressed
+        // branch and emit a 0 `data_length` that `decompress` reads back as the
+        // uncompressed marker, corrupting the round trip.
+        if packet.len() < threshold || packet.is_empty() {
+            // Below threshold (or empty): a zero marker, then the raw packet.
             write_var_int(out, 0);
             out.put_slice(packet);
             return Ok(());
@@ -511,6 +517,19 @@ mod tests {
         // An empty packet is below any positive threshold and round-trips as a
         // bare zero marker.
         let state = CompressionState::enabled(8);
+        let mut out = BytesMut::new();
+        state.compress(&[], &mut out).unwrap();
+        assert_eq!(&out[..], &[0x00]);
+        assert_eq!(state.decompress(&out).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn zero_byte_packet_at_threshold_zero_roundtrips() {
+        // Regression: at threshold 0 the compressed branch would otherwise catch
+        // an empty packet and emit a 0 `data_length` (the uncompressed marker)
+        // followed by a zlib stream, which decompress reads back as the raw body.
+        // An empty packet must be sent uncompressed regardless of threshold.
+        let state = CompressionState::enabled(0);
         let mut out = BytesMut::new();
         state.compress(&[], &mut out).unwrap();
         assert_eq!(&out[..], &[0x00]);

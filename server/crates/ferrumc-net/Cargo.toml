@@ -39,6 +39,9 @@ ferrumc-codec = { workspace = true }
 ferrumc-proto = { workspace = true }
 # Decode the player UUID echoed back in Login Success during integration tests.
 uuid = { workspace = true }
+# Property-based malformed-input testing: assert the frame, packet, and
+# compression decode paths never panic and respect their caps on arbitrary bytes.
+proptest = { workspace = true }
 
 [lints]
 workspace = true
