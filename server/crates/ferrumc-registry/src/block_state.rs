@@ -337,6 +337,31 @@ mod catalog_tests {
         }
     }
 
+    /// Drift guard: every generated `ids::*` constant equals the value the
+    /// runtime lookups return for its block. The `ids` consts and this table are
+    /// emitted from the same parsed `blocks.json` as `block_default_state` /
+    /// `compute_state_id`, so a curated const can never silently rot away from
+    /// the lookup path (or a re-vendor that shifts an id fails here).
+    #[test]
+    fn id_constants_match_runtime_lookups() {
+        assert!(
+            !super::IDS_DRIFT_TABLE.is_empty(),
+            "curated ids table must not be empty"
+        );
+        for (name, value) in super::IDS_DRIFT_TABLE {
+            assert_eq!(
+                block_default_state(name),
+                Some(value),
+                "ids const for {name} disagrees with block_default_state"
+            );
+            assert_eq!(
+                compute_state_id(name, &BTreeMap::new()),
+                Some(value),
+                "ids const for {name} disagrees with compute_state_id"
+            );
+        }
+    }
+
     #[test]
     fn block_default_state_resolves_namespaced_and_bare() {
         assert_eq!(block_default_state("minecraft:oak_log"), Some(137));

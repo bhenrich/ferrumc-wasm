@@ -231,6 +231,25 @@ mod tests {
         }
     }
 
+    /// Drift guard: every generated `ids::*` constant equals the protocol id the
+    /// runtime name lookup returns. The consts and this table are emitted from
+    /// the same parsed `items.json` as `lookup_item_protocol_id`, so a curated
+    /// const can never silently rot (or a re-vendor that shifts an id fails here).
+    #[test]
+    fn id_constants_match_runtime_lookups() {
+        assert!(
+            !super::ITEM_IDS_DRIFT_TABLE.is_empty(),
+            "curated item ids table must not be empty"
+        );
+        for (name, value) in super::ITEM_IDS_DRIFT_TABLE {
+            assert_eq!(
+                lookup_item_protocol_id(name),
+                Some(value),
+                "ids const for {name} disagrees with lookup_item_protocol_id"
+            );
+        }
+    }
+
     /// Drift guard: re-parse the vendored mapping and confirm the generated
     /// item -> block-state table agrees for every entry.
     #[test]

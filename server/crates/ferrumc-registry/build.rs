@@ -39,6 +39,94 @@ struct RawComponents {
     max_stack_size: Option<i64>,
 }
 
+/// Bare block names exposed as named `block_state::ids` constants.
+///
+/// Each emits its *default* state id, looked up in `blocks.json` (so the const
+/// cannot drift from the runtime block lookups). Curated to cover the blocks the
+/// sample plugins and tests reference plus the common building/glass set; a name
+/// missing from the snapshot fails the build rather than shipping a wrong id.
+/// The bare name uppercased is the constant identifier (e.g. `glass` -> `GLASS`).
+const CURATED_BLOCK_IDS: &[&str] = &[
+    // Stone family and dirt/grass surface set.
+    "air",
+    "stone",
+    "granite",
+    "diorite",
+    "andesite",
+    "dirt",
+    "coarse_dirt",
+    "podzol",
+    "grass_block",
+    // Common building blocks.
+    "cobblestone",
+    "bedrock",
+    "gravel",
+    "sand",
+    "oak_planks",
+    "oak_log",
+    "bricks",
+    "bookshelf",
+    "obsidian",
+    "glowstone",
+    // Glass and the 16 stained-glass colours (+ tinted).
+    "glass",
+    "tinted_glass",
+    "white_stained_glass",
+    "orange_stained_glass",
+    "magenta_stained_glass",
+    "light_blue_stained_glass",
+    "yellow_stained_glass",
+    "lime_stained_glass",
+    "pink_stained_glass",
+    "gray_stained_glass",
+    "light_gray_stained_glass",
+    "cyan_stained_glass",
+    "purple_stained_glass",
+    "blue_stained_glass",
+    "brown_stained_glass",
+    "green_stained_glass",
+    "red_stained_glass",
+    "black_stained_glass",
+];
+
+/// Bare item names exposed as named `item::ids` constants (protocol item ids).
+///
+/// Each emits the item's protocol id, looked up in `items.json` (so the const
+/// cannot drift from `lookup_item_protocol_id`). Mirrors the placeable subset of
+/// [`CURATED_BLOCK_IDS`]; a name missing from the snapshot fails the build.
+const CURATED_ITEM_IDS: &[&str] = &[
+    "stone",
+    "dirt",
+    "grass_block",
+    "cobblestone",
+    "bedrock",
+    "gravel",
+    "sand",
+    "oak_planks",
+    "oak_log",
+    "bricks",
+    "glowstone",
+    "obsidian",
+    "glass",
+    "tinted_glass",
+    "white_stained_glass",
+    "orange_stained_glass",
+    "magenta_stained_glass",
+    "light_blue_stained_glass",
+    "yellow_stained_glass",
+    "lime_stained_glass",
+    "pink_stained_glass",
+    "gray_stained_glass",
+    "light_gray_stained_glass",
+    "cyan_stained_glass",
+    "purple_stained_glass",
+    "blue_stained_glass",
+    "brown_stained_glass",
+    "green_stained_glass",
+    "red_stained_glass",
+    "black_stained_glass",
+];
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let data_dir = manifest_dir.join("data");
@@ -302,7 +390,60 @@ fn emit_blocks(blocks: &[Block]) -> String {
     }
     out.push_str("];\n");
 
+    emit_block_ids(&mut out, blocks);
+
     out
+}
+
+/// Appends the curated `ids` module of named default-state constants plus a
+/// test-only drift table, both derived from the same parsed `blocks`.
+///
+/// Panics if a curated name is absent from the snapshot, so a botched re-vendor
+/// fails the build instead of emitting a const for a block that no longer exists.
+fn emit_block_ids(out: &mut String, blocks: &[Block]) {
+    let by_name: BTreeMap<&str, &Block> = blocks.iter().map(|b| (b.name.as_str(), b)).collect();
+
+    out.push_str("\n/// Named block-state id constants for common 1.21.8 blocks.\n");
+    out.push_str("///\n");
+    out.push_str("/// Each constant is the block's *default* state id, generated from the same\n");
+    out.push_str(
+        "/// `data/blocks.json` snapshot the runtime lookups read, so it can never drift\n",
+    );
+    out.push_str(
+        "/// from `block_default_state` / `compute_state_id`. Prefer these named ids over\n",
+    );
+    out.push_str("/// magic numbers wherever a plugin or system needs a specific block-state.\n");
+    out.push_str("pub mod ids {\n");
+    for name in CURATED_BLOCK_IDS {
+        let block = by_name
+            .get(name)
+            .unwrap_or_else(|| panic!("curated block id {name:?} is not in blocks.json"));
+        let _ = writeln!(
+            out,
+            "    /// Default block-state id for `minecraft:{name}`."
+        );
+        let _ = writeln!(
+            out,
+            "    pub const {}: u32 = {};",
+            name.to_uppercase(),
+            block.default_state
+        );
+    }
+    out.push_str("}\n\n");
+
+    // Test-only (bare name, generated const) pairs the crate's drift guard walks
+    // to assert each `ids` const still equals the runtime lookup.
+    out.push_str("/// Test-only drift table pairing each `ids` constant with its block name.\n");
+    out.push_str("#[cfg(test)]\n");
+    let _ = writeln!(
+        out,
+        "pub(crate) static IDS_DRIFT_TABLE: [(&str, u32); {}] = [",
+        CURATED_BLOCK_IDS.len()
+    );
+    for name in CURATED_BLOCK_IDS {
+        let _ = writeln!(out, "    ({name:?}, ids::{}),", name.to_uppercase());
+    }
+    out.push_str("];\n");
 }
 
 /// Parses `items.json` into an id-indexed `(name, max_stack)` table, asserting
@@ -435,5 +576,53 @@ fn emit(names_and_stacks: &[(String, u8)], to_block: &[(i32, u32)]) -> String {
     }
     out.push_str("];\n");
 
+    emit_item_ids(&mut out, names_and_stacks);
+
     out
+}
+
+/// Appends the curated `ids` module of named protocol item-id constants plus a
+/// test-only drift table, both derived from the id-indexed `names_and_stacks`.
+///
+/// Panics if a curated name is absent from the snapshot, mirroring the block-id
+/// emission so a botched re-vendor fails the build.
+fn emit_item_ids(out: &mut String, names_and_stacks: &[(String, u8)]) {
+    // Names are stored namespaced (`minecraft:<bare>`); the curated list is bare.
+    let id_by_bare: BTreeMap<&str, i32> = names_and_stacks
+        .iter()
+        .enumerate()
+        .map(|(idx, (name, _))| {
+            let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+            (bare, i32::try_from(idx).expect("item id fits i32"))
+        })
+        .collect();
+
+    out.push_str("\n/// Named protocol item id constants for common 1.21.8 items.\n");
+    out.push_str("///\n");
+    out.push_str("/// Each constant is generated from the same `data/items.json` snapshot the\n");
+    out.push_str(
+        "/// runtime reads, so it can never drift from `lookup_item_protocol_id`. Prefer\n",
+    );
+    out.push_str("/// these named ids over magic numbers when referencing a specific item.\n");
+    out.push_str("pub mod ids {\n");
+    for name in CURATED_ITEM_IDS {
+        let id = id_by_bare
+            .get(name)
+            .unwrap_or_else(|| panic!("curated item id {name:?} is not in items.json"));
+        let _ = writeln!(out, "    /// Protocol item id for `minecraft:{name}`.");
+        let _ = writeln!(out, "    pub const {}: i32 = {id};", name.to_uppercase());
+    }
+    out.push_str("}\n\n");
+
+    out.push_str("/// Test-only drift table pairing each `ids` constant with its item name.\n");
+    out.push_str("#[cfg(test)]\n");
+    let _ = writeln!(
+        out,
+        "pub(crate) static ITEM_IDS_DRIFT_TABLE: [(&str, i32); {}] = [",
+        CURATED_ITEM_IDS.len()
+    );
+    for name in CURATED_ITEM_IDS {
+        let _ = writeln!(out, "    ({name:?}, ids::{}),", name.to_uppercase());
+    }
+    out.push_str("];\n");
 }
