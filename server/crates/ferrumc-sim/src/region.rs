@@ -41,8 +41,9 @@ pub enum RegionOp {
 
 /// Default ceiling on the number of blocks a single region edit may address.
 ///
-/// `32_768` is a 32x32x32 cube — large enough to shape terrain on camera, small
-/// enough that applying it in one tick is bounded work. The app overrides this
+/// `32_768` is a 32x32x32 cube — large enough to shape terrain on camera. It is
+/// applied incrementally under [`RegionLimits::max_blocks_per_tick`], so even at
+/// the cap a fill never does all its work in one tick. The app overrides this
 /// from configuration (`max_region_fill_volume`).
 pub const DEFAULT_MAX_REGION_VOLUME: u64 = 32_768;
 
@@ -51,6 +52,15 @@ pub const DEFAULT_MAX_REGION_VOLUME: u64 = 32_768;
 /// The oldest is evicted once a player exceeds this many edits. Combined with
 /// [`DEFAULT_MAX_REGION_VOLUME`] this bounds the per-player undo memory.
 pub const DEFAULT_MAX_UNDO_ENTRIES: usize = 16;
+
+/// Default number of region cells a shard processes per tick across all in-flight
+/// edits.
+///
+/// `8_192` lets a default-cap fill complete in four ticks (~200 ms at 20 TPS)
+/// while keeping a normal fill (a few thousand blocks) instant. The budget bounds
+/// per-tick work even if an operator raises [`max_volume`](RegionLimits::max_volume),
+/// honouring the "defer, never stall the tick" overload rule.
+pub const DEFAULT_MAX_BLOCKS_PER_TICK: usize = 8_192;
 
 /// Bounds applied to region edits so a command can never make a shard iterate or
 /// retain an unbounded amount of work.
@@ -66,6 +76,11 @@ pub struct RegionLimits {
     /// Maximum number of undoable edits retained per player; the oldest is
     /// evicted when a new edit would exceed it. Zero disables undo history.
     pub max_undo_entries: usize,
+    /// Maximum number of region cells the shard processes per tick across all
+    /// in-flight edits, so a large fill is applied across several ticks instead of
+    /// stalling one. A value below `1` is treated as `1` so progress is always
+    /// made.
+    pub max_blocks_per_tick: usize,
 }
 
 impl Default for RegionLimits {
@@ -73,6 +88,7 @@ impl Default for RegionLimits {
         Self {
             max_volume: DEFAULT_MAX_REGION_VOLUME,
             max_undo_entries: DEFAULT_MAX_UNDO_ENTRIES,
+            max_blocks_per_tick: DEFAULT_MAX_BLOCKS_PER_TICK,
         }
     }
 }
@@ -86,6 +102,7 @@ mod tests {
         let limits = RegionLimits::default();
         assert_eq!(limits.max_volume, 32_768);
         assert_eq!(limits.max_undo_entries, 16);
+        assert_eq!(limits.max_blocks_per_tick, 8_192);
     }
 
     #[test]

@@ -121,6 +121,52 @@ struct RegionUndoEntry {
     blocks: Vec<(BlockPos, BlockStateId)>,
 }
 
+/// Maximum number of region edits/undos a shard buffers in flight at once.
+///
+/// Each item is drained incrementally under [`RegionLimits::max_blocks_per_tick`],
+/// so the queue length is the number of *distinct* region commands still in
+/// progress. Bounding it stops a flood of region commands from growing shard
+/// memory without limit; past the cap a new region command is dropped
+/// (best-effort backpressure, the same posture the inbox uses).
+const MAX_PENDING_REGION_WORK: usize = 256;
+
+/// A region operation in progress, applied incrementally across ticks under the
+/// per-tick block budget.
+#[derive(Debug, Clone)]
+struct PendingRegionWork {
+    /// The player the work is attributed to (the undo-history key).
+    player: PlayerId,
+    /// What the work does, plus the cursor it resumes from.
+    kind: RegionWorkKind,
+}
+
+/// The two kinds of in-flight region work and the progress cursor each resumes
+/// from across ticks.
+#[derive(Debug, Clone)]
+enum RegionWorkKind {
+    /// A `/fill` or `/replace`: walk `region` from `cursor`, applying `op`, and
+    /// accumulate the prior states into `prior`. A completed edit pushes `prior`
+    /// onto the acting player's undo history.
+    Edit {
+        /// The cuboid being edited.
+        region: Cuboid,
+        /// How each cell changes.
+        op: RegionOp,
+        /// The next linear index into `region` to process.
+        cursor: u64,
+        /// Prior states captured so far, for the undo entry recorded on completion.
+        prior: Vec<(BlockPos, BlockStateId)>,
+    },
+    /// A `/undo`: re-apply `restore[cursor..]` (the prior states captured by the
+    /// edit being undone) verbatim through the funnel.
+    Undo {
+        /// The `(position, prior_state)` pairs to restore.
+        restore: Vec<(BlockPos, BlockStateId)>,
+        /// The next index into `restore` to apply.
+        cursor: usize,
+    },
+}
+
 /// Per-player state owned exclusively by the shard.
 #[derive(Debug, Clone, Copy)]
 struct PlayerState {
@@ -241,6 +287,11 @@ pub struct SimShard {
     /// Caps bounding region edits and the per-player undo history. Set from
     /// configuration by the app via [`set_region_limits`](SimShard::set_region_limits).
     region_limits: RegionLimits,
+    /// Region edits/undos awaiting (or mid-) application, drained a budgeted number
+    /// of cells per tick (see [`RegionLimits::max_blocks_per_tick`]) so a large fill
+    /// spreads across ticks instead of stalling one. Bounded by
+    /// [`MAX_PENDING_REGION_WORK`].
+    pending_region_work: VecDeque<PendingRegionWork>,
 }
 
 impl SimShard {
@@ -288,6 +339,7 @@ impl SimShard {
             mutation_log: Vec::new(),
             undo_history: BTreeMap::new(),
             region_limits: RegionLimits::default(),
+            pending_region_work: VecDeque::new(),
         }
     }
 
@@ -589,10 +641,12 @@ impl SimShard {
                     });
                 }
                 GameInput::RegionEdit { player, region, op } => {
-                    self.apply_region_edit(&mut outputs, player, region, op);
+                    // Queue the edit; it is drained a budgeted number of cells per
+                    // tick (starting this tick) by `drive_region_work` below.
+                    self.enqueue_region_edit(player, region, op);
                 }
                 GameInput::RegionUndo { player } => {
-                    self.apply_region_undo(&mut outputs, player);
+                    self.enqueue_region_undo(player);
                 }
                 GameInput::UpdateSign {
                     player,
@@ -649,6 +703,11 @@ impl SimShard {
                 });
             }
         }
+
+        // Apply a budgeted slice of any in-flight region edits/undos. Runs after
+        // the inbox drain so an edit enqueued this tick begins applying this tick,
+        // while a large fill spreads its remaining cells over later ticks.
+        self.drive_region_work(&mut outputs);
 
         outputs
     }
@@ -787,78 +846,79 @@ impl SimShard {
         }
     }
 
-    /// Applies a region (cuboid) block edit through the single block-edit funnel,
-    /// capturing the prior states it overwrites into `player`'s bounded undo
-    /// history.
+    /// Queues a region (cuboid) block edit for incremental application after a
+    /// defensive volume re-check.
     ///
-    /// The whole cuboid is applied at this one tick boundary under
-    /// [`MutationCause::Command`], so every changed cell persists via the overlay
-    /// and broadcasts a viewer `BlockUpdate` (no ack — a command edit is
-    /// authoritative, not a client prediction). A cell is skipped (no write, no
-    /// broadcast, no undo entry) when its chunk is not resident in this shard
-    /// (cross-shard edits are out of scope this milestone), when a
-    /// [`RegionOp::Replace`] does not match, or when the new state already equals
-    /// the current one.
-    ///
-    /// The cuboid's volume is re-checked against [`RegionLimits::max_volume`]: an
-    /// over-cap region is rejected wholesale (the command layer already reported a
-    /// user-facing error; this guards every other caller from stalling the tick).
-    fn apply_region_edit(
-        &mut self,
-        outputs: &mut Vec<GameOutput>,
-        player: PlayerId,
-        region: Cuboid,
-        op: RegionOp,
-    ) {
-        // Defense in depth: never iterate a region larger than the configured cap.
+    /// The command layer already rejected an over-cap region with a user-facing
+    /// error; re-checking [`RegionLimits::max_volume`] here guards every other
+    /// caller from stalling a tick. The edit is appended to the bounded pending
+    /// queue and drained a budgeted number of cells per tick by
+    /// [`drive_region_work`](Self::drive_region_work); when the queue is full it is
+    /// dropped (best-effort backpressure, like the inbox).
+    fn enqueue_region_edit(&mut self, player: PlayerId, region: Cuboid, op: RegionOp) {
         if region.volume() > self.region_limits.max_volume {
             return;
         }
-        let cause = MutationCause::Command;
-        let mut prior: Vec<(BlockPos, BlockStateId)> = Vec::new();
-        for position in region.iter() {
-            // Only mutate cells in resident chunks; a cell whose chunk is absent is
-            // skipped (no client to heal under an authoritative command edit). The
-            // immutable borrow ends before `apply_block_edit` re-borrows mutably.
-            let Some(current) = self
-                .chunks
-                .get(position.to_chunk_pos())
-                .and_then(|chunk| chunk.get_block(position))
-            else {
-                continue;
-            };
-            let new_state = match op {
-                RegionOp::Fill { state } => state,
-                RegionOp::Replace { from, to } => {
-                    if current != from {
-                        continue;
-                    }
-                    to
-                }
-            };
-            // A write that changes nothing is skipped, so `/undo` restores only
-            // genuinely-changed cells and no redundant `BlockUpdate` is broadcast.
-            if new_state == current {
-                continue;
-            }
-            let result = self.apply_block_edit(cause, position, new_state);
-            // Record the prior state only for cells that actually changed, so undo
-            // restores exactly what the edit overwrote.
-            if matches!(result, MutationResult::Applied { .. }) {
-                prior.push((position, current));
-            }
-            if let Some(output) = block_change_output(cause, 0, position, new_state, result) {
-                outputs.push(output);
-            }
+        // Best-effort backpressure: past the (generous) in-flight bound a new edit
+        // is dropped rather than growing memory. The per-tick budget drains the
+        // queue continuously, so this is only reachable under an absurd command
+        // flood; the deterministic shard has no logger, so the drop is silent.
+        if self.pending_region_work.len() >= MAX_PENDING_REGION_WORK {
+            return;
         }
-        if !prior.is_empty() {
-            self.push_undo(player, RegionUndoEntry { blocks: prior });
-        }
+        self.pending_region_work.push_back(PendingRegionWork {
+            player,
+            kind: RegionWorkKind::Edit {
+                region,
+                op,
+                cursor: 0,
+                prior: Vec::new(),
+            },
+        });
     }
 
-    /// Pushes a region edit's captured prior states onto `player`'s undo history,
-    /// evicting the oldest entry once [`RegionLimits::max_undo_entries`] is
-    /// exceeded. A cap of zero disables history entirely.
+    /// Pops `player`'s most recent undo entry and queues its restoration as
+    /// incremental work, or does nothing if they have no recorded edits.
+    ///
+    /// The entry is popped now (deterministically, at the tick boundary) so a
+    /// later `/undo` walks back to the previous edit; the restoration itself is
+    /// drained across ticks like any region edit and is *not* re-recorded. When
+    /// the pending queue is full the undo is dropped without popping (the operator
+    /// can retry).
+    fn enqueue_region_undo(&mut self, player: PlayerId) {
+        // Best-effort backpressure, as in `enqueue_region_edit`: drop the undo
+        // (without popping the history) when the in-flight queue is saturated.
+        if self.pending_region_work.len() >= MAX_PENDING_REGION_WORK {
+            return;
+        }
+        // Pop the newest entry; the mutable borrow ends before anything else.
+        let entry = match self.undo_history.get_mut(&player) {
+            Some(stack) => stack.pop_back(),
+            None => None,
+        };
+        // Drop an emptied stack so the map does not retain idle players.
+        if self
+            .undo_history
+            .get(&player)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.undo_history.remove(&player);
+        }
+        let Some(entry) = entry else {
+            return;
+        };
+        self.pending_region_work.push_back(PendingRegionWork {
+            player,
+            kind: RegionWorkKind::Undo {
+                restore: entry.blocks,
+                cursor: 0,
+            },
+        });
+    }
+
+    /// Pushes a completed region edit's captured prior states onto `player`'s undo
+    /// history, evicting the oldest entry once [`RegionLimits::max_undo_entries`]
+    /// is exceeded. A cap of zero disables history entirely.
     fn push_undo(&mut self, player: PlayerId, entry: RegionUndoEntry) {
         let cap = self.region_limits.max_undo_entries;
         if cap == 0 {
@@ -873,35 +933,109 @@ impl SimShard {
         }
     }
 
-    /// Undoes `player`'s most recent region edit, restoring every captured prior
-    /// state through the same funnel (so the restoration also persists and
-    /// broadcasts a viewer `BlockUpdate`).
+    /// Applies up to [`RegionLimits::max_blocks_per_tick`] region cells from the
+    /// pending queue this tick, oldest item first, emitting a `BlockChanged` for
+    /// every changed cell.
     ///
-    /// A no-op if the player has no recorded edits. The undo is *not* itself
-    /// recorded, so repeated calls walk back through successive edits.
-    fn apply_region_undo(&mut self, outputs: &mut Vec<GameOutput>, player: PlayerId) {
-        // Pop the newest entry, ending the mutable borrow on `undo_history` before
-        // the funnel re-borrows `self` to apply the restores.
-        let entry = match self.undo_history.get_mut(&player) {
-            Some(stack) => stack.pop_back(),
-            None => None,
-        };
-        let Some(entry) = entry else {
-            return;
-        };
-        // Drop an emptied stack so the map does not retain idle players.
-        if self
-            .undo_history
-            .get(&player)
-            .is_some_and(VecDeque::is_empty)
-        {
-            self.undo_history.remove(&player);
+    /// A completed edit records its captured prior states as an undo entry. An item
+    /// that does not finish within the budget resumes from its saved cursor next
+    /// tick. Called once per [`run_tick`](Self::run_tick), after the inbox drain,
+    /// so a region command enqueued this tick begins applying this tick.
+    fn drive_region_work(&mut self, outputs: &mut Vec<GameOutput>) {
+        // At least one cell per tick, so progress is always made even if the budget
+        // is misconfigured to zero.
+        let mut budget = self.region_limits.max_blocks_per_tick.max(1);
+        while budget > 0 {
+            let Some(mut work) = self.pending_region_work.pop_front() else {
+                break;
+            };
+            if self.advance_region_work(&mut work, &mut budget, outputs) {
+                // Completed: an Edit that changed at least one cell is undoable.
+                if let RegionWorkKind::Edit { prior, .. } = work.kind {
+                    if !prior.is_empty() {
+                        self.push_undo(work.player, RegionUndoEntry { blocks: prior });
+                    }
+                }
+            } else {
+                // Budget exhausted mid-item: resume it next tick.
+                self.pending_region_work.push_front(work);
+                break;
+            }
         }
+    }
+
+    /// Advances one pending region-work item by up to `*budget` cells through the
+    /// single block-edit funnel under [`MutationCause::Command`], decrementing
+    /// `budget` per cell examined and emitting a `BlockChanged` per changed cell.
+    ///
+    /// Returns `true` when the item is fully applied, `false` when the budget ran
+    /// out first (the item's cursor is left ready to resume). A cell is skipped (no
+    /// write, no broadcast, no undo capture) when its chunk is not resident
+    /// (cross-shard edits are out of scope), when a [`RegionOp::Replace`] does not
+    /// match, or when the new state already equals the current one.
+    fn advance_region_work(
+        &mut self,
+        work: &mut PendingRegionWork,
+        budget: &mut usize,
+        outputs: &mut Vec<GameOutput>,
+    ) -> bool {
         let cause = MutationCause::Command;
-        for (position, state) in entry.blocks {
-            let result = self.apply_block_edit(cause, position, state);
-            if let Some(output) = block_change_output(cause, 0, position, state, result) {
-                outputs.push(output);
+        match &mut work.kind {
+            RegionWorkKind::Edit {
+                region,
+                op,
+                cursor,
+                prior,
+            } => {
+                while *budget > 0 {
+                    let Some(position) = region.block_at_index(*cursor) else {
+                        return true; // every cell examined
+                    };
+                    *cursor += 1;
+                    *budget -= 1;
+                    let Some(current) = self
+                        .chunks
+                        .get(position.to_chunk_pos())
+                        .and_then(|chunk| chunk.get_block(position))
+                    else {
+                        continue;
+                    };
+                    let new_state = match *op {
+                        RegionOp::Fill { state } => state,
+                        RegionOp::Replace { from, to } => {
+                            if current != from {
+                                continue;
+                            }
+                            to
+                        }
+                    };
+                    if new_state == current {
+                        continue;
+                    }
+                    let result = self.apply_block_edit(cause, position, new_state);
+                    if matches!(result, MutationResult::Applied { .. }) {
+                        prior.push((position, current));
+                    }
+                    if let Some(output) = block_change_output(cause, 0, position, new_state, result)
+                    {
+                        outputs.push(output);
+                    }
+                }
+                false
+            }
+            RegionWorkKind::Undo { restore, cursor } => {
+                while *budget > 0 {
+                    let Some(&(position, state)) = restore.get(*cursor) else {
+                        return true; // every captured cell restored
+                    };
+                    *cursor += 1;
+                    *budget -= 1;
+                    let result = self.apply_block_edit(cause, position, state);
+                    if let Some(output) = block_change_output(cause, 0, position, state, result) {
+                        outputs.push(output);
+                    }
+                }
+                false
             }
         }
     }
@@ -2425,7 +2559,7 @@ mod tests {
         let mut s = shard_with_loaded_chunk(ChunkPos::new(0, 0)).await;
         s.set_region_limits(RegionLimits {
             max_volume: 8,
-            max_undo_entries: 16,
+            ..RegionLimits::default()
         });
         let p = player("flooder");
         let stone = BlockStateId::new(1);
@@ -2445,8 +2579,8 @@ mod tests {
     async fn region_undo_history_is_bounded_and_evicts_oldest() {
         let mut s = shard_with_loaded_chunk(ChunkPos::new(0, 0)).await;
         s.set_region_limits(RegionLimits {
-            max_volume: 32_768,
             max_undo_entries: 2,
+            ..RegionLimits::default()
         });
         let p = player("historian");
         let stone = BlockStateId::new(1);
@@ -2646,5 +2780,62 @@ mod tests {
             .lines()
             .iter()
             .all(String::is_empty));
+    }
+
+    #[tokio::test]
+    async fn region_fill_and_undo_apply_across_ticks_under_the_budget() {
+        let mut s = shard_with_loaded_chunk(ChunkPos::new(0, 0)).await;
+        // A tiny per-tick budget forces a multi-tick application; the volume cap
+        // stays at its default so the 18-cell region is accepted.
+        s.set_region_limits(RegionLimits {
+            max_blocks_per_tick: 4,
+            ..RegionLimits::default()
+        });
+        let p = player("slowbuilder");
+        let stone = BlockStateId::new(1);
+        let (a, b) = (BlockPos::new(2, 64, 2), BlockPos::new(4, 65, 4)); // 18 air cells
+
+        // The first tick enqueues the edit and applies only the budget of 4 cells.
+        let first = region_edit(&mut s, p, a, b, RegionOp::Fill { state: stone });
+        assert_eq!(
+            first.len(),
+            4,
+            "only the per-tick budget applies on tick one"
+        );
+        assert_ne!(
+            block_at(&s, b),
+            Some(stone),
+            "the far corner is not filled yet"
+        );
+
+        // Later ticks drain the rest (4, 4, 4, then the final 2): 5 ticks, 18 cells.
+        let mut applied = first.len();
+        let mut ticks = 1;
+        while applied < 18 {
+            let out = s.run_tick();
+            assert!(out.len() <= 4, "a tick never exceeds the budget");
+            applied += out.len();
+            ticks += 1;
+        }
+        assert_eq!(applied, 18);
+        assert_eq!(ticks, 5, "18 cells at 4/tick takes 5 ticks");
+        assert_eq!(block_at(&s, a), Some(stone));
+        assert_eq!(block_at(&s, b), Some(stone));
+
+        // The whole edit undoes as one logical op, also budgeted across ticks.
+        s.enqueue(GameInput::RegionUndo { player: p })
+            .expect("room");
+        let mut restored = 0;
+        loop {
+            let out = s.run_tick();
+            if out.is_empty() {
+                break;
+            }
+            assert!(out.len() <= 4, "undo also respects the budget");
+            restored += out.len();
+        }
+        assert_eq!(restored, 18, "undo restores all 18 cells across ticks");
+        assert_eq!(block_at(&s, a), Some(BlockStateId::AIR));
+        assert_eq!(block_at(&s, b), Some(BlockStateId::AIR));
     }
 }
