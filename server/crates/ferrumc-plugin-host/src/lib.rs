@@ -64,7 +64,7 @@ pub use dynamic::{DirLoadReport, LoadError, PluginLoader};
 pub use error::HostError;
 pub use host::{
     DispatchReport, HostConfig, PluginDecisionReport, PluginHost, ResolvedBlockDecision,
-    ResolvedDecision,
+    ResolvedDecision, ResolvedEventOutcome,
 };
 pub use state::{DisableReason, PluginState, PluginStats};
 pub use storage::{InMemoryPluginStorage, PluginStorageBackend};

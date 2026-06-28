@@ -7,10 +7,10 @@ use std::time::Instant;
 use ferrumc_command::CommandTree;
 use ferrumc_core::{PluginId, TextComponent};
 use ferrumc_plugin_api::{
-    BlockBreakAttempt, BlockPlaceAttempt, Capability, CapabilityManifest, CommandRegistrar,
-    CommandSink, EventContext, EventKind, EventRegistrar, PermissionApi, Plugin,
-    PluginBlockDecision, PluginEvent, PluginMetadata, SetupContext, TeardownContext, WorldIntent,
-    WorldView, MAX_EMITTED_INTENTS,
+    BlockBreakAttempt, BlockPlaceAttempt, Capability, CapabilityManifest, ChatAttempt,
+    CommandRegistrar, CommandSink, EventContext, EventKind, EventRegistrar, InteractAttempt,
+    PermissionApi, Plugin, PluginBlockDecision, PluginEvent, PluginEventDecision, PluginMetadata,
+    SetupContext, TeardownContext, WorldIntent, WorldView, MAX_EMITTED_INTENTS,
 };
 
 use crate::budget::CallBudget;
@@ -206,6 +206,43 @@ impl ResolvedBlockDecision {
     /// Consumes the result, yielding the decision and emitted intents.
     pub fn into_parts(self) -> (ResolvedDecision, Vec<WorldIntent>) {
         (self.decision, self.emitted)
+    }
+}
+
+/// The combined verdict on a vetoable player event (a chat message or an
+/// interaction) after every consulted plugin has voted.
+///
+/// Produced by folding each plugin's [`PluginEventDecision`] (see
+/// [`PluginHost::dispatch_chat_decision`] /
+/// [`PluginHost::dispatch_interact_decision`]). The event-side counterpart of
+/// [`ResolvedBlockDecision`] — there is no `emitted` field because the event
+/// hooks carry no inline-intent variant; intents a plugin submits ride the
+/// [`CommandSink`] the caller passes in. UNSTABLE / dev-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEventOutcome {
+    decision: PluginEventDecision,
+    report: DispatchReport,
+}
+
+impl ResolvedEventOutcome {
+    /// Returns the combined decision.
+    pub const fn decision(&self) -> &PluginEventDecision {
+        &self.decision
+    }
+
+    /// Returns the dispatch report (panicked / budget-exceeded plugins).
+    pub const fn report(&self) -> &DispatchReport {
+        &self.report
+    }
+
+    /// Returns whether the event was denied.
+    pub const fn is_deny(&self) -> bool {
+        self.decision.is_deny()
+    }
+
+    /// Consumes the outcome, yielding the combined decision.
+    pub fn into_decision(self) -> PluginEventDecision {
+        self.decision
     }
 }
 
@@ -658,6 +695,143 @@ impl PluginHost {
         }
     }
 
+    /// Consults every enabled, [`VetoEvents`](Capability::VetoEvents)-capable plugin
+    /// about a pending *chat message* and folds their decisions into one
+    /// [`ResolvedEventOutcome`].
+    ///
+    /// See [`PluginHost::dispatch_interact_decision`] for the shared semantics
+    /// (precedence, isolation, fail-safe); this is the chat-side entry point. Any
+    /// intents a plugin submits during the hook are pushed to `sink`.
+    pub fn dispatch_chat_decision(
+        &mut self,
+        attempt: &ChatAttempt,
+        world: &dyn WorldView,
+        sink: &mut dyn CommandSink,
+        permissions: &dyn PermissionApi,
+    ) -> ResolvedEventOutcome {
+        self.fold_event_decision(world, sink, permissions, |plugin, ctx| {
+            plugin.before_chat(attempt, ctx)
+        })
+    }
+
+    /// Consults every enabled, [`VetoEvents`](Capability::VetoEvents)-capable plugin
+    /// about a pending *interaction* and folds their decisions into one
+    /// [`ResolvedEventOutcome`].
+    ///
+    /// # Precedence (deterministic, fail-safe)
+    ///
+    /// Plugins are consulted in registration order; the first
+    /// [`Deny`](PluginEventDecision::Deny) is *absorbing*: it wins, the remaining
+    /// plugins are skipped, and its message (the first non-`None`) is carried. If
+    /// nobody objects the result is [`Allow`](PluginEventDecision::Allow).
+    ///
+    /// # Isolation and fail-safe
+    ///
+    /// Each hook is wrapped in [`catch_unwind`], exactly like
+    /// [`dispatch_event`](Self::dispatch_event). A plugin that *panics* is disabled,
+    /// counted in [`PluginStats`], logged, and — the fail-safe — treated as a
+    /// [`Deny`](PluginEventDecision::Deny). Per-call budgets apply as for event
+    /// dispatch. None of this runs inside the simulation tick.
+    pub fn dispatch_interact_decision(
+        &mut self,
+        attempt: &InteractAttempt,
+        world: &dyn WorldView,
+        sink: &mut dyn CommandSink,
+        permissions: &dyn PermissionApi,
+    ) -> ResolvedEventOutcome {
+        self.fold_event_decision(world, sink, permissions, |plugin, ctx| {
+            plugin.before_interact(attempt, ctx)
+        })
+    }
+
+    /// The shared fold driving both `before_chat` / `before_interact` decision
+    /// paths.
+    ///
+    /// `call` invokes the appropriate hook on one plugin; everything else (the
+    /// [`VetoEvents`](Capability::VetoEvents) gate, panic isolation, budgeting, and
+    /// the absorbing-`Deny` precedence) is identical for chat and interact.
+    fn fold_event_decision<F>(
+        &mut self,
+        world: &dyn WorldView,
+        sink: &mut dyn CommandSink,
+        permissions: &dyn PermissionApi,
+        mut call: F,
+    ) -> ResolvedEventOutcome
+    where
+        F: FnMut(&mut dyn Plugin, &mut EventContext<'_>) -> PluginEventDecision,
+    {
+        let Self {
+            plugins,
+            storage,
+            config,
+            ..
+        } = self;
+        let budget = config.call_budget();
+        let disable_on_overrun = config.disable_on_overrun();
+
+        let mut decision = PluginEventDecision::Allow;
+        let mut report = DispatchReport::default();
+
+        for slot in plugins.iter_mut() {
+            // A Deny is absorbing: once denied, stop consulting plugins.
+            if decision.is_deny() {
+                break;
+            }
+            if !slot.state.is_enabled() || !slot.capabilities.grants(Capability::VetoEvents) {
+                continue;
+            }
+
+            let namespaced = NamespacedStorage::new(storage.as_ref(), slot.id.clone());
+            let mut ctx = EventContext::new(
+                slot.capabilities,
+                world,
+                &mut *sink,
+                permissions,
+                &namespaced,
+            );
+
+            let start = Instant::now();
+            let outcome = catch_unwind(AssertUnwindSafe(|| call(&mut *slot.plugin, &mut ctx)));
+            let elapsed = start.elapsed();
+
+            let Ok(plugin_decision) = outcome else {
+                // Fail-safe: a panicking plugin denies the event and is disabled.
+                slot.stats.panics += 1;
+                slot.state = PluginState::Disabled(DisableReason::Panicked);
+                report.panicked.push(slot.id.clone());
+                tracing::warn!(
+                    plugin = %slot.id,
+                    "plugin panicked during a before_* event decision; disabled and treated as Deny"
+                );
+                decision = PluginEventDecision::Deny { message: None };
+                continue;
+            };
+
+            report.delivered += 1;
+            if budget.is_exceeded(elapsed) {
+                slot.stats.budget_overruns += 1;
+                report.budget_exceeded.push(slot.id.clone());
+                tracing::warn!(
+                    plugin = %slot.id,
+                    ?elapsed,
+                    "plugin exceeded its time budget during a before_* event decision"
+                );
+                if disable_on_overrun {
+                    slot.state = PluginState::Disabled(DisableReason::BudgetExceeded);
+                }
+            }
+
+            // A Deny is absorbing and recorded; Allow (and, since the enum is
+            // `#[non_exhaustive]`, any unknown future variant) leaves the fold
+            // unchanged.
+            if let PluginEventDecision::Deny { message } = plugin_decision {
+                decision = PluginEventDecision::Deny { message };
+            }
+        }
+
+        ResolvedEventOutcome { decision, report }
+    }
+
     /// Returns the number of registered plugins.
     pub fn len(&self) -> usize {
         self.plugins.len()
@@ -825,7 +999,8 @@ mod tests {
     use ferrumc_math::{BlockPos, ChunkPos, Vec3};
     use ferrumc_permission::{PermissionNode, Resolution};
     use ferrumc_plugin_api::{
-        BlockBreakAttempt, BlockPlaceAttempt, IntentError, PluginBlockDecision, PluginError,
+        BlockBreakAttempt, BlockPlaceAttempt, ChatAttempt, IntentError, InteractAttempt,
+        InteractHand, InteractTarget, PluginBlockDecision, PluginError, PluginEventDecision,
         WorldIntent,
     };
 
@@ -945,6 +1120,99 @@ mod tests {
                     let _ = sink.submit(WorldIntent::Message {
                         player: *player,
                         message: TextComponent::text("placed"),
+                    });
+                }
+            }
+        }
+    }
+
+    /// A plugin that returns a fixed decision from the chat / interact hooks and
+    /// records that each was called.
+    struct EventDecisionPlugin {
+        id: &'static str,
+        decision: PluginEventDecision,
+    }
+
+    impl EventDecisionPlugin {
+        fn boxed(id: &'static str, decision: PluginEventDecision) -> Box<dyn Plugin> {
+            Box::new(Self { id, decision })
+        }
+    }
+
+    impl Plugin for EventDecisionPlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata::new(
+                PluginId::new(self.id),
+                self.id,
+                Version::new(0, 1, 0),
+                CapabilityManifest::empty().with(Capability::VetoEvents),
+            )
+        }
+        fn before_chat(
+            &mut self,
+            _ev: &ChatAttempt,
+            _ctx: &mut EventContext<'_>,
+        ) -> PluginEventDecision {
+            self.decision.clone()
+        }
+        fn before_interact(
+            &mut self,
+            _ev: &InteractAttempt,
+            _ctx: &mut EventContext<'_>,
+        ) -> PluginEventDecision {
+            self.decision.clone()
+        }
+    }
+
+    /// A plugin with no `VetoEvents` capability; its event hooks must never run.
+    struct PassiveEventPlugin {
+        id: &'static str,
+    }
+
+    impl Plugin for PassiveEventPlugin {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata::new(
+                PluginId::new(self.id),
+                self.id,
+                Version::new(0, 1, 0),
+                CapabilityManifest::empty().with(Capability::ReceiveEvents),
+            )
+        }
+        fn before_chat(
+            &mut self,
+            _ev: &ChatAttempt,
+            _ctx: &mut EventContext<'_>,
+        ) -> PluginEventDecision {
+            panic!("a plugin without VetoEvents must never have its chat hook called");
+        }
+    }
+
+    /// A recorder that proves a `PlayerMove` notification is delivered.
+    struct MoveRecorder {
+        id: &'static str,
+    }
+
+    impl Plugin for MoveRecorder {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata::new(
+                PluginId::new(self.id),
+                self.id,
+                Version::new(0, 1, 0),
+                CapabilityManifest::empty()
+                    .with(Capability::ReceiveEvents)
+                    .with(Capability::SubmitIntents),
+            )
+        }
+        fn on_enable(&mut self, ctx: &mut SetupContext<'_>) -> Result<(), PluginError> {
+            ctx.events()?.subscribe(EventKind::PlayerMove);
+            Ok(())
+        }
+        fn on_event(&mut self, event: &PluginEvent, ctx: &mut EventContext<'_>) {
+            if let PluginEvent::PlayerMove { player, .. } = event {
+                if let Ok(sink) = ctx.sink() {
+                    let _ = sink.submit(WorldIntent::Message {
+                        player: *player,
+                        message: TextComponent::text("moved"),
                     });
                 }
             }
@@ -1300,5 +1568,220 @@ mod tests {
         );
         assert_eq!(report.delivered(), 1);
         assert_eq!(sink.intents.len(), 1, "after_* fired and emitted a message");
+    }
+
+    // --- Event-decision surface (chat / interact / move) ----------------------
+
+    fn chat_attempt(message: &str) -> ChatAttempt {
+        ChatAttempt::new(PlayerId::offline("Steve"), message)
+    }
+
+    fn interact_attempt() -> InteractAttempt {
+        InteractAttempt::new(
+            PlayerId::offline("Steve"),
+            InteractHand::Main,
+            InteractTarget::Block {
+                pos: BlockPos::new(0, 64, 0),
+                face: ferrumc_math::Direction::Up,
+            },
+        )
+    }
+
+    #[test]
+    fn chat_deny_drops_the_message() {
+        let mut host = PluginHost::in_memory();
+        let id = host
+            .register(EventDecisionPlugin::boxed(
+                "filter",
+                PluginEventDecision::Deny {
+                    message: Some(TextComponent::text("watch it")),
+                },
+            ))
+            .expect("registers");
+        enable_all(&mut host, &[&id]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_chat_decision(
+            &chat_attempt("hi"),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert!(resolved.is_deny(), "a Deny drops the chat line");
+        assert_eq!(
+            resolved.decision(),
+            &PluginEventDecision::Deny {
+                message: Some(TextComponent::text("watch it")),
+            }
+        );
+    }
+
+    #[test]
+    fn chat_allow_passes_through() {
+        let mut host = PluginHost::in_memory();
+        let id = host
+            .register(EventDecisionPlugin::boxed(
+                "filter",
+                PluginEventDecision::Allow,
+            ))
+            .expect("registers");
+        enable_all(&mut host, &[&id]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_chat_decision(
+            &chat_attempt("clean"),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert_eq!(resolved.decision(), &PluginEventDecision::Allow);
+        assert_eq!(resolved.report().delivered(), 1, "the hook ran");
+    }
+
+    #[test]
+    fn interact_is_delivered_and_can_deny() {
+        let mut host = PluginHost::in_memory();
+        let id = host
+            .register(EventDecisionPlugin::boxed(
+                "gate",
+                PluginEventDecision::Deny { message: None },
+            ))
+            .expect("registers");
+        enable_all(&mut host, &[&id]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_interact_decision(
+            &interact_attempt(),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert!(resolved.is_deny(), "the interaction was vetoed");
+        assert_eq!(resolved.report().delivered(), 1);
+    }
+
+    #[test]
+    fn first_deny_is_absorbing_for_events() {
+        let mut host = PluginHost::in_memory();
+        // Registration order: a denier first, then an allower that must never run.
+        let denier = host
+            .register(EventDecisionPlugin::boxed(
+                "denier",
+                PluginEventDecision::Deny { message: None },
+            ))
+            .expect("registers denier");
+        let allower = host
+            .register(EventDecisionPlugin::boxed(
+                "allower",
+                PluginEventDecision::Allow,
+            ))
+            .expect("registers allower");
+        enable_all(&mut host, &[&denier, &allower]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_chat_decision(
+            &chat_attempt("x"),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert!(resolved.is_deny());
+        assert_eq!(
+            resolved.report().delivered(),
+            1,
+            "the absorbing Deny short-circuits the later plugin"
+        );
+    }
+
+    #[test]
+    fn plugin_without_veto_events_is_not_consulted() {
+        let mut host = PluginHost::in_memory();
+        let id = host
+            .register(Box::new(PassiveEventPlugin { id: "passive" }))
+            .expect("registers");
+        enable_all(&mut host, &[&id]);
+
+        let mut sink = RecordingSink::default();
+        // PassiveEventPlugin panics if consulted; an Allow proves it was skipped.
+        let resolved = host.dispatch_chat_decision(
+            &chat_attempt("x"),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert_eq!(resolved.decision(), &PluginEventDecision::Allow);
+        assert_eq!(resolved.report().delivered(), 0);
+    }
+
+    #[test]
+    fn player_move_notification_is_delivered() {
+        let mut host = PluginHost::in_memory();
+        let id = host
+            .register(Box::new(MoveRecorder { id: "mover" }))
+            .expect("registers");
+        enable_all(&mut host, &[&id]);
+
+        let mut sink = RecordingSink::default();
+        let report = host.dispatch_event(
+            &PluginEvent::PlayerMove {
+                player: PlayerId::offline("Steve"),
+                from: BlockPos::new(0, 64, 0),
+                to: BlockPos::new(1, 64, 0),
+            },
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert_eq!(report.delivered(), 1);
+        assert_eq!(
+            sink.intents.len(),
+            1,
+            "PlayerMove fired and emitted a message"
+        );
+    }
+
+    #[test]
+    fn event_decision_panic_is_contained_and_fails_safe_to_deny() {
+        // A plugin that panics in before_chat must be disabled and treated as Deny.
+        struct PanicChat {
+            id: &'static str,
+        }
+        impl Plugin for PanicChat {
+            fn metadata(&self) -> PluginMetadata {
+                PluginMetadata::new(
+                    PluginId::new(self.id),
+                    self.id,
+                    Version::new(0, 1, 0),
+                    CapabilityManifest::empty().with(Capability::VetoEvents),
+                )
+            }
+            fn before_chat(
+                &mut self,
+                _ev: &ChatAttempt,
+                _ctx: &mut EventContext<'_>,
+            ) -> PluginEventDecision {
+                panic!("boom in before_chat");
+            }
+        }
+
+        let mut host = PluginHost::in_memory();
+        let id = host
+            .register(Box::new(PanicChat { id: "boom" }))
+            .expect("registers");
+        enable_all(&mut host, &[&id]);
+
+        let mut sink = RecordingSink::default();
+        let resolved = host.dispatch_chat_decision(
+            &chat_attempt("x"),
+            &NullWorld,
+            &mut sink,
+            &NullPermissions,
+        );
+        assert!(resolved.is_deny(), "a panicking filter fails safe to Deny");
+        assert_eq!(resolved.report().panicked(), std::slice::from_ref(&id));
+        assert_eq!(
+            host.state(&id),
+            Some(PluginState::Disabled(DisableReason::Panicked))
+        );
     }
 }
