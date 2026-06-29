@@ -144,7 +144,6 @@ pub(crate) fn clientbound_play_name(packet: &ClientboundPlayPacket) -> &'static 
         ClientboundPlayPacket::SetActionBarText(_) => "set_action_bar_text",
         ClientboundPlayPacket::SetTitleAnimationTimes(_) => "set_title_animation_times",
         ClientboundPlayPacket::SoundEffect(_) => "sound_effect",
-        ClientboundPlayPacket::EntitySoundEffect(_) => "entity_sound_effect",
         ClientboundPlayPacket::Particle(_) => "particle",
         ClientboundPlayPacket::UpdateObjectives(_) => "update_objectives",
         ClientboundPlayPacket::DisplayObjective(_) => "display_objective",

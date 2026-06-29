@@ -64,8 +64,7 @@ pub struct RunningServer {
     /// final flush is committed before the server returns.
     storage_worker_task: JoinHandle<()>,
     /// The shared metric registry, fed by the driver and every connection task.
-    /// Exposed for an on-demand metrics snapshot (see [`metrics`](Self::metrics)
-    /// and [`dump_metrics`](Self::dump_metrics)).
+    /// Exposed for an on-demand metrics snapshot (see [`metrics`](Self::metrics)).
     metrics: Arc<CounterRegistry>,
     /// The read side of the per-tick [`ServerSnapshot`] the driver publishes.
     /// Handed to the read-only dashboard task via [`snapshot_handle`].
@@ -92,14 +91,6 @@ impl RunningServer {
         &self.metrics
     }
 
-    /// Emits the current metrics as one structured tracing event carrying JSON.
-    ///
-    /// A convenience over [`metrics`](Self::metrics) for operators who just want
-    /// the snapshot in the logs (for example on a future SIGUSR1 or admin hook).
-    pub fn dump_metrics(&self) {
-        self.metrics.dump();
-    }
-
     /// A read handle onto the per-tick [`ServerSnapshot`] the driver publishes.
     ///
     /// Cloned and handed to the read-only dashboard task; the handle only ever
@@ -111,10 +102,13 @@ impl RunningServer {
         self.snapshots.clone()
     }
 
-    /// Signals shutdown and waits for the accept loop and driver to finish.
+    /// Signals shutdown and waits for the accept loop, driver, and storage worker
+    /// to finish.
     ///
-    /// In-flight connection tasks observe the same signal and end on their own;
-    /// they are detached, so this resolves once the two owned tasks complete.
+    /// In-flight connection tasks observe the same signal and end on their own; the
+    /// accept loop owns them in a `JoinSet` and drains it, so awaiting the accept
+    /// task blocks until the last connection has run its leave-save teardown — then
+    /// the driver and storage worker are awaited in turn so the final flush commits.
     ///
     /// # Errors
     ///

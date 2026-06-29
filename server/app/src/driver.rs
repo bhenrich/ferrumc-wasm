@@ -104,7 +104,7 @@ struct SnapshotCtx {
     /// into it off the hot path; the driver prunes and folds it each tick.
     net_telemetry: Arc<NetTelemetryHub>,
     /// The long-lived block-event dispatcher, read once per tick for the
-    /// per-plugin block-edit decision counts.
+    /// per-plugin event-decision counts (block edits, chat, and interactions).
     block_events: Arc<BlockEventDispatcher>,
 }
 
@@ -1247,7 +1247,8 @@ fn run_tick(
 /// assembled from the driver-owned roster plus public read-only shard/router
 /// queries, the per-player network counters and server-wide packet-trace
 /// summaries aggregated from the network-telemetry hub, and the per-plugin
-/// block-edit decision counts read from the block-event dispatcher.
+/// event-decision counts (block edits, chat, and interactions) read from the
+/// block-event dispatcher.
 ///
 /// The roster is pruned against the router's public connection check and the
 /// telemetry hub is pruned against the surviving roster, so neither grows without
@@ -1328,7 +1329,8 @@ fn publish_snapshot(
         // counts; surface the flag as a 0/1 approximation and leave dirty at 0.
         chunks_dirty: 0,
         chunks_persist_dirty: usize::from(shard.loaded_chunks().has_persist_dirty()),
-        // Per-plugin block-edit decision counts, read from the shared dispatcher.
+        // Per-plugin event-decision counts (block edits, chat, and interactions),
+        // read from the shared dispatcher.
         plugin_decisions: snap.block_events.decision_snapshots(),
         network_per_player: net.per_player,
         inbound_trace_summary: net.inbound,

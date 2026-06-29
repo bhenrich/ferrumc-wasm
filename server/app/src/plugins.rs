@@ -13,7 +13,8 @@
 //!
 //! The resulting [`PlayPolicy`] bundles the rest of what a connection consults
 //! during play: the per-player bypass permissions, the command tree, and the
-//! spawn position; the [`BlockEventDispatcher`] carries the block-edit decisions.
+//! spawn position; the [`BlockEventDispatcher`] carries the plugin event
+//! decisions (block edits, chat, and interactions).
 //!
 //! ## Where block edits are decided
 //!
@@ -267,8 +268,8 @@ impl BlockEventDispatcher {
         }
     }
 
-    /// Snapshots each plugin's cumulative block-edit decision counts for the live
-    /// `ServerSnapshot`.
+    /// Snapshots each plugin's cumulative event-decision counts — across block
+    /// edits, chat, and interactions — for the live `ServerSnapshot`.
     ///
     /// Locks the host briefly to copy the per-plugin
     /// [`PluginDecisionReport`](ferrumc_plugin_host::PluginDecisionReport) tally
