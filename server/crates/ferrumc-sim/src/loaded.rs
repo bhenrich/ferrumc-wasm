@@ -192,8 +192,13 @@ struct ResidentChunk {
 ///
 /// The returned [`ChunkProvenance`] is [`Loaded`](ChunkProvenance::Loaded) for
 /// cases 1–2 and [`Generated`](ChunkProvenance::Generated) for case 3. A loaded
-/// chunk is returned clean: both the network and persist-dirty masks are cleared,
-/// since what came back from the store is by definition already persisted.
+/// chunk is returned clean: both the network and per-flush persist-dirty masks are
+/// cleared, since what came back from the store is by definition already persisted.
+/// For the overlay path (case 1) the chunk's *cumulative* persist-edited set is
+/// additionally reseeded from the overlay's sections, so a later edit to a different
+/// section re-captures the whole set rather than overwriting these (matching the
+/// always-whole block-entity capture); the per-flush gate stays clear, so the reseed
+/// does not itself trigger a flush.
 pub async fn load_or_generate(
     store: &dyn WorldStore,
     generator: &FlatWorldGenerator,
@@ -214,6 +219,18 @@ pub async fn load_or_generate(
                 pos,
                 source: source.into(),
             })?;
+        // Reseed the cumulative persist-edited set from the sections the overlay
+        // carried: they differ from the regenerated baseline, so the chunk's NEXT
+        // overlay flush must re-capture them in full. Without this, an edit to a
+        // *different* section after this reload would overwrite the stored overlay
+        // with only that section and silently drop these — the same last-write-wins
+        // data loss the cumulative capture prevents, just across a reload boundary.
+        // (Block entities are immune for free: they reload into the map and the
+        // capture always serializes the whole map.) This seeds only the cumulative
+        // capture set, never the per-flush gate, so the reload does not itself flush.
+        for index in overlay.section_indices() {
+            chunk.restore_persist_edited_section(index);
+        }
         chunk.clear_dirty();
         chunk.clear_persist_dirty();
         return Ok((chunk, ChunkProvenance::Loaded));
@@ -500,9 +517,12 @@ impl LoadedChunkMap {
     ///
     /// This is the persistence handoff: unlike [`take_dirty`](Self::take_dirty)
     /// (which emits a full [`ChunkRecord`] for any network-dirty chunk, including
-    /// a freshly generated one), this emits a [`ChunkOverlayRecord`] carrying only
-    /// the player-modified sections, gated on the persist-dirty signal. A
-    /// generated-but-never-edited chunk has an empty persist-dirty mask and so is
+    /// a freshly generated one), this emits a [`ChunkOverlayRecord`] carrying every
+    /// section a gameplay edit has ever touched (the chunk's cumulative persist-edited
+    /// set), gated on the per-flush persist-dirty signal. Capturing the cumulative set
+    /// on each flush keeps the store's last-write-wins overwrite a complete snapshot,
+    /// so edits to different sections on different flush ticks are not lost on reload.
+    /// A generated-but-never-edited chunk has an empty persist-dirty mask and so is
     /// **never** included, which is what keeps untouched terrain at zero storage.
     /// Each overlay is stamped with `tick` as its capture time and
     /// [`OVERLAY_SCHEMA_VERSION`]. The batch is ordered by [`ChunkPos`] for
@@ -847,6 +867,132 @@ mod tests {
         // A loaded chunk is clean: it is not immediately re-persisted.
         assert!(!reloaded.persist_dirty_sections().any());
         let _ = key;
+    }
+
+    #[tokio::test]
+    async fn two_sections_edited_on_separate_flush_ticks_both_survive_reload() {
+        // Regression for the overlay last-write-wins data-loss bug: editing two
+        // DIFFERENT sections of ONE chunk on DIFFERENT flush ticks must not let the
+        // later flush overwrite the earlier section away. `InMemoryStore` overwrites
+        // per key (like redb), so correctness rests on each flush capturing the full
+        // cumulative set of edited sections.
+        let store = InMemoryStore::new();
+        let generator = gen();
+        let pos = ChunkPos::new(4, -2);
+        let mut m = map();
+        m.acquire(&store, &generator, pos, spawn_ticket())
+            .await
+            .expect("acquire");
+
+        // Edit 1: break the grass surface at y=63 (section 7) and flush on tick 1.
+        let dug = pos.origin_block(63);
+        {
+            let chunk = m.get_mut(pos).expect("resident");
+            chunk.set_block(dug, BlockStateId::AIR).expect("in range");
+            chunk.mark_persist_dirty(dug);
+        }
+        store
+            .save_chunk_overlays(m.take_persist_dirty(1))
+            .await
+            .expect("flush 1");
+
+        // Edit 2: place stone at y=70 (section 8) and flush on a LATER tick.
+        let placed = pos.origin_block(70);
+        {
+            let chunk = m.get_mut(pos).expect("resident");
+            chunk
+                .set_block(placed, BlockStateId::new(1))
+                .expect("in range");
+            chunk.mark_persist_dirty(placed);
+        }
+        store
+            .save_chunk_overlays(m.take_persist_dirty(2))
+            .await
+            .expect("flush 2");
+
+        // Reload from a fresh map: BOTH edits must survive (the dug hole did not
+        // revert to the baseline grass when the second flush overwrote the overlay).
+        let mut m2 = map();
+        m2.acquire(&store, &generator, pos, spawn_ticket())
+            .await
+            .expect("reload");
+        let reloaded = m2.get(pos).expect("resident");
+        assert_eq!(
+            reloaded.get_block(dug),
+            Some(BlockStateId::AIR),
+            "section 7 edit (the dug hole) must survive the second flush's overwrite",
+        );
+        assert_eq!(
+            reloaded.get_block(placed),
+            Some(BlockStateId::new(1)),
+            "section 8 edit (the placed stone) must survive",
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_after_reload_does_not_overwrite_a_previously_persisted_section() {
+        // The cumulative set must also survive a reload boundary: edit section A,
+        // flush, reload; then edit a DIFFERENT section B, flush, reload. Because the
+        // load path reseeds the cumulative persist-edited set from the loaded
+        // overlay's sections, the second flush re-captures BOTH sections rather than
+        // overwriting A away — matching the always-whole block-entity capture.
+        let store = InMemoryStore::new();
+        let generator = gen();
+        let pos = ChunkPos::new(-5, 6);
+        let dug = pos.origin_block(63); // section 7
+        let placed = pos.origin_block(70); // section 8
+
+        // Session 1: edit section 7, flush, end session.
+        {
+            let mut m = map();
+            m.acquire(&store, &generator, pos, spawn_ticket())
+                .await
+                .expect("acquire s1");
+            let chunk = m.get_mut(pos).expect("resident");
+            chunk.set_block(dug, BlockStateId::AIR).expect("in range");
+            chunk.mark_persist_dirty(dug);
+            store
+                .save_chunk_overlays(m.take_persist_dirty(1))
+                .await
+                .expect("flush s1");
+        }
+
+        // Session 2: reload (seeds the cumulative set), edit section 8, flush.
+        {
+            let mut m = map();
+            m.acquire(&store, &generator, pos, spawn_ticket())
+                .await
+                .expect("acquire s2");
+            // The reseed must NOT itself mark the chunk for a flush: a freshly
+            // reloaded, unedited chunk is still clean.
+            assert!(!m.has_persist_dirty());
+            let chunk = m.get_mut(pos).expect("resident");
+            chunk
+                .set_block(placed, BlockStateId::new(1))
+                .expect("in range");
+            chunk.mark_persist_dirty(placed);
+            store
+                .save_chunk_overlays(m.take_persist_dirty(2))
+                .await
+                .expect("flush s2");
+        }
+
+        // Session 3: reload and assert BOTH the pre- and post-reload edits survive.
+        let mut m3 = map();
+        m3.acquire(&store, &generator, pos, spawn_ticket())
+            .await
+            .expect("acquire s3");
+        let reloaded = m3.get(pos).expect("resident");
+        assert_eq!(
+            reloaded.get_block(dug),
+            Some(BlockStateId::AIR),
+            "the section edited BEFORE the reload must not be overwritten by a later flush",
+        );
+        assert_eq!(
+            reloaded.get_block(placed),
+            Some(BlockStateId::new(1)),
+            "the section edited AFTER the reload must survive",
+        );
     }
 
     #[tokio::test]
