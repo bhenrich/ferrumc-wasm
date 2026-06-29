@@ -61,7 +61,10 @@ pub const MAX_PLAYER_DATA_LEN: usize = 1024 * 1024;
 ///
 /// Wraps a fully structured [`Chunk`] together with the [`SchemaVersion`] under
 /// which it was written.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` but not `Eq`: a [`Chunk`] may hold a chest block-entity whose
+/// [`ItemStack`](ferrumc_items::ItemStack) NBT component data is `PartialEq`-only.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChunkRecord {
     schema_version: SchemaVersion,
     chunk: Chunk,
