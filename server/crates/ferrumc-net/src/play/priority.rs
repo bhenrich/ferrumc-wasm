@@ -196,6 +196,10 @@ impl OutboundPriority {
             | ClientboundPlayPacket::SetActionBarText(_)
             | ClientboundPlayPacket::SetTitleAnimationTimes(_)
             | ClientboundPlayPacket::Particle(_)
+            // Update Time animates the sky (sun/moon position): purely visual and
+            // self-healing, since a dropped update is superseded by the next
+            // periodic broadcast a second later, so it rides droppable Cosmetic.
+            | ClientboundPlayPacket::UpdateTime(_)
             | ClientboundPlayPacket::SoundEffect(_) => Self::Cosmetic,
         }
     }
@@ -303,6 +307,8 @@ impl Criticality {
             | ClientboundPlayPacket::SetActionBarText(_)
             | ClientboundPlayPacket::SetTitleAnimationTimes(_)
             | ClientboundPlayPacket::Particle(_)
+            // A dropped Update Time is healed by the next periodic broadcast.
+            | ClientboundPlayPacket::UpdateTime(_)
             | ClientboundPlayPacket::SoundEffect(_)
             | ClientboundPlayPacket::UpdateObjectives(_)
             | ClientboundPlayPacket::DisplayObjective(_)
@@ -480,6 +486,19 @@ mod tests {
             );
             assert_eq!(Criticality::for_packet(packet), Criticality::Droppable);
         }
+    }
+
+    #[test]
+    fn update_time_is_cosmetic_and_droppable() {
+        use ferrumc_proto::generated::play::UpdateTime;
+        // The day-night sky update is purely visual and self-heals on the next
+        // periodic broadcast, so it sheds under congestion like particles/sounds.
+        let packet = ClientboundPlayPacket::UpdateTime(UpdateTime::new(1_000, 1_000, true));
+        assert_eq!(
+            OutboundPriority::for_packet(&packet),
+            OutboundPriority::Cosmetic
+        );
+        assert_eq!(Criticality::for_packet(&packet), Criticality::Droppable);
     }
 
     #[test]
