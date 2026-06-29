@@ -8,8 +8,8 @@ use std::num::NonZeroUsize;
 use ferrumc_core::{DimensionId, GameMode, PlayerId, WorldId};
 use ferrumc_math::{BlockPos, Cuboid, Direction, ShardPos, Vec3};
 use ferrumc_placement::{
-    compute_fence_connection_state, compute_placement, NeighborQuery, PlacementContext,
-    PlacementResult, PlacementRule,
+    compute_fence_connection_state, compute_placement, is_water_source, NeighborQuery,
+    PlacementContext, PlacementResult, PlacementRule,
 };
 use ferrumc_registry::block_state::{block_metadata, state_id_to_block_name};
 use ferrumc_world::{sign_kind_for_state, BlockEntity, BlockStateId, Sign, SIGN_LINES};
@@ -556,11 +556,12 @@ impl SimShard {
                     player_yaw,
                 } => {
                     // Refine the held item's default state into the correct placed
-                    // state (rotation/facing/half/fence connectivity) against an
-                    // immutable view of the resident chunks. The borrow ends before
-                    // the mutable write below. The same refinement backs the
-                    // off-tick `preview_placement` the driver uses to report the
-                    // final state to the after-hook, so the two never diverge.
+                    // state (rotation/facing/half/fence connectivity, plus any
+                    // relocated merge or extra door/bed cell) against an immutable
+                    // view of the resident chunks. The borrow ends before the
+                    // mutable writes below. The same refinement backs the off-tick
+                    // `preview_placement` the driver uses to report the final state
+                    // to the after-hook, so the two never diverge.
                     let computed = self.refine_placement(
                         state,
                         clicked_face,
@@ -568,38 +569,14 @@ impl SimShard {
                         player_yaw,
                         position,
                     );
-                    // Unsupported/unrecognised -> safe default (the held state).
-                    let placed = computed.map_or(state, |r| BlockStateId::new(r.state_id));
-                    let is_fence = computed.is_some_and(|r| r.rule == PlacementRule::FenceLike);
-
-                    let cause = MutationCause::PlayerCreative { player };
-                    let result = self.apply_block_edit(cause, position, placed);
-                    if let Some(output) =
-                        block_change_output(cause, sequence, position, placed, result)
-                    {
-                        outputs.push(output);
-                    }
-                    // An accepted sign placement created the (blank) sign block-entity
-                    // in apply_block_edit; open the editor for the placer so they can
-                    // type its text (the client replies with an UpdateSign). Ordered
-                    // after the BlockChanged so the block exists client-side first.
-                    if matches!(result, MutationResult::Applied { .. })
-                        && sign_kind_for_state(placed.as_u32()).is_some()
-                    {
-                        outputs.push(GameOutput::OpenSignEditor { player, position });
-                    }
-                    // A placed fence updates its same-fence cardinal neighbours so
-                    // they connect back to it (broadcast-only, no extra ack).
-                    if is_fence {
-                        if let MutationResult::Applied { .. } = result {
-                            // The reverse lookup yields a `'static` name, so it does
-                            // not borrow `self` and is free to pass into the mutable
-                            // neighbour-update pass below.
-                            if let Some(fence_name) = state_id_to_block_name(placed.as_u32()) {
-                                self.update_fence_neighbors(&mut outputs, position, fence_name);
-                            }
-                        }
-                    }
+                    self.apply_player_placement(
+                        &mut outputs,
+                        player,
+                        position,
+                        sequence,
+                        state,
+                        computed.as_ref(),
+                    );
                 }
                 GameInput::SetBlockExact {
                     player,
@@ -844,6 +821,140 @@ impl SimShard {
                 authoritative_state: old_state,
             },
         }
+    }
+
+    /// Applies a player block placement at the tick boundary, honouring the
+    /// placement engine's full result: a relocated **merge** write, a
+    /// water-replaceable target, and **multi-cell** doors/beds — atomically.
+    ///
+    /// `computed` is the [`PlacementResult`] from
+    /// [`refine_placement`](Self::refine_placement), or `None` for an unrecognised
+    /// block (which falls back to writing the held `state` at `position`). The write
+    /// plan is:
+    ///
+    /// - **Primary cell** — [`PlacementResult::place_at`] when set (a double-slab or
+    ///   candle *merge*, which intentionally replaces the block already there),
+    ///   otherwise `position`. Written under [`MutationCause::PlayerCreative`] so the
+    ///   placing client is acked/resynced.
+    /// - **Extra cells** — [`PlacementResult::extra_blocks`] (a door's `upper` half,
+    ///   a bed's `head`). Written under [`MutationCause::Command`]: broadcast-only,
+    ///   no per-cell ack, no reach check (vanilla does not reach-check the second
+    ///   cell).
+    ///
+    /// Every cell that must be newly occupied (the primary of a non-merge placement,
+    /// and every extra) is first checked to be *free* — air or a replaceable water
+    /// source (see [`is_placement_clear`](Self::is_placement_clear)). If any is
+    /// obstructed (a ceiling above a door, a wall where a bed head would go) the
+    /// **whole** placement is rejected and the actor healed — never a half-door. A
+    /// merge's primary cell is exempt: it completes the matching block already there,
+    /// which the engine validated.
+    fn apply_player_placement(
+        &mut self,
+        outputs: &mut Vec<GameOutput>,
+        player: PlayerId,
+        position: BlockPos,
+        sequence: i32,
+        held: BlockStateId,
+        computed: Option<&PlacementResult>,
+    ) {
+        let cause = MutationCause::PlayerCreative { player };
+        // A merge relocates the single write onto the clicked cell.
+        let primary_pos = computed.and_then(|r| r.place_at).unwrap_or(position);
+        let is_merge = computed.is_some_and(|r| r.place_at.is_some());
+        // Unsupported/unrecognised -> safe default (the held state).
+        let primary_state = computed.map_or(held, |r| BlockStateId::new(r.state_id));
+        let is_fence = computed.is_some_and(|r| r.rule == PlacementRule::FenceLike);
+
+        // Replaceability / multi-cell gate: validate every cell that must be newly
+        // occupied BEFORE writing anything, so an obstructed door/bed never lands a
+        // half-block. A merge's primary cell is exempt (it completes the block
+        // already there). A non-resident extra chunk counts as obstructed.
+        let primary_blocked = !is_merge && !self.is_placement_clear(primary_pos);
+        let extra_blocked = computed.is_some_and(|r| {
+            r.extra_blocks
+                .iter()
+                .any(|&(epos, _)| !self.is_placement_clear(epos))
+        });
+        if primary_blocked || extra_blocked {
+            // Heal the actor's prediction at the clicked cell, but only when the
+            // actor is present (an absent actor has no session to resync).
+            if self.players.contains_key(&player) {
+                outputs.push(GameOutput::BlockChangeRejected {
+                    player,
+                    position,
+                    sequence,
+                    requested_state: held,
+                    authoritative_state: self.authoritative_state(position),
+                });
+            }
+            return;
+        }
+
+        // Apply the primary cell first. If it is refused (absent actor, unloaded
+        // chunk, out of reach, y-out-of-bounds) nothing else is written, so a
+        // rejected door never lands its upper half.
+        let result = self.apply_block_edit(cause, primary_pos, primary_state);
+        let MutationResult::Applied { .. } = result else {
+            if let Some(output) =
+                block_change_output(cause, sequence, position, primary_state, result)
+            {
+                outputs.push(output);
+            }
+            return;
+        };
+        if let Some(output) =
+            block_change_output(cause, sequence, primary_pos, primary_state, result)
+        {
+            outputs.push(output);
+        }
+        // An accepted sign placement opens the editor for the placer (ordered after
+        // the BlockChanged so the block exists client-side first).
+        if sign_kind_for_state(primary_state.as_u32()).is_some() {
+            outputs.push(GameOutput::OpenSignEditor {
+                player,
+                position: primary_pos,
+            });
+        }
+        // Apply the pre-validated extra cells (door upper / bed head). They are part
+        // of the same placement: broadcast-only (Command cause -> no extra ack) and
+        // persisted like any gameplay edit.
+        if let Some(r) = computed {
+            for &(epos, estate) in &r.extra_blocks {
+                let estate = BlockStateId::new(estate);
+                let eresult = self.apply_block_edit(MutationCause::Command, epos, estate);
+                if let Some(output) =
+                    block_change_output(MutationCause::Command, sequence, epos, estate, eresult)
+                {
+                    outputs.push(output);
+                }
+            }
+        }
+        // A placed fence updates its same-fence cardinal neighbours so they connect
+        // back to it (broadcast-only, no extra ack). The reverse lookup yields a
+        // `'static` name, so it does not borrow `self`.
+        if is_fence {
+            if let Some(fence_name) = state_id_to_block_name(primary_state.as_u32()) {
+                self.update_fence_neighbors(outputs, primary_pos, fence_name);
+            }
+        }
+    }
+
+    /// Returns `true` if `position` is a resident, in-range cell a placement may
+    /// occupy: it must hold air or a replaceable water *source*.
+    ///
+    /// A non-resident chunk or an out-of-range `y` returns `false` (the placement
+    /// cannot safely land there). A water source counts as replaceable so a
+    /// waterloggable block can be placed into it; every other block (flowing water
+    /// included, and any solid) blocks the placement, preserving the usual "cannot
+    /// place into an occupied cell" rule.
+    fn is_placement_clear(&self, position: BlockPos) -> bool {
+        let Some(chunk) = self.chunks.get(position.to_chunk_pos()) else {
+            return false;
+        };
+        let Some(state) = chunk.get_block(position) else {
+            return false;
+        };
+        state.is_air() || is_water_source(state.as_u32())
     }
 
     /// Queues a region (cuboid) block edit for incremental application after a
@@ -2442,6 +2553,171 @@ mod tests {
             sequence: 0,
             cause: MutationCause::Command,
         }));
+    }
+
+    // --- multi-block placement, merges, and waterlogging (Part B apply path) ---
+
+    /// `oak_door` default (facing=north, lower, hinge=left, open/powered=false).
+    const OAK_DOOR: u32 = 4697;
+    /// `white_bed` default (facing=north, occupied=false, part=foot).
+    const WHITE_BED: u32 = 1734;
+    /// A still `water` source (level=0), the one fluid a placement may replace.
+    const WATER_SOURCE: u32 = 86;
+
+    /// Directly writes `state` at `pos` in the resident chunk — test scaffolding for
+    /// a pre-existing world block (a slab to merge onto, a water source, or an
+    /// obstruction), bypassing the placement funnel.
+    fn set_world_block(s: &mut SimShard, pos: BlockPos, state: u32) {
+        s.loaded_chunks_mut()
+            .get_mut(pos.to_chunk_pos())
+            .expect("resident chunk")
+            .set_block(pos, BlockStateId::new(state))
+            .expect("in-range y");
+    }
+
+    #[tokio::test]
+    async fn place_door_writes_lower_and_upper_halves() {
+        let p = player("carpenter");
+        let mut s = shard_with_player(p).await;
+        let lower = BlockPos::new(8, 65, 8);
+        let upper = BlockPos::new(8, 66, 8);
+        // yaw 0 -> facing south; no neighbours -> hinge right.
+        let outputs = place_block(&mut s, p, lower, OAK_DOOR, Direction::Up, 0.5, 0.0, 1);
+        assert_eq!(block_at(&s, lower), Some(BlockStateId::new(4717))); // south, lower, hinge=right
+        assert_eq!(block_at(&s, upper), Some(BlockStateId::new(4709))); // south, upper, hinge=right
+                                                                        // The lower half is acked to the placer; the upper half is broadcast-only.
+        assert!(outputs.contains(&GameOutput::BlockChanged {
+            position: lower,
+            state: BlockStateId::new(4717),
+            sequence: 1,
+            cause: MutationCause::PlayerCreative { player: p },
+        }));
+        assert!(outputs.contains(&GameOutput::BlockChanged {
+            position: upper,
+            state: BlockStateId::new(4709),
+            sequence: 1,
+            cause: MutationCause::Command,
+        }));
+    }
+
+    #[tokio::test]
+    async fn place_bed_writes_foot_and_head() {
+        let p = player("sleeper");
+        let mut s = shard_with_player(p).await;
+        let foot = BlockPos::new(8, 65, 8);
+        let head = BlockPos::new(8, 65, 9); // one cell south (yaw 0 -> facing south)
+        let _ = place_block(&mut s, p, foot, WHITE_BED, Direction::Up, 0.5, 0.0, 1);
+        assert_eq!(block_at(&s, foot), Some(BlockStateId::new(1738))); // south, foot
+        assert_eq!(block_at(&s, head), Some(BlockStateId::new(1737))); // south, head
+    }
+
+    #[tokio::test]
+    async fn place_door_with_obstructed_upper_rejects_whole_placement() {
+        let p = player("blocked-carpenter");
+        let mut s = shard_with_player(p).await;
+        let lower = BlockPos::new(8, 65, 8);
+        let upper = BlockPos::new(8, 66, 8);
+        // A ceiling (stone) sits where the upper half would go.
+        set_world_block(&mut s, upper, 1);
+        let outputs = place_block(&mut s, p, lower, OAK_DOOR, Direction::Up, 0.5, 0.0, 1);
+        // Nothing placed: no half-door. The lower cell stays air; the ceiling stands.
+        assert_eq!(block_at(&s, lower), Some(BlockStateId::AIR));
+        assert_eq!(block_at(&s, upper), Some(BlockStateId::new(1)));
+        // The actor is healed: the predicted lower cell resyncs to its real air state.
+        assert_eq!(
+            outputs,
+            vec![GameOutput::BlockChangeRejected {
+                player: p,
+                position: lower,
+                sequence: 1,
+                requested_state: BlockStateId::new(OAK_DOOR),
+                authoritative_state: BlockStateId::AIR,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn place_bed_with_obstructed_head_rejects_whole_placement() {
+        let p = player("blocked-sleeper");
+        let mut s = shard_with_player(p).await;
+        let foot = BlockPos::new(8, 65, 8);
+        let head = BlockPos::new(8, 65, 9);
+        // A wall (stone) sits where the head would go.
+        set_world_block(&mut s, head, 1);
+        let outputs = place_block(&mut s, p, foot, WHITE_BED, Direction::Up, 0.5, 0.0, 1);
+        assert_eq!(block_at(&s, foot), Some(BlockStateId::AIR));
+        assert_eq!(block_at(&s, head), Some(BlockStateId::new(1)));
+        assert_eq!(
+            outputs,
+            vec![GameOutput::BlockChangeRejected {
+                player: p,
+                position: foot,
+                sequence: 1,
+                requested_state: BlockStateId::new(WHITE_BED),
+                authoritative_state: BlockStateId::AIR,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn place_slab_merges_into_a_double_at_the_clicked_cell() {
+        let p = player("slab-merger");
+        let mut s = shard_with_player(p).await;
+        // A bottom slab already sits at the clicked cell.
+        let clicked = BlockPos::new(8, 65, 8);
+        set_world_block(&mut s, clicked, OAK_SLAB); // 12054 (bottom)
+                                                    // The client clicks its top face; the place target steps up to (8,66,8).
+        let stepped = BlockPos::new(8, 66, 8);
+        let outputs = place_block(&mut s, p, stepped, OAK_SLAB, Direction::Up, 0.5, 0.0, 1);
+        // The merge relocates the write onto the clicked cell: it becomes a double.
+        assert_eq!(block_at(&s, clicked), Some(BlockStateId::new(12056))); // double
+                                                                           // The stepped cell stays empty — no second slab is placed there.
+        assert_eq!(block_at(&s, stepped), Some(BlockStateId::AIR));
+        // The double is acked to the placer at the clicked cell, not the stepped one.
+        assert!(outputs.contains(&GameOutput::BlockChanged {
+            position: clicked,
+            state: BlockStateId::new(12056),
+            sequence: 1,
+            cause: MutationCause::PlayerCreative { player: p },
+        }));
+    }
+
+    #[tokio::test]
+    async fn place_slab_into_water_source_applies_waterlogged() {
+        let p = player("diver");
+        let mut s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+        // A still water source occupies the target cell (a replaceable fluid).
+        set_world_block(&mut s, target, WATER_SOURCE);
+        // A bottom slab placed into it becomes waterlogged (12053), replacing water.
+        let _ = place_block(&mut s, p, target, OAK_SLAB, Direction::Up, 0.0, 0.0, 1);
+        assert_eq!(block_at(&s, target), Some(BlockStateId::new(12053))); // bottom + waterlogged
+    }
+
+    #[tokio::test]
+    async fn place_into_a_solid_block_is_rejected() {
+        // The replaceability gate keeps the usual "cannot place into a solid" rule:
+        // a non-air, non-water target refuses the placement and heals the actor.
+        let p = player("overwriter");
+        let mut s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+        set_world_block(&mut s, target, 1); // stone already there
+        let outputs = place_block(&mut s, p, target, OAK_SLAB, Direction::Up, 0.0, 0.0, 1);
+        assert_eq!(
+            block_at(&s, target),
+            Some(BlockStateId::new(1)),
+            "solid untouched"
+        );
+        assert_eq!(
+            outputs,
+            vec![GameOutput::BlockChangeRejected {
+                player: p,
+                position: target,
+                sequence: 1,
+                requested_state: BlockStateId::new(OAK_SLAB),
+                authoritative_state: BlockStateId::new(1),
+            }]
+        );
     }
 
     /// Enqueues and applies a single region edit, returning the tick's outputs.
