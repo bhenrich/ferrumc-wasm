@@ -20,7 +20,7 @@ pub mod wire;
 
 pub use component::{ComponentPatch, ComponentTypeId, ComponentValue, OpaqueComponent};
 pub use item_id::ItemId;
-pub use stack::ItemStack;
+pub use stack::{left_click_exchange, ItemStack};
 pub use untrusted::{ItemValidationError, UntrustedItemStack};
 pub use wire::{
     encode_container_content_payload, MAX_COMPONENTS, MAX_COMPONENTS_TOTAL_BYTES,

@@ -119,6 +119,47 @@ impl ItemStack {
     }
 }
 
+/// Resolves a vanilla left-click pickup / place / merge / swap between a window
+/// `slot` and the `cursor` (carried) stack, mutating both in place.
+///
+/// This models exactly the left mouse button in normal mode (`button = 0`,
+/// `mode = 0`) — the only [`WindowClick`] interaction the container handler
+/// applies directly (every other mode/button resyncs the window instead of
+/// guessing). It is **item-count conserving in every branch**: for each item id,
+/// the summed count across `{slot, cursor}` is identical before and after, so a
+/// click can never duplicate or destroy an item. The four reachable cases:
+///
+/// * cursor empty, slot present → pick the whole slot stack up onto the cursor;
+/// * cursor present, slot empty → drop the whole cursor stack into the slot;
+/// * same item *and* identical components → merge the cursor into the slot up to
+///   the item's max stack size, leaving any remainder on the cursor;
+/// * different items (or differing components) → swap the cursor and the slot.
+///
+/// [`WindowClick`]: https://minecraft.wiki/w/Java_Edition_protocol/Packets#Click_Container
+pub fn left_click_exchange(slot: &mut ItemStack, cursor: &mut ItemStack) {
+    match (cursor.item, slot.item) {
+        (Some(cursor_item), Some(slot_item))
+            if cursor_item == slot_item && cursor.components == slot.components =>
+        {
+            // Same item: merge the cursor into the slot, capped at the max stack.
+            // `moved` is bounded by both the slot's remaining space and the cursor
+            // count, so neither count can overflow `u8` or exceed the max stack.
+            let space = slot_item.max_stack().saturating_sub(slot.count);
+            let moved = space.min(cursor.count);
+            slot.count += moved;
+            cursor.count -= moved;
+            // Restore the empty-slot invariant (no item => count 0, empty patch)
+            // when the cursor is fully drained.
+            if cursor.count == 0 {
+                *cursor = ItemStack::empty();
+            }
+        }
+        // Pickup (cursor empty), place (slot empty), or swap (different items): a
+        // straight exchange trivially conserves both stacks.
+        _ => std::mem::swap(slot, cursor),
+    }
+}
+
 /// Encodes one component as trusted (typed, unprefixed) wire data.
 fn encode_component_trusted(
     out: &mut Vec<u8>,
@@ -281,6 +322,76 @@ mod tests {
         let (decoded, consumed) = decode_trusted_slot(&buf).unwrap();
         assert_eq!(decoded, stack);
         assert_eq!(consumed, buf.len());
+    }
+
+    /// The summed count of `item` across `slot` + `cursor`.
+    fn total_of(slot: &ItemStack, cursor: &ItemStack, item: ItemId) -> u32 {
+        [slot, cursor]
+            .iter()
+            .filter(|s| s.item() == Some(item))
+            .map(|s| u32::from(s.count()))
+            .sum()
+    }
+
+    #[test]
+    fn left_click_pickup_and_place_move_whole_stacks() {
+        let stone = ItemId::new(1).unwrap();
+        // Cursor empty + slot present -> pick the whole stack up.
+        let mut slot = ItemStack::new(stone, nz(40), ComponentPatch::empty());
+        let mut cursor = ItemStack::empty();
+        left_click_exchange(&mut slot, &mut cursor);
+        assert!(slot.item().is_none(), "slot emptied on pickup");
+        assert_eq!(cursor.count(), 40);
+        assert!(slot.is_valid() && cursor.is_valid());
+
+        // Cursor present + slot empty -> drop the whole stack down.
+        left_click_exchange(&mut slot, &mut cursor);
+        assert_eq!(slot.count(), 40);
+        assert!(cursor.item().is_none(), "cursor emptied on place");
+    }
+
+    #[test]
+    fn left_click_merges_same_item_with_overflow_remainder() {
+        let stone = ItemId::new(1).unwrap(); // max stack 64
+        let mut slot = ItemStack::new(stone, nz(50), ComponentPatch::empty());
+        let mut cursor = ItemStack::new(stone, nz(30), ComponentPatch::empty());
+        let before = total_of(&slot, &cursor, stone);
+        left_click_exchange(&mut slot, &mut cursor);
+        // Slot fills to the max stack; the remainder stays on the cursor.
+        assert_eq!(slot.count(), 64);
+        assert_eq!(cursor.count(), 16);
+        assert_eq!(total_of(&slot, &cursor, stone), before, "no dupe/loss");
+        assert!(slot.is_valid() && cursor.is_valid());
+    }
+
+    #[test]
+    fn left_click_full_merge_empties_cursor() {
+        let stone = ItemId::new(1).unwrap();
+        let mut slot = ItemStack::new(stone, nz(10), ComponentPatch::empty());
+        let mut cursor = ItemStack::new(stone, nz(20), ComponentPatch::empty());
+        left_click_exchange(&mut slot, &mut cursor);
+        assert_eq!(slot.count(), 30);
+        assert!(cursor.item().is_none(), "cursor drained into the slot");
+        assert!(
+            cursor.is_valid(),
+            "drained cursor keeps the empty invariant"
+        );
+    }
+
+    #[test]
+    fn left_click_swaps_different_items_and_conserves_each() {
+        let stone = ItemId::new(1).unwrap();
+        let glass = ItemId::new(195).unwrap();
+        let mut slot = ItemStack::new(stone, nz(5), ComponentPatch::empty());
+        let mut cursor = ItemStack::new(glass, nz(7), ComponentPatch::empty());
+        left_click_exchange(&mut slot, &mut cursor);
+        // Different items swap; each id's total is preserved (5 stone, 7 glass).
+        assert_eq!(slot.item(), Some(glass));
+        assert_eq!(slot.count(), 7);
+        assert_eq!(cursor.item(), Some(stone));
+        assert_eq!(cursor.count(), 5);
+        assert_eq!(total_of(&slot, &cursor, stone), 5);
+        assert_eq!(total_of(&slot, &cursor, glass), 7);
     }
 
     #[test]
