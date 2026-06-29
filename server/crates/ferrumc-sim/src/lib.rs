@@ -52,6 +52,7 @@ mod region;
 mod shard;
 mod spawn;
 mod ticket;
+mod time;
 
 pub use coordinator::{TickCoordinator, TickRate};
 pub use error::{SimError, SimResult};
@@ -66,6 +67,7 @@ pub use message::{GameInput, GameOutput};
 pub use mutation::{MutationCause, PendingMutation};
 pub use region::{RegionLimits, RegionOp};
 pub use shard::SimShard;
+pub use time::{WorldTime, DAY_LENGTH_TICKS, TIME_DAY, TIME_MIDNIGHT, TIME_NIGHT, TIME_NOON};
 
 /// Re-exported from [`ferrumc_world`] so callers can name the block-state ids
 /// carried by [`GameOutput::BlockChanged`] / produced by block-edit inputs
