@@ -51,7 +51,7 @@ mod scoreboard;
 mod text;
 mod translate;
 
-pub use block_entity::{open_sign_editor, sign_block_entity_data};
+pub use block_entity::{open_screen, open_sign_editor, sign_block_entity_data};
 pub use error::SessionError;
 pub use event::NetEvent;
 pub use outbound::OutboundMessage;
@@ -80,5 +80,5 @@ pub use scoreboard::{
 pub use text::system_chat;
 pub use translate::{
     net_event_to_input, output_to_clientbound, player_info_add, shard_for_position,
-    use_item_on_face, use_item_on_target, PLAYER_INFO_ADD,
+    use_item_on_block, use_item_on_face, use_item_on_target, PLAYER_INFO_ADD,
 };

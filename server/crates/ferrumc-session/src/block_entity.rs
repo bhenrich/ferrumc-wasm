@@ -7,11 +7,16 @@
 //! because this crate is the only one that depends on both the simulation model
 //! (`ferrumc-sim`, which re-exports [`Sign`]) and the protocol/NBT crates.
 
+use ferrumc_core::TextComponent;
 use ferrumc_math::BlockPos;
 use ferrumc_nbt::{NbtCompound, NbtTag};
-use ferrumc_proto::generated::play::{BlockEntityData, ClientboundPlayPacket, OpenSignEditor};
+use ferrumc_proto::generated::play::{
+    BlockEntityData, ClientboundPlayPacket, OpenScreen, OpenSignEditor,
+};
 use ferrumc_proto::types::BlockPosition;
 use ferrumc_sim::{Sign, SignFace};
+
+use crate::text::text_component_to_nbt;
 
 /// Converts a typed [`BlockPos`] into the wire [`BlockPosition`].
 fn wire_pos(position: BlockPos) -> BlockPosition {
@@ -75,6 +80,29 @@ pub fn sign_block_entity_data(position: BlockPos, sign: &Sign) -> ClientboundPla
 pub fn open_sign_editor(position: BlockPos) -> ClientboundPlayPacket {
     // The placer always edits the front face first, matching vanilla.
     ClientboundPlayPacket::OpenSignEditor(OpenSignEditor::new(wire_pos(position), true))
+}
+
+/// Builds the clientbound [`OpenScreen`] packet that opens a container GUI.
+///
+/// `window_id` is the server-assigned `ContainerID` the client echoes on every
+/// subsequent Click Container / Close Container; `window_type` is the
+/// `minecraft:menu` registry id (e.g. `2` = `generic_9x3`, a single chest);
+/// `title` is the window title, encoded as a network-NBT text component the same
+/// way [`system_chat`](crate::system_chat) encodes its content.
+///
+/// The app pairs this with a `SetContainerContent` carrying the window's slots so
+/// the freshly opened screen renders the container's contents.
+#[must_use]
+pub fn open_screen(
+    window_id: i32,
+    window_type: i32,
+    title: &TextComponent,
+) -> ClientboundPlayPacket {
+    ClientboundPlayPacket::OpenScreen(OpenScreen::new(
+        window_id,
+        window_type,
+        text_component_to_nbt(title),
+    ))
 }
 
 #[cfg(test)]
@@ -167,5 +195,27 @@ mod tests {
         let loc = packet.location();
         assert_eq!((loc.x(), loc.y(), loc.z()), (5, 70, 5));
         assert!(packet.is_front_text());
+    }
+
+    #[test]
+    fn open_screen_carries_window_id_type_and_title() {
+        let title = TextComponent::text("Chest");
+        let ClientboundPlayPacket::OpenScreen(packet) = open_screen(3, 2, &title) else {
+            panic!("expected an OpenScreen");
+        };
+        assert_eq!(packet.window_id(), 3);
+        // generic_9x3 (single chest) is menu-registry id 2.
+        assert_eq!(packet.window_type(), 2);
+        // The title encodes as a network-NBT text component ({ text: "Chest" }),
+        // and survives a network-root round trip.
+        let NbtTag::Compound(root) = packet.title() else {
+            panic!("title is not a compound");
+        };
+        assert_eq!(root.get("text"), Some(&NbtTag::String("Chest".to_owned())));
+        let bytes = write_network_root(packet.title(), &NbtLimits::default()).expect("encode");
+        assert_eq!(
+            &read_network_root(&bytes, &NbtLimits::default()).expect("decode"),
+            packet.title()
+        );
     }
 }

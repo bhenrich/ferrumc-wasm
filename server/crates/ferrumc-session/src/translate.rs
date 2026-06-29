@@ -212,6 +212,17 @@ pub fn use_item_on_face(packet: &UseItemOn) -> Option<Direction> {
     face_from_index(packet.direction())
 }
 
+/// Resolves the block a serverbound `UseItemOn` clicked *on* (the targeted block
+/// itself, not the adjacent placement cell).
+///
+/// This is the position [`use_item_on_target`] steps off; the app uses it to ask
+/// the simulation whether the clicked block is an interactable container (a chest
+/// to open) before falling back to placing against the stepped-off face.
+#[must_use]
+pub fn use_item_on_block(packet: &UseItemOn) -> BlockPos {
+    block_pos(packet.location())
+}
+
 /// Converts a wire [`BlockPosition`] into a typed [`BlockPos`].
 fn block_pos(pos: BlockPosition) -> BlockPos {
     BlockPos::new(pos.x(), pos.y(), pos.z())
