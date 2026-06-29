@@ -201,13 +201,18 @@ pub struct ChunkOverlayRecord {
 }
 
 impl ChunkOverlayRecord {
-    /// Captures the persist-dirty sections of `chunk` into an overlay record
+    /// Captures the persist-*edited* sections of `chunk` into an overlay record
     /// stamped with `schema_version` and `updated_at_tick`.
     ///
-    /// Only sections reported by [`Chunk::persist_dirty_sections`] are captured,
-    /// each as its full dense block list. A chunk with no persist-dirty sections
-    /// produces an empty record (caller should skip persisting it); callers
-    /// typically gate on [`Chunk::persist_dirty_sections`]`.any()` first.
+    /// The cumulative [`Chunk::persist_edited_sections`] set is captured — **every**
+    /// section a gameplay edit has touched since the chunk's baseline, not just those
+    /// dirtied since the last flush — each as its full dense block list. Capturing the
+    /// complete set on every flush is what keeps the store's last-write-wins overlay
+    /// overwrite a complete snapshot, so edits to different sections on different flush
+    /// ticks cannot overwrite one another on reload. A chunk with no edited sections
+    /// produces an empty record (caller should skip persisting it); callers gate the
+    /// *flush* on [`Chunk::persist_dirty_sections`]`.any()`, but the *capture* reads
+    /// the cumulative [`Chunk::persist_edited_sections`] (a superset of that gate).
     ///
     /// The chunk's **entire** block-entity set is captured (not just those in the
     /// dirty sections) whenever `schema_version` is at least
@@ -224,7 +229,7 @@ impl ChunkOverlayRecord {
     ) -> Self {
         let mut sections = Vec::new();
         let mut mask: u32 = 0;
-        for index in chunk.persist_dirty_sections().dirty_indices() {
+        for index in chunk.persist_edited_sections().dirty_indices() {
             let Some(section) = chunk.section(index) else {
                 continue;
             };
@@ -364,6 +369,19 @@ impl ChunkOverlayRecord {
     #[must_use]
     pub fn section_count(&self) -> usize {
         self.sections.len()
+    }
+
+    /// Returns the indices of the sections this overlay carries, ascending from the
+    /// bottom of the world.
+    ///
+    /// Pairs with [`dirty_section_mask`](Self::dirty_section_mask): it yields exactly
+    /// that mask's set bits as `usize` indices. The persistence load path uses it to
+    /// reseed a reloaded chunk's cumulative persist-edited set (via
+    /// `Chunk::restore_persist_edited_section`) so the chunk's next overlay flush
+    /// re-captures these sections in full, matching how block entities are always
+    /// captured whole.
+    pub fn section_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..SECTION_COUNT).filter(move |&index| (self.dirty_section_mask >> index) & 1 == 1)
     }
 
     /// Returns the number of block entities this overlay carries.
@@ -776,6 +794,27 @@ mod tests {
         assert_eq!(overlay.section_count(), 2);
         assert_eq!(overlay.updated_at_tick(), 42);
         assert_eq!(overlay.dirty_section_mask(), (1 << 4) | (1 << 8));
+    }
+
+    #[test]
+    fn section_indices_match_the_dirty_section_mask() {
+        let mut chunk = Chunk::new(ChunkPos::new(0, 0));
+        let a = BlockPos::new(1, 5, 1); // section 4
+        let b = BlockPos::new(2, 70, 2); // section 8
+        for pos in [a, b] {
+            chunk
+                .set_block(pos, BlockStateId::new(9))
+                .expect("in range");
+            chunk.mark_persist_dirty(pos);
+        }
+        let overlay = ChunkOverlayRecord::from_chunk(SchemaVersion::new(3), chunk.pos(), &chunk, 0);
+        let indices: Vec<usize> = overlay.section_indices().collect();
+        assert_eq!(indices, vec![4, 8]);
+        // The iterator is exactly the set bits of the mask.
+        let from_mask: Vec<usize> = (0..SECTION_COUNT)
+            .filter(|&i| (overlay.dirty_section_mask() >> i) & 1 == 1)
+            .collect();
+        assert_eq!(indices, from_mask);
     }
 
     #[test]
