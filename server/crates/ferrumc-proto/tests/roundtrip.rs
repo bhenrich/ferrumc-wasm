@@ -19,14 +19,14 @@ use ferrumc_proto::generated::login::{
 use ferrumc_proto::generated::play::{
     BlockEntityData, BlockUpdate, BossBar, ChatCommand, ChunkBlockEntity, ChunkDataAndLight,
     ClientboundKeepAlive, ClientboundPlayPacket, ConfirmTeleportation, DeathLocation,
-    DisplayObjective, EntitySoundEffect, EntityTeleport, EntityVelocity, GameEvent, Heightmap,
-    JoinGame, OpenSignEditor, Particle, PlayerAction, PlayerInfoUpdate, RemoveEntities,
-    RemovePlayerInfo, ServerboundKeepAlive, ServerboundPlayPacket, SetActionBarText,
-    SetCenterChunk, SetDefaultSpawnPosition, SetHeadRotation, SetPlayerPosition,
-    SetPlayerPositionAndRotation, SetPlayerTeam, SetSubtitleText, SetTitleAnimationTimes,
-    SetTitleText, SoundEffect, SpawnEntity, SpawnInfo, SynchronizePlayerPosition, UnloadChunk,
-    UpdateEntityPosition, UpdateEntityPositionAndRotation, UpdateEntityRotation, UpdateObjectives,
-    UpdateScore, UpdateSign, UseItemOn,
+    DisplayObjective, EntityTeleport, EntityVelocity, GameEvent, Heightmap, JoinGame,
+    OpenSignEditor, Particle, PlayerAction, PlayerInfoUpdate, RemoveEntities, RemovePlayerInfo,
+    ServerboundKeepAlive, ServerboundPlayPacket, SetActionBarText, SetCenterChunk,
+    SetDefaultSpawnPosition, SetHeadRotation, SetPlayerPosition, SetPlayerPositionAndRotation,
+    SetPlayerTeam, SetSubtitleText, SetTitleAnimationTimes, SetTitleText, SoundEffect, SpawnEntity,
+    SpawnInfo, SynchronizePlayerPosition, UnloadChunk, UpdateEntityPosition,
+    UpdateEntityPositionAndRotation, UpdateEntityRotation, UpdateObjectives, UpdateScore,
+    UpdateSign, UseItemOn,
 };
 use ferrumc_proto::generated::status::{
     PingRequest, PongResponse, ServerboundStatusPacket, StatusRequest, StatusResponse,
@@ -762,19 +762,12 @@ fn play_reserved_typed_packets_round_trip() {
 /// feature lane hand-encodes.
 #[test]
 fn play_reserved_opaque_packets_round_trip() {
-    // Sound / Entity Sound: the leading ItemSoundHolder union forces the whole
-    // body opaque.
+    // Sound: the leading ItemSoundHolder union forces the whole body opaque.
     roundtrip(
         &SoundEffect::new(vec![0x01, 0x02, 0x03, 0x04]),
         SoundEffect::encode,
         SoundEffect::decode,
         SoundEffect::PACKET_ID,
-    );
-    roundtrip(
-        &EntitySoundEffect::new(vec![0xAA, 0xBB]),
-        EntitySoundEffect::encode,
-        EntitySoundEffect::decode,
-        EntitySoundEffect::PACKET_ID,
     );
 
     // Particle: typed leading fields, then a typed particle id and an opaque

@@ -4107,43 +4107,6 @@ impl SetTitleAnimationTimes {
     }
 }
 
-/// `EntitySoundEffect`: the play clientbound packet (wire id `0x6d`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EntitySoundEffect {
-    payload: Vec<u8>,
-}
-
-impl EntitySoundEffect {
-    /// The wire packet id for `EntitySoundEffect`.
-    pub const PACKET_ID: i32 = 0x6d;
-
-    /// Creates a new `EntitySoundEffect` from its wire fields.
-    pub fn new(payload: Vec<u8>) -> Self {
-        Self { payload }
-    }
-
-    /// Returns the `payload` field.
-    pub fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
-    /// Decodes a `EntitySoundEffect` body from `reader` (any packet id is already consumed).
-    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
-        let payload = {
-            let remaining = reader.remaining();
-            reader.read_bytes(remaining)?.to_vec()
-        };
-        Ok(Self { payload })
-    }
-
-    /// Encodes this value (packet id, when present, then fields) into `buf`.
-    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
-        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
-        wire::write_raw(buf, &self.payload);
-        Ok(())
-    }
-}
-
 /// `SoundEffect`: the play clientbound packet (wire id `0x6e`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SoundEffect {
@@ -4438,8 +4401,6 @@ pub enum ClientboundPlayPacket {
     SetTitleText(SetTitleText),
     /// The `SetTitleAnimationTimes` packet.
     SetTitleAnimationTimes(SetTitleAnimationTimes),
-    /// The `EntitySoundEffect` packet.
-    EntitySoundEffect(EntitySoundEffect),
     /// The `SoundEffect` packet.
     SoundEffect(SoundEffect),
     /// The `SystemChat` packet.
@@ -4535,9 +4496,6 @@ impl ClientboundPlayPacket {
             SetTitleAnimationTimes::PACKET_ID => Ok(Self::SetTitleAnimationTimes(
                 SetTitleAnimationTimes::decode(reader)?,
             )),
-            EntitySoundEffect::PACKET_ID => {
-                Ok(Self::EntitySoundEffect(EntitySoundEffect::decode(reader)?))
-            }
             SoundEffect::PACKET_ID => Ok(Self::SoundEffect(SoundEffect::decode(reader)?)),
             SystemChat::PACKET_ID => Ok(Self::SystemChat(SystemChat::decode(reader)?)),
             other => Err(ProtoError::UnknownPacketId {
@@ -4590,7 +4548,6 @@ impl ClientboundPlayPacket {
             Self::SetSubtitleText(_) => SetSubtitleText::PACKET_ID,
             Self::SetTitleText(_) => SetTitleText::PACKET_ID,
             Self::SetTitleAnimationTimes(_) => SetTitleAnimationTimes::PACKET_ID,
-            Self::EntitySoundEffect(_) => EntitySoundEffect::PACKET_ID,
             Self::SoundEffect(_) => SoundEffect::PACKET_ID,
             Self::SystemChat(_) => SystemChat::PACKET_ID,
         }
@@ -4638,7 +4595,6 @@ impl ClientboundPlayPacket {
             Self::SetSubtitleText(packet) => packet.encode(buf),
             Self::SetTitleText(packet) => packet.encode(buf),
             Self::SetTitleAnimationTimes(packet) => packet.encode(buf),
-            Self::EntitySoundEffect(packet) => packet.encode(buf),
             Self::SoundEffect(packet) => packet.encode(buf),
             Self::SystemChat(packet) => packet.encode(buf),
         }

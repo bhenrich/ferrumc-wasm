@@ -983,22 +983,21 @@ fields = [
     { name = "fade_out", type = "i32" },
 ]
 
-# --- Sound effects (pre-reserved for the sound feature lane) ---------------------
+# --- Sound effect (pre-reserved for the sound feature lane) ----------------------
 #
-# Ids verified against fixtures/protocol/1_21_8/protocol.json (protocol 772):
-# sound_effect 0x6E, entity_sound_effect 0x6D.
+# Id verified against fixtures/protocol/1_21_8/protocol.json (protocol 772):
+# sound_effect 0x6E.
 #
-# DEVIATION: both packets LEAD with `sound`, an `ItemSoundHolder` — a
+# DEVIATION: the packet LEADs with `sound`, an `ItemSoundHolder` — a
 # registry-id-or-inline union (a VarInt id; if 0, an inline SoundEvent =
 # identifier + optional fixed-range f32). Because that variable-length union is
-# the FIRST field, nothing after it (sound category, coords/entity, volume,
-# pitch, seed) can be modeled typed without expressing the union itself, which the
-# closed packets.toml grammar cannot do. So — exactly like the Commands packet —
-# the WHOLE body is carried as one opaque `payload` (`remaining_bytes`). The sound
+# the FIRST field, nothing after it (sound category, coords, volume, pitch, seed)
+# can be modeled typed without expressing the union itself, which the closed
+# packets.toml grammar cannot do. So — exactly like the Commands packet — the
+# WHOLE body is carried as one opaque `payload` (`remaining_bytes`). The sound
 # feature lane hand-encodes the full body (sound holder + soundSource VarInt +
-# i32 x/y/z [or entity_id VarInt] + f32 volume + f32 pitch + i64 seed) and is
-# covered by golden-byte tests. Clientbound-only; the generated decode is never
-# exercised at runtime.
+# i32 x/y/z + f32 volume + f32 pitch + i64 seed) and is covered by golden-byte
+# tests. Clientbound-only; the generated decode is never exercised at runtime.
 
 # minecraft-data: play.toClient.sound_effect ("Sound Effect").
 [[packet]]
@@ -1006,14 +1005,6 @@ state = "play"
 direction = "clientbound"
 name = "SoundEffect"
 id = 0x6E
-fields = [{ name = "payload", type = "remaining_bytes" }]
-
-# minecraft-data: play.toClient.entity_sound_effect ("Entity Sound Effect").
-[[packet]]
-state = "play"
-direction = "clientbound"
-name = "EntitySoundEffect"
-id = 0x6D
 fields = [{ name = "payload", type = "remaining_bytes" }]
 
 # --- Particles (pre-reserved for the particle feature lane) ----------------------
