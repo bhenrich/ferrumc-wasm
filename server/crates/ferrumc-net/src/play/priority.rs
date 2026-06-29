@@ -190,14 +190,13 @@ impl OutboundPriority {
             | ClientboundPlayPacket::SetEquipment(_) => Self::World,
             // Purely visual / audio overlays, safely shed under congestion: the
             // title stack (title / subtitle / action bar / animation times), world
-            // particles, and the positional / entity sound effects.
+            // particles, and the positional sound effect.
             ClientboundPlayPacket::SetTitleText(_)
             | ClientboundPlayPacket::SetSubtitleText(_)
             | ClientboundPlayPacket::SetActionBarText(_)
             | ClientboundPlayPacket::SetTitleAnimationTimes(_)
             | ClientboundPlayPacket::Particle(_)
-            | ClientboundPlayPacket::SoundEffect(_)
-            | ClientboundPlayPacket::EntitySoundEffect(_) => Self::Cosmetic,
+            | ClientboundPlayPacket::SoundEffect(_) => Self::Cosmetic,
         }
     }
 }
@@ -305,7 +304,6 @@ impl Criticality {
             | ClientboundPlayPacket::SetTitleAnimationTimes(_)
             | ClientboundPlayPacket::Particle(_)
             | ClientboundPlayPacket::SoundEffect(_)
-            | ClientboundPlayPacket::EntitySoundEffect(_)
             | ClientboundPlayPacket::UpdateObjectives(_)
             | ClientboundPlayPacket::DisplayObjective(_)
             | ClientboundPlayPacket::UpdateScore(_)
