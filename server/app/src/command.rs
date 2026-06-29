@@ -34,7 +34,7 @@ use ferrumc_session::{
     SOUND_EXPERIENCE_ORB_PICKUP, SOUND_NOTE_BLOCK_HARP, SOUND_PLAYER_LEVELUP,
     SOUND_UI_BUTTON_CLICK,
 };
-use ferrumc_sim::{BlockStateId, RegionOp};
+use ferrumc_sim::{BlockStateId, RegionOp, TIME_DAY, TIME_MIDNIGHT, TIME_NIGHT, TIME_NOON};
 use uuid::Uuid;
 
 use crate::driver::SimCommand;
@@ -60,6 +60,15 @@ pub const WEATHER_COMMAND: &str = "weather";
 /// Permission *level* required to run `/weather` (operator-tier, matching
 /// [`GAMEMODE_LEVEL`]).
 pub const WEATHER_LEVEL: u8 = 2;
+
+/// The literal name of the world-time command.
+pub const TIME_COMMAND: &str = "time";
+/// Permission *level* required to run `/time` (operator-tier, matching
+/// [`GAMEMODE_LEVEL`]).
+pub const TIME_LEVEL: u8 = 2;
+/// Usage shown when `/time` arguments do not parse.
+const TIME_USAGE: &str =
+    "usage: /time set <day|noon|night|midnight|ticks> | add <ticks> | query daytime";
 
 /// Usage shown when `/tp` arguments do not parse.
 const TP_USAGE: &str = "usage: /tp <x> <y> <z> | /tp <player>";
@@ -198,6 +207,7 @@ pub fn build_command_tree_with_limits(region_volume_cap: u64) -> CommandTree {
     tree.register(gamemode_command());
     tree.register(tp_command());
     tree.register(weather_command());
+    tree.register(time_command());
 
     // `/title`, `/subtitle`, `/actionbar` take greedy free text; the clientbound
     // title/action-bar packets are applied on success by `presentation_packets`.
@@ -506,6 +516,91 @@ fn weather_feedback(kind: WeatherKind, duration: Option<u32>) -> String {
         Some(secs) => format!("Set the weather to {label} for {secs}s"),
         None => format!("Set the weather to {label}"),
     }
+}
+
+/// Builds the `/time set <day|noon|night|midnight|ticks>`, `/time add <ticks>`, and
+/// `/time query daytime` command (operator-gated).
+///
+/// The day-night phase lives in the simulation/driver, not the command layer, so
+/// this only validates and reports feedback; [`region_commands`] routes the
+/// matching [`SimCommand::SetTime`] / [`SimCommand::AddTime`] / [`SimCommand::QueryTime`]
+/// to the driver on a successful dispatch. The query carries no command-layer
+/// feedback (the driver replies with the live value), so its handler returns empty
+/// feedback the connection suppresses.
+fn time_command() -> CommandBuilder {
+    literal(TIME_COMMAND).requires_level(TIME_LEVEL).then(
+        argument("args", ArgumentType::GreedyString).executes(|ctx| {
+            let args = ctx.string("args").unwrap_or_default();
+            match parse_time(args) {
+                Some(action) => CommandResult::success(TextComponent::text(action.feedback())),
+                None => CommandResult::failure(TextComponent::text(TIME_USAGE)),
+            }
+        }),
+    )
+}
+
+/// A parsed `/time` invocation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TimeAction {
+    /// `set <phase|ticks>` — set the absolute day-night phase.
+    Set { time_of_day: i64 },
+    /// `add <ticks>` — add (signed) to the day-night phase.
+    Add { ticks: i64 },
+    /// `query daytime` — report the current day-night phase.
+    QueryDaytime,
+}
+
+impl TimeAction {
+    /// The success message shown to the issuer.
+    ///
+    /// `query daytime` returns an empty string: the driver answers with the live
+    /// value, so the connection suppresses the command-layer line to avoid a
+    /// duplicate (blank-feedback handlers are skipped at the dispatch site).
+    fn feedback(self) -> String {
+        match self {
+            Self::Set { time_of_day } => format!("Set the time to {time_of_day}"),
+            Self::Add { ticks } => format!("Added {ticks} to the time"),
+            Self::QueryDaytime => String::new(),
+        }
+    }
+}
+
+/// Parses a `/time` argument tail, or `None` if it is not a supported form (an
+/// unknown subcommand, a non-integer tick count, an unknown phase name, or
+/// trailing tokens).
+fn parse_time(args: &str) -> Option<TimeAction> {
+    let mut tokens = args.split_whitespace();
+    match tokens.next()? {
+        "set" => {
+            let time_of_day = time_phase_by_name(tokens.next()?)?;
+            only((), tokens)?;
+            Some(TimeAction::Set { time_of_day })
+        }
+        "add" => {
+            let ticks: i64 = tokens.next()?.parse().ok()?;
+            only((), tokens)?;
+            Some(TimeAction::Add { ticks })
+        }
+        "query" => match tokens.next()? {
+            "daytime" => only(TimeAction::QueryDaytime, tokens),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Resolves a `/time set` phase argument: a named phase (`day`, `noon`, `night`,
+/// `midnight`) or a raw tick count. Returns `None` for an unknown name that is also
+/// not a valid integer.
+fn time_phase_by_name(token: &str) -> Option<i64> {
+    let phase = match token {
+        "day" => TIME_DAY,
+        "noon" => TIME_NOON,
+        "night" => TIME_NIGHT,
+        "midnight" => TIME_MIDNIGHT,
+        other => other.parse().ok()?,
+    };
+    Some(phase)
 }
 
 /// Builds the clientbound packets a successfully dispatched presentation command
@@ -1124,6 +1219,9 @@ fn bounded_feedback(region: Cuboid, cap: u64, success: String) -> CommandResult 
 ///   connection applies it via [`parse_gamemode`]).
 /// - `/weather <clear|rain>` — a [`SimCommand::SetWeather`] the driver broadcasts
 ///   to every player as a `GameEvent`.
+/// - `/time set|add|query` — a [`SimCommand::SetTime`] / [`SimCommand::AddTime`] /
+///   [`SimCommand::QueryTime`]; the driver owns the world clock, broadcasting the
+///   new time on set/add and replying to the issuer on query.
 pub(crate) fn region_commands(command: &str, player: PlayerId) -> Vec<SimCommand> {
     let Some(name) = command.split_whitespace().next() else {
         return Vec::new();
@@ -1165,6 +1263,12 @@ pub(crate) fn region_commands(command: &str, player: PlayerId) -> Vec<SimCommand
             Some((kind, _duration)) => vec![SimCommand::SetWeather {
                 raining: kind == WeatherKind::Rain,
             }],
+            None => Vec::new(),
+        },
+        TIME_COMMAND => match parse_time(args) {
+            Some(TimeAction::Set { time_of_day }) => vec![SimCommand::SetTime { time_of_day }],
+            Some(TimeAction::Add { ticks }) => vec![SimCommand::AddTime { ticks }],
+            Some(TimeAction::QueryDaytime) => vec![SimCommand::QueryTime { player }],
             None => Vec::new(),
         },
         _ => Vec::new(),
@@ -1932,6 +2036,108 @@ mod tests {
             "weather snow",      // unknown kind
             "weather rain fast", // non-integer duration
             "weather rain 1 2",  // trailing token
+        ] {
+            assert!(
+                !tree
+                    .dispatch(cmd, &op())
+                    .expect("reaches the handler")
+                    .is_success(),
+                "{cmd}"
+            );
+            assert!(region_commands(cmd, region_player()).is_empty(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn time_set_dispatches_and_builds_set_time() {
+        let tree = build_command_tree();
+        // Named phases resolve to their canonical ticks; a raw count passes through.
+        for (cmd, ticks) in [
+            ("time set day", 1_000),
+            ("time set noon", 6_000),
+            ("time set night", 13_000),
+            ("time set midnight", 18_000),
+            ("time set 1234", 1_234),
+        ] {
+            let result = tree.dispatch(cmd, &op()).expect("dispatches");
+            assert!(result.is_success(), "{cmd}");
+            assert_eq!(
+                result.feedback().to_plain_string(),
+                format!("Set the time to {ticks}"),
+                "{cmd}"
+            );
+            let cmds = region_commands(cmd, region_player());
+            let [SimCommand::SetTime { time_of_day }] = cmds.as_slice() else {
+                panic!("{cmd} builds one SetTime");
+            };
+            assert_eq!(*time_of_day, ticks, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn time_add_builds_add_time_including_negative() {
+        let tree = build_command_tree();
+        for (cmd, ticks) in [("time add 100", 100), ("time add -50", -50)] {
+            assert!(
+                tree.dispatch(cmd, &op()).expect("dispatches").is_success(),
+                "{cmd}"
+            );
+            let cmds = region_commands(cmd, region_player());
+            let [SimCommand::AddTime { ticks: t }] = cmds.as_slice() else {
+                panic!("{cmd} builds one AddTime");
+            };
+            assert_eq!(*t, ticks, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn time_query_builds_query_time_with_empty_feedback() {
+        let tree = build_command_tree();
+        // The query dispatches successfully but carries no command-layer feedback:
+        // the driver replies with the live value, so the connection suppresses the
+        // empty line.
+        let result = tree
+            .dispatch("time query daytime", &op())
+            .expect("dispatches");
+        assert!(result.is_success());
+        assert!(result.feedback().to_plain_string().is_empty());
+
+        let player = region_player();
+        let cmds = region_commands("time query daytime", player);
+        let [SimCommand::QueryTime { player: p }] = cmds.as_slice() else {
+            panic!("/time query daytime builds one QueryTime");
+        };
+        assert_eq!(*p, player);
+    }
+
+    #[test]
+    fn time_requires_operator_level() {
+        let tree = build_command_tree();
+        let member = CommandSource::for_player(PlayerId::offline("Joe"), "Joe", 0);
+        for cmd in ["time set day", "time add 1", "time query daytime"] {
+            let err = tree.dispatch(cmd, &member).expect_err("member lacks level");
+            assert!(matches!(err, CommandError::PermissionDenied(_)), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn time_rejects_malformed_arguments() {
+        let tree = build_command_tree();
+        // A bare `/time` is missing its required greedy argument.
+        assert!(matches!(
+            tree.dispatch("time", &op()),
+            Err(CommandError::MissingArgument(_))
+        ));
+        // These reach the handler with an unparsable tail and report a usage failure.
+        for cmd in [
+            "time set",         // missing phase/ticks
+            "time set dusk",    // unknown phase that is not an integer
+            "time set day 1",   // trailing token
+            "time add",         // missing ticks
+            "time add x",       // non-integer ticks
+            "time query",       // missing subject
+            "time query night", // unknown query subject
+            "time wibble",      // unknown subcommand
         ] {
             assert!(
                 !tree

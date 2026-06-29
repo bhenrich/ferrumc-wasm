@@ -32,13 +32,15 @@ use ferrumc_observability::{
     PlayerSnapshot, ServerClock, ServerSnapshotParts, SnapshotPublisher, TickMetrics, Vec3Snapshot,
     DEFAULT_TOP_N,
 };
-use ferrumc_proto::generated::play::{ChunkDataAndLight, ClientboundPlayPacket, GameEvent};
+use ferrumc_proto::generated::play::{
+    ChunkDataAndLight, ClientboundPlayPacket, GameEvent, UpdateTime,
+};
 use ferrumc_session::{
     sign_block_entity_data, NetEvent, PlayerSessionHandle, SessionError, SessionRouter,
 };
 use ferrumc_sim::{
     BlockStateId, ChunkTicket, GameInput, GameOutput, MutationCause, PendingMutation, RegionOp,
-    SimShard, TicketReason,
+    SimShard, TicketReason, WorldTime,
 };
 use ferrumc_storage::{
     BlockMutationLogRecord, MutationActor, MutationLogCause, SchemaVersion, WorldStore,
@@ -69,6 +71,19 @@ const GAME_EVENT_STOP_RAINING: u8 = 2;
 /// The `GameEvent` `value` field carried by the weather toggles, which use no
 /// value (unlike `change_game_mode`, whose value is the mode id).
 const GAME_EVENT_WEATHER_VALUE: f32 = 0.0;
+
+/// How often the driver broadcasts the world time to every player: once per second
+/// (every 20 ticks at the 20 TPS target). Clients interpolate the sun/moon between
+/// updates, so a one-second cadence animates the sky smoothly without sending a
+/// packet every tick.
+const TIME_BROADCAST_INTERVAL_TICKS: i64 = 20;
+
+/// The `time_of_day_increasing` flag (the 1.21.2+ `tickDayTime` bool) sent on every
+/// Update Time. Always `true`: the daylight cycle runs by default (the
+/// `doDaylightCycle` equivalent), so the client keeps advancing the sky locally
+/// between the server's periodic updates. A configurable gamerule toggle is
+/// deferred.
+const DAYLIGHT_CYCLE_INCREASING: bool = true;
 
 /// Upper bound on the number of recent tick timestamps the effective-TPS window
 /// retains. At 20 TPS only ~21 fall inside the one-second window, so this is
@@ -171,6 +186,19 @@ fn gamemode_label(mode: GameMode) -> String {
         GameMode::Spectator => "spectator",
     }
     .to_string()
+}
+
+/// Builds the clientbound Update Time packet from the driver-owned [`WorldTime`].
+///
+/// Carries the current monotonic world age and day-night phase plus the always-on
+/// [`DAYLIGHT_CYCLE_INCREASING`] flag; used for the per-join send and the periodic
+/// and `/time` broadcasts.
+fn update_time_packet(world_time: &WorldTime) -> ClientboundPlayPacket {
+    ClientboundPlayPacket::UpdateTime(UpdateTime::new(
+        world_time.world_age(),
+        world_time.time_of_day(),
+        DAYLIGHT_CYCLE_INCREASING,
+    ))
 }
 
 /// A request from a connection task to the simulation/session driver.
@@ -409,6 +437,36 @@ pub(crate) enum SimCommand {
         /// `true` begins rain (`start_raining`); `false` clears it (`stop_raining`).
         raining: bool,
     },
+    /// Set the absolute world time-of-day — the `/time set <phase|ticks>` command.
+    ///
+    /// The driver applies it to the authoritative [`WorldTime`] it owns (wrapping
+    /// into a single day) and immediately broadcasts the new time to every player
+    /// as an Update Time, so every sky jumps at once. Only the driver-owned
+    /// [`SessionRouter`] can reach every player's channel.
+    SetTime {
+        /// The absolute day-night phase in ticks (wrapped to `0..24000`).
+        time_of_day: i64,
+    },
+    /// Add ticks to the world time-of-day — the `/time add <ticks>` command.
+    ///
+    /// The relative counterpart to [`SimCommand::SetTime`]: the driver applies the
+    /// (signed, wrapping) delta to its [`WorldTime`] and broadcasts the adjusted
+    /// time to every player.
+    AddTime {
+        /// The signed tick delta to add (wrapping within a day).
+        ticks: i64,
+    },
+    /// Report the current day-night phase to `player` — the `/time query daytime`
+    /// command.
+    ///
+    /// The command layer runs on the connection, which has no world state, so it
+    /// cannot read the live clock. The query routes here and the driver — the owner
+    /// of the authoritative [`WorldTime`] — replies with a System Chat Message
+    /// naming the current `time_of_day`.
+    QueryTime {
+        /// The player who asked, and who receives the answer.
+        player: PlayerId,
+    },
     /// Send a System Chat Message to a single `player`.
     ///
     /// Fulfils a plugin's `Message` intent aimed at a player other than the acting
@@ -569,6 +627,11 @@ pub(crate) async fn run(
     // stamp their packet traces with the current tick.
     let mut tick = Tick::ZERO;
 
+    // The driver also owns the deterministic day-night clock: it advances once per
+    // `run_tick` (alongside `tick`) and is mutated by `/time`. The world starts at
+    // age 0 / phase 0; the first periodic broadcast (and every join) seeds clients.
+    let mut world_time = WorldTime::new();
+
     // Monotonic id stamped on each journal entry so the append-only mutation log
     // stays ordered across the server's lifetime.
     let mut next_mutation_id: u64 = 0;
@@ -601,6 +664,7 @@ pub(crate) async fn run(
                     &metrics,
                     &clock,
                     &mut tick,
+                    &mut world_time,
                     &mut snap_ctx,
                 );
                 // End-of-tick flush: hand the tick's player edits to the storage
@@ -617,6 +681,7 @@ pub(crate) async fn run(
                         &storage_tx,
                         tick,
                         &mut next_mutation_id,
+                        &mut world_time,
                         &mut snap_ctx.roster,
                         command,
                     )
@@ -729,6 +794,7 @@ async fn handle_command(
     storage_tx: &mpsc::Sender<StorageFlushRequest>,
     tick: Tick,
     next_mutation_id: &mut u64,
+    world_time: &mut WorldTime,
     player_roster: &mut BTreeMap<PlayerId, String>,
     command: SimCommand,
 ) {
@@ -747,6 +813,12 @@ async fn handle_command(
             // against the router's public connection check, so it stays bounded.
             if result.is_ok() {
                 player_roster.insert(player, name);
+                // Seed the joiner's sky with the current world time so the
+                // day-night cycle starts correct immediately, rather than waiting
+                // up to a second for the next periodic broadcast. Queued on the
+                // player's outbound channel, it is drained after the join kit, so
+                // it lands once the client is in the play state.
+                router.send_play_packet_to(player, update_time_packet(world_time));
             }
             // The connection task may have already gone away; a failed reply send
             // means the join handle is simply discarded.
@@ -952,6 +1024,23 @@ async fn handle_command(
                 GAME_EVENT_WEATHER_VALUE,
             )));
         }
+        SimCommand::SetTime { time_of_day } => {
+            // Apply the absolute phase to the authoritative clock (wrapped into a
+            // single day) and broadcast it so every client's sky jumps at once.
+            world_time.set_time_of_day(time_of_day);
+            router.broadcast_play_packet(&update_time_packet(world_time));
+        }
+        SimCommand::AddTime { ticks } => {
+            // Relative counterpart of SetTime: adjust the clock and broadcast.
+            world_time.add_time(ticks);
+            router.broadcast_play_packet(&update_time_packet(world_time));
+        }
+        SimCommand::QueryTime { player } => {
+            // Only the driver holds the live clock; answer the asker directly with
+            // the current day-night phase. A gone player is a no-op in the router.
+            let message = TextComponent::text(format!("The time is {}", world_time.time_of_day()));
+            router.send_system_chat_to(player, &message, false);
+        }
         SimCommand::SendSystemChat {
             player,
             content,
@@ -1141,6 +1230,7 @@ async fn release_chunks_acked(
 /// (`ferrumc_tick_ms{shard}`), counts accepted and sim-rejected block edits
 /// (`ferrumc_block_mutation_total{kind,result}`), advances and publishes the
 /// authoritative tick through `clock`, and emits a structured tick event.
+#[allow(clippy::too_many_arguments)] // the driver threads its per-tick state (tick, world clock, snapshot) through
 fn run_tick(
     router: &mut SessionRouter,
     shard: &mut SimShard,
@@ -1148,6 +1238,7 @@ fn run_tick(
     metrics: &CounterRegistry,
     clock: &ServerClock,
     tick: &mut Tick,
+    world_time: &mut WorldTime,
     snap: &mut SnapshotCtx,
 ) {
     let start = Instant::now();
@@ -1209,6 +1300,16 @@ fn run_tick(
     // silently), then record the tick metrics for this shard.
     *tick = tick.saturating_add(1);
     clock.set(*tick);
+
+    // Advance the deterministic day-night clock in lockstep with the tick, then
+    // broadcast the world time to every player once per second so their skies keep
+    // animating between client-side interpolation. A zero-player broadcast is a
+    // no-op, and a dropped (Cosmetic) update is healed by the next one.
+    world_time.advance();
+    if world_time.world_age() % TIME_BROADCAST_INTERVAL_TICKS == 0 {
+        router.broadcast_play_packet(&update_time_packet(world_time));
+    }
+
     let shard_pos = shard.shard_pos();
     let tick_metrics = TickMetrics {
         shard_x: shard_pos.x(),
@@ -1355,7 +1456,7 @@ mod tests {
     use ferrumc_math::{BlockPos, Direction, ShardPos, Vec3};
     use ferrumc_proto::generated::play::ClientboundPlayPacket;
     use ferrumc_session::{PlayerSessionHandle, SessionRouter};
-    use ferrumc_sim::{BlockStateId, GameInput, SimShard};
+    use ferrumc_sim::{BlockStateId, GameInput, SimShard, WorldTime, TIME_DAY, TIME_NOON};
     use ferrumc_storage::InMemoryStore;
     use ferrumc_world::FlatWorldGenerator;
     use tokio::sync::{mpsc, oneshot};
@@ -1378,6 +1479,21 @@ mod tests {
         (event.reason(), event.value())
     }
 
+    /// The `(world_age, time_of_day, increasing)` of the next outbound
+    /// `UpdateTime` on `handle`, skipping any other queued packets.
+    fn next_update_time(handle: &mut PlayerSessionHandle) -> (i64, i64, bool) {
+        while let Some(message) = handle.try_recv() {
+            if let ClientboundPlayPacket::UpdateTime(update) = message.into_packet() {
+                return (
+                    update.world_age(),
+                    update.time_of_day(),
+                    update.time_of_day_increasing(),
+                );
+            }
+        }
+        panic!("expected a queued UpdateTime");
+    }
+
     #[tokio::test]
     async fn place_block_command_replies_with_the_refined_state() {
         // The driver previews the placement and replies with the FINAL computed
@@ -1391,6 +1507,7 @@ mod tests {
         let generator = FlatWorldGenerator::new();
         let (storage_tx, _storage_rx) = mpsc::channel(1);
         let mut next_mutation_id = 0u64;
+        let mut world_time = WorldTime::new();
         let mut player_roster = BTreeMap::new();
         let (reply_tx, reply_rx) = oneshot::channel();
 
@@ -1402,6 +1519,7 @@ mod tests {
             &storage_tx,
             Tick::ZERO,
             &mut next_mutation_id,
+            &mut world_time,
             &mut player_roster,
             SimCommand::PlaceBlock {
                 player: PlayerId::offline("placer"),
@@ -1447,6 +1565,7 @@ mod tests {
         let generator = FlatWorldGenerator::new();
         let (storage_tx, _storage_rx) = mpsc::channel(1);
         let mut next_mutation_id = 0u64;
+        let mut world_time = WorldTime::new();
         let mut roster = BTreeMap::new();
 
         handle_command(
@@ -1457,6 +1576,7 @@ mod tests {
             &storage_tx,
             Tick::ZERO,
             &mut next_mutation_id,
+            &mut world_time,
             &mut roster,
             SimCommand::SetWeather { raining: true },
         )
@@ -1465,6 +1585,135 @@ mod tests {
         // Both players receive start_raining (reason 1, no value). clear would be 2.
         assert_eq!(next_game_event(&mut a), (1, 0.0));
         assert_eq!(next_game_event(&mut b), (1, 0.0));
+    }
+
+    #[tokio::test]
+    async fn set_time_sets_the_phase_and_broadcasts_to_everyone() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let mut a = router
+            .join_player(PlayerId::offline("a"), "a", spawn())
+            .expect("join a");
+        let mut b = router
+            .join_player(PlayerId::offline("b"), "b", spawn())
+            .expect("join b");
+        drain(&mut a);
+        drain(&mut b);
+
+        let mut shard = SimShard::new(ShardPos::new(0, 0));
+        let store = InMemoryStore::new();
+        let generator = FlatWorldGenerator::new();
+        let (storage_tx, _storage_rx) = mpsc::channel(1);
+        let mut next_mutation_id = 0u64;
+        let mut world_time = WorldTime::new();
+        let mut roster = BTreeMap::new();
+
+        handle_command(
+            &mut router,
+            &mut shard,
+            &store,
+            &generator,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &mut world_time,
+            &mut roster,
+            SimCommand::SetTime {
+                time_of_day: TIME_DAY,
+            },
+        )
+        .await;
+
+        // `/time set day` sets the authoritative phase to 1000 (age unchanged) ...
+        assert_eq!(world_time.time_of_day(), 1_000);
+        assert_eq!(world_time.world_age(), 0);
+        // ... and every player receives an Update Time carrying it (increasing).
+        assert_eq!(next_update_time(&mut a), (0, 1_000, true));
+        assert_eq!(next_update_time(&mut b), (0, 1_000, true));
+    }
+
+    #[tokio::test]
+    async fn join_sends_the_current_world_time() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+
+        let mut shard = SimShard::new(ShardPos::new(0, 0));
+        let store = InMemoryStore::new();
+        let generator = FlatWorldGenerator::new();
+        let (storage_tx, _storage_rx) = mpsc::channel(1);
+        let mut next_mutation_id = 0u64;
+        // A clock already wound to noon: the join send must carry that phase so the
+        // client's sky is correct from the first frame, not the default phase 0.
+        let mut world_time = WorldTime::new();
+        world_time.set_time_of_day(TIME_NOON);
+        let mut roster = BTreeMap::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        handle_command(
+            &mut router,
+            &mut shard,
+            &store,
+            &generator,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &mut world_time,
+            &mut roster,
+            SimCommand::Join {
+                player: PlayerId::offline("joiner"),
+                name: "joiner".to_string(),
+                position: spawn(),
+                equipment: Vec::new(),
+                reply: reply_tx,
+            },
+        )
+        .await;
+
+        let mut handle = reply_rx
+            .await
+            .expect("driver replied to the join")
+            .expect("join accepted");
+        assert_eq!(next_update_time(&mut handle), (0, TIME_NOON, true));
+    }
+
+    #[tokio::test]
+    async fn query_time_sends_a_chat_to_the_asker() {
+        let mut router = SessionRouter::new();
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let asker = PlayerId::offline("asker");
+        let mut handle = router
+            .join_player(asker, "asker", spawn())
+            .expect("join asker");
+        drain(&mut handle);
+
+        let mut shard = SimShard::new(ShardPos::new(0, 0));
+        let store = InMemoryStore::new();
+        let generator = FlatWorldGenerator::new();
+        let (storage_tx, _storage_rx) = mpsc::channel(1);
+        let mut next_mutation_id = 0u64;
+        let mut world_time = WorldTime::new();
+        world_time.set_time_of_day(TIME_DAY);
+        let mut roster = BTreeMap::new();
+
+        handle_command(
+            &mut router,
+            &mut shard,
+            &store,
+            &generator,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &mut world_time,
+            &mut roster,
+            SimCommand::QueryTime { player: asker },
+        )
+        .await;
+
+        // The driver answers the asker directly with a System Chat Message.
+        assert!(matches!(
+            handle.try_recv().expect("a queued packet").into_packet(),
+            ClientboundPlayPacket::SystemChat(_),
+        ));
     }
 
     #[tokio::test]
@@ -1486,6 +1735,7 @@ mod tests {
         let generator = FlatWorldGenerator::new();
         let (storage_tx, _storage_rx) = mpsc::channel(1);
         let mut next_mutation_id = 0u64;
+        let mut world_time = WorldTime::new();
         let mut roster = BTreeMap::new();
         roster.insert(target, "Joe".to_string());
 
@@ -1497,6 +1747,7 @@ mod tests {
             &storage_tx,
             Tick::ZERO,
             &mut next_mutation_id,
+            &mut world_time,
             &mut roster,
             SimCommand::SetGameModeFor {
                 target: "Joe".to_string(),
@@ -1537,6 +1788,7 @@ mod tests {
         let generator = FlatWorldGenerator::new();
         let (storage_tx, _storage_rx) = mpsc::channel(1);
         let mut next_mutation_id = 0u64;
+        let mut world_time = WorldTime::new();
         let mut roster = BTreeMap::new();
         roster.insert(target, "Joe".to_string());
 
@@ -1548,6 +1800,7 @@ mod tests {
             &storage_tx,
             Tick::ZERO,
             &mut next_mutation_id,
+            &mut world_time,
             &mut roster,
             SimCommand::TeleportToPlayer {
                 player: issuer,

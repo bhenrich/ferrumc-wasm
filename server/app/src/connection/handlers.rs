@@ -687,14 +687,18 @@ async fn handle_command(
     };
 
     // The handler ran: show its feedback to the issuer (covers both a success and a
-    // `CommandResult::failure`).
-    enqueue_traced_classified(
-        writer,
-        debug,
-        compression,
-        &ctx.clock,
-        ferrumc_session::system_chat(result.feedback(), false),
-    );
+    // `CommandResult::failure`). A handler may return empty feedback to suppress its
+    // own line — e.g. `/time query daytime`, whose authoritative answer the driver
+    // sends — so skip enqueuing a blank chat line in that case.
+    if !result.feedback().to_plain_string().is_empty() {
+        enqueue_traced_classified(
+            writer,
+            debug,
+            compression,
+            &ctx.clock,
+            ferrumc_session::system_chat(result.feedback(), false),
+        );
+    }
     if !result.is_success() {
         return Ok(());
     }
