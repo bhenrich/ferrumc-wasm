@@ -996,6 +996,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn three_sections_edited_across_three_flushes_and_a_reload_all_survive() {
+        // Extends the two-section regressions to three sections over three flush
+        // ticks with an unload/reload in the middle, exercising the cumulative
+        // capture and the load-path reseed together: every ever-edited section must
+        // be present after the final reload, not just the two most recent.
+        let store = InMemoryStore::new();
+        let generator = gen();
+        let pos = ChunkPos::new(3, -7);
+        let s4 = pos.origin_block(5); // section 4 (below the flat surface, so solid)
+        let s8 = pos.origin_block(70); // section 8 (above the surface, so air)
+        let s12 = pos.origin_block(130); // section 12 (above the surface, so air)
+
+        // Session 1: edit section 4 then section 8, flushing each on its own tick.
+        {
+            let mut m = map();
+            m.acquire(&store, &generator, pos, spawn_ticket())
+                .await
+                .expect("acquire s1");
+            {
+                let chunk = m.get_mut(pos).expect("resident");
+                chunk.set_block(s4, BlockStateId::AIR).expect("in range");
+                chunk.mark_persist_dirty(s4);
+            }
+            store
+                .save_chunk_overlays(m.take_persist_dirty(1))
+                .await
+                .expect("flush 1");
+            {
+                let chunk = m.get_mut(pos).expect("resident");
+                chunk.set_block(s8, BlockStateId::new(1)).expect("in range");
+                chunk.mark_persist_dirty(s8);
+            }
+            store
+                .save_chunk_overlays(m.take_persist_dirty(2))
+                .await
+                .expect("flush 2");
+        }
+
+        // Session 2: reload (reseeds the cumulative set with {4, 8}), edit a third
+        // section, flush. The reseed must keep the earlier two from being dropped.
+        {
+            let mut m = map();
+            m.acquire(&store, &generator, pos, spawn_ticket())
+                .await
+                .expect("acquire s2");
+            assert!(
+                !m.has_persist_dirty(),
+                "the reseed must not arm the flush gate"
+            );
+            {
+                let chunk = m.get_mut(pos).expect("resident");
+                chunk
+                    .set_block(s12, BlockStateId::new(1))
+                    .expect("in range");
+                chunk.mark_persist_dirty(s12);
+            }
+            store
+                .save_chunk_overlays(m.take_persist_dirty(3))
+                .await
+                .expect("flush 3");
+        }
+
+        // Session 3: reload and assert ALL THREE edits survive.
+        let mut m3 = map();
+        m3.acquire(&store, &generator, pos, spawn_ticket())
+            .await
+            .expect("acquire s3");
+        let reloaded = m3.get(pos).expect("resident");
+        assert_eq!(
+            reloaded.get_block(s4),
+            Some(BlockStateId::AIR),
+            "section 4 (first flush, before the reload) must survive",
+        );
+        assert_eq!(
+            reloaded.get_block(s8),
+            Some(BlockStateId::new(1)),
+            "section 8 (second flush, before the reload) must survive",
+        );
+        assert_eq!(
+            reloaded.get_block(s12),
+            Some(BlockStateId::new(1)),
+            "section 12 (third flush, after the reload) must survive",
+        );
+    }
+
+    #[tokio::test]
     async fn block_entities_round_trip_through_store_reload() {
         use ferrumc_items::{ComponentPatch, ItemId, ItemStack};
         use ferrumc_math::BlockPos;
