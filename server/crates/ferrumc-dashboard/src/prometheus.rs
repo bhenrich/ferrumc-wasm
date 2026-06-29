@@ -208,6 +208,7 @@ fn render(snapshot: &ServerSnapshot) -> String {
     render_decode_errors(&mut e, snapshot);
     render_plugins(&mut e, snapshot);
     render_players(&mut e, snapshot);
+    render_network_per_player(&mut e, snapshot);
     render_packet_trace(&mut e, snapshot);
     e.into_string()
 }
@@ -514,6 +515,90 @@ fn render_players(e: &mut Exposition, snapshot: &ServerSnapshot) {
     }
 }
 
+/// Outbound priority labels for the per-player `dropped` array, indexed by the
+/// network lane's `OutboundPriority` rank (Critical, State, World, Cosmetic).
+///
+/// Mirrored here as a constant because the dashboard crate does not — and must
+/// not — depend on `ferrumc-net`; the ordering is fixed by the wire protocol's
+/// priority ranking and is asserted by the `/metrics` test.
+const DROPPED_PRIORITY_LABELS: [&str; 4] = ["critical", "state", "world", "cosmetic"];
+
+/// The per-player families sourced from the `network_per_player` feed.
+///
+/// Distinct family names from [`render_players`] (sourced from `players[]`) so the
+/// two feeds never collide on a shared series, while still exposing everything the
+/// JSON `/api/snapshot` does — the per-priority `dropped` breakdown and the
+/// `over_budget` count that the `players[]` rows omit. Label cardinality stays
+/// bounded by the online player count (times the fixed direction/priority sets).
+fn render_network_per_player(e: &mut Exposition, snapshot: &ServerSnapshot) {
+    e.family(
+        "ferrumc_network_per_player_bytes_total",
+        "Bytes per player by direction (in/out), from the network lane.",
+        MetricKind::Counter,
+    );
+    for net in &snapshot.network_per_player {
+        let name = net.player_name.as_str();
+        e.sample(
+            "ferrumc_network_per_player_bytes_total",
+            &[("player", name), ("dir", "in")],
+            &fmt_u64(net.bytes_in),
+        );
+        e.sample(
+            "ferrumc_network_per_player_bytes_total",
+            &[("player", name), ("dir", "out")],
+            &fmt_u64(net.bytes_out),
+        );
+    }
+
+    e.family(
+        "ferrumc_network_per_player_frames_total",
+        "Frames per player by direction (in/out), from the network lane.",
+        MetricKind::Counter,
+    );
+    for net in &snapshot.network_per_player {
+        let name = net.player_name.as_str();
+        e.sample(
+            "ferrumc_network_per_player_frames_total",
+            &[("player", name), ("dir", "in")],
+            &fmt_u64(net.frames_in),
+        );
+        e.sample(
+            "ferrumc_network_per_player_frames_total",
+            &[("player", name), ("dir", "out")],
+            &fmt_u64(net.frames_out),
+        );
+    }
+
+    e.family(
+        "ferrumc_network_per_player_over_budget_total",
+        "Serverbound frames classified over the per-connection budget, per player.",
+        MetricKind::Counter,
+    );
+    for net in &snapshot.network_per_player {
+        e.sample(
+            "ferrumc_network_per_player_over_budget_total",
+            &[("player", &net.player_name)],
+            &fmt_u64(net.over_budget),
+        );
+    }
+
+    e.family(
+        "ferrumc_network_per_player_dropped_total",
+        "Clientbound packets dropped per player by outbound priority.",
+        MetricKind::Counter,
+    );
+    for net in &snapshot.network_per_player {
+        let name = net.player_name.as_str();
+        for (label, &count) in DROPPED_PRIORITY_LABELS.into_iter().zip(&net.dropped) {
+            e.sample(
+                "ferrumc_network_per_player_dropped_total",
+                &[("player", name), ("priority", label)],
+                &fmt_u64(count),
+            );
+        }
+    }
+}
+
 /// The packet-trace counter family (bounded by the snapshot's top-N window).
 fn render_packet_trace(e: &mut Exposition, snapshot: &ServerSnapshot) {
     e.family(
@@ -546,8 +631,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use ferrumc_observability::{
-        DecodeErrorSnapshot, MutationCountSnapshot, PacketFrequency, PacketTraceSummary,
-        PlayerSnapshot, PluginDecisionSnapshot, PluginDecisions,
+        DecodeErrorSnapshot, MutationCountSnapshot, NetworkMetricsSnapshot, PacketFrequency,
+        PacketTraceSummary, PlayerSnapshot, PluginDecisionSnapshot, PluginDecisions,
     };
 
     /// A representative snapshot exercising every family, including a hostile
@@ -578,6 +663,29 @@ mod tests {
                     name: "ev\"il\\\nguy".to_string(),
                     network_in_bytes: 7,
                     ..PlayerSnapshot::default()
+                },
+            ],
+            network_per_player: vec![
+                NetworkMetricsSnapshot {
+                    player_name: "Notch".to_string(),
+                    frames_in: 50,
+                    bytes_in: 1_024,
+                    frames_out: 80,
+                    bytes_out: 4_096,
+                    over_budget: 2,
+                    // dropped indexed by priority rank: critical/state/world/cosmetic.
+                    dropped: [1, 0, 3, 4],
+                },
+                NetworkMetricsSnapshot {
+                    // Same hostile name as the players[] feed: distinct family names
+                    // keep the two feeds from colliding on a shared series.
+                    player_name: "ev\"il\\\nguy".to_string(),
+                    frames_in: 1,
+                    bytes_in: 7,
+                    frames_out: 0,
+                    bytes_out: 0,
+                    over_budget: 9,
+                    dropped: [0, 0, 0, 0],
                 },
             ],
             chunks_loaded: 81,
@@ -747,6 +855,8 @@ mod tests {
             "ferrumc_decode_errors_total",
             "ferrumc_plugin_decisions_total",
             "ferrumc_player_network_bytes_total",
+            "ferrumc_network_per_player_over_budget_total",
+            "ferrumc_network_per_player_dropped_total",
             "ferrumc_packet_trace_total",
         ] {
             assert!(metrics.contains(expected), "missing family {expected}");
@@ -779,6 +889,24 @@ mod tests {
         ));
         // build_info is a constant 1 gauge.
         assert!(body.contains("ferrumc_build_info{build=\"ferrumc 0.2.0-dev\"} 1\n"));
+        // Per-player network feed: over_budget and the per-priority dropped
+        // breakdown the players[] rows omit, plus bytes/frames under their own
+        // family names so they never collide with the players[] series.
+        assert!(body.contains("ferrumc_network_per_player_over_budget_total{player=\"Notch\"} 2\n"));
+        assert!(body.contains(
+            "ferrumc_network_per_player_dropped_total{player=\"Notch\",priority=\"critical\"} 1\n"
+        ));
+        assert!(body.contains(
+            "ferrumc_network_per_player_dropped_total{player=\"Notch\",priority=\"world\"} 3\n"
+        ));
+        assert!(body.contains(
+            "ferrumc_network_per_player_dropped_total{player=\"Notch\",priority=\"cosmetic\"} 4\n"
+        ));
+        assert!(body.contains(
+            "ferrumc_network_per_player_bytes_total{player=\"Notch\",dir=\"out\"} 4096\n"
+        ));
+        assert!(body
+            .contains("ferrumc_network_per_player_frames_total{player=\"Notch\",dir=\"in\"} 50\n"));
     }
 
     #[test]
