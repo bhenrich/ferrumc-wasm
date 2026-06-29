@@ -253,7 +253,17 @@ pub(super) async fn handle_play_body(
         // Set Creative Slot (untrusted): validate the hostile item bytes, store the
         // slot, and echo it back so the client view matches the server.
         ServerboundPlayPacket::SetCreativeSlot(p) => {
-            return handle_set_creative_slot(ctx, name, writer, inventory, p, debug, compression);
+            return handle_set_creative_slot(
+                ctx,
+                player,
+                name,
+                writer,
+                inventory,
+                p,
+                debug,
+                compression,
+            )
+            .await;
         }
         // Set Held Item (serverbound): update the selected hotbar index and, on a
         // real change, broadcast the new held item to viewers.
@@ -1087,8 +1097,16 @@ async fn handle_update_sign(
 /// decode/validate error is logged and ignored, never fatal. On success the slot is
 /// stored, the state id bumped, and a mandatory `SetContainerSlot` echoes the
 /// authoritative slot back so the client view matches the server.
-fn handle_set_creative_slot(
+///
+/// If the changed slot is mirrored into the player's visible equipment (held main
+/// hand, off hand, or worn armor — see [`PlayerInventory::is_equipment_slot`]), the
+/// full equipment set is rebroadcast to viewers via [`SimCommand::SetEquipment`] so
+/// they see the new piece — or its removal, since empty slots encode as air. An
+/// encode failure for the broadcast is logged and skipped (never fatal).
+#[allow(clippy::too_many_arguments)] // one creative-slot step: identity + window state + I/O + trace
+async fn handle_set_creative_slot(
     ctx: &ConnContext,
+    player: PlayerId,
     name: &str,
     writer: &mut PlayWriter,
     inventory: &mut PlayerInventory,
@@ -1144,7 +1162,30 @@ fn handle_set_creative_slot(
             packet.slot(),
             item_bytes,
         )),
-    )
+    )?;
+
+    // If the changed slot is mirrored into the player's visible equipment (held
+    // main hand, off hand, or worn armor), rebroadcast the full equipment set so
+    // viewers see the new piece — or its removal, since empty slots encode as air.
+    // Non-equipment slots (storage grid, crafting) need no broadcast.
+    if inventory.is_equipment_slot(index) {
+        match inventory.equipment_body() {
+            Ok(equipment) => {
+                ctx.commands
+                    .send(SimCommand::SetEquipment { player, equipment })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    player = name,
+                    %err,
+                    "failed to encode equipment after creative slot set; skipping broadcast"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Handles a serverbound Set Held Item: update the selected hotbar index and, on a
@@ -1171,7 +1212,7 @@ async fn handle_set_held_item(
     if !inventory.set_selected(slot) {
         return Ok(());
     }
-    let equipment = match inventory.main_hand_equipment_body() {
+    let equipment = match inventory.equipment_body() {
         Ok(body) => body,
         Err(err) => {
             tracing::warn!(%err, "failed to encode held-item equipment; skipping broadcast");
@@ -1480,8 +1521,9 @@ async fn close_open_container(
         )),
     )?;
     // The held hotbar slot may have changed during the session; refresh the
-    // broadcast equipment so viewers see the right main-hand item.
-    match inventory.main_hand_equipment_body() {
+    // broadcast equipment so viewers see the right main-hand item (the full set is
+    // sent, so off-hand/armor stay in sync too).
+    match inventory.equipment_body() {
         Ok(equipment) => ctx
             .commands
             .send(SimCommand::SetEquipment { player, equipment })

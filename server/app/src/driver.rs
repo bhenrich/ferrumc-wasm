@@ -187,9 +187,10 @@ pub(crate) enum SimCommand {
         name: String,
         /// The world-space position to join at.
         position: Vec3,
-        /// The pre-encoded main-hand `SetEquipment` body (slot byte + trusted Slot)
-        /// for the joiner's initial held item, cached by the router at join so
-        /// viewers entering view see it without a follow-up (which would race).
+        /// The pre-encoded `SetEquipment` body (the joiner's full equipment set —
+        /// main hand, off hand, and armor — as continuation-terminated slot+Slot
+        /// entries), cached by the router at join so viewers entering view see it
+        /// without a follow-up (which would race).
         equipment: Vec<u8>,
         /// One-shot channel the driver replies on with the new session handle (or
         /// a classified routing error).
@@ -422,16 +423,18 @@ pub(crate) enum SimCommand {
         /// Whether to render above the hotbar (action bar) rather than the chat box.
         overlay: bool,
     },
-    /// Update `player`'s broadcast equipment (held item) after a hotbar change.
+    /// Update `player`'s broadcast equipment (the full visible set) after a
+    /// held-item or worn-equipment change.
     ///
     /// The inventory is connection-local, so the connection encodes the new
-    /// main-hand `SetEquipment` body and routes it here; the driver-owned
-    /// [`SessionRouter`] caches it and broadcasts it (droppable) to the viewers that
-    /// currently have `player` spawned. A gone player is a no-op.
+    /// `SetEquipment` body (main hand, off hand, and armor) and routes it here; the
+    /// driver-owned [`SessionRouter`] caches it and broadcasts it (droppable) to the
+    /// viewers that currently have `player` spawned. A gone player is a no-op.
     SetEquipment {
-        /// The player whose held item changed.
+        /// The player whose equipment changed.
         player: PlayerId,
-        /// The pre-encoded main-hand `SetEquipment` body (slot byte + trusted Slot).
+        /// The pre-encoded `SetEquipment` body (the full equipment set as
+        /// continuation-terminated slot+Slot entries).
         equipment: Vec<u8>,
     },
     /// Apply a player's edit to a sign's text after a serverbound `UpdateSign`.

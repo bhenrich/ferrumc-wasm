@@ -98,10 +98,11 @@ pub(super) async fn enter_play(
         ),
     };
 
-    // The opaque main-hand equipment body threaded into the join, reflecting the
-    // restored held slot. The kit never fails to encode; on the off chance it does,
-    // fall back to empty (no equipment shown) rather than aborting the join.
-    let equipment = inventory.main_hand_equipment_body().unwrap_or_else(|err| {
+    // The opaque equipment body threaded into the join: the player's full visible
+    // set (main hand, off hand, and armor), reflecting the restored slots. The kit
+    // never fails to encode; on the off chance it does, fall back to empty (no
+    // equipment shown) rather than aborting the join.
+    let equipment = inventory.equipment_body().unwrap_or_else(|err| {
         tracing::warn!(%err, "failed to encode initial equipment; joining without it");
         Vec::new()
     });

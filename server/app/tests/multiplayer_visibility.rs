@@ -21,8 +21,11 @@ use std::time::Duration;
 use tokio::time::timeout;
 use uuid::Uuid;
 
+use ferrumc_codec::{write_var_int, BoundedReader};
 use ferrumc_core::PlayerId;
-use ferrumc_proto::generated::play::{ClientboundPlayPacket, PlayerInfoUpdate, SetPlayerPosition};
+use ferrumc_proto::generated::play::{
+    ClientboundPlayPacket, PlayerInfoUpdate, SetCreativeSlot, SetPlayerPosition,
+};
 use ferrumc_session::PLAYER_INFO_ADD;
 
 use ferrumc_app::AppConfig;
@@ -31,6 +34,20 @@ use common::{encode, login_to_play, TestClient};
 
 /// Overall guard so a regression can never hang the suite.
 const GUARD: Duration = Duration::from_secs(10);
+
+/// `SetEquipment` slot id for the main hand (the lowest-id entry).
+const EQUIP_MAIN_HAND: u8 = 0;
+/// `SetEquipment` slot id for the helmet (the highest-id armor entry).
+const EQUIP_HELMET: u8 = 5;
+/// High bit of a `SetEquipment` entry's slot byte: set on every entry but the last.
+const EQUIP_CONTINUATION: u8 = 0x80;
+
+/// Window-0 inventory index of the worn helmet (the `SetCreativeSlot` wire slot).
+const HELMET_INV_SLOT: i16 = 5;
+/// Protocol item id of `minecraft:leather_helmet` and `minecraft:stone` (the held
+/// kit item the main hand carries by default).
+const LEATHER_HELMET_ITEM: i32 = 913;
+const STONE_ITEM: i32 = 1;
 
 /// Reads the UUID a `PlayerInfoUpdate` carries in this server's minimal entries
 /// layout: a single count byte followed by the 16-byte UUID.
@@ -130,6 +147,121 @@ async fn run_flow(addr: SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Decodes a `SetEquipment` body into `(equipment-slot id, item id)` pairs, with
+/// `None` for an air (empty) slot. Test slots are component-free, so each non-air
+/// Slot is `count, item_id, 0 added, 0 removed`.
+fn decode_equipment(body: &[u8]) -> anyhow::Result<Vec<(u8, Option<i32>)>> {
+    let mut reader = BoundedReader::new(body);
+    let mut entries = Vec::new();
+    loop {
+        let slot_byte = reader.read_u8()?;
+        let more = slot_byte & EQUIP_CONTINUATION != 0;
+        let slot = slot_byte & !EQUIP_CONTINUATION;
+        let count = reader.read_var_int()?;
+        let item = if count == 0 {
+            None
+        } else {
+            let id = reader.read_var_int()?;
+            let added = reader.read_var_int()?;
+            let removed = reader.read_var_int()?;
+            anyhow::ensure!(
+                added == 0 && removed == 0,
+                "test only decodes component-free equipment slots",
+            );
+            Some(id)
+        };
+        entries.push((slot, item));
+        if !more {
+            break;
+        }
+    }
+    Ok(entries)
+}
+
+/// Builds a component-free `Set Creative Slot` item body for `item` (count 1), or
+/// the empty/air slot when `item` is `None`.
+fn creative_item_bytes(item: Option<i32>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    match item {
+        None => write_var_int(&mut buf, 0), // itemCount 0 = air
+        Some(id) => {
+            write_var_int(&mut buf, 1); // itemCount
+            write_var_int(&mut buf, id); // itemId
+            write_var_int(&mut buf, 0); // addedCount
+            write_var_int(&mut buf, 0); // removedCount
+        }
+    }
+    buf
+}
+
+/// Reads play packets from `client` until it sees a `SetEquipment` for `entity_id`
+/// whose helmet entry (equip slot 5) carries `expected_helmet`, returning that
+/// packet's decoded entries so the caller can assert the rest of the set.
+async fn observe_equipment(
+    client: &mut TestClient,
+    entity_id: i32,
+    expected_helmet: Option<i32>,
+) -> anyhow::Result<Vec<(u8, Option<i32>)>> {
+    loop {
+        if let ClientboundPlayPacket::SetEquipment(equip) = client.next_play().await? {
+            if equip.entity_id() != entity_id {
+                continue;
+            }
+            let entries = decode_equipment(equip.equipments())?;
+            let helmet = entries.iter().find(|(slot, _)| *slot == EQUIP_HELMET);
+            if helmet.map(|(_, item)| *item) == Some(expected_helmet) {
+                return Ok(entries);
+            }
+        }
+    }
+}
+
+/// The body of the armor-broadcast test, run under the timeout guard.
+async fn run_armor_flow(addr: SocketAddr) -> anyhow::Result<()> {
+    let saad = PlayerId::offline("Saad").as_uuid();
+    let notch = PlayerId::offline("Notch").as_uuid();
+
+    let mut c1 = login_to_play(addr, "Saad").await?;
+    let mut c2 = login_to_play(addr, "Notch").await?;
+
+    // Each client sees the other; keep Saad's entity id so Notch can match Saad's
+    // equipment broadcasts.
+    let saad_eid = observe_appearance(&mut c2, saad).await?;
+    observe_appearance(&mut c1, notch).await?;
+
+    // Saad (creative by default) puts a leather helmet in armor slot 5. Notch must
+    // receive a SetEquipment whose helmet entry carries the leather helmet, and
+    // whose full set still reports Saad's held stone in the main hand.
+    c1.send_frame(&encode(|buf| {
+        SetCreativeSlot::new(
+            HELMET_INV_SLOT,
+            creative_item_bytes(Some(LEATHER_HELMET_ITEM)),
+        )
+        .encode(buf)
+    }))
+    .await?;
+    let entries = observe_equipment(&mut c2, saad_eid, Some(LEATHER_HELMET_ITEM)).await?;
+    // The broadcast is the full six-slot set, not just the helmet.
+    anyhow::ensure!(entries.len() == 6, "expected the full equipment set");
+    let main_hand = entries
+        .iter()
+        .find(|(slot, _)| *slot == EQUIP_MAIN_HAND)
+        .and_then(|(_, item)| *item);
+    anyhow::ensure!(
+        main_hand == Some(STONE_ITEM),
+        "main hand should still carry Saad's held stone, got {main_hand:?}",
+    );
+
+    // Clearing the helmet broadcasts an air entry, not a stale render.
+    c1.send_frame(&encode(|buf| {
+        SetCreativeSlot::new(HELMET_INV_SLOT, creative_item_bytes(None)).encode(buf)
+    }))
+    .await?;
+    observe_equipment(&mut c2, saad_eid, None).await?;
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn two_clients_see_each_other_and_movement() {
     // Ephemeral port; radius-1 spawn keeps the chunk payload small. Both players
@@ -143,6 +275,26 @@ async fn two_clients_see_each_other_and_movement() {
         .await
         .expect("multiplayer flow finished within the timeout guard")
         .expect("multiplayer flow succeeded");
+
+    timeout(GUARD, server.shutdown())
+        .await
+        .expect("shutdown finished within the timeout guard")
+        .expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn worn_armor_is_broadcast_to_viewers() {
+    // Two players in view of each other; one wears (then removes) a helmet and the
+    // other must see the SetEquipment broadcast carrying it in the helmet slot.
+    let config = AppConfig::from_toml_str("bind = \"127.0.0.1:0\"\nspawn_chunk_radius = 1")
+        .expect("config parses");
+    let server = ferrumc_app::run(&config).await.expect("server starts");
+    let addr = server.local_addr();
+
+    timeout(GUARD, run_armor_flow(addr))
+        .await
+        .expect("armor flow finished within the timeout guard")
+        .expect("armor flow succeeded");
 
     timeout(GUARD, server.shutdown())
         .await

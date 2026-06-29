@@ -44,6 +44,41 @@ pub(crate) const HOTBAR_START: usize = 36;
 /// Number of selectable hotbar slots (indices `0..=8`).
 const HOTBAR_LEN: u8 = 9;
 
+// Window-0 inventory indices of the slots mirrored into a player's *visible*
+// equipment. The four armor pieces occupy `5..=8`; the off-hand is `45`; the
+// main hand is the currently selected hotbar slot (`HOTBAR_START + selected`).
+/// Inventory index of the worn helmet.
+const HELMET_SLOT: usize = 5;
+/// Inventory index of the worn chestplate.
+const CHESTPLATE_SLOT: usize = 6;
+/// Inventory index of the worn leggings.
+const LEGGINGS_SLOT: usize = 7;
+/// Inventory index of the worn boots.
+const BOOTS_SLOT: usize = 8;
+/// Inventory index of the off-hand slot.
+const OFFHAND_SLOT: usize = 45;
+
+// Equipment-slot ids carried in the clientbound `SetEquipment` packet: the low 7
+// bits of each entry's slot byte. The high bit (`EQUIPMENT_CONTINUATION_BIT`)
+// marks a non-terminal entry. These are the wire ids, distinct from the inventory
+// indices above.
+/// `SetEquipment` slot id for the main hand.
+const EQUIP_MAIN_HAND: u8 = 0;
+/// `SetEquipment` slot id for the off hand.
+const EQUIP_OFF_HAND: u8 = 1;
+/// `SetEquipment` slot id for the boots.
+const EQUIP_BOOTS: u8 = 2;
+/// `SetEquipment` slot id for the leggings.
+const EQUIP_LEGGINGS: u8 = 3;
+/// `SetEquipment` slot id for the chestplate.
+const EQUIP_CHESTPLATE: u8 = 4;
+/// `SetEquipment` slot id for the helmet.
+const EQUIP_HELMET: u8 = 5;
+
+/// High bit of a `SetEquipment` entry's slot byte: set on every entry except the
+/// last to signal that another entry follows.
+const EQUIPMENT_CONTINUATION_BIT: u8 = 0x80;
+
 /// The starter creative kit placed in the hotbar (slots `36..=44`) on join: one
 /// simple, placeable full block per hotbar slot. Every name is a placeable block
 /// item in the pinned 1.21.8 registry.
@@ -261,22 +296,64 @@ impl PlayerInventory {
         encode_container_content_payload(&self.slots, &ItemStack::empty())
     }
 
-    /// Builds the opaque `SetEquipment` body for the player's main hand: the slot
-    /// byte `0x00` (slot 0 = main hand, high bit clear = the terminal entry)
-    /// followed by the trusted [`ItemStack::encode_slot`] of the currently held
-    /// item. Armor/offhand are out of scope for the v0 main-hand target.
+    /// Whether inventory slot `index` is mirrored into the player's *visible*
+    /// equipment — the held main hand, the off hand, or one of the four armor
+    /// pieces — so a change to it must be rebroadcast to viewers via `SetEquipment`.
+    ///
+    /// The main-hand slot is the currently selected hotbar slot, so changing the
+    /// selection (or the item in the selected slot) flips which slot this reports.
+    pub(crate) fn is_equipment_slot(&self, index: usize) -> bool {
+        matches!(
+            index,
+            HELMET_SLOT | CHESTPLATE_SLOT | LEGGINGS_SLOT | BOOTS_SLOT | OFFHAND_SLOT
+        ) || index == HOTBAR_START + self.selected as usize
+    }
+
+    /// Builds the opaque `SetEquipment` body for the player's full visible
+    /// equipment set: the main hand, the off hand, and the four armor pieces, in
+    /// ascending equipment-slot-id order.
+    ///
+    /// Each entry is a slot byte (the equipment-slot id, with
+    /// [`EQUIPMENT_CONTINUATION_BIT`] set on every entry except the last) followed
+    /// by the trusted [`ItemStack::encode_slot`] of the source inventory slot. Every
+    /// entry is *always* emitted: an empty source slot encodes as an air Slot, so
+    /// removing a piece of armor (or the off-hand item) visibly clears it on viewers
+    /// rather than leaving a stale render.
     ///
     /// The session/router layer carries this opaque (it has no `ferrumc-items`
     /// dependency) and only prepends the router-owned entity id.
     ///
     /// # Errors
     ///
-    /// Propagates an [`ItemValidationError`] from encoding the held [`ItemStack`]
+    /// Propagates an [`ItemValidationError`] from encoding any source [`ItemStack`]
     /// (e.g. an NBT component failure); the default creative-kit items never error.
-    pub(crate) fn main_hand_equipment_body(&self) -> Result<Vec<u8>, ItemValidationError> {
-        // Slot 0 (main hand), high bit clear so it is the single terminal entry.
-        let mut body = vec![0x00u8];
-        self.held().encode_slot(&mut body)?;
+    pub(crate) fn equipment_body(&self) -> Result<Vec<u8>, ItemValidationError> {
+        // (equipment-slot id, source inventory index) in ascending equipment-slot
+        // order. The main hand tracks the selected hotbar slot; the rest are fixed.
+        let entries = [
+            (EQUIP_MAIN_HAND, HOTBAR_START + self.selected as usize),
+            (EQUIP_OFF_HAND, OFFHAND_SLOT),
+            (EQUIP_BOOTS, BOOTS_SLOT),
+            (EQUIP_LEGGINGS, LEGGINGS_SLOT),
+            (EQUIP_CHESTPLATE, CHESTPLATE_SLOT),
+            (EQUIP_HELMET, HELMET_SLOT),
+        ];
+        let mut body = Vec::new();
+        let last = entries.len() - 1;
+        for (position, (equip_slot, inv_index)) in entries.iter().enumerate() {
+            // Continuation bit on every entry but the last marks the terminator.
+            let slot_byte = if position == last {
+                *equip_slot
+            } else {
+                *equip_slot | EQUIPMENT_CONTINUATION_BIT
+            };
+            body.push(slot_byte);
+            // Indices are all in `0..SLOT_COUNT`; a defensive miss encodes as air.
+            match self.slots.get(*inv_index) {
+                Some(stack) => stack.encode_slot(&mut body)?,
+                None => ItemStack::empty().encode_slot(&mut body)?,
+            }
+        }
         Ok(body)
     }
 }
@@ -398,5 +475,152 @@ mod tests {
         assert_eq!(inv.game_mode(), GameMode::Creative);
         inv.set_game_mode(GameMode::Survival);
         assert_eq!(inv.game_mode(), GameMode::Survival);
+    }
+
+    /// A single decoded `SetEquipment` entry: the equipment-slot id, whether the
+    /// continuation bit was set (another entry follows), and the carried item id
+    /// (`None` for an empty/air slot).
+    #[derive(Debug, PartialEq, Eq)]
+    struct EquipEntry {
+        slot: u8,
+        more: bool,
+        item: Option<i32>,
+    }
+
+    /// Reads a Minecraft `VarInt` (LEB128) from `buf` at `*i`, advancing the cursor.
+    fn read_varint(buf: &[u8], i: &mut usize) -> i32 {
+        let mut value: i32 = 0;
+        let mut shift = 0;
+        loop {
+            let byte = buf[*i];
+            *i += 1;
+            value |= i32::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        value
+    }
+
+    /// Walks an opaque equipment body into its entries. Test items use an empty
+    /// `ComponentPatch`, so each non-air Slot is `count, item_id, 0 added, 0 removed`.
+    fn parse_equipment(body: &[u8]) -> Vec<EquipEntry> {
+        let mut entries = Vec::new();
+        let mut i = 0;
+        loop {
+            let slot_byte = body[i];
+            i += 1;
+            let more = slot_byte & EQUIPMENT_CONTINUATION_BIT != 0;
+            let slot = slot_byte & !EQUIPMENT_CONTINUATION_BIT;
+            let count = read_varint(body, &mut i);
+            let item = if count == 0 {
+                None
+            } else {
+                let id = read_varint(body, &mut i);
+                let _added = read_varint(body, &mut i);
+                let _removed = read_varint(body, &mut i);
+                Some(id)
+            };
+            entries.push(EquipEntry { slot, more, item });
+            if !more {
+                break;
+            }
+        }
+        entries
+    }
+
+    fn stone_stack() -> ItemStack {
+        ItemStack::new(
+            ItemId::new(STONE_ITEM).unwrap(),
+            nz(1),
+            ComponentPatch::empty(),
+        )
+    }
+
+    #[test]
+    fn equipment_body_emits_full_set_in_order_with_continuation_bits() {
+        // Default kit: hotbar slot 0 (stone) is held; off-hand and all armor empty.
+        let inv = PlayerInventory::with_creative_kit(GameMode::Creative);
+        let body = inv.equipment_body().expect("body encodes");
+        let entries = parse_equipment(&body);
+
+        // Six entries, ascending equipment-slot id, continuation bit on all but last.
+        let slots: Vec<u8> = entries.iter().map(|e| e.slot).collect();
+        assert_eq!(
+            slots,
+            vec![
+                EQUIP_MAIN_HAND,
+                EQUIP_OFF_HAND,
+                EQUIP_BOOTS,
+                EQUIP_LEGGINGS,
+                EQUIP_CHESTPLATE,
+                EQUIP_HELMET,
+            ]
+        );
+        let more: Vec<bool> = entries.iter().map(|e| e.more).collect();
+        assert_eq!(more, vec![true, true, true, true, true, false]);
+
+        // Main hand carries the held stone; off-hand and armor are air.
+        assert_eq!(entries[0].item, Some(STONE_ITEM));
+        for entry in &entries[1..] {
+            assert_eq!(entry.item, None, "slot {} should be air", entry.slot);
+        }
+    }
+
+    #[test]
+    fn equipment_body_reflects_armor_and_offhand_set_then_clear() {
+        let mut inv = PlayerInventory::with_creative_kit(GameMode::Creative);
+        // Place a piece in the helmet (5) and the off-hand (45).
+        inv.set_creative_slot(HELMET_SLOT, stone_stack());
+        inv.set_creative_slot(OFFHAND_SLOT, stone_stack());
+
+        let entries = parse_equipment(&inv.equipment_body().expect("body encodes"));
+        let by_slot = |s: u8| entries.iter().find(|e| e.slot == s).unwrap().item;
+        assert_eq!(by_slot(EQUIP_HELMET), Some(STONE_ITEM));
+        assert_eq!(by_slot(EQUIP_OFF_HAND), Some(STONE_ITEM));
+        // Untouched armor stays air.
+        assert_eq!(by_slot(EQUIP_BOOTS), None);
+
+        // Clearing the helmet sends an air entry, not a stale render.
+        inv.set_creative_slot(HELMET_SLOT, ItemStack::empty());
+        let cleared = parse_equipment(&inv.equipment_body().expect("body encodes"));
+        let helmet = cleared.iter().find(|e| e.slot == EQUIP_HELMET).unwrap();
+        assert_eq!(helmet.item, None);
+    }
+
+    #[test]
+    fn equipment_body_main_hand_tracks_selection() {
+        let mut inv = PlayerInventory::with_creative_kit(GameMode::Creative);
+        // Hotbar slot 3 holds glass; selecting it makes it the main hand.
+        assert!(inv.set_selected(3));
+        let entries = parse_equipment(&inv.equipment_body().expect("body encodes"));
+        let main = entries.iter().find(|e| e.slot == EQUIP_MAIN_HAND).unwrap();
+        assert_eq!(main.item, Some(GLASS_ITEM));
+    }
+
+    #[test]
+    fn is_equipment_slot_classifies_armor_offhand_and_selected_hotbar() {
+        let mut inv = PlayerInventory::with_creative_kit(GameMode::Creative);
+        // Armor and off-hand are always equipment slots.
+        for slot in [
+            HELMET_SLOT,
+            CHESTPLATE_SLOT,
+            LEGGINGS_SLOT,
+            BOOTS_SLOT,
+            OFFHAND_SLOT,
+        ] {
+            assert!(inv.is_equipment_slot(slot), "slot {slot}");
+        }
+        // The selected hotbar slot is the main hand; siblings are not equipment.
+        assert!(inv.is_equipment_slot(HOTBAR_START)); // selected == 0
+        assert!(!inv.is_equipment_slot(HOTBAR_START + 1));
+        // Storage grid and crafting slots are never equipment.
+        assert!(!inv.is_equipment_slot(MAIN_START));
+        assert!(!inv.is_equipment_slot(0));
+        // Changing the selection moves which hotbar slot counts as the main hand.
+        assert!(inv.set_selected(4));
+        assert!(inv.is_equipment_slot(HOTBAR_START + 4));
+        assert!(!inv.is_equipment_slot(HOTBAR_START));
     }
 }
