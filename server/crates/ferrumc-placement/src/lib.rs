@@ -54,10 +54,17 @@
 //! simulation. See [`compute_placement`] for the input it reads and the
 //! [crate-level note](#waterlogging-input) on what full fidelity still needs.
 //!
+//! Two families occupy **more than one cell** and so express their second cell
+//! through [`PlacementResult::extra_blocks`] rather than a single relocated write:
+//!
+//! - Doors — `facing` from yaw, `hinge` (`left`/`right`) from neighbouring doors
+//!   and walls (default `right`); placed as the `lower` half with the `upper` half
+//!   added one cell above.
+//! - Beds — `facing` from yaw; placed as the `foot` with the `head` added one cell
+//!   along the facing direction.
+//!
 //! Out of scope (placed as the default/simple state): rails, banners, and
-//! redstone wiring. Out of *reach* of this engine entirely — they need a
-//! *multi-cell* placement path, not just a relocated single write — are doors
-//! (upper+lower) and beds (head+foot).
+//! redstone wiring.
 //!
 //! ## Waterlogging input
 //!
@@ -98,14 +105,15 @@ pub struct PlacementContext {
 
 /// The outcome of [`compute_placement`].
 ///
-/// A result names one block-state and (via [`place_at`](PlacementResult::place_at))
-/// the one cell it belongs in. Most rules write at the caller-chosen
-/// `ctx.position`; the **merge** rules (double-slab, candle stacking) instead set
-/// `place_at` to *relocate* the write onto the clicked cell, replacing the block
-/// already there. Families that need to write *two* blocks (doors' upper half,
-/// beds' foot) still cannot be expressed here — that needs a multi-cell mutation
-/// path, a deliberately out-of-scope change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A result names a primary block-state and (via
+/// [`place_at`](PlacementResult::place_at)) the one cell it belongs in. Most rules
+/// write at the caller-chosen `ctx.position`; the **merge** rules (double-slab,
+/// candle stacking) instead set `place_at` to *relocate* the write onto the clicked
+/// cell, replacing the block already there. Families that occupy *more than one*
+/// cell (doors' upper half, beds' head) name those extra cells in
+/// [`extra_blocks`](PlacementResult::extra_blocks); the primary
+/// [`state_id`](PlacementResult::state_id) is the lower/foot cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementResult {
     /// The computed block-state id to write to the world.
     pub state_id: u32,
@@ -123,6 +131,19 @@ pub struct PlacementResult {
     /// will still write a valid block — just at `ctx.position` — so the merge
     /// silently degrades to a normal placement rather than corrupting the world.
     pub place_at: Option<BlockPos>,
+    /// Additional cells this placement occupies beyond the primary
+    /// [`state_id`](PlacementResult::state_id), each an absolute [`BlockPos`] and
+    /// the block-state id to write there.
+    ///
+    /// Empty for every single-cell rule (the common case). Populated only by the
+    /// multi-cell families: a door adds its `upper` half one cell above, a bed adds
+    /// its `head` one cell along the facing direction. The host must place the
+    /// primary cell *and* every extra atomically — first checking each extra cell is
+    /// free, and rejecting the whole placement if any is obstructed (vanilla's
+    /// no-half-door rule). A host that ignores this field places only the
+    /// lower/foot cell, degrading a door/bed to a single (visually broken) block
+    /// rather than corrupting the world.
+    pub extra_blocks: Vec<(BlockPos, u32)>,
 }
 
 /// Which placement rule produced a [`PlacementResult`].
@@ -180,6 +201,13 @@ pub enum PlacementRule {
     /// A candle stacked onto a matching candle, incrementing `candles`; the write
     /// is relocated onto the clicked cell (see [`PlacementResult::place_at`]).
     CandleStack,
+    /// A door: `facing` from yaw, `hinge` from neighbouring doors/walls; the primary
+    /// cell is the `lower` half and the `upper` half rides in
+    /// [`PlacementResult::extra_blocks`].
+    Door,
+    /// A bed: `facing` from yaw; the primary cell is the `foot` and the `head` rides
+    /// in [`PlacementResult::extra_blocks`].
+    Bed,
 }
 
 /// Queries neighbouring blocks for fence connectivity.
@@ -531,13 +559,18 @@ fn block_has_property(name: &str, prop: &str) -> bool {
     block_metadata(name).is_some_and(|m| m.properties.iter().any(|p| p.name == prop))
 }
 
-/// Returns `true` if `state` is a water *source* block (still `water` at
-/// `level=0`). Flowing water and every other block — including `None` (air or an
-/// unreadable cell) — return `false`.
-fn is_water_source(state: Option<u32>) -> bool {
-    let Some(state) = state else { return false };
-    state_id_to_block_name(state) == Some(WATER_BLOCK)
-        && state_property(state, "level") == Some(WATER_SOURCE_LEVEL)
+/// Returns `true` if `state_id` is a water *source* block (still `water` at
+/// `level=0`). Flowing water (a non-zero `level`) and every other block return
+/// `false`.
+///
+/// Exposed so a host can treat a water-source cell as *replaceable* — admitting a
+/// waterloggable block into it (which the waterlogging post-step then flips to
+/// `waterlogged=true`) without breaking the usual "cannot place into a solid"
+/// rule.
+#[must_use]
+pub fn is_water_source(state_id: u32) -> bool {
+    state_id_to_block_name(state_id) == Some(WATER_BLOCK)
+        && state_property(state_id, "level") == Some(WATER_SOURCE_LEVEL)
 }
 
 /// Resolves the stair at `position` into its `(facing, half)`, or `None` when the
@@ -834,6 +867,13 @@ pub fn compute_placement(
         return Some(merged);
     }
 
+    // Doors and beds occupy two cells; resolved before the single-cell family rules
+    // and exempt from the waterlogging post-step (neither carries a `waterlogged`
+    // property).
+    if let Some(multi) = try_multiblock(name, ctx, neighbors) {
+        return Some(multi);
+    }
+
     let (state_id, rule) = match classify(name) {
         Class::SimpleCube => (fallback, PlacementRule::SimpleCube),
         Class::Axis => place_axis(name, fallback, ctx),
@@ -869,7 +909,9 @@ pub fn compute_placement(
     // property), so it composes with every family rule above.
     let placed_name = state_id_to_block_name(state_id).unwrap_or(name);
     let state_id = if block_has_property(placed_name, WATERLOGGED)
-        && is_water_source(neighbors.block_state_at(ctx.position))
+        && neighbors
+            .block_state_at(ctx.position)
+            .is_some_and(is_water_source)
     {
         set_state_property(state_id, WATERLOGGED, BOOL_TRUE).unwrap_or(state_id)
     } else {
@@ -881,6 +923,7 @@ pub fn compute_placement(
         requested_state: ctx.item_block_state,
         rule,
         place_at: None,
+        extra_blocks: Vec::new(),
     })
 }
 
@@ -951,6 +994,7 @@ fn try_merge(
         requested_state: ctx.item_block_state,
         rule,
         place_at: Some(clicked),
+        extra_blocks: Vec::new(),
     })
 }
 
@@ -1135,6 +1179,151 @@ fn place_dripstone(name: &str, fallback: u32, ctx: &PlacementContext) -> (u32, P
     );
     props.insert("thickness", "tip");
     (encode(name, &props, fallback), PlacementRule::Dripstone)
+}
+
+/// Returns `true` for a door block, the family placed as a two-cell `lower`+`upper`
+/// block. A `_trapdoor` is excluded — it does not end with `_door`.
+fn is_door(name: &str) -> bool {
+    name.ends_with("_door")
+}
+
+/// Returns `true` for a bed block, the family placed as a two-cell `foot`+`head`
+/// block.
+fn is_bed(name: &str) -> bool {
+    name.ends_with("_bed")
+}
+
+/// Resolves a door or bed into its full multi-cell [`PlacementResult`], or `None`
+/// for any other block.
+///
+/// Both occupy two cells: the primary [`PlacementResult::state_id`] is the cell the
+/// caller chose (`ctx.position` — the door's `lower` half, the bed's `foot`) and
+/// the second cell (the `upper` half / `head`) rides in
+/// [`PlacementResult::extra_blocks`].
+fn try_multiblock(
+    name: &str,
+    ctx: &PlacementContext,
+    neighbors: &dyn NeighborQuery,
+) -> Option<PlacementResult> {
+    if is_door(name) {
+        Some(place_door(name, ctx, neighbors))
+    } else if is_bed(name) {
+        Some(place_bed(name, ctx))
+    } else {
+        None
+    }
+}
+
+/// A door: `facing` from the player's yaw, `hinge` from neighbouring doors/walls
+/// (default `right`); placed as the `lower` half at `ctx.position` with the `upper`
+/// half one cell above (in [`PlacementResult::extra_blocks`]). Both halves share
+/// the same `facing`/`hinge` and inherit `open=false`/`powered=false`.
+fn place_door(
+    name: &str,
+    ctx: &PlacementContext,
+    neighbors: &dyn NeighborQuery,
+) -> PlacementResult {
+    let fallback = ctx.item_block_state;
+    let facing = yaw_to_cardinal(ctx.player_yaw);
+    let hinge = door_hinge(name, facing, ctx.position, neighbors);
+    let lower = door_state(name, facing, "lower", hinge, fallback);
+    let upper = door_state(name, facing, "upper", hinge, fallback);
+    PlacementResult {
+        state_id: lower,
+        requested_state: ctx.item_block_state,
+        rule: PlacementRule::Door,
+        place_at: None,
+        extra_blocks: vec![(ctx.position.offset(Direction::Up), upper)],
+    }
+}
+
+/// Encodes one door half (`lower`/`upper`) with the shared `facing`/`hinge` and the
+/// inherited `open=false`/`powered=false`, degrading to `fallback` on an encoding
+/// failure.
+fn door_state(name: &str, facing: Direction, half: &str, hinge: &str, fallback: u32) -> u32 {
+    let mut props = BTreeMap::new();
+    props.insert("facing", facing_string(facing));
+    props.insert("half", half);
+    props.insert("hinge", hinge);
+    props.insert("open", "false");
+    props.insert("powered", "false");
+    encode(name, &props, fallback)
+}
+
+/// Derives a door's `hinge` (`left`/`right`) from its neighbours, a simplified port
+/// of vanilla `DoorBlock.getHinge`.
+///
+/// The hinge defaults to `right`. It flips to `left` when an identical door (lower
+/// half) sits on the right side — so the pair meets as a matching double door — or
+/// when full-cube blocks weigh the placement toward the left. Vanilla's final
+/// cursor-position tie-break is intentionally dropped in favour of that documented
+/// `right` default. "Full cube" uses the registry [`block_metadata`]
+/// `is_solid_cube` flag as a proxy for vanilla's collision-shape test; other doors
+/// never count as full (they are handled by the same-door checks).
+fn door_hinge(
+    name: &str,
+    facing: Direction,
+    position: BlockPos,
+    neighbors: &dyn NeighborQuery,
+) -> &'static str {
+    let left = rotate_counterclockwise(facing);
+    let right = rotate_clockwise(facing);
+    let above = position.offset(Direction::Up);
+
+    let is_full = |p: BlockPos| {
+        neighbors
+            .block_state_at(p)
+            .and_then(state_id_to_block_name)
+            .is_some_and(|n| !is_door(n) && block_metadata(n).is_some_and(|m| m.is_solid_cube))
+    };
+    let is_same_lower_door = |p: BlockPos| {
+        neighbors.block_state_at(p).is_some_and(|s| {
+            state_id_to_block_name(s) == Some(name) && state_property(s, "half") == Some("lower")
+        })
+    };
+
+    let left_door = is_same_lower_door(position.offset(left));
+    let right_door = is_same_lower_door(position.offset(right));
+    // Positive favours the right side, negative the left (matching vanilla's `i`).
+    let score = i32::from(is_full(position.offset(right)))
+        + i32::from(is_full(above.offset(right)))
+        - i32::from(is_full(position.offset(left)))
+        - i32::from(is_full(above.offset(left)));
+
+    let favors_left = (!left_door || right_door) && score <= 0;
+    let tie_or_right = (!right_door || left_door) && score >= 0;
+    if favors_left && !tie_or_right {
+        "left"
+    } else {
+        "right"
+    }
+}
+
+/// A bed: `facing` from the player's yaw; placed as the `foot` at `ctx.position`
+/// with the `head` one cell along the facing direction (in
+/// [`PlacementResult::extra_blocks`]). Both parts share the same `facing` and
+/// inherit `occupied=false`.
+fn place_bed(name: &str, ctx: &PlacementContext) -> PlacementResult {
+    let fallback = ctx.item_block_state;
+    let facing = yaw_to_cardinal(ctx.player_yaw);
+    let foot = bed_state(name, facing, "foot", fallback);
+    let head = bed_state(name, facing, "head", fallback);
+    PlacementResult {
+        state_id: foot,
+        requested_state: ctx.item_block_state,
+        rule: PlacementRule::Bed,
+        place_at: None,
+        extra_blocks: vec![(ctx.position.offset(facing), head)],
+    }
+}
+
+/// Encodes one bed part (`foot`/`head`) with the shared `facing` and the inherited
+/// `occupied=false`, degrading to `fallback` on an encoding failure.
+fn bed_state(name: &str, facing: Direction, part: &str, fallback: u32) -> u32 {
+    let mut props = BTreeMap::new();
+    props.insert("facing", facing_string(facing));
+    props.insert("part", part);
+    encode(name, &props, fallback)
 }
 
 #[cfg(test)]
@@ -1880,5 +2069,59 @@ mod tests {
         assert_eq!(place(Direction::Up).rule, PlacementRule::Dripstone);
         assert_eq!(place(Direction::Down).state_id, 25815); // down/tip
         assert_eq!(place(Direction::North).state_id, 25813); // horizontal -> up/tip
+    }
+
+    // Multi-cell families (doors + beds): default states unless noted.
+    const OAK_DOOR: u32 = 4697; // facing=north, lower, hinge=left, open/powered=false
+    const WHITE_BED: u32 = 1734; // facing=north, occupied=false, part=foot
+    /// An oak door (south-facing, lower half, hinge=right) used as a right-side
+    /// neighbour to drive the hinge-mirror rule.
+    const OAK_DOOR_SOUTH_LOWER: u32 = 4717;
+
+    #[test]
+    fn door_facing_from_yaw_with_lower_and_upper_halves() {
+        // No neighbours -> hinge defaults to right. The lower half lands at the
+        // chosen cell; the upper half rides one cell above, both yaw-faced.
+        let south =
+            compute_placement(&ctx(OAK_DOOR, Direction::Up, 0.5, 0.0), &NoNeighbors).unwrap();
+        assert_eq!(south.rule, PlacementRule::Door);
+        assert_eq!(south.state_id, 4717); // facing=south, lower, hinge=right
+        assert_eq!(south.place_at, None);
+        assert_eq!(south.extra_blocks, vec![(BlockPos::new(0, 65, 0), 4709)]); // upper
+
+        let north =
+            compute_placement(&ctx(OAK_DOOR, Direction::Up, 0.5, 180.0), &NoNeighbors).unwrap();
+        assert_eq!(north.state_id, 4701); // facing=north, lower, hinge=right
+        assert_eq!(north.extra_blocks, vec![(BlockPos::new(0, 65, 0), 4693)]); // upper
+    }
+
+    #[test]
+    fn door_hinge_flips_left_to_mirror_a_door_on_the_right() {
+        // Facing south, the right side is west. An identical lower door there makes
+        // the new door hinge left so the pair meets as a matching double door.
+        let right_door = MockNeighbors {
+            states: vec![(BlockPos::new(-1, 64, 0), OAK_DOOR_SOUTH_LOWER)],
+            ..Default::default()
+        };
+        let placed =
+            compute_placement(&ctx(OAK_DOOR, Direction::Up, 0.5, 0.0), &right_door).unwrap();
+        assert_eq!(placed.state_id, 4713); // facing=south, lower, hinge=left
+        assert_eq!(placed.extra_blocks, vec![(BlockPos::new(0, 65, 0), 4705)]); // upper, hinge=left
+    }
+
+    #[test]
+    fn bed_foot_and_head_from_yaw() {
+        // The foot lands at the chosen cell; the head rides one cell along facing.
+        let south =
+            compute_placement(&ctx(WHITE_BED, Direction::Up, 0.5, 0.0), &NoNeighbors).unwrap();
+        assert_eq!(south.rule, PlacementRule::Bed);
+        assert_eq!(south.state_id, 1738); // facing=south, foot
+        assert_eq!(south.place_at, None);
+        assert_eq!(south.extra_blocks, vec![(BlockPos::new(0, 64, 1), 1737)]); // head one cell south
+
+        let north =
+            compute_placement(&ctx(WHITE_BED, Direction::Up, 0.5, 180.0), &NoNeighbors).unwrap();
+        assert_eq!(north.state_id, 1734); // facing=north, foot (default)
+        assert_eq!(north.extra_blocks, vec![(BlockPos::new(0, 64, -1), 1733)]); // head one cell north
     }
 }
