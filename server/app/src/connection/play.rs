@@ -14,7 +14,7 @@ use ferrumc_net::{
     InboundPacket, PlayWriter,
 };
 use ferrumc_observability::{PacketState, SessionDebug};
-use ferrumc_proto::generated::play::{ClientboundKeepAlive, ClientboundPlayPacket};
+use ferrumc_proto::generated::play::{ClientboundKeepAlive, ClientboundPlayPacket, GameEvent};
 use ferrumc_session::{NetEvent, PlayerSessionHandle};
 
 use crate::driver::SimCommand;
@@ -35,7 +35,7 @@ use super::outbound::{
 };
 use super::rate_limiter::ChatRateLimiter;
 use super::serverbound_budget::ServerboundBudget;
-use super::{Connection, READ_CHUNK};
+use super::{Connection, GAME_EVENT_CHANGE_GAMEMODE, READ_CHUNK};
 
 /// Joins the simulation and replays the join kit, then pumps the play link until
 /// the client disconnects or the server shuts down.
@@ -295,6 +295,14 @@ pub(super) async fn enter_play(
                             &mut player_pitch,
                             sync,
                         );
+                    }
+                    // A server-driven game-mode change reaches this client the same
+                    // way — through its outbound channel, not this task's own writer.
+                    // Mirror it into the connection-local mode so the targeted
+                    // `/gamemode <mode> <player>` form stays in lockstep with the sim,
+                    // exactly as the self-form does inline on its own task.
+                    if let ClientboundPlayPacket::GameEvent(event) = &packet {
+                        mirror_game_mode_change(event, &mut inventory);
                     }
                     let outcome =
                         enqueue_traced(&mut writer, &mut debug, &compression, &ctx.clock, priority, packet);
@@ -566,4 +574,66 @@ async fn pump_serverbound(
         .await?;
     }
     apply_chunk_stream(ctx, writer, chunk_stream, debug, compression).await
+}
+
+/// Mirrors a server-driven game-mode change into the connection-local game-mode.
+///
+/// A targeted `/gamemode <mode> <player>` (and the self-form aimed at one's own
+/// name) switches the target by routing a `change_game_mode` [`GameEvent`] through
+/// the session channel — unlike the self-form's inline switch, this never touches
+/// this task's mirror on its own. The creative-slot gate and the leave-save both
+/// read that mirror, so keep it in lockstep with the sim's authoritative mode
+/// here; otherwise a targeted change would block the target from authoring its
+/// creative inventory and be lost on relog. A non `change_game_mode` event, or one
+/// carrying an unknown mode id, is ignored.
+fn mirror_game_mode_change(event: &GameEvent, inventory: &mut PlayerInventory) {
+    if event.reason() != GAME_EVENT_CHANGE_GAMEMODE {
+        return;
+    }
+    if let Some(mode) = GameMode::from_id(event.value() as u8) {
+        inventory.set_game_mode(mode);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A routed `change_game_mode` event updates the connection-local mode that
+    /// both the creative-slot gate (`inventory.game_mode() == Creative`) and the
+    /// leave-save (`to_record(inventory.game_mode())`) read, so a targeted
+    /// `/gamemode creative <player>` both unblocks creative authoring in-session
+    /// and persists across relog.
+    #[test]
+    fn change_game_mode_event_updates_the_connection_mirror() {
+        let mut inventory = PlayerInventory::with_creative_kit(GameMode::Survival);
+        mirror_game_mode_change(
+            &GameEvent::new(
+                GAME_EVENT_CHANGE_GAMEMODE,
+                f32::from(GameMode::Creative.as_id()),
+            ),
+            &mut inventory,
+        );
+        assert_eq!(inventory.game_mode(), GameMode::Creative);
+    }
+
+    /// A non `change_game_mode` event (e.g. start-raining) never touches the mode.
+    #[test]
+    fn unrelated_game_event_leaves_the_mode_untouched() {
+        let mut inventory = PlayerInventory::with_creative_kit(GameMode::Creative);
+        mirror_game_mode_change(&GameEvent::new(1, 0.0), &mut inventory);
+        assert_eq!(inventory.game_mode(), GameMode::Creative);
+    }
+
+    /// A `change_game_mode` event carrying an unknown mode id is ignored rather
+    /// than corrupting the mirror.
+    #[test]
+    fn change_game_mode_event_with_unknown_id_is_ignored() {
+        let mut inventory = PlayerInventory::with_creative_kit(GameMode::Adventure);
+        mirror_game_mode_change(
+            &GameEvent::new(GAME_EVENT_CHANGE_GAMEMODE, 9.0),
+            &mut inventory,
+        );
+        assert_eq!(inventory.game_mode(), GameMode::Adventure);
+    }
 }
