@@ -17,11 +17,20 @@ use std::num::NonZeroU8;
 
 use ferrumc_core::GameMode;
 use ferrumc_items::{
-    encode_container_content_payload, ComponentPatch, ItemId, ItemStack, ItemValidationError,
+    encode_container_content_payload, left_click_exchange, ComponentPatch, ItemId, ItemStack,
+    ItemValidationError,
 };
 
 /// The player-inventory window id (window 0 is always open).
 pub(crate) const WINDOW_ID: i32 = 0;
+
+/// First main-inventory slot (the storage grid; armor/craft occupy `0..9`).
+pub(crate) const MAIN_START: usize = 9;
+
+/// One past the last hotbar slot (`45` is the offhand, excluded from a container
+/// window). `MAIN_START..PLAYER_WINDOW_END` is the 36-slot main+hotbar region a
+/// chest window mirrors after its own slots.
+pub(crate) const PLAYER_WINDOW_END: usize = 45;
 
 /// Number of slots in the player inventory window.
 ///
@@ -136,6 +145,69 @@ impl PlayerInventory {
     /// The stack in slot `index`, or `None` if `index` is out of range.
     pub(crate) fn slot(&self, index: usize) -> Option<&ItemStack> {
         self.slots.get(index)
+    }
+
+    /// A mutable reference to slot `index`, or `None` if out of range.
+    ///
+    /// Used by the container window handler to apply a conserving
+    /// [`left_click_exchange`] against a player-inventory slot shown inside an open
+    /// container window. The caller is responsible for the clientbound resync that
+    /// keeps the client's view in step.
+    pub(crate) fn slot_mut(&mut self, index: usize) -> Option<&mut ItemStack> {
+        self.slots.get_mut(index)
+    }
+
+    /// The 36-slot main-inventory + hotbar region (`MAIN_START..PLAYER_WINDOW_END`)
+    /// a container window mirrors after its own slots.
+    ///
+    /// The slice order — main grid then hotbar — is exactly the order the
+    /// `generic_9x3` window expects for its player-inventory section, so the
+    /// container payload builder can append it verbatim.
+    pub(crate) fn window_slots(&self) -> &[ItemStack] {
+        &self.slots[MAIN_START..PLAYER_WINDOW_END]
+    }
+
+    /// Deposits `cursor` back into the main inventory + hotbar, returning whatever
+    /// could not fit (empty in practice).
+    ///
+    /// Used when a container window closes so a carried item is never lost: it
+    /// first merges into matching stacks, then fills empty slots, applying the
+    /// item-count-conserving [`left_click_exchange`] only to slots that are empty
+    /// or hold the same item (never a different-item slot, which would swap an
+    /// unrelated item onto the cursor). Bumps the window state id when anything was
+    /// stored so the follow-up window-0 resync carries a fresh id. A non-empty
+    /// return means the inventory was full; the caller logs it rather than dropping
+    /// silently.
+    #[must_use]
+    pub(crate) fn deposit(&mut self, mut cursor: ItemStack) -> ItemStack {
+        if cursor.item().is_none() {
+            return cursor;
+        }
+        // Pass 1: top up existing matching stacks.
+        for index in MAIN_START..PLAYER_WINDOW_END {
+            if cursor.item().is_none() {
+                break;
+            }
+            let slot = &mut self.slots[index];
+            if slot.item().is_some()
+                && slot.item() == cursor.item()
+                && slot.components() == cursor.components()
+            {
+                left_click_exchange(slot, &mut cursor);
+            }
+        }
+        // Pass 2: drop the remainder into the first empty slots.
+        for index in MAIN_START..PLAYER_WINDOW_END {
+            if cursor.item().is_none() {
+                break;
+            }
+            let slot = &mut self.slots[index];
+            if slot.item().is_none() {
+                left_click_exchange(slot, &mut cursor);
+            }
+        }
+        self.bump_state_id();
+        cursor
     }
 
     /// The stack in the currently selected hotbar slot.
@@ -277,6 +349,47 @@ mod tests {
         assert_eq!(payload[0], SLOT_COUNT as u8);
         // 46 slots + a carried item means more than just the count byte.
         assert!(payload.len() > SLOT_COUNT);
+    }
+
+    #[test]
+    fn deposit_merges_then_fills_empties_and_conserves() {
+        let mut inv = PlayerInventory::with_creative_kit(GameMode::Creative);
+        let stone_id = ItemId::new(STONE_ITEM).unwrap();
+        // Seed main slot 9 with 40 stone; the hotbar already holds a 64 stone (36).
+        inv.set_creative_slot(9, ItemStack::new(stone_id, nz(40), ComponentPatch::empty()));
+        let before = total_stone(&inv) + 30; // we will deposit 30 more stone
+
+        // Depositing 30 stone tops up slot 9 (40 -> 64) and leaves 6 for an empty slot.
+        let leftover = inv.deposit(ItemStack::new(stone_id, nz(30), ComponentPatch::empty()));
+        assert!(leftover.item().is_none(), "all 30 stone were stored");
+        assert_eq!(total_stone(&inv), before, "no stone duplicated or lost");
+        assert_eq!(inv.slot(9).unwrap().count(), 64, "slot 9 topped to max");
+    }
+
+    #[test]
+    fn deposit_of_empty_cursor_is_a_noop() {
+        let mut inv = PlayerInventory::with_creative_kit(GameMode::Creative);
+        let before = inv.state_id();
+        let leftover = inv.deposit(ItemStack::empty());
+        assert!(leftover.item().is_none());
+        assert_eq!(
+            inv.state_id(),
+            before,
+            "an empty deposit does not bump state"
+        );
+    }
+
+    /// Total count of stone across the whole inventory.
+    fn total_stone(inv: &PlayerInventory) -> u32 {
+        (0..SLOT_COUNT)
+            .filter_map(|i| inv.slot(i))
+            .filter(|s| s.item() == ItemId::new(STONE_ITEM))
+            .map(|s| u32::from(s.count()))
+            .sum()
+    }
+
+    fn nz(n: u8) -> NonZeroU8 {
+        NonZeroU8::new(n).unwrap()
     }
 
     #[test]

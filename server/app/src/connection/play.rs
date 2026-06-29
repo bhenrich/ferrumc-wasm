@@ -21,6 +21,7 @@ use crate::driver::SimCommand;
 use crate::inventory::PlayerInventory;
 use crate::observe;
 use crate::player_data::PlayerData;
+use crate::window::WindowState;
 
 use super::chunk_stream::{
     apply_chunk_stream, mirror_server_teleport, pump_chunk_stream, ChunkStream,
@@ -166,6 +167,10 @@ pub(super) async fn enter_play(
     // returned via `?`, so this connection still runs the shared leave-save and
     // chunk-ticket release teardown below instead of leaking the join's tickets.
     let mut deferred_break: Option<anyhow::Error> = None;
+    // Per-connection open-container window state (a chest screen, when open). The
+    // always-open player inventory lives in `inventory`; this tracks the at-most-one
+    // container window layered on top of it.
+    let mut window_state = WindowState::new();
     if let Err(err) = pump_serverbound(
         &mut decoder,
         &compression,
@@ -177,6 +182,7 @@ pub(super) async fn enter_play(
         &mut chat_limiter,
         &mut budget,
         &mut inventory,
+        &mut window_state,
         &mut player_yaw,
         &mut player_pitch,
         &mut debug,
@@ -327,6 +333,7 @@ pub(super) async fn enter_play(
                         &mut chat_limiter,
                         &mut budget,
                         &mut inventory,
+                        &mut window_state,
                         &mut player_yaw,
                         &mut player_pitch,
                         &mut debug,
@@ -354,6 +361,20 @@ pub(super) async fn enter_play(
     // — reads the just-saved state rather than a stale one. The saved position is the
     // last one the client reported, or the join position if it never moved. Failures
     // are logged, never fatal: a connection ending must always run its teardown.
+    // If the player disconnects with a container open, return any carried (cursor)
+    // item to the inventory before the leave-save so it is persisted, not lost. The
+    // client cleared its own cursor on disconnect, so no clientbound sync is needed.
+    if let Some(open) = window_state.take() {
+        let leftover = inventory.deposit(open.cursor().clone());
+        if leftover.item().is_some() {
+            tracing::warn!(
+                player = name.as_str(),
+                count = leftover.count(),
+                "inventory full on disconnect; carried items could not be returned"
+            );
+        }
+    }
+
     let save_position = chunk_stream.last_position().unwrap_or(position);
     let player_data = PlayerData::capture(save_position, player_yaw, player_pitch, &inventory);
     match player_data.to_record(inventory.game_mode()) {
@@ -432,6 +453,7 @@ async fn read_and_pump(
     chat_limiter: &mut ChatRateLimiter,
     budget: &mut ServerboundBudget,
     inventory: &mut PlayerInventory,
+    window_state: &mut WindowState,
     player_yaw: &mut f32,
     player_pitch: &mut f32,
     debug: &mut SessionDebug,
@@ -449,6 +471,7 @@ async fn read_and_pump(
         chat_limiter,
         budget,
         inventory,
+        window_state,
         player_yaw,
         player_pitch,
         debug,
@@ -477,6 +500,7 @@ async fn pump_serverbound(
     chat_limiter: &mut ChatRateLimiter,
     budget: &mut ServerboundBudget,
     inventory: &mut PlayerInventory,
+    window_state: &mut WindowState,
     player_yaw: &mut f32,
     player_pitch: &mut f32,
     debug: &mut SessionDebug,
@@ -531,6 +555,7 @@ async fn pump_serverbound(
             chunk_stream,
             chat_limiter,
             inventory,
+            window_state,
             player_yaw,
             player_pitch,
             &body,

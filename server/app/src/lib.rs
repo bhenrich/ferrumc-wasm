@@ -26,6 +26,7 @@ mod plugins;
 mod registries;
 mod server;
 mod storage_worker;
+mod window;
 mod world;
 
 pub use cli::{load_or_init_config, Cli};

@@ -617,6 +617,7 @@ name = "ferrumc-sim"
 version = "0.2.0-dev"
 dependencies = [
  "ferrumc-core",
+ "ferrumc-items",
  "ferrumc-math",
  "ferrumc-placement",
  "ferrumc-registry",
@@ -657,6 +658,7 @@ dependencies = [
 name = "ferrumc-world"
 version = "0.2.0-dev"
 dependencies = [
+ "ferrumc-items",
  "ferrumc-math",
  "ferrumc-registry",
  "thiserror",

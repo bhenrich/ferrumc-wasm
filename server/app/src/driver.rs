@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
 use ferrumc_core::{GameMode, PlayerId, TextComponent, Tick};
+use ferrumc_items::ItemStack;
 use ferrumc_math::{BlockPos, ChunkPos, Cuboid, Direction, Vec3};
 use ferrumc_observability::{
     ChunkPosSnapshot, CounterRegistry, MutationKind, MutationResult, NetTelemetryHub,
@@ -450,6 +451,47 @@ pub(crate) enum SimCommand {
         is_front: bool,
         /// The four new text lines, top to bottom.
         lines: [String; ferrumc_world::SIGN_LINES],
+    },
+    /// Probe whether the block at `position` is an openable chest and, if so,
+    /// return a snapshot of its container for the player to open.
+    ///
+    /// Net never reads the world directly: the connection routes a right-click on a
+    /// block here, and the driver asks the block's owning shard
+    /// ([`SimShard::container_open`]) — which validates reach/residency, confirms
+    /// the block is a chest, lazily creates a missing container, and replies with a
+    /// 27-slot snapshot (or `None` for a non-chest / out-of-reach / absent-player
+    /// case, in which the connection falls through to placement). The snapshot is
+    /// the authoritative copy the connection mirrors into the opened window.
+    OpenContainer {
+        /// The player opening the container.
+        player: PlayerId,
+        /// Absolute position of the clicked block.
+        position: BlockPos,
+        /// One-shot reply: the chest's slot snapshot, or `None` if not openable.
+        reply: oneshot::Sender<Option<Vec<ItemStack>>>,
+    },
+    /// Apply a left-click on chest slot `slot` of the chest at `position` with the
+    /// carried `cursor`, returning the post-click cursor and the chest's updated
+    /// snapshot.
+    ///
+    /// The mutation is applied atomically against the world's authoritative chest
+    /// by [`SimShard::container_left_click`] using the item-count-conserving
+    /// exchange, so a click can never dupe or lose an item even with concurrent
+    /// viewers. The connection sends its current cursor and adopts the returned
+    /// cursor + snapshot; a `None` reply (chest gone / out of reach / bad slot)
+    /// leaves the connection's cursor untouched and triggers a resync.
+    ContainerLeftClick {
+        /// The clicking player.
+        player: PlayerId,
+        /// Absolute position of the open chest.
+        position: BlockPos,
+        /// The chest slot index clicked (`0..27`).
+        slot: usize,
+        /// The player's carried item at click time (server-authoritative).
+        cursor: ItemStack,
+        /// One-shot reply: the `(new_cursor, snapshot)` after the click, or `None`
+        /// if the click could not be applied (the caller keeps its cursor).
+        reply: oneshot::Sender<Option<(ItemStack, Vec<ItemStack>)>>,
     },
 }
 
@@ -939,6 +981,31 @@ async fn handle_command(
             ) {
                 tracing::trace!(%err, "dropping sign update");
             }
+        }
+        SimCommand::OpenContainer {
+            player,
+            position,
+            reply,
+        } => {
+            // Read (and lazily create) the chest container directly off the resident
+            // shard, like `preview_placement`: a request/response read that does not
+            // wait for the next tick. A gone connection just discards the reply.
+            let snapshot = shard.container_open(player, position);
+            let _ = reply.send(snapshot);
+        }
+        SimCommand::ContainerLeftClick {
+            player,
+            position,
+            slot,
+            cursor,
+            reply,
+        } => {
+            // Apply the conserving slot/cursor exchange atomically against the
+            // authoritative chest while we hold the shard, so concurrent viewers are
+            // serialised and a click can never dupe or lose an item. The connection
+            // adopts the returned cursor + snapshot (or keeps its cursor on `None`).
+            let outcome = shard.container_left_click(player, position, slot, cursor);
+            let _ = reply.send(outcome);
         }
     }
 }

@@ -5,7 +5,7 @@
 use ferrumc_codec::{BoundedReader, BoundedString};
 use ferrumc_command::{CommandSource, CommandTree};
 use ferrumc_core::{GameMode, PlayerId, TextColor, TextComponent};
-use ferrumc_items::UntrustedItemStack;
+use ferrumc_items::{left_click_exchange, ItemStack, UntrustedItemStack};
 use ferrumc_math::{BlockPos, Direction, Vec3, WorldIntent};
 use ferrumc_net::{CompressionState, PlayWriter};
 use ferrumc_observability::{PacketState, SessionDebug};
@@ -15,11 +15,14 @@ use ferrumc_plugin_api::{
 };
 use ferrumc_plugin_host::ResolvedDecision;
 use ferrumc_proto::generated::play::{
-    ClientboundPlayPacket, CommandSuggestionMatch, GameEvent, ServerboundPlayPacket,
-    ServerboundSetHeldItem, SetContainerContent, SetContainerSlot, SetCreativeSlot,
-    SetPlayerPosition, TabCompleteResponse, UpdateSign, UseItemOn, WindowClick,
+    ClientboundPlayPacket, CloseContainer, CommandSuggestionMatch, GameEvent,
+    ServerboundPlayPacket, ServerboundSetHeldItem, SetContainerContent, SetContainerSlot,
+    SetCreativeSlot, SetPlayerPosition, TabCompleteResponse, UpdateSign, UseItemOn, WindowClick,
 };
-use ferrumc_session::{net_event_to_input, use_item_on_face, use_item_on_target, NetEvent};
+use ferrumc_session::{
+    net_event_to_input, open_screen, use_item_on_block, use_item_on_face, use_item_on_target,
+    NetEvent,
+};
 use ferrumc_sim::{BlockStateId, GameInput};
 use tokio::sync::oneshot;
 
@@ -28,6 +31,7 @@ use crate::driver::SimCommand;
 use crate::inventory::{PlayerInventory, SLOT_COUNT, WINDOW_ID};
 use crate::observe;
 use crate::plugins::PermissionFacade;
+use crate::window::{OpenContainer, WindowSlot, WindowState, GENERIC_9X3_TYPE};
 
 use super::chunk_stream::{mirror_server_teleport, ChunkStream};
 use super::context::ConnContext;
@@ -53,6 +57,7 @@ pub(super) async fn handle_play_body(
     chunk_stream: &mut ChunkStream,
     chat_limiter: &mut ChatRateLimiter,
     inventory: &mut PlayerInventory,
+    window_state: &mut WindowState,
     player_yaw: &mut f32,
     player_pitch: &mut f32,
     body: &[u8],
@@ -230,6 +235,7 @@ pub(super) async fn handle_play_body(
                 player,
                 writer,
                 inventory,
+                window_state,
                 p,
                 *player_yaw,
                 chunk_stream.last_position(),
@@ -254,10 +260,34 @@ pub(super) async fn handle_play_body(
         ServerboundPlayPacket::ServerboundSetHeldItem(p) => {
             return handle_set_held_item(ctx, player, inventory, p).await;
         }
-        // Click Container: the slice models no click logic, so any click on window
-        // 0 triggers a safe resync of the authoritative inventory.
+        // Click Container: an open chest window applies the safe left-click subset
+        // (everything else resyncs); a click on window 0 resyncs the inventory.
         ServerboundPlayPacket::WindowClick(p) => {
-            return handle_window_click(ctx, writer, inventory, p, debug, compression);
+            return handle_window_click(
+                ctx,
+                player,
+                writer,
+                inventory,
+                window_state,
+                p,
+                debug,
+                compression,
+            )
+            .await;
+        }
+        // Close Container: return any carried item to the inventory and resync.
+        ServerboundPlayPacket::CloseContainer(p) => {
+            return handle_close_container(
+                ctx,
+                player,
+                writer,
+                inventory,
+                window_state,
+                p,
+                debug,
+                compression,
+            )
+            .await;
         }
         // The teleport confirmation (reply to the join position sync) and the
         // Keep Alive echo are accepted and need no action: the slice does not
@@ -777,7 +807,8 @@ async fn handle_use_item_on(
     ctx: &ConnContext,
     player: PlayerId,
     writer: &mut PlayWriter,
-    inventory: &PlayerInventory,
+    inventory: &mut PlayerInventory,
+    window_state: &mut WindowState,
     packet: &UseItemOn,
     player_yaw: f32,
     player_position: Option<Vec3>,
@@ -862,6 +893,40 @@ async fn handle_use_item_on(
         compression,
     )
     .await?;
+
+    // Right-clicking a chest opens its container instead of placing (vanilla opens
+    // regardless of a held placeable block when not sneaking). Net never reads the
+    // world, so ask the clicked block's owning shard whether it is an openable chest
+    // and, if so, snapshot its contents. A non-chest falls through to placement.
+    let clicked = use_item_on_block(packet);
+    let (open_tx, open_rx) = oneshot::channel();
+    ctx.commands
+        .send(SimCommand::OpenContainer {
+            player,
+            position: clicked,
+            reply: open_tx,
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+    let chest_open = open_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver dropped the open-container reply"))?;
+    if let Some(slots) = chest_open {
+        // End the client's interaction prediction, then show the container screen.
+        ack_sequence(writer, debug, compression, &ctx.clock, sequence)?;
+        return open_chest_window(
+            ctx,
+            player,
+            writer,
+            inventory,
+            window_state,
+            clicked,
+            slots,
+            debug,
+            compression,
+        )
+        .await;
+    }
 
     // Empty hand or non-placeable item: nothing to place, just ack. The block-place
     // plugins are not consulted for a no-op placement (the interaction already was).
@@ -1119,25 +1184,43 @@ async fn handle_set_held_item(
         .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
 }
 
-/// Handles a serverbound Click Container on window 0 with a conservative resync.
+/// Handles a serverbound Click Container.
 ///
-/// The slice models no click logic, so any click on the player inventory — a
-/// state-id mismatch or otherwise — is answered by bumping the state id and
-/// re-sending the full authoritative container content (mandatory). Clicks on any
-/// other window are ignored. Never disconnects, never trusts the click, never
-/// panics.
-fn handle_window_click(
+/// On the open chest window, the SAFE click subset is applied directly:
+/// **normal-mode left-click** (`mode = 0`, `button = 0`) on a chest or
+/// player-inventory slot runs the item-count-conserving exchange (pickup / place /
+/// merge / swap — chest mutations round-trip atomically to the simulation). EVERY
+/// other case — right-click, shift-click, drag, number-key swap, double-click,
+/// drop-outside, an out-of-window slot, or a malformed body — is treated as a
+/// no-op and the whole window is resynced (authoritative `SetContainerContent`)
+/// rather than guessed, so the protocol can never duplicate or lose an item. A
+/// click on window 0 (the always-open inventory) resyncs it. Never disconnects,
+/// never trusts the client's claimed result, never panics.
+#[allow(clippy::too_many_arguments)] // one click step: identity + window state + I/O + trace
+async fn handle_window_click(
     ctx: &ConnContext,
+    player: PlayerId,
     writer: &mut PlayWriter,
     inventory: &mut PlayerInventory,
+    window_state: &mut WindowState,
     packet: &WindowClick,
     debug: &mut SessionDebug,
     compression: &CompressionState,
 ) -> anyhow::Result<()> {
-    if packet.window_id() != WINDOW_ID {
+    let window_id = packet.window_id();
+    // A click on the open chest window: apply the safe subset, then resync (which
+    // both confirms a handled click and heals an unhandled/ambiguous one).
+    if window_state
+        .open()
+        .is_some_and(|open| open.window_id() == window_id)
+    {
+        apply_chest_window_click(ctx, player, inventory, window_state, packet).await?;
+        return resync_chest_window(ctx, writer, inventory, window_state, debug, compression);
+    }
+    // Otherwise the always-open player inventory (window 0): conservative resync.
+    if window_id != WINDOW_ID {
         return Ok(());
     }
-    // Bump first so the resync carries a fresh state id the client adopts.
     inventory.bump_state_id();
     let payload = match inventory.container_content_payload() {
         Ok(payload) => payload,
@@ -1157,6 +1240,258 @@ fn handle_window_click(
             payload,
         )),
     )
+}
+
+/// Applies the SAFE subset of a click on the open chest window to the
+/// authoritative state, mutating the chest mirror / cursor / player inventory.
+///
+/// Only normal-mode left-click is applied; any other mode/button, an out-of-window
+/// slot, or a malformed body is a no-op (the caller's resync heals the client).
+/// The server recomputes the outcome from its own authoritative state and never
+/// trusts the click body's trailing changed-slots / cursor (`HashedSlot`) fields,
+/// which are not even parsed.
+async fn apply_chest_window_click(
+    ctx: &ConnContext,
+    player: PlayerId,
+    inventory: &mut PlayerInventory,
+    window_state: &mut WindowState,
+    packet: &WindowClick,
+) -> anyhow::Result<()> {
+    // Parse only the fixed prefix: slot (i16), button (i8), mode (varint). A
+    // truncated/malformed body resyncs (no-op here).
+    let Some((slot, button, mode)) = decode_click_prefix(packet.rest()) else {
+        return Ok(());
+    };
+    // Normal-mode left-click only; everything else resyncs.
+    if mode != 0 || button != 0 {
+        return Ok(());
+    }
+    let Some(target) = OpenContainer::classify_slot(slot) else {
+        return Ok(());
+    };
+    match target {
+        WindowSlot::Chest(chest_slot) => {
+            // Round-trip to the sim for an atomic, conserving chest mutation. Send
+            // the current cursor; adopt the authoritative result.
+            let Some(open) = window_state.open() else {
+                return Ok(());
+            };
+            let position = open.position();
+            let cursor = open.cursor().clone();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            ctx.commands
+                .send(SimCommand::ContainerLeftClick {
+                    player,
+                    position,
+                    slot: chest_slot,
+                    cursor,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+            let outcome = reply_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("simulation driver dropped the container reply"))?;
+            // `None` (chest gone / out of reach) keeps the cursor; the resync heals.
+            if let (Some((new_cursor, snapshot)), Some(open)) = (outcome, window_state.open_mut()) {
+                open.set_cursor(new_cursor);
+                open.set_chest_slots(snapshot);
+            }
+        }
+        WindowSlot::Player(index) => {
+            // A player-inventory slot shown in the window: a purely local conserving
+            // exchange against the connection-owned inventory and cursor.
+            if let (Some(open), Some(slot_ref)) =
+                (window_state.open_mut(), inventory.slot_mut(index))
+            {
+                left_click_exchange(slot_ref, open.cursor_mut());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decodes the fixed prefix of a Click Container body: slot (`i16`), button
+/// (`i8`), and mode (`VarInt`).
+///
+/// Returns `None` for a truncated or malformed body (the caller then resyncs). It
+/// never panics on hostile input: [`BoundedReader`] rejects a short read or an
+/// over-long `VarInt` with an error rather than reading out of bounds. The trailing
+/// changed-slots / cursor (`HashedSlot`) fields are deliberately NOT decoded — the
+/// server recomputes the click outcome from its own authoritative state and never
+/// trusts the client's claimed result.
+fn decode_click_prefix(rest: &[u8]) -> Option<(i16, i8, i32)> {
+    let mut reader = BoundedReader::new(rest);
+    let slot = reader.read_i16().ok()?;
+    let button = reader.read_i8().ok()?;
+    let mode = reader.read_var_int().ok()?;
+    Some((slot, button, mode))
+}
+
+/// Resyncs the open chest window: bumps its state id and re-sends the full
+/// authoritative `SetContainerContent` (chest slots, player section, cursor).
+///
+/// This is the single confirm/heal path — sent after every handled click and
+/// after every unhandled/ambiguous one — so the client's view always converges on
+/// the server's authoritative state regardless of what it predicted.
+fn resync_chest_window(
+    ctx: &ConnContext,
+    writer: &mut PlayWriter,
+    inventory: &PlayerInventory,
+    window_state: &mut WindowState,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+) -> anyhow::Result<()> {
+    let Some(open) = window_state.open_mut() else {
+        return Ok(());
+    };
+    open.bump_state_id();
+    let payload = match open.content_payload(inventory) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::warn!(%err, "failed to encode chest-window resync");
+            return Ok(());
+        }
+    };
+    send_mandatory(
+        writer,
+        debug,
+        compression,
+        &ctx.clock,
+        ClientboundPlayPacket::SetContainerContent(SetContainerContent::new(
+            open.window_id(),
+            open.state_id(),
+            payload,
+        )),
+    )
+}
+
+/// Opens a chest window: assigns a window id, stores the open state seeded with the
+/// sim's slot snapshot, and sends `OpenScreen` + the initial `SetContainerContent`.
+///
+/// If a container is already open, it is closed first (returning its cursor) so a
+/// carried item is never discarded when one window replaces another.
+#[allow(clippy::too_many_arguments)] // one open step: identity + I/O + the chest snapshot
+async fn open_chest_window(
+    ctx: &ConnContext,
+    player: PlayerId,
+    writer: &mut PlayWriter,
+    inventory: &mut PlayerInventory,
+    window_state: &mut WindowState,
+    position: BlockPos,
+    slots: Vec<ItemStack>,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+) -> anyhow::Result<()> {
+    if window_state.open().is_some() {
+        close_open_container(
+            ctx,
+            player,
+            writer,
+            inventory,
+            window_state,
+            debug,
+            compression,
+        )
+        .await?;
+    }
+    let window_id = window_state.open_chest(position, slots);
+    // OpenScreen first (generic_9x3, titled "Chest"), then the initial contents.
+    send_mandatory(
+        writer,
+        debug,
+        compression,
+        &ctx.clock,
+        open_screen(window_id, GENERIC_9X3_TYPE, &TextComponent::text("Chest")),
+    )?;
+    resync_chest_window(ctx, writer, inventory, window_state, debug, compression)
+}
+
+/// Handles a serverbound Close Container: close any open container, returning its
+/// carried item to the inventory.
+#[allow(clippy::too_many_arguments)] // one close step: identity + window state + I/O + trace
+async fn handle_close_container(
+    ctx: &ConnContext,
+    player: PlayerId,
+    writer: &mut PlayWriter,
+    inventory: &mut PlayerInventory,
+    window_state: &mut WindowState,
+    _packet: &CloseContainer,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+) -> anyhow::Result<()> {
+    close_open_container(
+        ctx,
+        player,
+        writer,
+        inventory,
+        window_state,
+        debug,
+        compression,
+    )
+    .await
+}
+
+/// Closes the open container (if any): deposits its carried item into the player
+/// inventory (never lost), resyncs window 0 (player-slot clicks during the session
+/// changed it), and refreshes the broadcast held item.
+async fn close_open_container(
+    ctx: &ConnContext,
+    player: PlayerId,
+    writer: &mut PlayWriter,
+    inventory: &mut PlayerInventory,
+    window_state: &mut WindowState,
+    debug: &mut SessionDebug,
+    compression: &CompressionState,
+) -> anyhow::Result<()> {
+    let Some(open) = window_state.take() else {
+        return Ok(());
+    };
+    // Return the carried item to the inventory; a non-empty leftover means the
+    // inventory was full (logged, never silently dropped — extremely unlikely in
+    // the creative slice, which always has empty slots).
+    let leftover = inventory.deposit(open.cursor().clone());
+    if leftover.item().is_some() {
+        tracing::warn!(
+            ?player,
+            count = leftover.count(),
+            "inventory full on container close; carried items could not be returned"
+        );
+    }
+    // Resync window 0 so the client sees both the returned cursor and any inventory
+    // changes the session's player-slot clicks made.
+    inventory.bump_state_id();
+    let payload = match inventory.container_content_payload() {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::warn!(%err, "failed to encode inventory resync on container close");
+            return Ok(());
+        }
+    };
+    send_mandatory(
+        writer,
+        debug,
+        compression,
+        &ctx.clock,
+        ClientboundPlayPacket::SetContainerContent(SetContainerContent::new(
+            WINDOW_ID,
+            inventory.state_id(),
+            payload,
+        )),
+    )?;
+    // The held hotbar slot may have changed during the session; refresh the
+    // broadcast equipment so viewers see the right main-hand item.
+    match inventory.main_hand_equipment_body() {
+        Ok(equipment) => ctx
+            .commands
+            .send(SimCommand::SetEquipment { player, equipment })
+            .await
+            .map_err(|_| anyhow::anyhow!("simulation driver is gone")),
+        Err(err) => {
+            tracing::warn!(%err, "failed to encode equipment after container close");
+            Ok(())
+        }
+    }
 }
 
 /// Answers a serverbound tab-complete request, enqueuing a `TabCompleteResponse`
@@ -1266,8 +1601,32 @@ mod tests {
         ServerboundPlayPacket, SetPlayerPosition, SetPlayerRotation, UpdateSign,
     };
 
-    use super::{reported_yaw, tab_complete_reply};
+    use super::{decode_click_prefix, reported_yaw, tab_complete_reply};
     use crate::command::{build_command_tree, GAMEMODE_COMMAND, SPAWN_COMMAND};
+
+    #[test]
+    fn decode_click_prefix_parses_valid_and_rejects_malformed_without_panicking() {
+        // Valid: slot 5 (i16 big-endian), button 0, mode 0; trailing bytes ignored.
+        assert_eq!(
+            decode_click_prefix(&[0x00, 0x05, 0x00, 0x00]),
+            Some((5, 0, 0))
+        );
+        assert_eq!(
+            decode_click_prefix(&[0x00, 0x05, 0x01, 0x01, 0xDE, 0xAD]),
+            Some((5, 1, 1)),
+            "trailing changed-slots/cursor bytes are ignored, not trusted"
+        );
+        // Truncated bodies are rejected (no panic), not read out of bounds.
+        assert_eq!(decode_click_prefix(&[]), None);
+        assert_eq!(decode_click_prefix(&[0x00]), None); // half a slot
+        assert_eq!(decode_click_prefix(&[0x00, 0x05]), None); // no button
+        assert_eq!(decode_click_prefix(&[0x00, 0x05, 0x00]), None); // no mode
+                                                                    // An over-long (6-byte) VarInt for mode is rejected by the bounded reader.
+        assert_eq!(
+            decode_click_prefix(&[0x00, 0x05, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]),
+            None
+        );
+    }
 
     const OP_LEVEL: u8 = 4;
     const MEMBER_LEVEL: u8 = 0;
