@@ -671,6 +671,40 @@ impl WindowClick {
     }
 }
 
+/// `CloseContainer`: the play serverbound packet (wire id `0x12`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloseContainer {
+    window_id: i32,
+}
+
+impl CloseContainer {
+    /// The wire packet id for `CloseContainer`.
+    pub const PACKET_ID: i32 = 0x12;
+
+    /// Creates a new `CloseContainer` from its wire fields.
+    pub fn new(window_id: i32) -> Self {
+        Self { window_id }
+    }
+
+    /// Returns the `window_id` field.
+    pub fn window_id(&self) -> i32 {
+        self.window_id
+    }
+
+    /// Decodes a `CloseContainer` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let window_id = reader.read_var_int()?;
+        Ok(Self { window_id })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        ferrumc_codec::write_var_int(buf, self.window_id);
+        Ok(())
+    }
+}
+
 /// `ServerboundKeepAlive`: the play serverbound packet (wire id `0x1b`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerboundKeepAlive {
@@ -2980,6 +3014,77 @@ impl UpdateEntityRotation {
     }
 }
 
+/// `OpenScreen`: the play clientbound packet (wire id `0x34`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenScreen {
+    window_id: i32,
+    window_type: i32,
+    title: ferrumc_nbt::NbtTag,
+}
+
+impl OpenScreen {
+    /// The wire packet id for `OpenScreen`.
+    pub const PACKET_ID: i32 = 0x34;
+
+    /// Creates a new `OpenScreen` from its wire fields.
+    pub fn new(window_id: i32, window_type: i32, title: ferrumc_nbt::NbtTag) -> Self {
+        Self {
+            window_id,
+            window_type,
+            title,
+        }
+    }
+
+    /// Returns the `window_id` field.
+    pub fn window_id(&self) -> i32 {
+        self.window_id
+    }
+
+    /// Returns the `window_type` field.
+    pub fn window_type(&self) -> i32 {
+        self.window_type
+    }
+
+    /// Returns the `title` field.
+    pub fn title(&self) -> &ferrumc_nbt::NbtTag {
+        &self.title
+    }
+
+    /// Decodes a `OpenScreen` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let window_id = reader.read_var_int()?;
+        let window_type = reader.read_var_int()?;
+        let title = {
+            let available = reader.remaining();
+            let bytes = reader.read_bytes(available)?;
+            let (tag, consumed) = ferrumc_nbt::read_network_root_with_consumed(
+                bytes,
+                &ferrumc_nbt::NbtLimits::default(),
+            )?;
+            *reader = BoundedReader::new(bytes.get(consumed..).unwrap_or_default());
+            tag
+        };
+        Ok(Self {
+            window_id,
+            window_type,
+            title,
+        })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        ferrumc_codec::write_var_int(buf, self.window_id);
+        ferrumc_codec::write_var_int(buf, self.window_type);
+        {
+            let nbt_bytes =
+                ferrumc_nbt::write_network_root(&self.title, &ferrumc_nbt::NbtLimits::default())?;
+            wire::write_raw(buf, &nbt_bytes);
+        }
+        Ok(())
+    }
+}
+
 /// `OpenSignEditor`: the play clientbound packet (wire id `0x35`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSignEditor {
@@ -4144,6 +4249,8 @@ pub enum ServerboundPlayPacket {
     TabCompleteRequest(TabCompleteRequest),
     /// The `WindowClick` packet.
     WindowClick(WindowClick),
+    /// The `CloseContainer` packet.
+    CloseContainer(CloseContainer),
     /// The `ServerboundKeepAlive` packet.
     ServerboundKeepAlive(ServerboundKeepAlive),
     /// The `SetPlayerPosition` packet.
@@ -4177,6 +4284,7 @@ impl ServerboundPlayPacket {
                 TabCompleteRequest::decode(reader)?,
             )),
             WindowClick::PACKET_ID => Ok(Self::WindowClick(WindowClick::decode(reader)?)),
+            CloseContainer::PACKET_ID => Ok(Self::CloseContainer(CloseContainer::decode(reader)?)),
             ServerboundKeepAlive::PACKET_ID => Ok(Self::ServerboundKeepAlive(
                 ServerboundKeepAlive::decode(reader)?,
             )),
@@ -4214,6 +4322,7 @@ impl ServerboundPlayPacket {
             Self::ChatMessage(_) => ChatMessage::PACKET_ID,
             Self::TabCompleteRequest(_) => TabCompleteRequest::PACKET_ID,
             Self::WindowClick(_) => WindowClick::PACKET_ID,
+            Self::CloseContainer(_) => CloseContainer::PACKET_ID,
             Self::ServerboundKeepAlive(_) => ServerboundKeepAlive::PACKET_ID,
             Self::SetPlayerPosition(_) => SetPlayerPosition::PACKET_ID,
             Self::SetPlayerPositionAndRotation(_) => SetPlayerPositionAndRotation::PACKET_ID,
@@ -4234,6 +4343,7 @@ impl ServerboundPlayPacket {
             Self::ChatMessage(packet) => packet.encode(buf),
             Self::TabCompleteRequest(packet) => packet.encode(buf),
             Self::WindowClick(packet) => packet.encode(buf),
+            Self::CloseContainer(packet) => packet.encode(buf),
             Self::ServerboundKeepAlive(packet) => packet.encode(buf),
             Self::SetPlayerPosition(packet) => packet.encode(buf),
             Self::SetPlayerPositionAndRotation(packet) => packet.encode(buf),
@@ -4288,6 +4398,8 @@ pub enum ClientboundPlayPacket {
     UpdateEntityPositionAndRotation(UpdateEntityPositionAndRotation),
     /// The `UpdateEntityRotation` packet.
     UpdateEntityRotation(UpdateEntityRotation),
+    /// The `OpenScreen` packet.
+    OpenScreen(OpenScreen),
     /// The `OpenSignEditor` packet.
     OpenSignEditor(OpenSignEditor),
     /// The `PlayerAbilities` packet.
@@ -4379,6 +4491,7 @@ impl ClientboundPlayPacket {
             UpdateEntityRotation::PACKET_ID => Ok(Self::UpdateEntityRotation(
                 UpdateEntityRotation::decode(reader)?,
             )),
+            OpenScreen::PACKET_ID => Ok(Self::OpenScreen(OpenScreen::decode(reader)?)),
             OpenSignEditor::PACKET_ID => Ok(Self::OpenSignEditor(OpenSignEditor::decode(reader)?)),
             PlayerAbilities::PACKET_ID => {
                 Ok(Self::PlayerAbilities(PlayerAbilities::decode(reader)?))
@@ -4457,6 +4570,7 @@ impl ClientboundPlayPacket {
             Self::UpdateEntityPosition(_) => UpdateEntityPosition::PACKET_ID,
             Self::UpdateEntityPositionAndRotation(_) => UpdateEntityPositionAndRotation::PACKET_ID,
             Self::UpdateEntityRotation(_) => UpdateEntityRotation::PACKET_ID,
+            Self::OpenScreen(_) => OpenScreen::PACKET_ID,
             Self::OpenSignEditor(_) => OpenSignEditor::PACKET_ID,
             Self::PlayerAbilities(_) => PlayerAbilities::PACKET_ID,
             Self::RemovePlayerInfo(_) => RemovePlayerInfo::PACKET_ID,
@@ -4504,6 +4618,7 @@ impl ClientboundPlayPacket {
             Self::UpdateEntityPosition(packet) => packet.encode(buf),
             Self::UpdateEntityPositionAndRotation(packet) => packet.encode(buf),
             Self::UpdateEntityRotation(packet) => packet.encode(buf),
+            Self::OpenScreen(packet) => packet.encode(buf),
             Self::OpenSignEditor(packet) => packet.encode(buf),
             Self::PlayerAbilities(packet) => packet.encode(buf),
             Self::RemovePlayerInfo(packet) => packet.encode(buf),

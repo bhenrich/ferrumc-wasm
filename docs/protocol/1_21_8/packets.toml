@@ -870,6 +870,23 @@ fields = [
     { name = "item", type = "remaining_bytes" },
 ]
 
+# minecraft-data: play.toClient.open_window ("Open Screen"). Opens a container GUI
+# on the client: `window_id` is the ContainerID (varint) the server assigns and the
+# client echoes on Click Container / Close Container; `window_type` is the
+# minecraft:menu registry id (generic_9x3 = 2, a single chest — verified against the
+# pinned 1.21.8 menu registry); `title` is the window title as a network-NBT text
+# component (the `nbt` type, written by ferrumc_nbt::write_network_root).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "OpenScreen"
+id = 0x34
+fields = [
+    { name = "window_id", type = "varint" },
+    { name = "window_type", type = "varint" },
+    { name = "title", type = "nbt" },
+]
+
 # minecraft-data: play.toClient.held_item_slot ("Set Held Item"). The clientbound
 # form is a varint slot (the serverbound form above is an i16); direction-prefixed.
 [[packet]]
@@ -907,6 +924,17 @@ fields = [
     { name = "state_id", type = "varint" },
     { name = "rest", type = "remaining_bytes" },
 ]
+
+# minecraft-data: play.toServer.close_window ("Close Container"). Sent when the
+# player closes any container GUI (including pressing Escape). The body is just the
+# ContainerID (varint) being closed; the server returns any carried (cursor) item to
+# the player inventory so closing never loses items.
+[[packet]]
+state = "play"
+direction = "serverbound"
+name = "CloseContainer"
+id = 0x12
+fields = [{ name = "window_id", type = "varint" }]
 
 # --- Title / action bar (pre-reserved for the title feature lane) ----------------
 #
