@@ -93,9 +93,14 @@ pub const MAX_BLOCK_ENTITIES: usize = 4096;
 /// A chunk tracks which sections have been modified (see
 /// [`Chunk::dirty_sections`]) so the persistence and network layers can flush
 /// only what changed. Lighting is a documented placeholder (see [`ChunkLight`]);
-/// block entities (signs, ...) are owned in a bounded map keyed by
+/// block entities (signs, chests, ...) are owned in a bounded map keyed by
 /// [`BlockPos`] (see [`Chunk::block_entities`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` but not `Eq`: a chest block-entity holds [`ItemStack`]s whose NBT
+/// component data is `PartialEq`-only.
+///
+/// [`ItemStack`]: ferrumc_items::ItemStack
+#[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     /// The column this chunk occupies.
     pos: ChunkPos,

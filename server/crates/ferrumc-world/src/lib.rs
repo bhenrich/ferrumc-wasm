@@ -40,7 +40,10 @@ mod network;
 mod packed_array;
 mod paletted_container;
 
-pub use block_entity::{sign_kind_for_state, BlockEntity, Sign, SignFace, SignKind, SIGN_LINES};
+pub use block_entity::{
+    is_chest_state, sign_kind_for_state, BlockEntity, ChestInventory, Sign, SignFace, SignKind,
+    CHEST_SLOTS, SIGN_LINES,
+};
 pub use block_state::BlockStateId;
 pub use chunk::{Chunk, ChunkLight, MAX_BLOCK_ENTITIES, SECTION_COUNT};
 pub use chunk_section::{ChunkSection, SECTION_VOLUME};

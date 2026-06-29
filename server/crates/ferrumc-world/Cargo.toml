@@ -10,6 +10,10 @@ repository.workspace = true
 ferrumc-math = { workspace = true }
 # Block-state id constants (air) and the pinned flat-world block lookup.
 ferrumc-registry = { workspace = true }
+# ItemStack: the contents of a chest block-entity's container. ferrumc-items
+# depends only on codec/nbt/registry, so this edge is acyclic (it never reaches
+# back to world) and keeps container contents modelled as the canonical item type.
+ferrumc-items = { workspace = true }
 # Classifying error variants for bit-packing / indexing failures.
 thiserror = { workspace = true }
 

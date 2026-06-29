@@ -13,10 +13,17 @@
 //! [`Chunk`]: crate::Chunk
 //! [`Chunk::set_block_entity`]: crate::Chunk::set_block_entity
 
+use ferrumc_items::ItemStack;
 use ferrumc_registry::block_state::state_id_to_block_name;
 
 /// The number of text lines on one face of a sign (the vanilla fixed count).
 pub const SIGN_LINES: usize = 4;
+
+/// The number of item slots in a single-chest container (the vanilla 3×9 grid).
+///
+/// A 1.21.8 client opens a single chest with the `generic_9x3` menu, whose
+/// container region is exactly these 27 slots.
+pub const CHEST_SLOTS: usize = 27;
 
 /// Which sign block-entity kind a sign block is. Selects the protocol
 /// block-entity-type id the client expects in a `BlockEntityData` packet.
@@ -160,16 +167,83 @@ impl Sign {
     }
 }
 
+/// The item contents of a chest block-entity: a fixed [`CHEST_SLOTS`]-slot
+/// container of [`ItemStack`]s.
+///
+/// The slot array is always exactly [`CHEST_SLOTS`] long (empty slots hold
+/// [`ItemStack::empty`]); the container is created empty when a chest block is
+/// placed and mutated only through the simulation. Contents are bounded by the
+/// fixed slot count, and the whole container is dropped with its [`Chunk`] on
+/// unload (so it needs no separate cleanup).
+///
+/// [`Chunk`]: crate::Chunk
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChestInventory {
+    slots: Box<[ItemStack; CHEST_SLOTS]>,
+}
+
+impl ChestInventory {
+    /// Creates an empty chest container (every slot [`ItemStack::empty`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            slots: Box::new(std::array::from_fn(|_| ItemStack::empty())),
+        }
+    }
+
+    /// Returns the container's slots, indices `0..`[`CHEST_SLOTS`].
+    #[must_use]
+    pub fn slots(&self) -> &[ItemStack] {
+        self.slots.as_slice()
+    }
+
+    /// Returns the stack in slot `index`, or `None` if `index` is out of range.
+    #[must_use]
+    pub fn slot(&self, index: usize) -> Option<&ItemStack> {
+        self.slots.get(index)
+    }
+
+    /// Returns a mutable reference to slot `index`, or `None` if out of range.
+    ///
+    /// The simulation uses this to apply a conserving slot mutation (e.g.
+    /// `ferrumc_items::left_click_exchange`) atomically against the chest.
+    pub fn slot_mut(&mut self, index: usize) -> Option<&mut ItemStack> {
+        self.slots.get_mut(index)
+    }
+
+    /// Clones the whole container into a [`Vec`] snapshot for the session/network
+    /// layer to encode into a `SetContainerContent` body.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<ItemStack> {
+        self.slots.to_vec()
+    }
+}
+
+impl Default for ChestInventory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A block entity stored in a [`Chunk`](crate::Chunk), keyed by its
 /// [`BlockPos`](ferrumc_math::BlockPos).
 ///
-/// The enum is `#[non_exhaustive]`: later milestones add chests, spawners, and
-/// the like, so downstream `match`es must carry a wildcard arm.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The enum is `#[non_exhaustive]`: later milestones add spawners and the like,
+/// so downstream `match`es must carry a wildcard arm. It is `PartialEq` but not
+/// `Eq` because [`ItemStack`] (inside [`ChestInventory`]) carries NBT component
+/// data that is `PartialEq`-only.
+// `Sign` inlines eight text lines (~264 B) while `Chest` is a boxed pointer; the
+// size gap trips `large_enum_variant`. Block-entities live only in a heap-backed
+// `BTreeMap` and are never stored in bulk arrays, so the per-entry footprint is
+// not worth an extra `Box<Sign>` indirection on the (far hotter) sign path.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum BlockEntity {
     /// A sign with front/back text.
     Sign(Sign),
+    /// A chest with a [`CHEST_SLOTS`]-slot item container.
+    Chest(ChestInventory),
 }
 
 /// Classifies a block-state id as the [`SignKind`] of the sign block it belongs
@@ -190,6 +264,21 @@ pub fn sign_kind_for_state(state_id: u32) -> Option<SignKind> {
     } else {
         None
     }
+}
+
+/// Returns `true` if `state_id` is a chest block that carries a 27-slot
+/// [`ChestInventory`] block-entity (a `minecraft:chest` or `minecraft:trapped_chest`).
+///
+/// Resolves the state id to its block name via the registry and matches the two
+/// vanilla single-chest families this milestone models. The ender chest (a
+/// per-player container) and the barrel (a distinct block-entity) are out of scope
+/// and classify as `false`.
+#[must_use]
+pub fn is_chest_state(state_id: u32) -> bool {
+    matches!(
+        state_id_to_block_name(state_id),
+        Some("chest" | "trapped_chest")
+    )
 }
 
 #[cfg(test)]
@@ -252,5 +341,46 @@ mod tests {
         assert_eq!(sign_kind_for_state(0), None);
         assert_eq!(sign_kind_for_state(1), None);
         assert_eq!(sign_kind_for_state(u32::MAX), None);
+    }
+
+    #[test]
+    fn new_chest_inventory_is_empty_with_fixed_slot_count() {
+        let chest = ChestInventory::new();
+        assert_eq!(chest.slots().len(), CHEST_SLOTS);
+        assert!(chest.slots().iter().all(|s| s.item().is_none()));
+        assert_eq!(chest.snapshot().len(), CHEST_SLOTS);
+        // An out-of-range slot is rejected rather than panicking.
+        assert!(chest.slot(CHEST_SLOTS).is_none());
+    }
+
+    #[test]
+    fn chest_inventory_slot_mut_round_trips() {
+        use ferrumc_items::{ComponentPatch, ItemId, ItemStack};
+        use std::num::NonZeroU8;
+
+        let mut chest = ChestInventory::new();
+        let stone = ItemStack::new(
+            ItemId::new(1).unwrap(),
+            NonZeroU8::new(64).unwrap(),
+            ComponentPatch::empty(),
+        );
+        *chest.slot_mut(0).expect("slot 0 in range") = stone.clone();
+        assert_eq!(chest.slot(0), Some(&stone));
+        assert!(chest.slot_mut(CHEST_SLOTS).is_none());
+    }
+
+    #[test]
+    fn chest_states_classify_chest_and_trapped_chest_only() {
+        let chest = block_default_state("chest").expect("chest in registry");
+        assert!(is_chest_state(chest));
+        let trapped = block_default_state("trapped_chest").expect("trapped_chest in registry");
+        assert!(is_chest_state(trapped));
+        // Ender chest is a per-player container (out of scope) and not a normal chest.
+        let ender = block_default_state("ender_chest").expect("ender_chest in registry");
+        assert!(!is_chest_state(ender));
+        // Non-chest blocks and an unknown id classify as false.
+        assert!(!is_chest_state(0));
+        assert!(!is_chest_state(1));
+        assert!(!is_chest_state(u32::MAX));
     }
 }
