@@ -87,6 +87,24 @@ impl SignFace {
     pub fn set_lines(&mut self, lines: [String; SIGN_LINES]) {
         self.lines = lines;
     }
+
+    /// Rebuilds a face from its persisted parts.
+    ///
+    /// Crate-internal, used only by [`crate::block_entity_codec`] to reconstruct a
+    /// sign read back from storage; the public API mutates a face through
+    /// [`SignFace::set_lines`] so callers cannot fabricate an arbitrary styled
+    /// face out of band.
+    pub(crate) fn from_parts(
+        lines: [String; SIGN_LINES],
+        color: String,
+        has_glowing_text: bool,
+    ) -> Self {
+        Self {
+            lines,
+            color,
+            has_glowing_text,
+        }
+    }
 }
 
 impl Default for SignFace {
@@ -163,6 +181,26 @@ impl Sign {
             self.front.set_lines(lines);
         } else {
             self.back.set_lines(lines);
+        }
+    }
+
+    /// Rebuilds a sign from its persisted parts.
+    ///
+    /// Crate-internal, used only by [`crate::block_entity_codec`] to reconstruct a
+    /// sign read back from storage. The public API builds a sign with
+    /// [`Sign::new`] and mutates only its line text, so this is the single seam
+    /// that can restore a sign's full styled/waxed state from disk.
+    pub(crate) fn from_parts(
+        kind: SignKind,
+        is_waxed: bool,
+        front: SignFace,
+        back: SignFace,
+    ) -> Self {
+        Self {
+            kind,
+            is_waxed,
+            front,
+            back,
         }
     }
 }

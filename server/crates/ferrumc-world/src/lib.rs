@@ -29,6 +29,7 @@
 //! [`ChunkLightData`] for the light masks and full-bright sky arrays.
 
 mod block_entity;
+mod block_entity_codec;
 mod block_state;
 mod chunk;
 mod chunk_section;
@@ -43,6 +44,10 @@ mod paletted_container;
 pub use block_entity::{
     is_chest_state, sign_kind_for_state, BlockEntity, ChestInventory, Sign, SignFace, SignKind,
     CHEST_SLOTS, SIGN_LINES,
+};
+pub use block_entity_codec::{
+    decode_block_entity, encode_block_entity, BlockEntityCodecError, MAX_BLOCK_ENTITY_PAYLOAD_LEN,
+    MAX_SIGN_COLOR_BYTES, MAX_SIGN_LINE_BYTES,
 };
 pub use block_state::BlockStateId;
 pub use chunk::{Chunk, ChunkLight, MAX_BLOCK_ENTITIES, SECTION_COUNT};
