@@ -6,13 +6,17 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 
 use ferrumc_core::{DimensionId, GameMode, PlayerId, WorldId};
+use ferrumc_items::{left_click_exchange, ItemStack};
 use ferrumc_math::{BlockPos, Cuboid, Direction, ShardPos, Vec3};
 use ferrumc_placement::{
     compute_fence_connection_state, compute_placement, is_water_source, NeighborQuery,
     PlacementContext, PlacementResult, PlacementRule,
 };
 use ferrumc_registry::block_state::{block_metadata, state_id_to_block_name};
-use ferrumc_world::{sign_kind_for_state, BlockEntity, BlockStateId, Sign, SIGN_LINES};
+use ferrumc_world::{
+    is_chest_state, sign_kind_for_state, BlockEntity, BlockStateId, ChestInventory, Sign,
+    SIGN_LINES,
+};
 
 use crate::error::SimError;
 use crate::loaded::LoadedChunkMap;
@@ -789,7 +793,21 @@ impl SimShard {
                         }
                     }
                     None => {
-                        chunk.remove_block_entity(position);
+                        // A chest block gains (or, if absent/of a different kind,
+                        // gains a fresh) empty container; an existing chest is
+                        // preserved so re-placing the same chest keeps its
+                        // contents. Any other block clears a stale block-entity.
+                        if is_chest_state(requested_state.as_u32()) {
+                            if !matches!(chunk.block_entity(position), Some(BlockEntity::Chest(_)))
+                            {
+                                let _ = chunk.set_block_entity(
+                                    position,
+                                    BlockEntity::Chest(ChestInventory::new()),
+                                );
+                            }
+                        } else {
+                            chunk.remove_block_entity(position);
+                        }
                     }
                 }
                 // A non-test gameplay edit drives the *persistence* signal: mark
@@ -1185,6 +1203,87 @@ impl SimShard {
         }
         sign.set_face_lines(is_front, lines);
         Some(sign.clone())
+    }
+
+    /// Opens the chest container at `position` for `player`, returning a snapshot
+    /// of its [`CHEST_SLOTS`](ferrumc_world::CHEST_SLOTS) item slots.
+    ///
+    /// Returns `None` (open refused) unless the actor is present, the target chunk
+    /// is resident, the target is within [`MAX_REACH`], and the block at
+    /// `position` is a chest. A chest block with no container block-entity yet
+    /// (e.g. one placed before this feature, or otherwise missing) gains a fresh
+    /// empty one here, so opening is robust to a missing block-entity. The chest
+    /// is the world's authoritative copy; the returned snapshot is what the
+    /// session layer encodes into the opening `SetContainerContent`.
+    ///
+    /// Called off-tick by the driver (request/response), like
+    /// [`preview_placement`](Self::preview_placement): the only mutation is the
+    /// lazy block-entity creation, which is idempotent and order-independent.
+    pub fn container_open(
+        &mut self,
+        player: PlayerId,
+        position: BlockPos,
+    ) -> Option<Vec<ItemStack>> {
+        let actor = self.players.get(&player).map(|state| state.position)?;
+        if !self.chunks.is_loaded(position.to_chunk_pos()) {
+            return None;
+        }
+        if !within_reach(actor, position) {
+            return None;
+        }
+        let chunk = self.chunks.get_mut(position.to_chunk_pos())?;
+        if !is_chest_state(chunk.get_block(position)?.as_u32()) {
+            return None;
+        }
+        // Lazily create the container if the chest block carries none yet.
+        if !matches!(chunk.block_entity(position), Some(BlockEntity::Chest(_))) {
+            let _ = chunk.set_block_entity(position, BlockEntity::Chest(ChestInventory::new()));
+        }
+        let Some(BlockEntity::Chest(chest)) = chunk.block_entity(position) else {
+            return None;
+        };
+        Some(chest.snapshot())
+    }
+
+    /// Applies a vanilla left-click on chest slot `slot` with the carried
+    /// `cursor`, returning the post-click cursor and the chest's full updated
+    /// snapshot.
+    ///
+    /// The exchange is [`left_click_exchange`], which is item-count conserving in
+    /// every branch (pickup / place / merge / swap), so this can never duplicate
+    /// or destroy an item. It is applied atomically against the world's
+    /// authoritative chest while the driver holds the shard, so two players
+    /// clicking the same chest are serialised — there is no read-modify-write race
+    /// on the connection's mirror.
+    ///
+    /// Returns `None` (the caller resyncs) if the actor is absent, the chunk is
+    /// not resident, the target is out of reach, the block is no longer a chest,
+    /// or `slot` is out of range — in every such case neither the chest nor the
+    /// passed cursor is mutated, so the cursor item is never lost.
+    pub fn container_left_click(
+        &mut self,
+        player: PlayerId,
+        position: BlockPos,
+        slot: usize,
+        mut cursor: ItemStack,
+    ) -> Option<(ItemStack, Vec<ItemStack>)> {
+        let actor = self.players.get(&player).map(|state| state.position)?;
+        if !self.chunks.is_loaded(position.to_chunk_pos()) {
+            return None;
+        }
+        if !within_reach(actor, position) {
+            return None;
+        }
+        let chunk = self.chunks.get_mut(position.to_chunk_pos())?;
+        if !is_chest_state(chunk.get_block(position)?.as_u32()) {
+            return None;
+        }
+        let Some(BlockEntity::Chest(chest)) = chunk.block_entity_mut(position) else {
+            return None;
+        };
+        let slot_ref = chest.slot_mut(slot)?;
+        left_click_exchange(slot_ref, &mut cursor);
+        Some((cursor, chest.snapshot()))
     }
 
     /// Refines a player placement's held state into the final block-state using
@@ -3113,5 +3212,106 @@ mod tests {
         assert_eq!(restored, 18, "undo restores all 18 cells across ticks");
         assert_eq!(block_at(&s, a), Some(BlockStateId::AIR));
         assert_eq!(block_at(&s, b), Some(BlockStateId::AIR));
+    }
+
+    /// The default `chest` block-state id from the pinned registry.
+    fn chest_state() -> u32 {
+        ferrumc_registry::block_state::block_default_state("chest").expect("chest in registry")
+    }
+
+    /// Builds a present stack of `count` `item_name`s with no components.
+    fn stack(item_name: &str, count: u8) -> ItemStack {
+        ItemStack::new(
+            ferrumc_items::ItemId::from_name(item_name).expect("item in registry"),
+            std::num::NonZeroU8::new(count).expect("non-zero count"),
+            ferrumc_items::ComponentPatch::empty(),
+        )
+    }
+
+    #[tokio::test]
+    async fn placing_a_chest_creates_an_empty_container() {
+        let p = player("chester");
+        let mut s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+        let _ = place_block(&mut s, p, target, chest_state(), Direction::Up, 1.0, 0.0, 1);
+
+        let chunk = s
+            .loaded_chunks()
+            .get(target.to_chunk_pos())
+            .expect("resident");
+        match chunk.block_entity(target) {
+            Some(BlockEntity::Chest(chest)) => {
+                assert_eq!(chest.slots().len(), ferrumc_world::CHEST_SLOTS);
+                assert!(chest.slots().iter().all(|slot| slot.item().is_none()));
+            }
+            other => panic!("expected an empty chest block-entity, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn container_open_validates_chest_reach_and_residency() {
+        let p = player("opener");
+        let mut s = shard_with_player(p).await;
+        let chest = BlockPos::new(8, 65, 8);
+        let _ = place_block(&mut s, p, chest, chest_state(), Direction::Up, 1.0, 0.0, 1);
+
+        // A reachable chest opens with a 27-slot empty snapshot.
+        let snapshot = s.container_open(p, chest).expect("chest opens");
+        assert_eq!(snapshot.len(), ferrumc_world::CHEST_SLOTS);
+        assert!(snapshot.iter().all(|slot| slot.item().is_none()));
+
+        // A non-chest block (air next to the chest) does not open.
+        assert!(s.container_open(p, BlockPos::new(9, 65, 8)).is_none());
+        // An out-of-reach chest does not open (far beyond MAX_REACH).
+        assert!(s.container_open(p, BlockPos::new(8, 65, 80)).is_none());
+        // An absent player does not open anything.
+        assert!(s.container_open(player("ghost"), chest).is_none());
+    }
+
+    #[tokio::test]
+    async fn container_left_click_put_then_take_conserves_items() {
+        let p = player("trader");
+        let mut s = shard_with_player(p).await;
+        let chest = BlockPos::new(8, 65, 8);
+        let _ = place_block(&mut s, p, chest, chest_state(), Direction::Up, 1.0, 0.0, 1);
+
+        // Place a whole cursor stack into empty chest slot 0.
+        let cursor = stack("diamond", 5);
+        let (cursor, snapshot) = s
+            .container_left_click(p, chest, 0, cursor)
+            .expect("place into empty slot");
+        assert!(cursor.item().is_none(), "cursor emptied after placing");
+        assert_eq!(snapshot[0].count(), 5);
+        assert_eq!(
+            snapshot[0].item(),
+            ferrumc_items::ItemId::from_name("diamond")
+        );
+
+        // Take the whole stack back onto an empty cursor.
+        let (cursor, snapshot) = s
+            .container_left_click(p, chest, 0, ItemStack::empty())
+            .expect("pick the stack back up");
+        assert_eq!(cursor.count(), 5, "no item duplicated or lost");
+        assert_eq!(cursor.item(), ferrumc_items::ItemId::from_name("diamond"));
+        assert!(
+            snapshot[0].item().is_none(),
+            "chest slot emptied after pickup"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_left_click_rejects_out_of_range_slot_without_losing_cursor() {
+        let p = player("fumbler");
+        let mut s = shard_with_player(p).await;
+        let chest = BlockPos::new(8, 65, 8);
+        let _ = place_block(&mut s, p, chest, chest_state(), Direction::Up, 1.0, 0.0, 1);
+
+        // An out-of-range slot is refused; the caller keeps its cursor (no loss).
+        assert!(s
+            .container_left_click(p, chest, ferrumc_world::CHEST_SLOTS, stack("diamond", 3))
+            .is_none());
+        // The chest is untouched.
+        let snapshot = s.container_open(p, chest).expect("chest opens");
+        assert!(snapshot.iter().all(|slot| slot.item().is_none()));
     }
 }

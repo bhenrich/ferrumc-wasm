@@ -17,6 +17,10 @@ ferrumc-math = { workspace = true }
 # The world model the simulation owns: `Chunk` is the resident chunk data and
 # `FlatWorldGenerator` is the miss path of the load-or-generate flow.
 ferrumc-world = { workspace = true }
+# ItemStack + left_click_exchange: the sim owns chest container mutation, applying
+# the conserving slot/cursor exchange against a chest block-entity. ferrumc-world
+# already depends on ferrumc-items, so this edge adds no new cycle.
+ferrumc-items = { workspace = true }
 # Pure placement rules: the authoritative place path turns the held item's default
 # block-state into the correct rotated/faced/halved state via `compute_placement`.
 # Depends only on core/math/registry, so this introduces no dependency cycle.
