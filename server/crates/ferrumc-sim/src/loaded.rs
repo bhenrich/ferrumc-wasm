@@ -23,7 +23,10 @@ use std::collections::BTreeMap;
 
 use ferrumc_core::{DimensionId, WorldId};
 use ferrumc_math::ChunkPos;
-use ferrumc_storage::{ChunkKey, ChunkOverlayRecord, ChunkRecord, SchemaVersion, WorldStore};
+use ferrumc_storage::{
+    ChunkKey, ChunkOverlayRecord, ChunkRecord, SchemaVersion, WorldStore,
+    OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES,
+};
 use ferrumc_world::{Chunk, FlatWorldGenerator};
 
 use crate::error::{SimError, SimResult};
@@ -41,10 +44,14 @@ pub const CHUNK_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 /// The schema version stamped on chunk *overlay* records.
 ///
 /// Distinct from [`CHUNK_SCHEMA_VERSION`] (full-chunk snapshots, v1): an overlay
-/// carries only the player-modified sections plus a section mask and capture
-/// tick, a different on-disk shape, so it is versioned separately (v2). Storage
-/// preserves it verbatim.
-pub const OVERLAY_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(2);
+/// carries only the player-modified sections plus a section mask, capture tick,
+/// and the chunk's block entities, a different on-disk shape, so it is versioned
+/// separately. v3 adds the block-entity section (sign text + chest contents) on
+/// top of the v2 block-state overlay; a v2 record on disk still loads, with no
+/// block entities (see [`OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES`]). Storage preserves
+/// the value verbatim.
+pub const OVERLAY_SCHEMA_VERSION: SchemaVersion =
+    SchemaVersion::new(OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES);
 
 /// How a chunk entered memory during the load-or-generate flow.
 ///
@@ -840,6 +847,70 @@ mod tests {
         // A loaded chunk is clean: it is not immediately re-persisted.
         assert!(!reloaded.persist_dirty_sections().any());
         let _ = key;
+    }
+
+    #[tokio::test]
+    async fn block_entities_round_trip_through_store_reload() {
+        use ferrumc_items::{ComponentPatch, ItemId, ItemStack};
+        use ferrumc_math::BlockPos;
+        use ferrumc_world::{BlockEntity, ChestInventory, Sign, SignKind};
+        use std::num::NonZeroU8;
+
+        let store = InMemoryStore::new();
+        let generator = gen();
+        let pos = ChunkPos::new(2, 2);
+        let mut m = map();
+        m.acquire(&store, &generator, pos, spawn_ticket())
+            .await
+            .expect("acquire");
+
+        // A sign with text and a chest holding a stack, both at in-chunk positions.
+        let sign_pos = pos.origin_block(64);
+        let chest_pos = BlockPos::new(sign_pos.x() + 1, 70, sign_pos.z() + 1);
+        let lines = [
+            "first".to_owned(),
+            "second".to_owned(),
+            String::new(),
+            "fourth".to_owned(),
+        ];
+        let mut sign = Sign::new(SignKind::Sign);
+        sign.set_face_lines(true, lines.clone());
+        let mut chest = ChestInventory::new();
+        *chest.slot_mut(5).expect("slot 5") = ItemStack::new(
+            ItemId::from_name("diamond").expect("diamond in registry"),
+            NonZeroU8::new(17).expect("non-zero"),
+            ComponentPatch::empty(),
+        );
+        {
+            let chunk = m.get_mut(pos).expect("resident");
+            chunk
+                .set_block_entity(sign_pos, BlockEntity::Sign(sign.clone()))
+                .expect("set sign");
+            chunk
+                .set_block_entity(chest_pos, BlockEntity::Chest(chest.clone()))
+                .expect("set chest");
+            // A block-entity edit marks its section persist-dirty (mirroring the sim
+            // shard's sign/chest handlers), so an overlay is emitted.
+            chunk.mark_persist_dirty(sign_pos);
+        }
+        let overlays = m.take_persist_dirty(1);
+        store.save_chunk_overlays(overlays).await.expect("persist");
+
+        // A fresh map reloads the chunk and reconstructs BOTH block entities with
+        // their exact contents (sign text restored; chest item id + count conserved).
+        let mut m2 = map();
+        m2.acquire(&store, &generator, pos, spawn_ticket())
+            .await
+            .expect("reload");
+        let reloaded = m2.get(pos).expect("resident");
+        assert_eq!(
+            reloaded.block_entity(sign_pos),
+            Some(&BlockEntity::Sign(sign))
+        );
+        assert_eq!(
+            reloaded.block_entity(chest_pos),
+            Some(&BlockEntity::Chest(chest))
+        );
     }
 
     #[tokio::test]

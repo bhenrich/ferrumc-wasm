@@ -1182,8 +1182,9 @@ impl SimShard {
     /// a reloaded sign stays editable instead of being permanently blank. On
     /// acceptance it replaces the addressed face's four text lines, leaving the
     /// face's color/glow and the other face untouched, and returns a clone of the
-    /// updated sign for the [`GameOutput::SignUpdated`] broadcast. No persistence
-    /// signal is raised this milestone (sign-text persistence is a follow-up).
+    /// updated sign for the [`GameOutput::SignUpdated`] broadcast. The chunk is
+    /// marked persist-dirty so the new text is captured into the overlay store and
+    /// survives a chunk unload/reload and a server restart.
     fn apply_sign_update(
         &mut self,
         player: PlayerId,
@@ -1217,7 +1218,12 @@ impl SimShard {
             return None;
         }
         sign.set_face_lines(is_front, lines);
-        Some(sign.clone())
+        let updated = sign.clone();
+        // A sign-text edit changes only the block entity, not the block state, so
+        // it does not go through `set_block`; mark the chunk persist-dirty here (as
+        // an accepted block edit does) so the new text reaches the overlay store.
+        chunk.mark_persist_dirty(position);
+        Some(updated)
     }
 
     /// Opens the chest container at `position` for `player`, returning a snapshot
@@ -1298,7 +1304,13 @@ impl SimShard {
         };
         let slot_ref = chest.slot_mut(slot)?;
         left_click_exchange(slot_ref, &mut cursor);
-        Some((cursor, chest.snapshot()))
+        let snapshot = chest.snapshot();
+        // The exchange mutated the chest block entity (not the block state), so mark
+        // the chunk persist-dirty here (as an accepted block edit does) to write the
+        // new contents to the overlay store; an out-of-range slot returned above
+        // without mutating, so we only reach this on an applied change.
+        chunk.mark_persist_dirty(position);
+        Some((cursor, snapshot))
     }
 
     /// Refines a player placement's held state into the final block-state using
@@ -3110,6 +3122,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_sign_marks_chunk_persist_dirty() {
+        let p = player("editor");
+        let mut s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+        let _ = place_block(&mut s, p, target, oak_sign(), Direction::Up, 1.0, 0.0, 1);
+        // Placement already marked the chunk persist-dirty; drain it so the test
+        // isolates the sign-text edit's own persistence signal.
+        let _ = s.loaded_chunks_mut().take_persist_dirty(0);
+        assert!(!s
+            .loaded_chunks()
+            .get(target.to_chunk_pos())
+            .expect("resident")
+            .persist_dirty_sections()
+            .any());
+
+        s.enqueue(GameInput::UpdateSign {
+            player: p,
+            position: target,
+            is_front: true,
+            lines: [
+                "saved".to_owned(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+        })
+        .expect("room");
+        let _ = s.run_tick();
+
+        assert!(
+            s.loaded_chunks()
+                .get(target.to_chunk_pos())
+                .expect("resident")
+                .persist_dirty_sections()
+                .any(),
+            "a sign-text edit must mark the chunk persist-dirty so the text persists",
+        );
+    }
+
+    #[tokio::test]
     async fn update_sign_recreates_a_missing_block_entity_for_a_reloaded_sign() {
         let p = player("editor");
         let mut s = shard_with_player(p).await;
@@ -3362,6 +3414,51 @@ mod tests {
         assert!(
             snapshot[0].item().is_none(),
             "chest slot emptied after pickup"
+        );
+    }
+
+    #[tokio::test]
+    async fn chest_item_move_marks_chunk_persist_dirty_and_a_refused_click_does_not() {
+        let p = player("trader");
+        let mut s = shard_with_player(p).await;
+        let chest = BlockPos::new(8, 65, 8);
+        let _ = place_block(&mut s, p, chest, chest_state(), Direction::Up, 1.0, 0.0, 1);
+        // Drain the placement's persist-dirty signal so the test isolates the item
+        // move's own.
+        let _ = s.loaded_chunks_mut().take_persist_dirty(0);
+        assert!(!s
+            .loaded_chunks()
+            .get(chest.to_chunk_pos())
+            .expect("resident")
+            .persist_dirty_sections()
+            .any());
+
+        // An applied item move marks the chunk persist-dirty.
+        let _ = s
+            .container_left_click(p, chest, 0, stack("diamond", 5))
+            .expect("place into slot");
+        assert!(
+            s.loaded_chunks()
+                .get(chest.to_chunk_pos())
+                .expect("resident")
+                .persist_dirty_sections()
+                .any(),
+            "a chest item move must mark the chunk persist-dirty so contents persist",
+        );
+
+        // A refused click (out-of-range slot) mutates nothing and must NOT mark the
+        // chunk persist-dirty.
+        let _ = s.loaded_chunks_mut().take_persist_dirty(0);
+        assert!(s
+            .container_left_click(p, chest, ferrumc_world::CHEST_SLOTS, stack("diamond", 1))
+            .is_none());
+        assert!(
+            !s.loaded_chunks()
+                .get(chest.to_chunk_pos())
+                .expect("resident")
+                .persist_dirty_sections()
+                .any(),
+            "a refused click must not mark the chunk persist-dirty",
         );
     }
 
