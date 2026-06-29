@@ -164,6 +164,10 @@ impl OutboundPriority {
             | ClientboundPlayPacket::SetPlayerTeam(_)
             | ClientboundPlayPacket::BossBar(_)
             | ClientboundPlayPacket::OpenSignEditor(_)
+            // OpenScreen opens a container GUI in direct response to an interaction;
+            // like OpenSignEditor it rides State so it is not tail-dropped behind
+            // bulk world traffic (the connection sends it mandatory at the call site).
+            | ClientboundPlayPacket::OpenScreen(_)
             | ClientboundPlayPacket::SetDefaultSpawnPosition(_) => Self::State,
             ClientboundPlayPacket::BlockUpdate(_)
             | ClientboundPlayPacket::ChunkDataAndLight(_)
@@ -308,7 +312,11 @@ impl Criticality {
             | ClientboundPlayPacket::SetPlayerTeam(_)
             | ClientboundPlayPacket::BossBar(_)
             | ClientboundPlayPacket::BlockEntityData(_)
-            | ClientboundPlayPacket::OpenSignEditor(_) => Self::Droppable,
+            | ClientboundPlayPacket::OpenSignEditor(_)
+            // OpenScreen defaults to droppable like the other GUI-open packets; the
+            // chest-open path sends it mandatory explicitly so a busy client still
+            // reliably gets the window it just asked to open.
+            | ClientboundPlayPacket::OpenScreen(_) => Self::Droppable,
         }
     }
 }
