@@ -75,9 +75,12 @@ struct SessionEntry {
     /// The player's last-known pitch in degrees (seeded at join, refreshed from
     /// every movement output).
     pitch: f32,
-    /// The pre-encoded `SetEquipment` body (main-hand slot + trusted Slot) for this
-    /// player, cached at join and refreshed on a hotbar change, sent to viewers as
-    /// they enter view. Empty means "no equipment to show" (the send is skipped).
+    /// The pre-encoded `SetEquipment` body (the player's full equipment set — main
+    /// hand, off hand, and the four armor pieces — as continuation-terminated
+    /// slot+Slot entries) for this player, cached at join and refreshed on any
+    /// held-item or worn-equipment change, sent to viewers as they enter view.
+    /// Empty means "no equipment to show" (the send is skipped). The body is opaque
+    /// here: the app owns the trusted Slot encoder and the equipment-slot layout.
     equipment: Vec<u8>,
     /// The last position of each *subject* (keyed by the subject's network
     /// `entity_id`) actually **delivered** to this viewer.
@@ -373,13 +376,13 @@ impl SessionRouter {
     }
 
     /// Joins `player` exactly like [`join_player`](Self::join_player), but also
-    /// caches their pre-encoded `equipment` (main-hand `SetEquipment` body) so it is
+    /// caches their pre-encoded `equipment` (the full `SetEquipment` body) so it is
     /// sent to every viewer the join makes the player visible to.
     ///
     /// Caching the equipment *at join* (rather than via a follow-up call) closes the
     /// enter-view race: viewers that become visible to the joiner during this call
-    /// receive the held item immediately with the spawn, not only after the next
-    /// hotbar change. An empty `equipment` skips the cosmetic send. All the error and
+    /// receive the full equipment set immediately with the spawn, not only after the
+    /// next change. An empty `equipment` skips the cosmetic send. All the error and
     /// backpressure behaviour of [`join_player`](Self::join_player) applies here.
     pub fn join_player_with_equipment(
         &mut self,
@@ -1040,10 +1043,10 @@ impl SessionRouter {
         }
     }
 
-    /// Broadcasts `player`'s changed held item (the pre-encoded `equipment`
-    /// [`SetEquipment`](set_equipment_shell) body) to every viewer that currently
-    /// has `player` spawned, and refreshes the cached body so later viewers entering
-    /// view receive it too.
+    /// Broadcasts `player`'s changed equipment (the pre-encoded `equipment`
+    /// [`SetEquipment`](set_equipment_shell) body — the full set: main hand, off
+    /// hand, and armor) to every viewer that currently has `player` spawned, and
+    /// refreshes the cached body so later viewers entering view receive it too.
     ///
     /// The body is built app-side (it owns the trusted Slot encoder) and passed
     /// opaque. Only viewers holding a [`delivered`](SessionEntry::delivered) baseline
@@ -2931,7 +2934,7 @@ mod tests {
         assert_eq!((rel.delta_x(), rel.delta_y(), rel.delta_z()), (12288, 0, 0));
     }
 
-    /// A non-empty pre-encoded main-hand equipment body (slot 0 + a fake Slot).
+    /// A non-empty pre-encoded equipment body (a single slot 0 entry + a fake Slot).
     /// The router treats it opaquely; only its non-emptiness and round-trip matter.
     fn equipment_body() -> Vec<u8> {
         vec![0x00, 0x01, 0x01]
