@@ -4,10 +4,10 @@
 > Last updated: 2026-06-29.
 
 ## Snapshot
-- Branch: `rework/v2-skeleton` · HEAD `f9f61c9c` · 120 commits ahead of the v1 base (`75d6f73e`) — 41 commits past the prior `f4d7b1a5` snapshot, after a large autonomous merge batch (see "Shipped (this autonomous batch)").
-- 1347 tests, all green (0 failed; grown from the prior ~1118 across the new lanes). Every commit passes: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask generate --check`, `cargo test --workspace`.
+- Branch: `rework/v2-skeleton` · HEAD `274f53ba` · **85 commits ahead of `origin/rework/v2-skeleton`** — all LOCAL, unpushed (origin = github.com/ferrumc-rs/ferrumc). (165 commits ahead of `master`.)
+- **1490 tests, all green (0 failed)** across the workspace. All four gates verified green at HEAD: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask generate --check`, `cargo test --workspace`.
 - North star: **a deterministic, Rust-native, observable creative/minigame server core for vanilla 1.21.8 clients** — NOT full vanilla.
-- Validated by a **live independent client** (PrismarineJS `minecraft-protocol`): status (proto 772) → offline login → play → chunks → cross-boundary streaming, all pass.
+- Validated by a **live independent client** (PrismarineJS `minecraft-protocol`) AND a **real vanilla 1.21.8 client** (Saad's): status (proto 772) → offline login → play → chunks → cross-boundary streaming → place/break → restart-persistence, all pass. Dashboard proven demo-ready against the real client.
 
 ## Shipped (this rework)
 Networking / protocol:
@@ -33,67 +33,82 @@ Ops / tooling:
 - `e23c19d4`/`f4d7b1a5` independent node `minecraft-protocol` black-box smoke (passing for join/world/streaming)
 - docs: FEATURES.md · ROADMAP.md · public-alpha.md · parity/v1-v2.md · dev/parallel-workstreams.md
 
-## Shipped (this autonomous batch)
-Merged across 41 commits since the prior snapshot (newest first per the orchestration merge log). Grouped:
+## Shipped — autonomous batch (32 lanes, this run)
+32 feature lanes merged serially since the prior snapshot. Each lane was built in an isolated worktree, gated green, and integrated one at a time. Grouped by theme (commit hashes from the merge log):
 
-Alpha-hardening / security:
-- `810b3ee7` serverbound packet budget wired into the play read loop (admit_frame charge → disconnect, 300/600 cfg) + audit DoS fix (post-join-drain flood was skipping leave-save + ReleaseChunks → permanent chunk-ticket leak).
-- `a2a0cacd` hostile-input proptest fuzz for codec/nbt/net + real fix (net compression empty-packet at threshold 0).
-- `89601a04` ops: per-IP connection limiter + whitelist + ban + access-control config (config `access.rs`, net `ip_limit.rs`, tests).
+**Alpha-hardening / security:**
+- `810b3ee7` serverbound packet budget wired into the play read loop (admit_frame charge → disconnect, 300/600 cfg) **+ audit DoS fix** (post-join-drain flood was skipping leave-save + ReleaseChunks → permanent chunk-ticket leak).
+- `a2a0cacd` hostile-input proptest fuzz for codec/nbt/net **+ real fix** (net compression empty-packet at threshold 0).
+- `89601a04` ops — per-IP connection limiter + whitelist + ban + access-control config (config `access.rs`, net `ip_limit.rs`).
+- `622def09` SIGTERM/SIGHUP now trigger the same graceful shutdown + flush as ctrl_c (was SIGINT-only — smoke found it).
+- `f9f61c9c` real-client black-box smoke extended — **31/31 PASS** vs live + restarted server (status → login → chunks → set-creative-slot → stateful place/break with state-id asserts → cross-chunk → reconnect → restart-persistence).
 - `7ab0a632` `SUPPORTED_VERSION.md` + README v2 positioning + gitignore `config.toml`.
-- `f9f61c9c` real-client black-box smoke extended — 31/31 PASS vs live + restarted server (status → login → chunks → set-creative-slot → stateful place/break with state-id asserts → cross-chunk → reconnect → restart-persistence).
 
-Persistence:
-- `69c1a77e` player-state (pos/yaw/pitch/gamemode/hotbar/46-slot inventory) persists across rejoin AND restart; JoinSet shutdown drain; Codex-found teleport-mirror bug fixed + regression test.
+**Persistence (now COMPLETE for the flat-world milestone):**
+- `69c1a77e` player-state (pos / yaw / pitch / gamemode / hotbar / 46-slot inventory) persists across rejoin AND restart; JoinSet shutdown drain; **Codex-found teleport-mirror desync fixed** + regression test.
+- chunk-edit overlays + journal (redb) — player-changed blocks survive unload/reload + restart.
+- `8d42c04f` block-entity persistence — sign text + chest contents serialized into the chunk overlay (schema v3, bounded codec, item-conserving, malformed-safe, v2 backward-compat).
+- `274f53ba` **multi-section overlay data-loss FIX** (cumulative ever-persist-edited section mask) — edits to different sections of one chunk across different ticks/flushes all survive restart. Was a CRITICAL data-loss bug; found by audit, fixed + audited + regression test. **This commit is HEAD.**
 
-Gameplay / creative:
-- `c59930ce` placement edge cases (trapdoor / fence-gate / button / lever / anvil / end-rod / stair-corner) + sim neighbour-state exposure.
-- `e90aa1a2` block-entities SIGNS — place → OpenSignEditor → UpdateSign → store → BlockEntityData broadcast → viewers + joiners render; world block-entity model (4096/chunk cap), sim apply, session packets, 2-client integ test. (v1: sign text in-memory only.)
-- `f84e34a2` + `dba5e41b` worldedit-lite (`/fill` `/replace` `/undo`) via sim region funnel, applied across ticks under a per-tick budget (8192/tick default; bounded pending/undo caps).
-- `0f801bb4` presentation builders (titles / subtitle / actionbar / sound / particle) + `/title` `/subtitle` `/actionbar` `/playsound` `/particle` commands.
-- `6bb1eb5f` scoreboard / team / bossbar session builders + `/scoreboard` `/team` `/bossbar` commands.
+**Gameplay / creative:**
+- `c59930ce` + `7ee6626b` placement (2 rounds, ~25 block families) — trapdoor / fence-gate / button / lever / anvil / end-rod / stair-corners, then waterlogging / double-slab / candle merges / walls / glass-panes / iron-bars / ladders / chains / lanterns / amethyst / dripstone.
+- `a80d366d` multi-block doors/beds (atomic, obstruction-rejected) + sim honors `place_at` (double-slab/candle merges) + water-replaceable cell (waterlogging fires in-game).
+- `e90aa1a2` SIGN block entities — place → OpenSignEditor → UpdateSign → store → BlockEntityData broadcast → viewers + joiners render.
+- `df84f65f` functional CHESTS (block-entity #2) — place → OpenScreen → put/take → persist; server-authoritative, dupe/loss-safe (audited hard), CloseContainer.
+- `f84e34a2` + `dba5e41b` worldedit-lite `/fill` `/replace` `/undo` via sim region funnel, applied across ticks under a per-tick budget (8192/tick default; bounded pending/undo caps).
+- `0f801bb4` presentation builders (titles / subtitle / actionbar / sound / particle) + `/title` `/subtitle` `/actionbar` `/playsound` `/particle`.
+- `6bb1eb5f` scoreboard / team / bossbar session builders + `/scoreboard` `/team` `/bossbar`.
+- `10f58ff3` `/tp` (coords/player) + `/weather` (GameEvent) + targeted `/gamemode <player>`.
+- `ceeeea1b` day-night cycle — deterministic WorldTime clock + Update Time broadcast + `/time set|add|query` (sun/moon animate on clients).
+- `52f26043` armor (slots 5-8) + off-hand (45) broadcast via SetEquipment (was mainhand-only) → players visibly armored.
 
-Observability / dashboard:
-- `a9d65005` rebuilt dashboard — Svelte 5 SPA + axum SSE `/events` + `/api/snapshot` + `ServeDir(dist)` (retired the htmx `pages.rs`).
+**Plugins:**
+- `f14de4f4` plugin events Chat(deny) / Interact(deny) / PlayerMove(throttled) + greeter + chat-filter sample plugin + `WorldView.player_position`; **+ audit fix** (interact-Deny ghost block heal).
+- `50f585cb` decision-tally fix — chat/interact plugin decisions now counted in `fold_event_decision` (was block-only) → surface on dashboard + /metrics.
+
+**Observability / dashboard:**
+- `a9d65005` rebuilt dashboard — Svelte 5 SPA over axum SSE `/events` + `/api/snapshot` + `ServeDir(dist)` (retired the htmx `pages.rs`).
 - `3a9e6dd6` live telemetry wiring — bounded net_telemetry hub + plugin decision tally → live snapshot aggregation (per-player net, packet-trace summaries, plugin_decisions).
-- `b8a4df1f` Prometheus `GET /metrics` exporter in the dashboard (zero-dep, reads live snapshot).
+- `b8a4df1f` Prometheus `GET /metrics` exporter (zero-dep, reads live snapshot; per-player feed).
+- **VERIFIED demo-ready** — all dashboard endpoints proven with live data against a real vanilla 1.21.8 client.
 
-Tooling / data:
-- `f0147795` 14 CB + 1 SB reserved protocol packets (titles / sounds / particles / scoreboard / team / bossbar / block-entity); ProtoVerify 15/15 ids match.
+**Tooling / data:**
+- `f0147795` 14 CB + 1 SB reserved protocol packets (titles / sounds / particles / scoreboard / team / bossbar / block-entity); ProtoVerify 15/15 ids match. (OpenScreen / CloseContainer / UpdateTime added by consuming lanes; the dead EntitySoundEffect entry was later dropped.)
 - `dffa2d11` registry named block/item id constants + drift-guard + de-magic'd block-rules plugin.
-- `2107c68a` real Anvil `.mca` region reader + chunk import + 16KB fixture + malformed-input tests (greenfield crate). (Startup map-load still un-wired.)
+- `2107c68a` + `827d033a` real Anvil `.mca` region reader + chunk import + malformed-input tests, **wired into startup** via `[world].anvil_import_dir`.
+- `783c3843` published characterization microbenchmarks (`docs/benchmarks/2026-06-29-10f58ff3.{md,json}`) — M5 Pro: chunk-gen ~146µs, chunk-encode ~832ns, placement-mix ~1.11µs, sim-tick@256 ~4.52µs.
 
-## Deferred / NOT-yet-built (GPT's "later" bucket — out of CreativeCore-v0 scope, in rough priority)
-1. **Published benchmark numbers** — harness exists; no numbers run on real hardware yet (commit SHA + hardware).
-2. **Fresh-clone build verification** — confirm a clean clone builds + runs.
-3. **Armor/offhand equipment** + remaining **placement edge cases** (waterlogging, rails, doors/beds multi-block). (Single-block edge cases — trapdoor/fence-gate/button/lever/anvil/end-rod/stair-corner — shipped this batch.)
-4. **Block entities: chests/containers** — prerequisite for survival storage. (Signs shipped as block-entity #1.)
-5. **Online-mode** auth + encryption; then **proxy/Velocity** forwarding. (Per-IP limit + whitelist + ban shipped this batch.)
-6. **Real terrain gen** (noise/biomes/caves/structures) + **real light engine** (currently full-bright).
-7. **Survival** — health/hunger/XP/death/respawn, crafting/smelting, containers/GUIs, tools/mining-time/drops.
-8. **Entities/mobs** — generic entity system, AI/pathfinding, item entities, projectiles, combat.
-9. **Fluids + block physics + redstone + scheduled/random ticks.**
-10. **Social (remaining)** — signed chat, resource packs. (Scoreboards/teams/bossbars/titles/sounds/particles shipped this batch.)
-11. **Ops (remaining)** — RCON/admin, anti-cheat, config hot-reload. (Ban/whitelist, per-IP rate-limit, and the dashboard /metrics exporter shipped this batch.)
-12. **Scale** — multi-shard runtime + cross-shard transfer + determinism replay harness.
-13. **Plugins** — WASM/Component-Model runtime; the C-ABI cdylib loader is a stub (in-process plugins work today).
+### Quality / process (how this batch stayed honest)
+- Every lane ran all four gates green in its own worktree before integration, and the full gate was re-run on trunk after each serial merge — no lane moved trunk while another rebase was in flight.
+- Hot / risky / protocol-touching lanes got an **independent Codex audit** before merge. That audit loop **caught + fixed 4 real bugs** the first-pass review missed:
+  1. player-state teleport-mirror desync (`/gamemode <player>` mirrored to the wrong target),
+  2. budget post-join-drain chunk-ticket-leak DoS (flood skipped leave-save + ReleaseChunks → permanent leak),
+  3. plugin interact-Deny ghost block (denied interaction left a client-side ghost),
+  4. multi-section overlay data-loss (cross-tick edits to different sections of one chunk lost on reload).
+- A final cross-cutting integration review (`dae6520e` review-fixes) confirmed the trunk coherent + demo-ready: 1430 tests / 0 fail at review time, no CRITICAL findings, no conflict cruft, SIGTERM durable, exhaustive dispatch. The 1 HIGH (`/gamemode <player>` target-mirror) + 3 MED it found were all fixed.
 
-## Known minor follow-ups (not blocking)
-- JoinGame `dimension=undefined` seen by the node client (it still joins + gets chunks; likely a log/field-name detail, verify the JoinGame dimension field).
-- Window-click container handling is minimal (state-id check → resync).
-- Full-bright lighting placeholder.
+## Deferred / NOT-yet-built (out of the flat-world / creative-core milestone)
+Big buckets, still entirely deferred:
+1. **Online-mode** auth + encryption; then **proxy/Velocity** forwarding. (Offline login + per-IP limit + whitelist + ban exist; the encryption/auth handshake does not.)
+2. **Real terrain gen** (noise/biomes/caves/structures) + **real light engine** (currently full-bright; flat world only).
+3. **Survival** — health/hunger/XP/death/respawn, crafting/smelting, tools/mining-time/drops, container GUIs beyond chests.
+4. **Entities/mobs** — generic entity system, AI/pathfinding, item-drop entities, projectiles, combat.
+5. **Fluids + block physics + redstone + scheduled/random ticks.**
+6. **Scale** — multi-shard runtime + cross-shard transfer + determinism replay harness.
+7. **Plugins** — WASM/Component-Model runtime; the C-ABI cdylib loader is a stub (in-process Rust plugins work today).
 
-New tracked follow-ups (this batch; non-blocking):
-- Sign text persistence across restart/unload (v1 stores sign text in-memory only).
-- Crash-safety flush: only SIGINT (ctrl_c) flushes today; add a SIGTERM/SIGKILL graceful-shutdown path (smoke found this).
-- Player inventory data-components (schema v2) + conditional `PlayerAbilities`-on-join.
-- Anvil startup map-load wiring (reader crate done; not yet wired into startup).
-- Per-sign edit-session ownership.
-- Budget: `burst < 1.0` config validation + durable Prometheus kick metric.
+## Tracked follow-ups (small, non-blocking)
+- **Anvil-imported-world edit-revert-on-reload:** the overlay reload path regenerates the FLAT baseline, so an Anvil-imported world reverts imported terrain on edit + reload. Pre-existing, NOT reachable on the flat-world milestone (runtime save is overlay-only). Fix when imported worlds become editable + persistent.
+- **Inventory data-components (schema v2)** + **conditional `PlayerAbilities`-on-join.**
+- **Per-sign edit-session ownership** (no ownership check on re-opening an edit session today).
+- **Budget `burst < 1.0` config validation** + a durable Prometheus kick counter.
+- **SIGKILL durability:** SIGTERM/SIGHUP now flush (`622def09`), but SIGKILL is uncatchable — bound the loss window with a periodic flush.
+- **Window-click container handling** is minimal (state-id check → resync; full click-modes / sneak-place deferred).
+- **JoinGame `dimension=undefined`** seen by the node client (still joins + gets chunks; verify the JoinGame dimension field).
 - Presentation/scoreboard hand-encoded wire payloads: confirm via a real client (golden tests guard regression only).
 
 ## Public-alpha gate
-Mostly green (see `docs/public-alpha.md`). The real-client smoke now covers place/break/reconnect/restart-persistence (31/31). Open: published benchmarks, fresh-clone build check.
+Mostly green (see `docs/public-alpha.md`). The real-client smoke covers place/break/reconnect/restart-persistence (31/31); characterization benchmarks are published (`docs/benchmarks/`); the dashboard is verified demo-ready against a real client. Open: fresh-clone build verification on a clean checkout.
 
 ## How to run / test
 ```
