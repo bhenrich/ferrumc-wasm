@@ -983,6 +983,28 @@ fields = [
     { name = "fade_out", type = "i32" },
 ]
 
+# --- Day-night cycle (world time) ------------------------------------------------
+#
+# Id verified against fixtures/protocol/1_21_8/protocol.json (protocol 772):
+# update_time 0x6A. minecraft-data: play.toClient.update_time ("Update Time").
+#
+# Fully typed (no deviation). `world_age` is the monotonic total world time in
+# ticks; `time_of_day` is the day-night phase in ticks (0..24000, where 1000 = day,
+# 6000 = noon, 13000 = night, 18000 = midnight). `time_of_day_increasing` (the
+# 1.21.2+ `tickDayTime` bool) tells the client whether to keep advancing the sky
+# locally between server updates; the server sends it `true` while the daylight
+# cycle runs (the default-on `doDaylightCycle` equivalent).
+[[packet]]
+state = "play"
+direction = "clientbound"
+name = "UpdateTime"
+id = 0x6A
+fields = [
+    { name = "world_age", type = "i64" },
+    { name = "time_of_day", type = "i64" },
+    { name = "time_of_day_increasing", type = "bool" },
+]
+
 # --- Sound effect (pre-reserved for the sound feature lane) ----------------------
 #
 # Id verified against fixtures/protocol/1_21_8/protocol.json (protocol 772):

@@ -26,7 +26,7 @@ use ferrumc_proto::generated::play::{
     SetPlayerTeam, SetSubtitleText, SetTitleAnimationTimes, SetTitleText, SoundEffect, SpawnEntity,
     SpawnInfo, SynchronizePlayerPosition, UnloadChunk, UpdateEntityPosition,
     UpdateEntityPositionAndRotation, UpdateEntityRotation, UpdateObjectives, UpdateScore,
-    UpdateSign, UseItemOn,
+    UpdateSign, UpdateTime, UseItemOn,
 };
 use ferrumc_proto::generated::status::{
     PingRequest, PongResponse, ServerboundStatusPacket, StatusRequest, StatusResponse,
@@ -413,6 +413,13 @@ fn play_clientbound_simple_packets_round_trip() {
         GameEvent::encode,
         GameEvent::decode,
         GameEvent::PACKET_ID,
+    );
+    // Update Time: world age + day-night phase (1000 = day) + the increasing flag.
+    roundtrip(
+        &UpdateTime::new(123_456, 1_000, true),
+        UpdateTime::encode,
+        UpdateTime::decode,
+        UpdateTime::PACKET_ID,
     );
     roundtrip(
         &SetCenterChunk::new(0, -7),

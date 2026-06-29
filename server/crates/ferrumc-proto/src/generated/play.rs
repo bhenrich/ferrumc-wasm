@@ -4002,6 +4002,64 @@ impl SetSubtitleText {
     }
 }
 
+/// `UpdateTime`: the play clientbound packet (wire id `0x6a`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateTime {
+    world_age: i64,
+    time_of_day: i64,
+    time_of_day_increasing: bool,
+}
+
+impl UpdateTime {
+    /// The wire packet id for `UpdateTime`.
+    pub const PACKET_ID: i32 = 0x6a;
+
+    /// Creates a new `UpdateTime` from its wire fields.
+    pub fn new(world_age: i64, time_of_day: i64, time_of_day_increasing: bool) -> Self {
+        Self {
+            world_age,
+            time_of_day,
+            time_of_day_increasing,
+        }
+    }
+
+    /// Returns the `world_age` field.
+    pub fn world_age(&self) -> i64 {
+        self.world_age
+    }
+
+    /// Returns the `time_of_day` field.
+    pub fn time_of_day(&self) -> i64 {
+        self.time_of_day
+    }
+
+    /// Returns the `time_of_day_increasing` field.
+    pub fn time_of_day_increasing(&self) -> bool {
+        self.time_of_day_increasing
+    }
+
+    /// Decodes a `UpdateTime` body from `reader` (any packet id is already consumed).
+    pub fn decode(reader: &mut BoundedReader<'_>) -> Result<Self, ProtoError> {
+        let world_age = reader.read_i64()?;
+        let time_of_day = reader.read_i64()?;
+        let time_of_day_increasing = wire::read_bool(reader)?;
+        Ok(Self {
+            world_age,
+            time_of_day,
+            time_of_day_increasing,
+        })
+    }
+
+    /// Encodes this value (packet id, when present, then fields) into `buf`.
+    pub fn encode(&self, buf: &mut BytesMut) -> Result<(), ProtoError> {
+        ferrumc_codec::write_var_int(buf, Self::PACKET_ID);
+        wire::write_i64(buf, self.world_age);
+        wire::write_i64(buf, self.time_of_day);
+        wire::write_bool(buf, self.time_of_day_increasing);
+        Ok(())
+    }
+}
+
 /// `SetTitleText`: the play clientbound packet (wire id `0x6b`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetTitleText {
@@ -4397,6 +4455,8 @@ pub enum ClientboundPlayPacket {
     UpdateScore(UpdateScore),
     /// The `SetSubtitleText` packet.
     SetSubtitleText(SetSubtitleText),
+    /// The `UpdateTime` packet.
+    UpdateTime(UpdateTime),
     /// The `SetTitleText` packet.
     SetTitleText(SetTitleText),
     /// The `SetTitleAnimationTimes` packet.
@@ -4492,6 +4552,7 @@ impl ClientboundPlayPacket {
             SetSubtitleText::PACKET_ID => {
                 Ok(Self::SetSubtitleText(SetSubtitleText::decode(reader)?))
             }
+            UpdateTime::PACKET_ID => Ok(Self::UpdateTime(UpdateTime::decode(reader)?)),
             SetTitleText::PACKET_ID => Ok(Self::SetTitleText(SetTitleText::decode(reader)?)),
             SetTitleAnimationTimes::PACKET_ID => Ok(Self::SetTitleAnimationTimes(
                 SetTitleAnimationTimes::decode(reader)?,
@@ -4546,6 +4607,7 @@ impl ClientboundPlayPacket {
             Self::SetPlayerTeam(_) => SetPlayerTeam::PACKET_ID,
             Self::UpdateScore(_) => UpdateScore::PACKET_ID,
             Self::SetSubtitleText(_) => SetSubtitleText::PACKET_ID,
+            Self::UpdateTime(_) => UpdateTime::PACKET_ID,
             Self::SetTitleText(_) => SetTitleText::PACKET_ID,
             Self::SetTitleAnimationTimes(_) => SetTitleAnimationTimes::PACKET_ID,
             Self::SoundEffect(_) => SoundEffect::PACKET_ID,
@@ -4593,6 +4655,7 @@ impl ClientboundPlayPacket {
             Self::SetPlayerTeam(packet) => packet.encode(buf),
             Self::UpdateScore(packet) => packet.encode(buf),
             Self::SetSubtitleText(packet) => packet.encode(buf),
+            Self::UpdateTime(packet) => packet.encode(buf),
             Self::SetTitleText(packet) => packet.encode(buf),
             Self::SetTitleAnimationTimes(packet) => packet.encode(buf),
             Self::SoundEffect(packet) => packet.encode(buf),
