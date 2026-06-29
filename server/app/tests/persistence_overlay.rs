@@ -7,7 +7,7 @@
 //! - `placed_block_survives_a_restart` — a creative place is captured as a chunk
 //!   overlay, survives a graceful shutdown, and is reconstructed (over a
 //!   regenerated flat baseline) with the placed block intact when the store is
-//!   reopened on the same directory; the overlay carries the v2 schema version
+//!   reopened on the same directory; the overlay carries the v3 schema version
 //!   (so `schema_version` round-trips, the acceptance test's third property).
 //! - `untouched_generated_chunks_persist_nothing` — a session that generates the
 //!   spawn area but edits nothing leaves **zero** overlay records: every spawn
@@ -133,7 +133,7 @@ async fn placed_block_survives_a_restart() {
         .expect("clean shutdown");
 
     // 2. Reopen the SAME store directly and assert the placed block persisted as a
-    //    chunk overlay (schema v2), reconstructed over a regenerated flat baseline.
+    //    chunk overlay (schema v3), reconstructed over a regenerated flat baseline.
     let store = RedbStore::open(temp.path().join("world.redb")).expect("reopen store");
     let placed_chunk = ChunkPos::new(0, 0);
     let key = ChunkKey::new(WORLD, DIMENSION, placed_chunk);
@@ -144,8 +144,8 @@ async fn placed_block_survives_a_restart() {
         .expect("an overlay must exist for the edited chunk");
     assert_eq!(
         overlay.schema_version(),
-        SchemaVersion::new(2),
-        "overlay schema_version must round-trip as v2",
+        SchemaVersion::new(3),
+        "overlay schema_version must round-trip as v3 (block-entity-carrying)",
     );
 
     let mut chunk = FlatWorldGenerator::new().generate(placed_chunk);
