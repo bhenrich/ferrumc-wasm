@@ -118,6 +118,21 @@ pub struct Chunk {
     /// untouched chunk has an empty `persist_dirty` set and therefore produces no
     /// overlay record.
     persist_dirty: DirtySections,
+    /// Cumulative set of sections changed by a *gameplay* mutation since the chunk's
+    /// baseline was established — its generation, or an overlay load that reseeds it
+    /// via [`Chunk::restore_persist_edited_section`]. Set alongside `persist_dirty`
+    /// by [`Chunk::mark_persist_dirty`] but, unlike `persist_dirty`, **never** cleared
+    /// by [`Chunk::clear_persist_dirty`].
+    ///
+    /// This is the persistence *capture* signal, distinct from the per-flush
+    /// `persist_dirty` *gate*: a flush clears `persist_dirty` (which decides only
+    /// *whether* to flush) yet leaves `persist_edited` intact, so the overlay capture
+    /// always serializes the full set of ever-edited sections. Each last-write-wins
+    /// overlay overwrite is then a complete snapshot, so edits to different sections on
+    /// different flush ticks can no longer overwrite one another on reload. It mirrors
+    /// the block-entity capture, which likewise serializes the chunk's entire
+    /// block-entity set on every flush.
+    persist_edited: DirtySections,
     /// Placeholder lighting; always `None` until the lighting milestone.
     light: Option<ChunkLight>,
     /// Block entities (signs, ...) keyed by their absolute [`BlockPos`], bounded
@@ -136,6 +151,7 @@ impl Chunk {
             sections: std::array::from_fn(|_| ChunkSection::new()),
             dirty: DirtySections::new(),
             persist_dirty: DirtySections::new(),
+            persist_edited: DirtySections::new(),
             light: None,
             block_entities: BTreeMap::new(),
         }
@@ -232,6 +248,13 @@ impl Chunk {
     /// Marks the section owning `pos` persist-dirty: a gameplay mutation changed a
     /// block there and the chunk must be written to the overlay store.
     ///
+    /// This marks **both** the per-flush
+    /// [`persist_dirty_sections`](Self::persist_dirty_sections) gate (which decides
+    /// whether a flush happens and is cleared each flush) and the cumulative
+    /// [`persist_edited_sections`](Self::persist_edited_sections) capture set (which is
+    /// not cleared by a flush), so the section is re-captured by every later flush and
+    /// no longer overwritten when a different section is edited on a later tick.
+    ///
     /// Called **only** by the simulation layer after an accepted block edit, never
     /// by [`Chunk::set_block`] or the generator, so the world model stays
     /// cause-agnostic and the generated baseline never marks itself for
@@ -240,13 +263,51 @@ impl Chunk {
     pub fn mark_persist_dirty(&mut self, pos: BlockPos) {
         if let Some((section_index, _)) = self.resolve(pos) {
             self.persist_dirty.mark(section_index);
+            self.persist_edited.mark(section_index);
         }
     }
 
-    /// Clears every persist-dirty section. Called after the chunk's gameplay
-    /// edits have been captured into an overlay record for the storage layer.
+    /// Clears the per-flush persist-dirty section signal. Called after the chunk's
+    /// gameplay edits have been captured into an overlay record for the storage layer.
+    ///
+    /// This clears only the per-flush *gate*
+    /// ([`persist_dirty_sections`](Self::persist_dirty_sections)), **not** the
+    /// cumulative *capture* set
+    /// ([`persist_edited_sections`](Self::persist_edited_sections)): the next flush
+    /// re-captures every ever-edited section so each last-write-wins overlay overwrite
+    /// stays a complete snapshot.
     pub fn clear_persist_dirty(&mut self) {
         self.persist_dirty.clear();
+    }
+
+    /// Returns the cumulative persist-*edited* section set: every section a gameplay
+    /// mutation has changed since the chunk's baseline was established, **including**
+    /// sections flushed on an earlier tick (a flush does not clear this set).
+    ///
+    /// This is the set the overlay *capture* serializes. Persisting the full set on
+    /// every flush keeps each last-write-wins overwrite a complete snapshot, so edits
+    /// to different sections on different ticks cannot overwrite one another on reload.
+    /// Contrast [`persist_dirty_sections`](Self::persist_dirty_sections), the per-flush
+    /// signal that decides *whether* to flush and is cleared by
+    /// [`clear_persist_dirty`](Self::clear_persist_dirty).
+    #[must_use]
+    pub const fn persist_edited_sections(&self) -> &DirtySections {
+        &self.persist_edited
+    }
+
+    /// Marks section `section_index` cumulatively persist-edited **without** marking
+    /// it persist- or network-dirty.
+    ///
+    /// Called by the persistence load path after an overlay is applied over a
+    /// regenerated baseline: the overlay's sections differ from that baseline, so they
+    /// must be re-captured in full by the chunk's next overlay flush — otherwise a
+    /// later edit to a *different* section would overwrite them, the very data-loss
+    /// this cumulative set prevents. Seeding only the cumulative set (never
+    /// `persist_dirty`) keeps a freshly loaded, unedited chunk from triggering a
+    /// redundant immediate re-flush. An out-of-range index is ignored (see
+    /// [`DirtySections::mark`]), so the call cannot panic.
+    pub fn restore_persist_edited_section(&mut self, section_index: usize) {
+        self.persist_edited.mark(section_index);
     }
 
     /// Returns the chunk's lighting, or `None` while lighting is unimplemented
@@ -494,6 +555,58 @@ mod tests {
         chunk.mark_persist_dirty(BlockPos::new(0, MIN_Y - 1, 0));
         chunk.mark_persist_dirty(BlockPos::new(16, 0, 0)); // a different column
         assert!(!chunk.persist_dirty_sections().any());
+        assert!(!chunk.persist_edited_sections().any());
+    }
+
+    #[test]
+    fn mark_persist_dirty_also_marks_the_cumulative_edited_set() {
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        let pos = BlockPos::new(3, 5, 9); // section ((5 - (-64)) / 16) == 4
+        chunk.mark_persist_dirty(pos);
+        // The per-flush gate and the cumulative capture set both record the section.
+        assert!(chunk.persist_dirty_sections().is_dirty(4));
+        assert!(chunk.persist_edited_sections().is_dirty(4));
+    }
+
+    #[test]
+    fn clear_persist_dirty_keeps_the_cumulative_edited_set() {
+        // This is the data-loss fix at the unit level: a flush clears the per-flush
+        // gate but must NOT clear the cumulative capture set, so a later edit to a
+        // different section captures BOTH sections (mirroring block-entity capture).
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        let first = BlockPos::new(3, 5, 9); // section 4
+        let second = BlockPos::new(2, 70, 2); // section 8
+        chunk.mark_persist_dirty(first);
+        // Flush tick 1: the gate is cleared, the cumulative set is retained.
+        chunk.clear_persist_dirty();
+        assert!(!chunk.persist_dirty_sections().any());
+        assert!(chunk.persist_edited_sections().is_dirty(4));
+
+        // A later edit to a different section on a later flush tick.
+        chunk.mark_persist_dirty(second);
+        // The gate sees only the new section...
+        assert!(chunk.persist_dirty_sections().is_dirty(8));
+        assert!(!chunk.persist_dirty_sections().is_dirty(4));
+        // ...but the cumulative capture set retains BOTH, so the overlay overwrite is
+        // a complete snapshot and the first edit is not lost on reload.
+        assert!(chunk.persist_edited_sections().is_dirty(4));
+        assert!(chunk.persist_edited_sections().is_dirty(8));
+        assert_eq!(chunk.persist_edited_sections().count(), 2);
+    }
+
+    #[test]
+    fn restore_persist_edited_section_marks_only_the_cumulative_set() {
+        // The load path seeds the cumulative set from a loaded overlay's sections
+        // without re-arming the per-flush gate (which would force a redundant
+        // immediate re-flush of an already-persisted chunk).
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        chunk.restore_persist_edited_section(7);
+        assert!(chunk.persist_edited_sections().is_dirty(7));
+        assert!(!chunk.persist_dirty_sections().any());
+        assert!(!chunk.dirty_sections().any());
+        // An out-of-range index is ignored rather than panicking.
+        chunk.restore_persist_edited_section(SECTION_COUNT);
+        assert_eq!(chunk.persist_edited_sections().count(), 1);
     }
 
     #[test]
