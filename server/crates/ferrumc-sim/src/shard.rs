@@ -1174,12 +1174,16 @@ impl SimShard {
     ///
     /// Refused (silently, mutating nothing and emitting no output) when the actor
     /// is absent, the target chunk is not resident, the target is beyond
-    /// [`MAX_REACH`] of the actor, there is no sign block-entity at `position`, or
-    /// the sign is waxed (its text is locked). On acceptance it replaces the
-    /// addressed face's four text lines, leaving the face's color/glow and the
-    /// other face untouched, and returns a clone of the updated sign for the
-    /// [`GameOutput::SignUpdated`] broadcast. No persistence signal is raised this
-    /// milestone (sign-text persistence is a follow-up).
+    /// [`MAX_REACH`] of the actor, the block at `position` is not a sign, or the
+    /// sign is waxed (its text is locked). A sign block whose block-entity is
+    /// missing — e.g. one reloaded after a chunk unload dropped the block-entity
+    /// while the block itself persisted — gains a fresh blank one here (mirroring
+    /// the chest's lazy recreation in [`container_open`](Self::container_open)), so
+    /// a reloaded sign stays editable instead of being permanently blank. On
+    /// acceptance it replaces the addressed face's four text lines, leaving the
+    /// face's color/glow and the other face untouched, and returns a clone of the
+    /// updated sign for the [`GameOutput::SignUpdated`] broadcast. No persistence
+    /// signal is raised this milestone (sign-text persistence is a follow-up).
     fn apply_sign_update(
         &mut self,
         player: PlayerId,
@@ -1195,6 +1199,17 @@ impl SimShard {
             return None;
         }
         let chunk = self.chunks.get_mut(position.to_chunk_pos())?;
+        // Only a sign BLOCK can carry sign text; resolve its kind from the block
+        // state so a reloaded sign can have its block-entity recreated. A non-sign
+        // block (or air) refuses the edit.
+        let kind = sign_kind_for_state(chunk.get_block(position)?.as_u32())?;
+        // Lazily (re)create a blank sign block-entity if the block carries none:
+        // a chunk unload drops the block-entity while the block itself persists, so
+        // without this a reloaded sign would be permanently blank and uneditable.
+        // Mirrors the chest's lazy recreation in `container_open`.
+        if !matches!(chunk.block_entity(position), Some(BlockEntity::Sign(_))) {
+            let _ = chunk.set_block_entity(position, BlockEntity::Sign(Sign::new(kind)));
+        }
         let Some(BlockEntity::Sign(sign)) = chunk.block_entity_mut(position) else {
             return None;
         };
@@ -3089,6 +3104,57 @@ mod tests {
         assert_eq!(signs[0].1.front().lines(), &lines);
 
         // The stored block-entity reflects the edit; the back face stays blank.
+        let stored = sign_at(&s, target);
+        assert_eq!(stored.front().lines(), &lines);
+        assert!(stored.back().lines().iter().all(String::is_empty));
+    }
+
+    #[tokio::test]
+    async fn update_sign_recreates_a_missing_block_entity_for_a_reloaded_sign() {
+        let p = player("editor");
+        let mut s = shard_with_player(p).await;
+        let target = BlockPos::new(8, 65, 8);
+
+        // Simulate a reloaded sign: the sign BLOCK is present but its block-entity
+        // was dropped on chunk unload. `set_world_block` writes the state directly,
+        // bypassing the placement funnel that would otherwise create the entity.
+        set_world_block(&mut s, target, oak_sign());
+        assert!(s
+            .loaded_chunks()
+            .get(target.to_chunk_pos())
+            .expect("resident")
+            .block_entity(target)
+            .is_none());
+
+        let lines = [
+            "Back".to_owned(),
+            "from".to_owned(),
+            "reload".to_owned(),
+            String::new(),
+        ];
+        s.enqueue(GameInput::UpdateSign {
+            player: p,
+            position: target,
+            is_front: true,
+            lines: lines.clone(),
+        })
+        .expect("room");
+        let outputs = s.run_tick();
+
+        // The edit recreates the block-entity and applies the text rather than
+        // being a silent no-op: exactly one SignUpdated carries the new front text.
+        let signs: Vec<_> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                GameOutput::SignUpdated { position, sign } => Some((*position, sign.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signs.len(), 1);
+        assert_eq!(signs[0].0, target);
+        assert_eq!(signs[0].1.front().lines(), &lines);
+
+        // The recreated block-entity is stored and reflects the edit.
         let stored = sign_at(&s, target);
         assert_eq!(stored.front().lines(), &lines);
         assert!(stored.back().lines().iter().all(String::is_empty));
