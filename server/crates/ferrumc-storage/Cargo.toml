@@ -35,6 +35,11 @@ tokio = { workspace = true }
 # `BlockMutationLogRecord` journal entry. Already a workspace dependency;
 # pure-Rust, no native deps.
 uuid = { workspace = true }
+# Structured `warn!` when a persisted block entity is skipped on chunk load
+# (corrupt/incompatible payload or an unplaceable position): the storage layer is
+# the right place to report a corrupt on-disk record, and skipping rather than
+# failing keeps the chunk loadable. Facade only; the binary owns the subscriber.
+tracing = { workspace = true }
 
 [dev-dependencies]
 # Backs the `RedbStore` round-trip/persistence tests with a throwaway on-disk

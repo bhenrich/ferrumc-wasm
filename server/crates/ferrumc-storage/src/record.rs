@@ -8,7 +8,10 @@
 
 use ferrumc_core::{GameMode, PlayerId};
 use ferrumc_math::{BlockPos, ChunkPos, LocalBlockPos};
-use ferrumc_world::{BlockStateId, Chunk, SECTION_COUNT, SECTION_VOLUME};
+use ferrumc_world::{
+    decode_block_entity, encode_block_entity, BlockStateId, Chunk, MAX_BLOCK_ENTITIES,
+    MAX_BLOCK_ENTITY_PAYLOAD_LEN, SECTION_COUNT, SECTION_VOLUME,
+};
 
 use crate::error::StorageError;
 use crate::schema::SchemaVersion;
@@ -103,6 +106,23 @@ impl ChunkRecord {
 /// rejected as malformed.
 pub const MAX_OVERLAY_SECTIONS: usize = SECTION_COUNT;
 
+/// The maximum number of block entities one [`ChunkOverlayRecord`] can carry.
+///
+/// Mirrors a [`Chunk`]'s own [`MAX_BLOCK_ENTITIES`] cap so a record can hold a
+/// fully-populated chunk's worth and no more; a decoded record (or a file)
+/// declaring more is rejected before any allocation, so a corrupt or hostile
+/// record cannot drive an unbounded reservation.
+pub const MAX_OVERLAY_BLOCK_ENTITIES: usize = MAX_BLOCK_ENTITIES;
+
+/// First overlay [`SchemaVersion`] whose on-disk encoding carries a block-entity
+/// section.
+///
+/// Overlays written under an earlier version (v2, block states only) carry no
+/// block-entity bytes; the codec keys its block-entity (de)serialization on this
+/// threshold so an old record loads with an empty block-entity set instead of
+/// being misread. The simulation stamps current overlays at or above this version.
+pub const OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES: u32 = 3;
+
 /// One modified chunk section inside a [`ChunkOverlayRecord`].
 ///
 /// Holds the section's full dense block-state list (`SECTION_VOLUME` entries in
@@ -153,9 +173,20 @@ impl OverlaySection {
 ///
 /// The record is self-describing for round-tripping: it carries its
 /// [`SchemaVersion`], the chunk [`ChunkPos`], a `dirty_section_mask` bitmask of
-/// which sections it holds, and the server tick it was captured at. The owning
-/// `(world, dimension)` lives in the [`crate::ChunkKey`] it is stored under, not
-/// in the value.
+/// which sections it holds, the server tick it was captured at, and the chunk's
+/// block entities. The owning `(world, dimension)` lives in the [`crate::ChunkKey`]
+/// it is stored under, not in the value.
+///
+/// # Block entities
+///
+/// Unlike block states (carried only for the persist-dirty sections, with the
+/// clean sections reconstructed from the regenerated baseline), block entities
+/// have **no** baseline source — the flat generator produces none — so an overlay
+/// carries the chunk's **entire** block-entity set whenever it is emitted. Each is
+/// stored as its [`BlockPos`] plus an opaque, length-bounded payload produced by
+/// `ferrumc-world` (storage stays ignorant of sign/chest internals); the payload
+/// is decoded back into a block entity by [`apply_to_chunk`](Self::apply_to_chunk),
+/// which skips an individually corrupt one rather than failing the chunk load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkOverlayRecord {
     schema_version: SchemaVersion,
@@ -163,6 +194,10 @@ pub struct ChunkOverlayRecord {
     dirty_section_mask: u32,
     sections: Vec<OverlaySection>,
     updated_at_tick: u64,
+    /// The chunk's block entities as `(position, opaque payload)`, bounded by
+    /// [`MAX_OVERLAY_BLOCK_ENTITIES`] entries and [`MAX_BLOCK_ENTITY_PAYLOAD_LEN`]
+    /// bytes each. Empty for a record written under a pre-v3 schema.
+    block_entities: Vec<(BlockPos, Vec<u8>)>,
 }
 
 impl ChunkOverlayRecord {
@@ -173,6 +208,13 @@ impl ChunkOverlayRecord {
     /// each as its full dense block list. A chunk with no persist-dirty sections
     /// produces an empty record (caller should skip persisting it); callers
     /// typically gate on [`Chunk::persist_dirty_sections`]`.any()` first.
+    ///
+    /// The chunk's **entire** block-entity set is captured (not just those in the
+    /// dirty sections) whenever `schema_version` is at least
+    /// [`OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES`], because block entities have no
+    /// baseline to reconstruct from. Each is serialized with `ferrumc-world` into a
+    /// bounded payload; the capture is bounded to [`MAX_OVERLAY_BLOCK_ENTITIES`]
+    /// entries (a chunk already caps its own block-entity count there).
     #[must_use]
     pub fn from_chunk(
         schema_version: SchemaVersion,
@@ -198,27 +240,50 @@ impl ChunkOverlayRecord {
                 blocks,
             });
         }
+
+        let mut block_entities = Vec::new();
+        if schema_version.get() >= OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES {
+            for (be_pos, entity) in chunk.block_entities() {
+                if block_entities.len() >= MAX_OVERLAY_BLOCK_ENTITIES {
+                    break;
+                }
+                let mut payload = Vec::new();
+                encode_block_entity(entity, &mut payload);
+                // A real block entity encodes well under the cap; defensively skip a
+                // pathological oversized payload rather than persisting a blob the
+                // decoder would reject anyway.
+                if payload.len() > MAX_BLOCK_ENTITY_PAYLOAD_LEN {
+                    continue;
+                }
+                block_entities.push((be_pos, payload));
+            }
+        }
+
         Self {
             schema_version,
             pos,
             dirty_section_mask: mask,
             sections,
             updated_at_tick,
+            block_entities,
         }
     }
 
     /// Reassembles a record from decoded parts, validating internal consistency.
     ///
     /// Rejects (with [`StorageError::Backend`]) a mask with bits set beyond
-    /// [`SECTION_COUNT`], a section count that disagrees with the mask, or a
-    /// section whose index is not the matching set bit, so a corrupt persisted
-    /// record can never reconstruct an inconsistent overlay.
+    /// [`SECTION_COUNT`], a section count that disagrees with the mask, a section
+    /// whose index is not the matching set bit, more than
+    /// [`MAX_OVERLAY_BLOCK_ENTITIES`] block entities, or a block-entity payload
+    /// longer than [`MAX_BLOCK_ENTITY_PAYLOAD_LEN`] — so a corrupt persisted record
+    /// can never reconstruct an inconsistent or unbounded overlay.
     pub(crate) fn from_parts(
         schema_version: SchemaVersion,
         pos: ChunkPos,
         dirty_section_mask: u32,
         sections: Vec<OverlaySection>,
         updated_at_tick: u64,
+        block_entities: Vec<(BlockPos, Vec<u8>)>,
     ) -> Result<Self, StorageError> {
         // No section beyond the world's section count may be claimed.
         if dirty_section_mask >> SECTION_COUNT != 0 {
@@ -246,12 +311,27 @@ impl ChunkOverlayRecord {
                 )));
             }
         }
+        if block_entities.len() > MAX_OVERLAY_BLOCK_ENTITIES {
+            return Err(StorageError::backend(format!(
+                "overlay carries {} block entities (maximum {MAX_OVERLAY_BLOCK_ENTITIES})",
+                block_entities.len()
+            )));
+        }
+        for (be_pos, payload) in &block_entities {
+            if payload.len() > MAX_BLOCK_ENTITY_PAYLOAD_LEN {
+                return Err(StorageError::backend(format!(
+                    "block-entity payload at {be_pos:?} is {} bytes (maximum {MAX_BLOCK_ENTITY_PAYLOAD_LEN})",
+                    payload.len()
+                )));
+            }
+        }
         Ok(Self {
             schema_version,
             pos,
             dirty_section_mask,
             sections,
             updated_at_tick,
+            block_entities,
         })
     }
 
@@ -286,23 +366,45 @@ impl ChunkOverlayRecord {
         self.sections.len()
     }
 
+    /// Returns the number of block entities this overlay carries.
+    #[must_use]
+    pub fn block_entity_count(&self) -> usize {
+        self.block_entities.len()
+    }
+
     /// Returns the overlay's modified sections, in ascending section-index order.
     pub(crate) fn sections(&self) -> &[OverlaySection] {
         &self.sections
     }
 
+    /// Returns the overlay's block entities as `(position, opaque payload)` pairs,
+    /// for the codec to serialize.
+    pub(crate) fn block_entities(&self) -> &[(BlockPos, Vec<u8>)] {
+        &self.block_entities
+    }
+
     /// Applies this overlay onto `chunk`, overwriting each carried section in full
-    /// (air included) so the result matches the chunk as it was when captured.
+    /// (air included) so the result matches the chunk as it was when captured, then
+    /// reconstructs the chunk's block entities.
     ///
     /// `chunk` is expected to be the freshly generated flat baseline for the same
     /// position; only the persist-dirty sections are replaced, leaving the
-    /// untouched sections as generated.
+    /// untouched sections as generated. Block entities are applied **after** the
+    /// block states so each lands on its restored block.
+    ///
+    /// Block-entity reconstruction is defensive: an individual payload that fails
+    /// to decode (corrupt, truncated, or written by an incompatible build), or
+    /// whose position is rejected by [`Chunk::set_block_entity`], is **logged and
+    /// skipped** rather than failing the whole load — so one bad block entity can
+    /// never blank out a chunk. The block itself still loads (signs/chests lazily
+    /// recreate a blank block entity on the next interaction).
     ///
     /// # Errors
     ///
     /// Returns [`StorageError::Backend`] if a section index is out of range or a
     /// computed block position is rejected by [`Chunk::set_block`] (which cannot
-    /// happen for a well-formed record, but is handled rather than panicking).
+    /// happen for a well-formed record, but is handled rather than panicking). A
+    /// malformed block entity is *not* an error (it is skipped, see above).
     pub fn apply_to_chunk(&self, chunk: &mut Chunk) -> Result<(), StorageError> {
         let pos = chunk.pos();
         for section in &self.sections {
@@ -321,6 +423,34 @@ impl ChunkOverlayRecord {
                 chunk.set_block(block, state).map_err(|e| {
                     StorageError::backend(format!("overlay block out of range: {e}"))
                 })?;
+            }
+        }
+
+        for (be_pos, payload) in &self.block_entities {
+            match decode_block_entity(payload) {
+                Ok(entity) => {
+                    if let Err(e) = chunk.set_block_entity(*be_pos, entity) {
+                        // The block entity decoded but could not be placed (out of
+                        // the chunk's column, or the map is full): skip it, keep the
+                        // chunk.
+                        tracing::warn!(
+                            chunk = ?pos,
+                            block = ?be_pos,
+                            error = %e,
+                            "skipping a persisted block entity that could not be placed",
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Corrupt / incompatible payload: skip this one block entity but
+                    // still load the chunk.
+                    tracing::warn!(
+                        chunk = ?pos,
+                        block = ?be_pos,
+                        error = %e,
+                        "skipping a corrupt persisted block entity",
+                    );
+                }
             }
         }
         Ok(())
@@ -681,6 +811,102 @@ mod tests {
     }
 
     #[test]
+    fn overlay_reconstructs_block_entities_on_apply() {
+        // Item-level conservation is covered by `ferrumc-world`'s block-entity
+        // codec tests and the end-to-end persistence integration test; here we
+        // prove the storage record reconstructs the block-entity *map* (a sign with
+        // text and a chest) through `apply_to_chunk` over a regenerated baseline.
+        use ferrumc_world::{BlockEntity, ChestInventory, FlatWorldGenerator, Sign, SignKind};
+
+        let pos = ChunkPos::new(0, 0);
+        let mut chunk = FlatWorldGenerator::new().generate(pos);
+        let sign_pos = pos.origin_block(64);
+        let chest_pos = BlockPos::new(sign_pos.x() + 2, 70, sign_pos.z() + 2);
+
+        let mut sign = Sign::new(SignKind::Sign);
+        sign.set_face_lines(
+            true,
+            [
+                "hello".to_owned(),
+                "world".to_owned(),
+                String::new(),
+                "!".to_owned(),
+            ],
+        );
+        let chest = ChestInventory::new();
+        chunk
+            .set_block_entity(sign_pos, BlockEntity::Sign(sign.clone()))
+            .expect("set sign");
+        chunk
+            .set_block_entity(chest_pos, BlockEntity::Chest(chest.clone()))
+            .expect("set chest");
+        chunk.mark_persist_dirty(sign_pos);
+
+        let overlay = ChunkOverlayRecord::from_chunk(SchemaVersion::new(3), pos, &chunk, 1);
+
+        // Apply onto a fresh baseline and confirm both block entities reconstruct.
+        let mut rebuilt = FlatWorldGenerator::new().generate(pos);
+        overlay.apply_to_chunk(&mut rebuilt).expect("apply");
+        assert_eq!(
+            rebuilt.block_entity(sign_pos),
+            Some(&BlockEntity::Sign(sign))
+        );
+        assert_eq!(
+            rebuilt.block_entity(chest_pos),
+            Some(&BlockEntity::Chest(chest))
+        );
+    }
+
+    #[test]
+    fn apply_skips_a_corrupt_block_entity_without_failing_the_chunk() {
+        use ferrumc_world::FlatWorldGenerator;
+        let pos = ChunkPos::new(0, 0);
+        let be_pos = pos.origin_block(64);
+        // `0xFF` is not a known block-entity tag, so the payload fails to decode.
+        let overlay = ChunkOverlayRecord::from_parts(
+            SchemaVersion::new(3),
+            pos,
+            0,
+            Vec::new(),
+            0,
+            vec![(be_pos, vec![0xFF])],
+        )
+        .expect("record builds");
+
+        let mut chunk = FlatWorldGenerator::new().generate(pos);
+        // The corrupt block entity must be skipped, not fail the whole apply.
+        overlay
+            .apply_to_chunk(&mut chunk)
+            .expect("apply tolerates a corrupt block entity");
+        assert!(
+            chunk.block_entity(be_pos).is_none(),
+            "the corrupt block entity is skipped, leaving none",
+        );
+    }
+
+    #[test]
+    fn overlay_from_parts_rejects_too_many_block_entities() {
+        let pos = ChunkPos::ORIGIN;
+        let be_pos = pos.origin_block(64);
+        let too_many = vec![(be_pos, vec![0u8]); MAX_OVERLAY_BLOCK_ENTITIES + 1];
+        let err =
+            ChunkOverlayRecord::from_parts(SchemaVersion::new(3), pos, 0, Vec::new(), 0, too_many)
+                .expect_err("over the block-entity cap");
+        assert!(matches!(err, StorageError::Backend(_)));
+    }
+
+    #[test]
+    fn overlay_from_parts_rejects_oversized_block_entity_payload() {
+        let pos = ChunkPos::ORIGIN;
+        let be_pos = pos.origin_block(64);
+        let oversized = vec![(be_pos, vec![0u8; MAX_BLOCK_ENTITY_PAYLOAD_LEN + 1])];
+        let err =
+            ChunkOverlayRecord::from_parts(SchemaVersion::new(3), pos, 0, Vec::new(), 0, oversized)
+                .expect_err("over the payload cap");
+        assert!(matches!(err, StorageError::Backend(_)));
+    }
+
+    #[test]
     fn overlay_from_parts_rejects_mask_section_mismatch() {
         let section = OverlaySection::new(3, vec![BlockStateId::AIR; SECTION_VOLUME]).expect("len");
         // Mask claims section 5 but the only section is index 3.
@@ -690,6 +916,7 @@ mod tests {
             1 << 5,
             vec![section],
             0,
+            Vec::new(),
         )
         .expect_err("inconsistent");
         assert!(matches!(err, StorageError::Backend(_)));

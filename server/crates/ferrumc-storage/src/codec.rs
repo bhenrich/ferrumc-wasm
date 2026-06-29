@@ -28,13 +28,15 @@
 
 use ferrumc_core::{GameMode, PlayerId, PluginId};
 use ferrumc_math::{BlockPos, ChunkPos, LocalBlockPos};
-use ferrumc_world::{BlockStateId, Chunk, SECTION_COUNT, SECTION_VOLUME};
+use ferrumc_world::{
+    BlockStateId, Chunk, MAX_BLOCK_ENTITY_PAYLOAD_LEN, SECTION_COUNT, SECTION_VOLUME,
+};
 
 use crate::error::StorageError;
 use crate::key::{ChunkKey, EntityKey, StorageKey};
 use crate::record::{
     BlockMutationLogRecord, ChunkOverlayRecord, ChunkRecord, EntityRecord, MutationActor,
-    OverlaySection, PlayerRecord,
+    OverlaySection, PlayerRecord, MAX_OVERLAY_BLOCK_ENTITIES, OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES,
 };
 use crate::schema::SchemaVersion;
 
@@ -310,6 +312,13 @@ const ACTOR_TAG_PLAYER: u8 = 1;
 /// `index(u8) ++ [SECTION_VOLUME × block-state id (u32)]`. The dense per-section
 /// form mirrors [`encode_chunk_record`] and is reused deliberately so the proven
 /// 4096-entry section codec backs overlays too.
+///
+/// When `schema >= OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES` a block-entity section
+/// follows the block sections: `be_count(u32)` then, per block entity,
+/// `x(i32) ++ y(i32) ++ z(i32) ++ payload_len(u32) ++ payload[payload_len]`. The
+/// payload is the opaque `ferrumc-world` block-entity blob. Pre-v3 records carry
+/// no block-entity bytes, so the section is omitted entirely and the schema gate
+/// keeps the decoder back-compatible.
 pub(crate) fn encode_chunk_overlay_record(record: &ChunkOverlayRecord) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&record.schema_version().get().to_be_bytes());
@@ -321,6 +330,19 @@ pub(crate) fn encode_chunk_overlay_record(record: &ChunkOverlayRecord) -> Vec<u8
         out.push(section.index());
         for state in section.blocks() {
             out.extend_from_slice(&state.as_u32().to_be_bytes());
+        }
+    }
+    if record.schema_version().get() >= OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES {
+        let block_entities = record.block_entities();
+        // `len <= MAX_OVERLAY_BLOCK_ENTITIES (4096)`, so the cast is lossless.
+        out.extend_from_slice(&(block_entities.len() as u32).to_be_bytes());
+        for (pos, payload) in block_entities {
+            out.extend_from_slice(&pos.x().to_be_bytes());
+            out.extend_from_slice(&pos.y().to_be_bytes());
+            out.extend_from_slice(&pos.z().to_be_bytes());
+            // `payload.len() <= MAX_BLOCK_ENTITY_PAYLOAD_LEN (16 KiB)`, lossless.
+            out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            out.extend_from_slice(payload);
         }
     }
     out
@@ -363,11 +385,48 @@ pub(crate) fn decode_chunk_overlay_record(
         sections.push(OverlaySection::new(stored_index, blocks)?);
     }
 
+    // The block-entity section is present only from the v3 schema on; a pre-v3
+    // record has none and falls through with an empty set (back-compatible load).
+    let mut block_entities = Vec::new();
+    if schema.get() >= OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES {
+        let count = usize::try_from(reader.read_u32()?)
+            .map_err(|_| corrupt("overlay block-entity count overflow"))?;
+        // Reject an over-cap count *before* reserving, so a corrupt record can
+        // never drive an unbounded allocation.
+        if count > MAX_OVERLAY_BLOCK_ENTITIES {
+            return Err(corrupt(format!(
+                "overlay declares {count} block entities (maximum {MAX_OVERLAY_BLOCK_ENTITIES})"
+            )));
+        }
+        block_entities.reserve(count);
+        for _ in 0..count {
+            let bx = reader.read_i32()?;
+            let by = reader.read_i32()?;
+            let bz = reader.read_i32()?;
+            let len = usize::try_from(reader.read_u32()?)
+                .map_err(|_| corrupt("overlay block-entity payload length overflow"))?;
+            if len > MAX_BLOCK_ENTITY_PAYLOAD_LEN {
+                return Err(corrupt(format!(
+                    "overlay block-entity payload is {len} bytes (maximum {MAX_BLOCK_ENTITY_PAYLOAD_LEN})"
+                )));
+            }
+            let payload = reader.take(len)?.to_vec();
+            block_entities.push((BlockPos::new(bx, by, bz), payload));
+        }
+    }
+
     if reader.remaining() != 0 {
         return Err(corrupt("trailing bytes after overlay record"));
     }
 
-    ChunkOverlayRecord::from_parts(schema, ChunkPos::new(x, z), mask, sections, tick)
+    ChunkOverlayRecord::from_parts(
+        schema,
+        ChunkPos::new(x, z),
+        mask,
+        sections,
+        tick,
+        block_entities,
+    )
 }
 
 /// Encodes a [`BlockMutationLogRecord`] to bytes.
@@ -651,6 +710,91 @@ mod tests {
         // Bit 24 is beyond the 24 sections (valid bits are 0..=23).
         bytes.extend_from_slice(&(1u32 << 24).to_be_bytes());
         bytes.extend_from_slice(&0u64.to_be_bytes());
+        assert!(decode_chunk_overlay_record(&bytes).is_err());
+    }
+
+    #[test]
+    fn overlay_round_trips_block_entities_under_v3() {
+        use ferrumc_world::{BlockEntity, ChestInventory, Sign, SignKind};
+        let pos = ChunkPos::new(1, 2);
+        let mut chunk = Chunk::new(pos);
+        // A sign and a chest, each at an in-chunk position, both captured by the v3
+        // overlay regardless of which section is persist-dirty.
+        let sign_pos = pos.origin_block(64);
+        let chest_pos = BlockPos::new(sign_pos.x() + 1, 70, sign_pos.z() + 1);
+        let mut sign = Sign::new(SignKind::Sign);
+        sign.set_face_lines(
+            true,
+            [
+                "line".to_owned(),
+                String::new(),
+                "text".to_owned(),
+                String::new(),
+            ],
+        );
+        chunk
+            .set_block_entity(sign_pos, BlockEntity::Sign(sign))
+            .expect("set sign");
+        chunk
+            .set_block_entity(chest_pos, BlockEntity::Chest(ChestInventory::new()))
+            .expect("set chest");
+        chunk.mark_persist_dirty(sign_pos);
+
+        let record = ChunkOverlayRecord::from_chunk(SchemaVersion::new(3), pos, &chunk, 10);
+        assert_eq!(record.block_entity_count(), 2);
+        let decoded =
+            decode_chunk_overlay_record(&encode_chunk_overlay_record(&record)).expect("decode");
+        assert_eq!(decoded, record);
+        assert_eq!(decoded.block_entity_count(), 2);
+    }
+
+    #[test]
+    fn pre_v3_overlay_carries_no_block_entities() {
+        // A v2 record encodes/decodes with no block-entity section even from a
+        // chunk that holds block entities, so old data stays back-compatible.
+        use ferrumc_world::{BlockEntity, Sign, SignKind};
+        let pos = ChunkPos::new(0, 0);
+        let mut chunk = Chunk::new(pos);
+        chunk
+            .set_block_entity(
+                pos.origin_block(64),
+                BlockEntity::Sign(Sign::new(SignKind::Sign)),
+            )
+            .expect("set sign");
+        let record = ChunkOverlayRecord::from_chunk(SchemaVersion::new(2), pos, &chunk, 0);
+        assert_eq!(record.block_entity_count(), 0);
+        let decoded =
+            decode_chunk_overlay_record(&encode_chunk_overlay_record(&record)).expect("decode");
+        assert_eq!(decoded.block_entity_count(), 0);
+    }
+
+    #[test]
+    fn overlay_decoder_rejects_over_cap_block_entity_count() {
+        // Header for a v3 record with no sections, then a block-entity count above
+        // the cap — rejected before any allocation.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&3u32.to_be_bytes()); // schema v3
+        bytes.extend_from_slice(&0i32.to_be_bytes()); // x
+        bytes.extend_from_slice(&0i32.to_be_bytes()); // z
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // mask: no sections
+        bytes.extend_from_slice(&0u64.to_be_bytes()); // tick
+        bytes.extend_from_slice(&(MAX_OVERLAY_BLOCK_ENTITIES as u32 + 1).to_be_bytes());
+        assert!(decode_chunk_overlay_record(&bytes).is_err());
+    }
+
+    #[test]
+    fn overlay_decoder_rejects_over_cap_block_entity_payload() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&3u32.to_be_bytes()); // schema v3
+        bytes.extend_from_slice(&0i32.to_be_bytes()); // x
+        bytes.extend_from_slice(&0i32.to_be_bytes()); // z
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // mask: no sections
+        bytes.extend_from_slice(&0u64.to_be_bytes()); // tick
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // one block entity
+        bytes.extend_from_slice(&0i32.to_be_bytes()); // x
+        bytes.extend_from_slice(&0i32.to_be_bytes()); // y
+        bytes.extend_from_slice(&0i32.to_be_bytes()); // z
+        bytes.extend_from_slice(&(MAX_BLOCK_ENTITY_PAYLOAD_LEN as u32 + 1).to_be_bytes());
         assert!(decode_chunk_overlay_record(&bytes).is_err());
     }
 
