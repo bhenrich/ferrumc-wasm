@@ -15,7 +15,7 @@
 //! ```
 //!
 //! The server is offline-mode only: it never contacts Mojang and assigns each
-//! player a deterministic UUID via [`crate::offline_uuid`]. No world or
+//! player a deterministic UUID via [`PlayerId::offline`]. No world or
 //! simulation runs; entering play sends a single clientbound `KeepAlive` (the
 //! "keepalive shell") and the connection then idles until it closes, times out,
 //! or the server winds down.
@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
+use ferrumc_core::PlayerId;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::watch;
@@ -56,7 +57,6 @@ use crate::compression::CompressionState;
 use crate::error::{FrameDecodeError, FrameEncodeError};
 use crate::inbound::{InboundDecoder, InboundPacket};
 use crate::limits::ConnectionLimits;
-use crate::offline::offline_uuid;
 use crate::outbound::{OutboundEncoder, OutboundPacket};
 use crate::server::{DEFAULT_IO_TIMEOUT, DEFAULT_MAX_CONNECTIONS};
 use crate::state::ConnectionState;
@@ -244,7 +244,7 @@ impl LoginFlow {
                 let name = login_start.name().clone();
                 // Offline mode: the client's claimed UUID is ignored; the server
                 // derives a deterministic one from the name.
-                let uuid = offline_uuid(name.as_str());
+                let uuid = PlayerId::offline(name.as_str()).as_uuid();
 
                 let mut directives = Vec::new();
                 if let Some(threshold) = self.enabled_threshold() {
@@ -649,6 +649,7 @@ async fn write_frame(
 #[cfg(test)]
 mod tests {
     use ferrumc_codec::BoundedString;
+    use ferrumc_core::PlayerId;
     use ferrumc_proto::generated::configuration::AckFinishConfiguration;
     use ferrumc_proto::generated::handshake::Handshake;
     use ferrumc_proto::generated::login::{LoginAcknowledged, LoginStart};
@@ -764,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn login_success_echoes_name_and_offline_uuid() {
+    fn login_success_uses_canonical_offline_uuid() {
         let mut flow = flow_with(None);
         flow.handle(&handshake_packet(NEXT_STATE_LOGIN));
         let step = flow.handle(&login_start_packet("Saad"));
@@ -775,7 +776,7 @@ mod tests {
             panic!("expected Login Success");
         };
         assert_eq!(success.name().as_str(), "Saad");
-        assert_eq!(success.uuid(), offline_uuid("Saad"));
+        assert_eq!(success.uuid(), PlayerId::offline("Saad").as_uuid());
     }
 
     #[test]

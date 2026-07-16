@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Canonical player identity, including vanilla-compatible offline UUIDs.
+ferrumc-core = { workspace = true }
 # Typed packet enums + per-(state, direction) dispatch this crate wires framing
 # into.
 ferrumc-proto = { workspace = true }
@@ -26,12 +28,6 @@ flate2 = { workspace = true }
 # Workspace-pinned; only the always-available `from_bytes`/`as_u128` surface is
 # used (no extra crate feature beyond the workspace default is required).
 uuid = { workspace = true }
-# Pure-Rust SHA-1 (RustCrypto) for the deterministic offline-mode player UUID.
-# Already a workspace dependency (declared for Mojang auth); reused here rather
-# than pulling in MD5, so no new workspace dependency is introduced. See
-# `offline::offline_uuid` for why this is NOT byte-identical to vanilla.
-sha1 = { workspace = true }
-
 [dev-dependencies]
 # Build wire buffers and decode readers in the round-trip / malformed tests.
 bytes = { workspace = true }

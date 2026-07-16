@@ -27,9 +27,9 @@
 //! - [`StatusServer`] (M09): the connection-per-task server-list status-ping
 //!   exchange.
 //! - [`LoginServer`] (M11): offline-mode login through the configuration phase
-//!   into the play state. It assigns each player a deterministic UUID with
-//!   [`offline_uuid`] and reuses the [`CompressionState`] framing when a
-//!   compression threshold is configured.
+//!   into the play state. It assigns each player the canonical Java-compatible
+//!   identity with [`ferrumc_core::PlayerId::offline`] and reuses the
+//!   [`CompressionState`] framing when a compression threshold is configured.
 //!
 //! The [`play`] module (M15) adds the play-phase reader/writer infrastructure on
 //! top of the framing: [`PlayReader`] (budgeted serverbound decode), [`PlayWriter`]
