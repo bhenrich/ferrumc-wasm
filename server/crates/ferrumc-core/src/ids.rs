@@ -9,14 +9,11 @@ use core::fmt;
 use core::str::FromStr;
 use std::sync::Arc;
 
+use md5::{Digest, Md5};
 use uuid::Uuid;
 
-/// Namespace used to derive deterministic offline-mode player UUIDs.
-///
-/// The bytes spell `FerrumC\0offline\0`; only their stability matters.
-const OFFLINE_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x46, 0x65, 0x72, 0x72, 0x75, 0x6d, 0x43, 0x00, 0x6f, 0x66, 0x66, 0x6c, 0x69, 0x6e, 0x65, 0x00,
-]);
+/// Prefix hashed by vanilla Java Edition for offline-mode player identities.
+const OFFLINE_PLAYER_PREFIX: &[u8] = b"OfflinePlayer:";
 
 /// A player's globally unique identity, backed by a [`Uuid`].
 ///
@@ -44,16 +41,22 @@ impl PlayerId {
     /// Derives a deterministic `PlayerId` for an offline-mode player from their
     /// `username`.
     ///
-    /// Offline-mode servers receive no authoritative Mojang UUID, so a stable id
-    /// is derived from the name using a version 3 (name-based, MD5) UUID under
-    /// this crate's namespace. The same username always maps to the same id.
+    /// Offline-mode servers receive no authoritative Mojang UUID, so this
+    /// implements Java Edition's exact
+    /// `UUID.nameUUIDFromBytes(("OfflinePlayer:" + username).getBytes(UTF_8))`
+    /// semantics: MD5 the literal prefix and username UTF-8 bytes, then stamp
+    /// UUID version 3 and the RFC 4122 variant bits.
     ///
-    /// Note: this uses the crate's own namespace and is therefore *not*
-    /// byte-identical to vanilla's `UUID.nameUUIDFromBytes("OfflinePlayer:" + name)`,
-    /// which hashes the raw bytes with no namespace. It is only guaranteed
-    /// stable within this server.
+    /// The username is case-sensitive and used verbatim. It is not trimmed or
+    /// Unicode-normalized, so byte-distinct names remain distinct identities.
     pub fn offline(username: &str) -> Self {
-        Self(Uuid::new_v3(&OFFLINE_NAMESPACE, username.as_bytes()))
+        let mut digest = Md5::new();
+        digest.update(OFFLINE_PLAYER_PREFIX);
+        digest.update(username.as_bytes());
+        let mut bytes: [u8; 16] = digest.finalize().into();
+        bytes[6] = (bytes[6] & 0x0f) | 0x30;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Self(Uuid::from_bytes(bytes))
     }
 
     /// Returns the underlying [`Uuid`].
@@ -266,6 +269,36 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.as_uuid().get_version_num(), 3);
+    }
+
+    #[test]
+    fn offline_uuid_matches_java_semantics() {
+        let vectors = [
+            ("a", "52428a0e-1e30-3cb1-976c-e728b2614047"),
+            ("Notch", "b50ad385-829d-3141-a216-7e7d7539ba7f"),
+            ("abcdefghijklmnop", "9dc76558-520f-3560-86b0-b5c7c500848b"),
+            ("Steve", "5627dd98-e6be-3c21-b8a8-e92344183641"),
+            ("steve", "53909932-f794-33c0-9329-948045a4c1ce"),
+            ("玩家", "511a6918-f669-3b23-ba72-decf60a9cb59"),
+            (" Steve ", "4d53680f-0c07-36b2-8793-d3931967c543"),
+            ("é", "7448742a-9f92-3a33-984e-c31c0f97cff3"),
+            ("e\u{301}", "931d7ffc-a1a9-35de-94ec-43db5fb39f2b"),
+        ];
+
+        for (name, expected) in vectors {
+            let actual = PlayerId::offline(name).as_uuid();
+            assert_eq!(actual.to_string(), expected, "offline UUID for {name:?}");
+            assert_eq!(actual.get_version_num(), 3, "version for {name:?}");
+            assert_eq!(
+                actual.get_variant(),
+                uuid::Variant::RFC4122,
+                "variant for {name:?}"
+            );
+        }
+
+        assert_ne!(PlayerId::offline("Steve"), PlayerId::offline("steve"));
+        assert_ne!(PlayerId::offline("Steve"), PlayerId::offline(" Steve "));
+        assert_ne!(PlayerId::offline("é"), PlayerId::offline("e\u{301}"));
     }
 
     #[test]

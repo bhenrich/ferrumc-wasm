@@ -7,9 +7,11 @@ repository.workspace = true
 
 [dependencies]
 # Player identity is a UUID (Minecraft identifies players by UUID). `v4` (from
-# the workspace default) gives fresh random ids; `v3` adds deterministic,
-# name-based ids used for offline-mode players.
-uuid = { workspace = true, features = ["v3"] }
+# the workspace default) gives fresh random ids.
+uuid = { workspace = true }
+# Vanilla offline identities are UUID v3 values built from an MD5 digest of the
+# literal UTF-8 bytes `OfflinePlayer:<name>` (without a UUID namespace).
+md5 = { package = "md-5", version = "0.10" }
 # Root server error type (`ServerError`) is a thiserror enum.
 thiserror = { workspace = true }
 # Optional (de)serialization for the shared value types (ids, ticks, text
