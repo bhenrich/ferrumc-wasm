@@ -83,10 +83,12 @@ pub trait WorldStore: Send + Sync {
 
     /// Appends `mutations` to the block-mutation journal in order.
     ///
-    /// The journal is append-only: entries carry a caller-assigned monotonic id
-    /// and are never overwritten, forming the foundation for future crash replay
-    /// and rollback. Rejects a batch larger than [`MAX_SAVE_BATCH`] with
-    /// [`crate::StorageError::BatchTooLarge`] before storing anything.
+    /// The journal is append-only: storage replaces each record's provisional
+    /// ID with a durable, strictly increasing sequence ID in the same atomic
+    /// commit that writes the batch. Existing entries are never overwritten.
+    /// Rejects a batch larger than [`MAX_SAVE_BATCH`] with
+    /// [`crate::StorageError::BatchTooLarge`] and sequence exhaustion with
+    /// [`crate::StorageError::JournalSequenceExhausted`] before storing anything.
     async fn append_block_mutations(&self, mutations: Vec<BlockMutationLogRecord>) -> Result<()>;
 
     /// Loads the entity at `key`, or `Ok(None)` if no entity is stored there.
@@ -104,6 +106,40 @@ pub trait WorldStore: Send + Sync {
     /// Removes the entity at `key`. Returns `Ok(true)` if an entity was present,
     /// `Ok(false)` otherwise.
     async fn delete_entity(&self, key: EntityKey) -> Result<bool>;
+}
+
+/// Computes the inclusive journal ID range for one append without mutating state.
+pub(crate) fn journal_id_range(
+    last_id: Option<u64>,
+    requested: usize,
+) -> std::result::Result<Option<(u64, u64)>, crate::StorageError> {
+    if requested == 0 {
+        return Ok(None);
+    }
+
+    let first_id = match last_id {
+        Some(id) => id
+            .checked_add(1)
+            .ok_or(crate::StorageError::JournalSequenceExhausted {
+                last_id: id,
+                requested,
+            })?,
+        None => 0,
+    };
+    let additional = u64::try_from(requested - 1).map_err(|_| {
+        crate::StorageError::JournalSequenceExhausted {
+            last_id: last_id.unwrap_or(0),
+            requested,
+        }
+    })?;
+    let final_id =
+        first_id
+            .checked_add(additional)
+            .ok_or(crate::StorageError::JournalSequenceExhausted {
+                last_id: last_id.unwrap_or(0),
+                requested,
+            })?;
+    Ok(Some((first_id, final_id)))
 }
 
 /// Persists and retrieves per-player records.

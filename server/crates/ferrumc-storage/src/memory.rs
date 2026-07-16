@@ -18,7 +18,16 @@ use crate::key::{ChunkKey, EntityKey, StorageKey};
 use crate::record::{
     BlockMutationLogRecord, ChunkOverlayRecord, ChunkRecord, EntityRecord, PlayerRecord,
 };
-use crate::store::{PlayerStore, PluginStore, WorldStore, MAX_PLUGIN_VALUE_LEN, MAX_SAVE_BATCH};
+use crate::store::{
+    journal_id_range, PlayerStore, PluginStore, WorldStore, MAX_PLUGIN_VALUE_LEN, MAX_SAVE_BATCH,
+};
+
+/// In-memory journal state protected by one lock so allocation and append are atomic.
+#[derive(Debug, Default)]
+struct MutationJournalState {
+    last_id: Option<u64>,
+    records: Vec<BlockMutationLogRecord>,
+}
 
 /// An in-memory store implementing [`WorldStore`], [`PlayerStore`], and
 /// [`PluginStore`].
@@ -32,8 +41,8 @@ pub struct InMemoryStore {
     /// Per-chunk overlays (only player-modified sections), keyed independently of
     /// the full-chunk map above.
     overlays: RwLock<HashMap<ChunkKey, ChunkOverlayRecord>>,
-    /// The append-only block-mutation journal, in append order.
-    mutation_log: RwLock<Vec<BlockMutationLogRecord>>,
+    /// The append-only block-mutation journal and its storage-owned sequence.
+    mutation_log: RwLock<MutationJournalState>,
     entities: RwLock<HashMap<EntityKey, EntityRecord>>,
     players: RwLock<HashMap<PlayerId, PlayerRecord>>,
     /// Each plugin id maps to its own private key-value namespace. Nesting the
@@ -126,7 +135,16 @@ impl WorldStore for InMemoryStore {
             .mutation_log
             .write()
             .map_err(|_| poisoned("mutation log"))?;
-        log.extend(mutations);
+        let Some((first_id, final_id)) = journal_id_range(log.last_id, mutations.len())? else {
+            return Ok(());
+        };
+        log.records.extend(
+            mutations
+                .into_iter()
+                .zip(first_id..=final_id)
+                .map(|(record, id)| record.with_storage_id(id)),
+        );
+        log.last_id = Some(final_id);
         Ok(())
     }
 
@@ -215,5 +233,75 @@ impl PluginStore for InMemoryStore {
             .get(plugin)
             .map(|ns| ns.keys().cloned().collect())
             .unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ferrumc_math::BlockPos;
+    use ferrumc_world::BlockStateId;
+
+    use super::*;
+    use crate::{MutationActor, MutationLogCause, SchemaVersion};
+
+    fn mutation(provisional_id: u64, tick: u64) -> BlockMutationLogRecord {
+        BlockMutationLogRecord::new(
+            SchemaVersion::new(1),
+            provisional_id,
+            tick,
+            MutationActor::System,
+            BlockPos::new(0, 64, 0),
+            BlockStateId::new(1),
+            BlockStateId::new(2),
+            MutationLogCause::Test,
+        )
+    }
+
+    #[tokio::test]
+    async fn in_memory_journal_assigns_storage_owned_ids() {
+        let store = InMemoryStore::new();
+        store
+            .append_block_mutations(vec![mutation(90, 1), mutation(90, 2)])
+            .await
+            .expect("first append");
+        store
+            .append_block_mutations(vec![mutation(0, 3)])
+            .await
+            .expect("second append");
+
+        let journal = store.mutation_log.read().expect("journal lock");
+        let ids: Vec<_> = journal
+            .records
+            .iter()
+            .map(BlockMutationLogRecord::id)
+            .collect();
+        let ticks: Vec<_> = journal
+            .records
+            .iter()
+            .map(BlockMutationLogRecord::tick)
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(ticks, vec![1, 2, 3]);
+        assert_eq!(journal.last_id, Some(2));
+    }
+
+    #[tokio::test]
+    async fn in_memory_journal_overflow_preserves_state() {
+        let store = InMemoryStore::new();
+        {
+            let mut journal = store.mutation_log.write().expect("journal lock");
+            journal.last_id = Some(u64::MAX);
+            journal.records.push(mutation(u64::MAX, 1));
+        }
+
+        let error = store
+            .append_block_mutations(vec![mutation(0, 2)])
+            .await
+            .expect_err("exhausted sequence");
+        assert!(matches!(error, ferrumc_core::ServerError::Capacity(_)));
+        let journal = store.mutation_log.read().expect("journal lock");
+        assert_eq!(journal.last_id, Some(u64::MAX));
+        assert_eq!(journal.records.len(), 1);
+        assert_eq!(journal.records[0].id(), u64::MAX);
     }
 }

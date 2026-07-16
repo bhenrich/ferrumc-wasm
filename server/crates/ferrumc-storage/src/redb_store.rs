@@ -39,7 +39,9 @@ use crate::key::{ChunkKey, EntityKey, StorageKey};
 use crate::record::{
     BlockMutationLogRecord, ChunkOverlayRecord, ChunkRecord, EntityRecord, PlayerRecord,
 };
-use crate::store::{PlayerStore, PluginStore, WorldStore, MAX_PLUGIN_VALUE_LEN, MAX_SAVE_BATCH};
+use crate::store::{
+    journal_id_range, PlayerStore, PluginStore, WorldStore, MAX_PLUGIN_VALUE_LEN, MAX_SAVE_BATCH,
+};
 
 /// On-disk layout version recorded in the metadata table.
 ///
@@ -50,6 +52,9 @@ const STORE_FORMAT_VERSION: u64 = 1;
 
 /// Metadata key under which [`STORE_FORMAT_VERSION`] is stored.
 const META_FORMAT_KEY: &str = "format_version";
+
+/// Metadata key storing the greatest durably allocated mutation-journal ID.
+const META_LAST_MUTATION_ID_KEY: &str = "last_mutation_id";
 
 /// Metadata table: small typed key-value entries describing the database itself.
 const META_TABLE: TableDefinition<'_, &str, u64> = TableDefinition::new("ferrumc:meta");
@@ -91,6 +96,14 @@ fn backend_err<E: fmt::Display>(err: E) -> ServerError {
 /// without the closure that a concrete-typed by-value parameter would require.
 fn join_err<E: fmt::Display>(err: E) -> ServerError {
     StorageError::backend(format!("storage task failed: {err}")).into()
+}
+
+/// Decodes an eight-byte big-endian mutation-journal key.
+fn mutation_id_from_key(key: &[u8]) -> std::result::Result<u64, StorageError> {
+    let bytes: [u8; 8] = key
+        .try_into()
+        .map_err(|_| StorageError::MalformedJournalKey { len: key.len() })?;
+    Ok(u64::from_be_bytes(bytes))
 }
 
 /// A durable, redb-backed store implementing [`WorldStore`], [`PlayerStore`],
@@ -144,7 +157,15 @@ impl RedbStore {
         // a pre-existing v1 database simply gains two empty tables rather than
         // tripping a format-version mismatch — see docs/adr/0007 for the rationale.
         txn.open_table(CHUNK_OVERLAY_TABLE).map_err(backend_err)?;
-        txn.open_table(MUTATION_LOG_TABLE).map_err(backend_err)?;
+        let journal_last_id = {
+            let journal = txn.open_table(MUTATION_LOG_TABLE).map_err(backend_err)?;
+            let last_id = journal
+                .last()
+                .map_err(backend_err)?
+                .map(|(key, _value)| mutation_id_from_key(key.value()))
+                .transpose()?;
+            last_id
+        };
         {
             let mut meta = txn.open_table(META_TABLE).map_err(backend_err)?;
             let existing = meta
@@ -161,6 +182,26 @@ impl RedbStore {
                 Some(_) => {}
                 None => {
                     meta.insert(META_FORMAT_KEY, STORE_FORMAT_VERSION)
+                        .map_err(backend_err)?;
+                }
+            }
+
+            // Older databases have journal rows but no durable sequence key.
+            // Reconcile once on open from the B-tree's greatest key; appends
+            // thereafter read only this metadata entry inside their write
+            // transaction, so allocation never scans the journal hot path.
+            let stored_last_id = meta
+                .get(META_LAST_MUTATION_ID_KEY)
+                .map_err(backend_err)?
+                .map(|guard| guard.value());
+            let reconciled_last_id = match (stored_last_id, journal_last_id) {
+                (Some(stored), Some(journal)) => Some(stored.max(journal)),
+                (stored @ Some(_), None) => stored,
+                (None, journal) => journal,
+            };
+            if reconciled_last_id != stored_last_id {
+                if let Some(last_id) = reconciled_last_id {
+                    meta.insert(META_LAST_MUTATION_ID_KEY, last_id)
                         .map_err(backend_err)?;
                 }
             }
@@ -303,22 +344,56 @@ impl WorldStore for RedbStore {
             }
             .into());
         }
+        if mutations.is_empty() {
+            return Ok(());
+        }
         let db = Arc::clone(&self.db);
         let join = tokio::task::spawn_blocking(move || -> Result<()> {
             let txn = db.begin_write().map_err(backend_err)?;
+            let previous_last_id = {
+                let meta = txn.open_table(META_TABLE).map_err(backend_err)?;
+                let last_id = meta
+                    .get(META_LAST_MUTATION_ID_KEY)
+                    .map_err(backend_err)?
+                    .map(|guard| guard.value());
+                last_id
+            };
+            let Some((first_id, final_id)) = journal_id_range(previous_last_id, mutations.len())?
+            else {
+                return Ok(());
+            };
             {
-                // Append-only: each entry is keyed by its monotonic id (big-endian
-                // so a forward scan returns the journal in order). The caller
-                // assigns ids monotonically, so this never overwrites an entry
-                // unless the same id is replayed, which is idempotent.
                 let mut table = txn.open_table(MUTATION_LOG_TABLE).map_err(backend_err)?;
-                for record in &mutations {
-                    let key_bytes = record.id().to_be_bytes();
-                    let value = codec::encode_mutation_log_record(record);
-                    table
+
+                // A stale/corrupt sequence must never turn `insert` into a
+                // replacement. Preflight the complete range before writing.
+                for id in first_id..=final_id {
+                    let key_bytes = id.to_be_bytes();
+                    if table
+                        .get(key_bytes.as_slice())
+                        .map_err(backend_err)?
+                        .is_some()
+                    {
+                        return Err(StorageError::JournalIdCollision { id }.into());
+                    }
+                }
+
+                for (record, id) in mutations.into_iter().zip(first_id..=final_id) {
+                    let record = record.with_storage_id(id);
+                    let key_bytes = id.to_be_bytes();
+                    let value = codec::encode_mutation_log_record(&record);
+                    let replaced = table
                         .insert(key_bytes.as_slice(), value.as_slice())
                         .map_err(backend_err)?;
+                    if replaced.is_some() {
+                        return Err(StorageError::JournalIdCollision { id }.into());
+                    }
                 }
+            }
+            {
+                let mut meta = txn.open_table(META_TABLE).map_err(backend_err)?;
+                meta.insert(META_LAST_MUTATION_ID_KEY, final_id)
+                    .map_err(backend_err)?;
             }
             txn.commit().map_err(backend_err)?;
             Ok(())
@@ -530,5 +605,386 @@ impl PluginStore for RedbStore {
             Ok(keys)
         });
         join.await.map_err(join_err)?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ferrumc_math::BlockPos;
+    use ferrumc_world::BlockStateId;
+    use tempfile::TempDir;
+    use tokio::sync::Barrier;
+
+    use super::*;
+    use crate::{MutationActor, MutationLogCause, SchemaVersion};
+
+    fn mutation(local_id: u64, tick: u64) -> BlockMutationLogRecord {
+        let coordinate = i32::try_from(tick).expect("test tick fits i32");
+        let state = u32::try_from(tick).expect("test tick fits u32");
+        BlockMutationLogRecord::new(
+            SchemaVersion::new(1),
+            local_id,
+            tick,
+            MutationActor::System,
+            BlockPos::new(coordinate, 64, 0),
+            BlockStateId::new(state),
+            BlockStateId::new(state + 1),
+            MutationLogCause::Test,
+        )
+    }
+
+    fn journal_snapshot(store: &RedbStore) -> Vec<(u64, Vec<u8>)> {
+        let txn = store.db.begin_read().expect("read transaction");
+        let table = txn.open_table(MUTATION_LOG_TABLE).expect("journal table");
+        table
+            .iter()
+            .expect("journal iterator")
+            .map(|entry| {
+                let (key, value) = entry.expect("journal entry");
+                let key: [u8; 8] = key.value().try_into().expect("u64 journal key");
+                (u64::from_be_bytes(key), value.value().to_vec())
+            })
+            .collect()
+    }
+
+    fn seed_journal(store: &RedbStore, last_id: Option<u64>, records: &[BlockMutationLogRecord]) {
+        let txn = store.db.begin_write().expect("write transaction");
+        {
+            let mut table = txn.open_table(MUTATION_LOG_TABLE).expect("journal table");
+            for record in records {
+                let key = record.id().to_be_bytes();
+                let value = codec::encode_mutation_log_record(record);
+                table
+                    .insert(key.as_slice(), value.as_slice())
+                    .expect("seed journal record");
+            }
+        }
+        {
+            let mut meta = txn.open_table(META_TABLE).expect("metadata table");
+            if let Some(last_id) = last_id {
+                meta.insert(META_LAST_MUTATION_ID_KEY, last_id)
+                    .expect("seed sequence");
+            } else {
+                meta.remove(META_LAST_MUTATION_ID_KEY)
+                    .expect("remove sequence");
+            }
+        }
+        txn.commit().expect("commit seed");
+    }
+
+    fn stored_last_id(store: &RedbStore) -> Option<u64> {
+        let txn = store.db.begin_read().expect("read transaction");
+        let meta = txn.open_table(META_TABLE).expect("metadata table");
+        let last_id = meta
+            .get(META_LAST_MUTATION_ID_KEY)
+            .expect("read sequence")
+            .map(|guard| guard.value());
+        last_id
+    }
+
+    #[tokio::test]
+    async fn journal_sequence_survives_restart_without_overwrite() {
+        const REOPEN_CYCLES: u64 = 3;
+        const RECORDS_PER_CYCLE: u64 = 3;
+
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("journal.redb");
+        let mut prior_snapshot = Vec::new();
+
+        for cycle in 0..=REOPEN_CYCLES {
+            let snapshot = {
+                let store = RedbStore::open(&path).expect("open store");
+                let tick_base = cycle * RECORDS_PER_CYCLE;
+                let batch = (0..RECORDS_PER_CYCLE)
+                    .map(|local_id| mutation(local_id, tick_base + local_id))
+                    .collect();
+                store
+                    .append_block_mutations(batch)
+                    .await
+                    .expect("append mutation batch");
+                journal_snapshot(&store)
+            };
+
+            let expected_len = usize::try_from((cycle + 1) * RECORDS_PER_CYCLE)
+                .expect("test journal length fits usize");
+            assert_eq!(
+                snapshot.len(),
+                expected_len,
+                "restart must append instead of overwriting prior history"
+            );
+            assert_eq!(
+                &snapshot[..prior_snapshot.len()],
+                prior_snapshot.as_slice(),
+                "every previously committed journal byte must remain unchanged"
+            );
+            prior_snapshot = snapshot;
+        }
+
+        for (expected_id, (stored_id, bytes)) in prior_snapshot.iter().enumerate() {
+            let expected_id = u64::try_from(expected_id).expect("test id fits u64");
+            assert_eq!(*stored_id, expected_id, "journal keys must be contiguous");
+            let record = codec::decode_mutation_log_record(bytes).expect("decode journal record");
+            assert_eq!(
+                record.id(),
+                expected_id,
+                "encoded record id must match its durable key"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_journal_batches_receive_disjoint_atomic_ranges() {
+        const TASKS: usize = 8;
+        const RECORDS_PER_TASK: usize = 4;
+
+        let dir = TempDir::new().expect("temp dir");
+        let store = Arc::new(RedbStore::open(dir.path().join("journal.redb")).expect("open store"));
+        let barrier = Arc::new(Barrier::new(TASKS));
+        let mut handles = Vec::with_capacity(TASKS);
+
+        for task in 0..TASKS {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                let tick_base = u64::try_from(task * 100).expect("test tick fits u64");
+                let batch = (0..RECORDS_PER_TASK)
+                    .map(|local| {
+                        let local = u64::try_from(local).expect("local id fits u64");
+                        mutation(10_000 + local, tick_base + local)
+                    })
+                    .collect();
+                barrier.wait().await;
+                store.append_block_mutations(batch).await
+            }));
+        }
+        for handle in handles {
+            handle
+                .await
+                .expect("append task did not panic")
+                .expect("append succeeded");
+        }
+
+        let snapshot = journal_snapshot(&store);
+        assert_eq!(snapshot.len(), TASKS * RECORDS_PER_TASK);
+        let decoded: Vec<_> = snapshot
+            .iter()
+            .map(|(id, bytes)| {
+                let record =
+                    codec::decode_mutation_log_record(bytes).expect("decode journal record");
+                assert_eq!(record.id(), *id, "encoded id must equal durable key");
+                (*id, record.tick())
+            })
+            .collect();
+        for (expected, (id, _tick)) in decoded.iter().enumerate() {
+            assert_eq!(*id, u64::try_from(expected).expect("id fits u64"));
+        }
+
+        for task in 0..TASKS {
+            let tick_base = u64::try_from(task * 100).expect("test tick fits u64");
+            let mut batch: Vec<_> = decoded
+                .iter()
+                .copied()
+                .filter(|(_id, tick)| *tick >= tick_base && *tick < tick_base + 100)
+                .collect();
+            batch.sort_by_key(|(_id, tick)| *tick);
+            assert_eq!(batch.len(), RECORDS_PER_TASK, "task batch must survive");
+            for pair in batch.windows(2) {
+                assert_eq!(pair[1].0, pair[0].0 + 1, "one batch must be contiguous");
+                assert_eq!(pair[1].1, pair[0].1 + 1, "batch order must be stable");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_allocated_id_rejects_the_entire_batch() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = RedbStore::open(dir.path().join("journal.redb")).expect("open store");
+        let first = mutation(0, 10);
+        let sentinel = mutation(2, 20);
+        seed_journal(&store, Some(0), &[first, sentinel]);
+        let before = journal_snapshot(&store);
+
+        let error = store
+            .append_block_mutations(vec![mutation(99, 30), mutation(99, 31)])
+            .await
+            .expect_err("collision must reject the append");
+        assert!(matches!(error, ServerError::Internal { .. }));
+        assert_eq!(
+            journal_snapshot(&store),
+            before,
+            "collision must roll back every record in the batch"
+        );
+        assert_eq!(stored_last_id(&store), Some(0));
+    }
+
+    #[tokio::test]
+    async fn journal_sequence_allows_u64_max_then_reports_exhaustion() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = RedbStore::open(dir.path().join("journal.redb")).expect("open store");
+        let penultimate = mutation(u64::MAX - 1, 10);
+        seed_journal(&store, Some(u64::MAX - 1), &[penultimate]);
+        let before = journal_snapshot(&store);
+
+        let error = store
+            .append_block_mutations(vec![mutation(0, 20), mutation(0, 21)])
+            .await
+            .expect_err("two ids cannot fit at the boundary");
+        assert!(matches!(error, ServerError::Capacity(_)));
+        assert_eq!(journal_snapshot(&store), before);
+        assert_eq!(stored_last_id(&store), Some(u64::MAX - 1));
+
+        store
+            .append_block_mutations(vec![mutation(0, 30)])
+            .await
+            .expect("u64::MAX itself remains allocatable");
+        let at_max = journal_snapshot(&store);
+        assert_eq!(at_max.len(), 2);
+        assert_eq!(at_max[1].0, u64::MAX);
+        let record = codec::decode_mutation_log_record(&at_max[1].1).expect("decode max-id record");
+        assert_eq!(record.id(), u64::MAX);
+        assert_eq!(stored_last_id(&store), Some(u64::MAX));
+
+        let error = store
+            .append_block_mutations(vec![mutation(0, 40)])
+            .await
+            .expect_err("sequence after u64::MAX is exhausted");
+        assert!(matches!(error, ServerError::Capacity(_)));
+        assert_eq!(journal_snapshot(&store), at_max);
+        assert_eq!(stored_last_id(&store), Some(u64::MAX));
+    }
+
+    #[tokio::test]
+    async fn legacy_journal_without_sequence_resumes_after_greatest_key() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("journal.redb");
+        let legacy_snapshot = {
+            let store = RedbStore::open(&path).expect("open store");
+            seed_journal(&store, None, &[mutation(4, 4), mutation(9, 9)]);
+            journal_snapshot(&store)
+        };
+
+        let store = RedbStore::open(&path).expect("reopen legacy store");
+        assert_eq!(stored_last_id(&store), Some(9));
+        store
+            .append_block_mutations(vec![mutation(0, 10)])
+            .await
+            .expect("append after legacy journal");
+        let snapshot = journal_snapshot(&store);
+        assert_eq!(
+            &snapshot[..legacy_snapshot.len()],
+            legacy_snapshot.as_slice()
+        );
+        assert_eq!(snapshot.last().map(|(id, _bytes)| *id), Some(10));
+    }
+
+    #[tokio::test]
+    async fn stale_sequence_metadata_reconciles_to_greatest_journal_key() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("journal.redb");
+        let prior_snapshot = {
+            let store = RedbStore::open(&path).expect("open store");
+            seed_journal(&store, Some(2), &[mutation(2, 2), mutation(9, 9)]);
+            journal_snapshot(&store)
+        };
+
+        let store = RedbStore::open(&path).expect("reopen store");
+        assert_eq!(stored_last_id(&store), Some(9));
+        store
+            .append_block_mutations(vec![mutation(0, 10)])
+            .await
+            .expect("append after reconciliation");
+        let snapshot = journal_snapshot(&store);
+        assert_eq!(&snapshot[..prior_snapshot.len()], prior_snapshot.as_slice());
+        assert_eq!(snapshot.last().map(|(id, _bytes)| *id), Some(10));
+    }
+
+    #[tokio::test]
+    async fn rejected_and_empty_batches_do_not_advance_sequence() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = RedbStore::open(dir.path().join("journal.redb")).expect("open store");
+        store
+            .append_block_mutations(vec![mutation(99, 1)])
+            .await
+            .expect("seed sequence");
+        let before = journal_snapshot(&store);
+
+        store
+            .append_block_mutations(Vec::new())
+            .await
+            .expect("empty append");
+        assert_eq!(journal_snapshot(&store), before);
+        assert_eq!(stored_last_id(&store), Some(0));
+
+        let oversized = (0..=MAX_SAVE_BATCH)
+            .map(|id| mutation(u64::try_from(id).expect("test id fits u64"), 2))
+            .collect();
+        let error = store
+            .append_block_mutations(oversized)
+            .await
+            .expect_err("oversized append must be rejected");
+        assert!(matches!(error, ServerError::Capacity(_)));
+        assert_eq!(journal_snapshot(&store), before);
+        assert_eq!(stored_last_id(&store), Some(0));
+    }
+
+    #[test]
+    fn mutation_journal_keys_require_exactly_eight_bytes() {
+        for malformed in [&[][..], &[0; 7], &[0; 9]] {
+            let error = mutation_id_from_key(malformed).expect_err("malformed key");
+            assert!(matches!(
+                error,
+                StorageError::MalformedJournalKey { len } if len == malformed.len()
+            ));
+        }
+        assert_eq!(
+            mutation_id_from_key(&u64::MAX.to_be_bytes()).expect("valid key"),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn opening_store_rejects_a_malformed_greatest_journal_key() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("journal.redb");
+        {
+            let store = RedbStore::open(&path).expect("open store");
+            let txn = store.db.begin_write().expect("write transaction");
+            {
+                let mut table = txn.open_table(MUTATION_LOG_TABLE).expect("journal table");
+                let malformed_key = [0xff; 9];
+                let value = [0];
+                table
+                    .insert(malformed_key.as_slice(), value.as_slice())
+                    .expect("seed malformed key");
+            }
+            txn.commit().expect("commit malformed key");
+        }
+
+        let error = RedbStore::open(&path).expect_err("malformed key must reject open");
+        assert!(matches!(error, ServerError::Internal { .. }));
+    }
+
+    #[test]
+    fn journal_sequence_range_reports_typed_exhaustion() {
+        assert_eq!(
+            journal_id_range(Some(u64::MAX - 1), 1).expect("max id is allocatable"),
+            Some((u64::MAX, u64::MAX))
+        );
+        assert!(matches!(
+            journal_id_range(Some(u64::MAX - 1), 2),
+            Err(StorageError::JournalSequenceExhausted {
+                last_id,
+                requested: 2,
+            }) if last_id == u64::MAX - 1
+        ));
+        assert!(matches!(
+            journal_id_range(Some(u64::MAX), 1),
+            Err(StorageError::JournalSequenceExhausted {
+                last_id: u64::MAX,
+                requested: 1,
+            })
+        ));
     }
 }

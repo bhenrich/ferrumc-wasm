@@ -57,6 +57,36 @@ pub enum StorageError {
         max: usize,
     },
 
+    /// The durable block-mutation journal has no sequence IDs left for the
+    /// requested batch. The append is rejected before any record is written.
+    #[error(
+        "mutation journal sequence exhausted after id {last_id} while allocating {requested} records"
+    )]
+    JournalSequenceExhausted {
+        /// Greatest sequence ID that was already durably allocated.
+        last_id: u64,
+        /// Number of records the rejected append attempted to allocate.
+        requested: usize,
+    },
+
+    /// A supposedly fresh journal sequence ID already existed on disk.
+    ///
+    /// This indicates corrupt or inconsistent sequence metadata. The whole
+    /// append transaction is rejected rather than replacing history.
+    #[error("mutation journal sequence id {id} already exists")]
+    JournalIdCollision {
+        /// Durable sequence ID that unexpectedly already existed.
+        id: u64,
+    },
+
+    /// A persisted mutation-journal key did not have the required eight-byte
+    /// big-endian representation.
+    #[error("malformed mutation journal key: {len} bytes (expected 8)")]
+    MalformedJournalKey {
+        /// Length of the malformed durable key, in bytes.
+        len: usize,
+    },
+
     /// The storage backend failed in an unexpected way (for example, an internal
     /// lock was poisoned by a panic in another thread). The payload describes
     /// the failure for diagnostics.
@@ -81,9 +111,12 @@ impl From<StorageError> for ServerError {
             StorageError::KeyTooLong { .. }
             | StorageError::ValueTooLarge { .. }
             | StorageError::RecordTooLarge { .. }
-            | StorageError::BatchTooLarge { .. } => Self::capacity(message),
+            | StorageError::BatchTooLarge { .. }
+            | StorageError::JournalSequenceExhausted { .. } => Self::capacity(message),
             // A backend failure is an internal invariant violation.
-            StorageError::Backend(_) => Self::internal(message),
+            StorageError::JournalIdCollision { .. }
+            | StorageError::MalformedJournalKey { .. }
+            | StorageError::Backend(_) => Self::internal(message),
         }
     }
 }
@@ -99,6 +132,10 @@ mod tests {
             StorageError::ValueTooLarge { len: 9, max: 8 },
             StorageError::RecordTooLarge { len: 9, max: 8 },
             StorageError::BatchTooLarge { len: 9, max: 8 },
+            StorageError::JournalSequenceExhausted {
+                last_id: u64::MAX,
+                requested: 1,
+            },
         ] {
             let converted: ServerError = err.into();
             assert!(matches!(converted, ServerError::Capacity(_)));
@@ -109,6 +146,20 @@ mod tests {
     fn backend_error_maps_to_internal() {
         let err = StorageError::backend("lock poisoned");
         assert_eq!(err.to_string(), "storage backend failure: lock poisoned");
+        let converted: ServerError = err.into();
+        assert!(matches!(converted, ServerError::Internal { .. }));
+    }
+
+    #[test]
+    fn journal_collision_maps_to_internal() {
+        let err = StorageError::JournalIdCollision { id: 7 };
+        let converted: ServerError = err.into();
+        assert!(matches!(converted, ServerError::Internal { .. }));
+    }
+
+    #[test]
+    fn malformed_journal_key_maps_to_internal() {
+        let err = StorageError::MalformedJournalKey { len: 7 };
         let converted: ServerError = err.into();
         assert!(matches!(converted, ServerError::Internal { .. }));
     }

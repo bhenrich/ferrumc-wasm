@@ -653,8 +653,11 @@ pub struct BlockMutationLogRecord {
 }
 
 impl BlockMutationLogRecord {
-    /// Builds a journal entry. `id` must be assigned monotonically by the caller
-    /// so the journal stays append-ordered.
+    /// Builds a journal entry.
+    ///
+    /// `id` is provisional input retained for codecs and detached records. A
+    /// [`crate::WorldStore`] replaces it with a storage-owned durable sequence
+    /// ID atomically when the record is appended.
     #[allow(clippy::too_many_arguments)] // a journal entry is an inherently wide, flat record
     #[must_use]
     pub fn new(
@@ -689,6 +692,13 @@ impl BlockMutationLogRecord {
     #[must_use]
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Replaces the provisional ID with a storage-owned durable sequence ID.
+    #[must_use]
+    pub(crate) fn with_storage_id(mut self, id: u64) -> Self {
+        self.id = id;
+        self
     }
 
     /// Returns the server tick the mutation happened on.
