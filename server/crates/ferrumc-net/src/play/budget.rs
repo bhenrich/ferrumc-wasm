@@ -223,7 +223,7 @@ mod tests {
         budget.charge(t0, 600); // empty it
         assert_eq!(budget.available_tokens(), 0.0);
         // A long idle period must not overflow past the burst cap.
-        let t1 = t0 + Duration::from_secs(60);
+        let t1 = t0 + Duration::from_mins(1);
         budget.refill(t1);
         assert_eq!(budget.available_tokens(), 600.0);
     }

@@ -135,8 +135,7 @@ impl SnapshotCtx {
             build: format!("ferrumc {}", env!("CARGO_PKG_VERSION")),
             started_at_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|since| since.as_secs())
-                .unwrap_or(0),
+                .map_or(0, |since| since.as_secs()),
             start_instant: Instant::now(),
             roster: BTreeMap::new(),
             tps_window: VecDeque::new(),

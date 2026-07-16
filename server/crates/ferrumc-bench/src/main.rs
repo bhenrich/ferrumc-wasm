@@ -138,9 +138,7 @@ fn gather_metadata(timestamp_label: Option<String>) -> RunMetadata {
         .filter(|value| !value.is_empty())
         .or_else(|| run_command("hostname", &[]))
         .unwrap_or_else(|| "unknown".to_owned());
-    let cpu_count = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(0);
+    let cpu_count = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
     let timestamp_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()

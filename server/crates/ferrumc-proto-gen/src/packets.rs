@@ -390,7 +390,7 @@ impl PacketSpec {
                 id: p.id,
             });
         }
-        packets.sort_by(|a, b| (a.state, a.direction, a.id).cmp(&(b.state, b.direction, b.id)));
+        packets.sort_by_key(|packet| (packet.state, packet.direction, packet.id));
 
         Ok(Self { structs, packets })
     }

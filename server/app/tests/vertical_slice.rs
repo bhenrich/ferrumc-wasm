@@ -229,17 +229,15 @@ async fn drive_client(addr: SocketAddr) -> anyhow::Result<JoinObservations> {
                 play_order.push("game_event");
             }
             ClientboundPlayPacket::SetCenterChunk(_) => play_order.push("center"),
-            ClientboundPlayPacket::SynchronizePlayerPosition(_) => {
+            ClientboundPlayPacket::SynchronizePlayerPosition(_)
+                if !play_order.contains(&"sync") =>
+            {
                 // Record the first sync only, to capture its position in the order.
-                if !play_order.contains(&"sync") {
-                    play_order.push("sync");
-                }
+                play_order.push("sync");
             }
-            ClientboundPlayPacket::ChunkDataAndLight(_) => {
+            ClientboundPlayPacket::ChunkDataAndLight(_) if !play_order.contains(&"chunk") => {
                 // Record the first chunk only, to capture its position in the order.
-                if !play_order.contains(&"chunk") {
-                    play_order.push("chunk");
-                }
+                play_order.push("chunk");
             }
             _ => {}
         }
