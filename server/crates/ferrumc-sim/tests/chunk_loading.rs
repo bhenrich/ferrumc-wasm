@@ -9,9 +9,12 @@ use ferrumc_sim::{
     TicketReason,
 };
 use ferrumc_storage::{
-    ChunkKey, ChunkRecord, InMemoryStore, SchemaVersion, WorldStore, MAX_SAVE_BATCH,
+    ChunkKey, ChunkOverlayRecord, ChunkRecord, InMemoryStore, SchemaVersion, WorldStore,
+    MAX_SAVE_BATCH,
 };
-use ferrumc_world::{BlockStateId, Chunk, FlatWorldGenerator};
+use ferrumc_world::{
+    BlockEntity, BlockStateId, ChestInventory, Chunk, FlatWorldGenerator, Sign, SignKind,
+};
 
 const WORLD: WorldId = WorldId::new(0);
 const DIMENSION: DimensionId = DimensionId::new(0);
@@ -76,6 +79,215 @@ async fn load_or_generate_miss_generates_hit_loads() {
         Some(BlockStateId::AIR),
         "a loaded chunk must not be regenerated"
     );
+}
+
+struct ImportedChunkFixture {
+    pos: ChunkPos,
+    edited: BlockPos,
+    imported_sibling: BlockPos,
+    imported_other_section: BlockPos,
+    later_edit: BlockPos,
+    sign_pos: BlockPos,
+    chest_pos: BlockPos,
+    sign: BlockEntity,
+    chest: BlockEntity,
+}
+
+impl ImportedChunkFixture {
+    fn new() -> Self {
+        let pos = ChunkPos::new(6, -3);
+        let origin = pos.origin_block(0);
+        let mut sign = Sign::new(SignKind::Sign);
+        sign.set_face_lines(
+            true,
+            [
+                "imported".to_owned(),
+                "anvil".to_owned(),
+                String::new(),
+                "survives".to_owned(),
+            ],
+        );
+        Self {
+            pos,
+            edited: BlockPos::new(origin.x() + 1, 70, origin.z() + 1),
+            imported_sibling: BlockPos::new(origin.x() + 2, 71, origin.z() + 2),
+            imported_other_section: BlockPos::new(origin.x() + 3, 20, origin.z() + 3),
+            later_edit: BlockPos::new(origin.x() + 4, 130, origin.z() + 4),
+            sign_pos: BlockPos::new(origin.x() + 5, 80, origin.z() + 5),
+            chest_pos: BlockPos::new(origin.x() + 6, 96, origin.z() + 6),
+            sign: BlockEntity::Sign(sign),
+            chest: BlockEntity::Chest(ChestInventory::new()),
+        }
+    }
+
+    fn imported_chunk(&self) -> Chunk {
+        let mut chunk = Chunk::new(self.pos);
+        for (pos, state) in [
+            (self.edited, 41),
+            (self.imported_sibling, 42),
+            (self.imported_other_section, 43),
+            (self.later_edit, 44),
+        ] {
+            chunk
+                .set_block(pos, BlockStateId::new(state))
+                .expect("imported coordinate in chunk");
+        }
+        chunk
+            .set_block_entity(self.sign_pos, self.sign.clone())
+            .expect("set imported sign");
+        chunk
+            .set_block_entity(self.chest_pos, self.chest.clone())
+            .expect("set imported chest");
+        chunk.clear_dirty();
+        chunk
+    }
+
+    fn assert_composed(&self, chunk: &Chunk, later_state: BlockStateId) {
+        assert_eq!(chunk.get_block(self.edited), Some(BlockStateId::new(51)));
+        assert_eq!(
+            chunk.get_block(self.imported_sibling),
+            Some(BlockStateId::new(42))
+        );
+        assert_eq!(
+            chunk.get_block(self.imported_other_section),
+            Some(BlockStateId::new(43)),
+            "an untouched imported section must not be replaced by flat terrain"
+        );
+        assert_eq!(chunk.get_block(self.later_edit), Some(later_state));
+        assert_eq!(chunk.block_entity(self.sign_pos), Some(&self.sign));
+        assert_eq!(chunk.block_entity(self.chest_pos), Some(&self.chest));
+    }
+}
+
+async fn seed_imported_base_and_overlay(store: &InMemoryStore, fixture: &ImportedChunkFixture) {
+    // A full `ChunkRecord` is the shape handed to sim by the Anvil import
+    // boundary. This synthetic fixture also carries block entities so composition
+    // is covered independently of the importer's still-separate decoding scope.
+    // Markers span the overlay section and untouched imported sections.
+    let imported = fixture.imported_chunk();
+    store
+        .save_chunk(
+            key(fixture.pos),
+            ChunkRecord::new(SchemaVersion::new(1), imported.clone()),
+        )
+        .await
+        .expect("seed imported full record");
+
+    let mut overlay_source = imported;
+    overlay_source
+        .set_block(fixture.edited, BlockStateId::new(51))
+        .expect("overlay coordinate in chunk");
+    overlay_source.mark_persist_dirty(fixture.edited);
+    let overlay = ChunkOverlayRecord::from_chunk(
+        ferrumc_sim::OVERLAY_SCHEMA_VERSION,
+        fixture.pos,
+        &overlay_source,
+        1,
+    );
+    assert_eq!(overlay.section_count(), 1);
+    store
+        .save_chunk_overlays(vec![(key(fixture.pos), overlay)])
+        .await
+        .expect("seed overlay");
+}
+
+async fn assert_empty_overlay_preserves_import(
+    store: &InMemoryStore,
+    generator: &FlatWorldGenerator,
+) {
+    let empty_pos = ChunkPos::new(-8, 5);
+    let empty_key = key(empty_pos);
+    let empty_marker = empty_pos.origin_block(140);
+    let empty_sign_pos = empty_pos.origin_block(90);
+    let empty_sign = BlockEntity::Sign(Sign::new(SignKind::Sign));
+    let mut empty_import = Chunk::new(empty_pos);
+    empty_import
+        .set_block(empty_marker, BlockStateId::new(61))
+        .expect("empty-overlay marker in chunk");
+    empty_import
+        .set_block_entity(empty_sign_pos, empty_sign.clone())
+        .expect("set empty-overlay sign");
+    empty_import.clear_dirty();
+    store
+        .save_chunk(
+            empty_key,
+            ChunkRecord::new(SchemaVersion::new(1), empty_import),
+        )
+        .await
+        .expect("seed second imported record");
+    let empty_overlay = ChunkOverlayRecord::from_chunk(
+        ferrumc_sim::OVERLAY_SCHEMA_VERSION,
+        empty_pos,
+        &Chunk::new(empty_pos),
+        3,
+    );
+    assert_eq!(empty_overlay.section_count(), 0);
+    assert_eq!(empty_overlay.block_entity_count(), 0);
+    store
+        .save_chunk_overlays(vec![(empty_key, empty_overlay)])
+        .await
+        .expect("seed empty overlay");
+
+    let mut empty_load = map();
+    empty_load
+        .acquire(store, generator, empty_pos, spawn_ticket())
+        .await
+        .expect("load import with empty overlay");
+    let empty_reloaded = empty_load.get(empty_pos).expect("empty-overlay resident");
+    assert_eq!(
+        empty_reloaded.get_block(empty_marker),
+        Some(BlockStateId::new(61))
+    );
+    assert_eq!(
+        empty_reloaded.block_entity(empty_sign_pos),
+        Some(&empty_sign)
+    );
+}
+
+#[tokio::test]
+async fn imported_anvil_chunk_is_base_then_overlay_applies() {
+    let store = InMemoryStore::new();
+    let generator = FlatWorldGenerator::new();
+    let fixture = ImportedChunkFixture::new();
+    seed_imported_base_and_overlay(&store, &fixture).await;
+
+    let mut first_load = map();
+    let outcome = first_load
+        .acquire(&store, &generator, fixture.pos, spawn_ticket())
+        .await
+        .expect("compose imported base and overlay");
+    assert_eq!(outcome.provenance(), Some(ChunkProvenance::Loaded));
+    let first_resident = first_load.get(fixture.pos).expect("first resident");
+    fixture.assert_composed(first_resident, BlockStateId::new(44));
+    assert!(!first_resident.dirty_sections().any());
+    assert!(!first_resident.persist_dirty_sections().any());
+
+    // A later edit in another section must persist cumulatively over the same
+    // imported base, retaining the first overlay and all imported data.
+    {
+        let chunk = first_load
+            .get_mut(fixture.pos)
+            .expect("resident for later edit");
+        chunk
+            .set_block(fixture.later_edit, BlockStateId::new(52))
+            .expect("later coordinate in chunk");
+        chunk.mark_persist_dirty(fixture.later_edit);
+    }
+    store
+        .save_chunk_overlays(first_load.take_persist_dirty(2))
+        .await
+        .expect("persist cumulative overlay");
+
+    let mut second_load = map();
+    second_load
+        .acquire(&store, &generator, fixture.pos, spawn_ticket())
+        .await
+        .expect("reload composed chunk");
+    fixture.assert_composed(
+        second_load.get(fixture.pos).expect("second resident"),
+        BlockStateId::new(52),
+    );
+    assert_empty_overlay_preserves_import(&store, &generator).await;
 }
 
 #[tokio::test]

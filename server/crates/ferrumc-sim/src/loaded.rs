@@ -181,24 +181,21 @@ struct ResidentChunk {
 /// Runs the load-or-generate flow for a single chunk.
 ///
 /// Resolution order, all surfacing a storage failure as [`SimError::ChunkLoad`]:
-/// 1. **Overlay** ([`WorldStore::load_chunk_overlay`]): on a hit, the flat
-///    baseline is regenerated for `key`'s position and the overlay's
-///    player-modified sections are [applied](ChunkOverlayRecord::apply_to_chunk)
-///    over it, reconstructing exactly the chunk as it was saved. This is the
-///    normal persisted-edit path.
-/// 2. **Full chunk** ([`WorldStore::load_chunk`]): a complete stored snapshot, if
-///    one exists (legacy / full-snapshot path).
-/// 3. **Generate**: neither is stored, so a fresh flat chunk is produced.
+/// 1. **Base**: use the complete record from [`WorldStore::load_chunk`] when one
+///    exists; otherwise generate a fresh flat chunk for `key`'s position.
+/// 2. **Overlay**: when [`WorldStore::load_chunk_overlay`] returns a record, apply
+///    only its player-modified sections over that base with
+///    [`ChunkOverlayRecord::apply_to_chunk`]. An imported full record therefore
+///    remains authoritative everywhere the overlay has no data.
 ///
-/// The returned [`ChunkProvenance`] is [`Loaded`](ChunkProvenance::Loaded) for
-/// cases 1–2 and [`Generated`](ChunkProvenance::Generated) for case 3. A loaded
-/// chunk is returned clean: both the network and per-flush persist-dirty masks are
-/// cleared, since what came back from the store is by definition already persisted.
-/// For the overlay path (case 1) the chunk's *cumulative* persist-edited set is
-/// additionally reseeded from the overlay's sections, so a later edit to a different
-/// section re-captures the whole set rather than overwriting these (matching the
-/// always-whole block-entity capture); the per-flush gate stays clear, so the reseed
-/// does not itself trigger a flush.
+/// The returned [`ChunkProvenance`] is [`Loaded`](ChunkProvenance::Loaded) when
+/// either record exists and [`Generated`](ChunkProvenance::Generated) only when
+/// both reads miss. A loaded chunk is returned clean: both the network and
+/// per-flush persist-dirty masks are cleared, since the composition is already
+/// persisted. When an overlay exists, the chunk's *cumulative* persist-edited set
+/// is additionally reseeded from its sections, so a later edit to a different
+/// section re-captures the whole overlay rather than overwriting earlier edits;
+/// the per-flush gate stays clear, so the reseed does not itself trigger a flush.
 pub async fn load_or_generate(
     store: &dyn WorldStore,
     generator: &FlatWorldGenerator,
@@ -206,13 +203,24 @@ pub async fn load_or_generate(
 ) -> SimResult<(Chunk, ChunkProvenance)> {
     let pos = key.pos();
 
-    // 1. Overlay over a regenerated baseline (the persisted-edit path).
+    // The durable full record is the base when present. In particular, this is
+    // the shape produced by Anvil import and must not be bypassed merely because
+    // the chunk also has a later gameplay overlay.
+    let stored = store
+        .load_chunk(key)
+        .await
+        .map_err(|source| SimError::ChunkLoad { pos, source })?;
+    let has_stored_base = stored.is_some();
+    let mut chunk = stored.map_or_else(|| generator.generate(pos), ChunkRecord::into_chunk);
+
+    // Apply only the overlay's carried sections and block entities over the
+    // selected base. An empty overlay is therefore a no-op, not a reason to
+    // replace an imported base with generated terrain.
     let overlay = store
         .load_chunk_overlay(key)
         .await
         .map_err(|source| SimError::ChunkLoad { pos, source })?;
     if let Some(overlay) = overlay {
-        let mut chunk = generator.generate(pos);
         overlay
             .apply_to_chunk(&mut chunk)
             .map_err(|source| SimError::ChunkLoad {
@@ -220,11 +228,11 @@ pub async fn load_or_generate(
                 source: source.into(),
             })?;
         // Reseed the cumulative persist-edited set from the sections the overlay
-        // carried: they differ from the regenerated baseline, so the chunk's NEXT
-        // overlay flush must re-capture them in full. Without this, an edit to a
-        // *different* section after this reload would overwrite the stored overlay
-        // with only that section and silently drop these — the same last-write-wins
-        // data loss the cumulative capture prevents, just across a reload boundary.
+        // carried, so the chunk's NEXT overlay flush re-captures them in full.
+        // Without this, an edit to a *different* section after this reload would
+        // overwrite the stored overlay with only that section and silently drop
+        // these — the same last-write-wins data loss the cumulative capture
+        // prevents, just across a reload boundary.
         // (Block entities are immune for free: they reload into the map and the
         // capture always serializes the whole map.) This seeds only the cumulative
         // capture set, never the per-flush gate, so the reload does not itself flush.
@@ -236,20 +244,15 @@ pub async fn load_or_generate(
         return Ok((chunk, ChunkProvenance::Loaded));
     }
 
-    // 2. A full stored snapshot, if any.
-    let stored = store
-        .load_chunk(key)
-        .await
-        .map_err(|source| SimError::ChunkLoad { pos, source })?;
-    match stored {
-        Some(record) => {
-            let mut chunk = record.into_chunk();
-            // The decoder already clears the network dirty mask; a stored chunk is
-            // not pending a fresh overlay either.
-            chunk.clear_persist_dirty();
-            Ok((chunk, ChunkProvenance::Loaded))
-        }
-        None => Ok((generator.generate(pos), ChunkProvenance::Generated)),
+    if has_stored_base {
+        // Durable records loaded through an in-memory implementation may still
+        // carry the source chunk's transient dirty bits, so normalize them here
+        // rather than relying on a particular backend decoder.
+        chunk.clear_dirty();
+        chunk.clear_persist_dirty();
+        Ok((chunk, ChunkProvenance::Loaded))
+    } else {
+        Ok((chunk, ChunkProvenance::Generated))
     }
 }
 
