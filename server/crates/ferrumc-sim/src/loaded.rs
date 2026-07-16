@@ -221,6 +221,23 @@ pub async fn load_or_generate(
         .await
         .map_err(|source| SimError::ChunkLoad { pos, source })?;
     if let Some(overlay) = overlay {
+        // Since schema v3, every emitted (nonempty) overlay carries the chunk's
+        // complete block-entity map. Clear the imported base map before applying
+        // that snapshot so a removed sign/chest cannot resurrect on reload. A
+        // legacy overlay has no block-entity section, while a truly empty v3
+        // overlay remains the explicit no-op required by the load contract.
+        let replaces_block_entities = has_stored_base
+            && overlay.schema_version().get() >= OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES
+            && overlay.section_count() != 0;
+        if replaces_block_entities {
+            let base_block_entities: Vec<_> = chunk
+                .block_entities()
+                .map(|(block_pos, _entity)| block_pos)
+                .collect();
+            for block_pos in base_block_entities {
+                chunk.remove_block_entity(block_pos);
+            }
+        }
         overlay
             .apply_to_chunk(&mut chunk)
             .map_err(|source| SimError::ChunkLoad {

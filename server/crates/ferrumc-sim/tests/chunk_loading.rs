@@ -291,6 +291,126 @@ async fn imported_anvil_chunk_is_base_then_overlay_applies() {
 }
 
 #[tokio::test]
+async fn deleted_imported_block_entity_does_not_resurrect() {
+    let store = InMemoryStore::new();
+    let generator = FlatWorldGenerator::new();
+    let fixture = ImportedChunkFixture::new();
+    let mut imported = fixture.imported_chunk();
+    imported
+        .set_block(fixture.sign_pos, BlockStateId::new(63))
+        .expect("imported sign block in chunk");
+    imported.clear_dirty();
+    store
+        .save_chunk(
+            key(fixture.pos),
+            ChunkRecord::new(SchemaVersion::new(1), imported.clone()),
+        )
+        .await
+        .expect("seed imported base");
+
+    let mut overlay_source = imported;
+    overlay_source
+        .set_block(fixture.sign_pos, BlockStateId::AIR)
+        .expect("break imported sign");
+    assert!(overlay_source
+        .remove_block_entity(fixture.sign_pos)
+        .is_some());
+    overlay_source.mark_persist_dirty(fixture.sign_pos);
+    let overlay = ChunkOverlayRecord::from_chunk(
+        ferrumc_sim::OVERLAY_SCHEMA_VERSION,
+        fixture.pos,
+        &overlay_source,
+        1,
+    );
+    assert_eq!(overlay.section_count(), 1);
+    assert_eq!(overlay.block_entity_count(), 1, "the chest remains");
+    store
+        .save_chunk_overlays(vec![(key(fixture.pos), overlay)])
+        .await
+        .expect("persist sign deletion");
+
+    let mut loaded = map();
+    loaded
+        .acquire(&store, &generator, fixture.pos, spawn_ticket())
+        .await
+        .expect("reload imported base plus deletion overlay");
+    let chunk = loaded.get(fixture.pos).expect("resident chunk");
+    assert_eq!(chunk.get_block(fixture.sign_pos), Some(BlockStateId::AIR));
+    assert!(
+        chunk.block_entity(fixture.sign_pos).is_none(),
+        "a complete v3 overlay must preserve deletion of an imported block entity"
+    );
+    assert_eq!(chunk.block_entity(fixture.chest_pos), Some(&fixture.chest));
+
+    // A later overlay in another section must carry the deletion forward when
+    // the cumulative edit set is captured and composed over the same import.
+    {
+        let chunk = loaded
+            .get_mut(fixture.pos)
+            .expect("resident for later edit");
+        chunk
+            .set_block(fixture.later_edit, BlockStateId::new(72))
+            .expect("later edit in chunk");
+        chunk.mark_persist_dirty(fixture.later_edit);
+    }
+    store
+        .save_chunk_overlays(loaded.take_persist_dirty(2))
+        .await
+        .expect("persist deletion plus later edit");
+    let mut reloaded = map();
+    reloaded
+        .acquire(&store, &generator, fixture.pos, spawn_ticket())
+        .await
+        .expect("reload cumulative deletion overlay");
+    let chunk = reloaded.get(fixture.pos).expect("reloaded chunk");
+    assert_eq!(
+        chunk.get_block(fixture.later_edit),
+        Some(BlockStateId::new(72))
+    );
+    assert!(chunk.block_entity(fixture.sign_pos).is_none());
+    assert_eq!(chunk.block_entity(fixture.chest_pos), Some(&fixture.chest));
+}
+
+#[tokio::test]
+async fn legacy_overlay_does_not_erase_imported_block_entities() {
+    let store = InMemoryStore::new();
+    let generator = FlatWorldGenerator::new();
+    let fixture = ImportedChunkFixture::new();
+    let imported = fixture.imported_chunk();
+    store
+        .save_chunk(
+            key(fixture.pos),
+            ChunkRecord::new(SchemaVersion::new(1), imported.clone()),
+        )
+        .await
+        .expect("seed imported base");
+
+    let mut overlay_source = imported;
+    overlay_source
+        .set_block(fixture.edited, BlockStateId::new(71))
+        .expect("legacy overlay edit in chunk");
+    overlay_source.mark_persist_dirty(fixture.edited);
+    let legacy_overlay =
+        ChunkOverlayRecord::from_chunk(SchemaVersion::new(2), fixture.pos, &overlay_source, 1);
+    assert_eq!(legacy_overlay.section_count(), 1);
+    assert_eq!(legacy_overlay.block_entity_count(), 0);
+    store
+        .save_chunk_overlays(vec![(key(fixture.pos), legacy_overlay)])
+        .await
+        .expect("persist legacy overlay");
+
+    let mut loaded = map();
+    loaded
+        .acquire(&store, &generator, fixture.pos, spawn_ticket())
+        .await
+        .expect("reload imported base plus legacy overlay");
+    let chunk = loaded.get(fixture.pos).expect("resident chunk");
+    assert_eq!(chunk.get_block(fixture.edited), Some(BlockStateId::new(71)));
+    assert_eq!(chunk.block_entity(fixture.sign_pos), Some(&fixture.sign));
+    assert_eq!(chunk.block_entity(fixture.chest_pos), Some(&fixture.chest));
+}
+
+#[tokio::test]
 async fn tickets_add_and_remove_govern_the_loaded_set() {
     let store = InMemoryStore::new();
     let generator = FlatWorldGenerator::new();
