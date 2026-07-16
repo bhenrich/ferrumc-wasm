@@ -58,6 +58,5 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc
 
-      # Enable once `cargo xtask generate` exists (M05):
-      # - name: Generated files are current
-      #   run: cargo xtask generate --check
+      - name: Generated files are current
+        run: cargo xtask generate --check
