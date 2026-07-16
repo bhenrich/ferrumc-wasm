@@ -6,6 +6,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Async trait implementation and deterministic synchronization gates for the
+# fault-injecting storage harness. No wall-clock sleeps are used.
+async-trait = "0.1"
+tokio.workspace = true
+# Typed server errors and the storage contract/records exercised by durability
+# tests in downstream crates.
+ferrumc-core.workspace = true
+ferrumc-storage.workspace = true
 # Error taxonomy for the harness (hex parse, transcript parse, round-trip,
 # script mismatch). Library convention is thiserror, not anyhow.
 thiserror.workspace = true
@@ -24,6 +32,9 @@ ferrumc-proto.workspace = true
 uuid.workspace = true
 # SystemChat's golden builds its network-NBT `content` via the NBT value tree.
 ferrumc-nbt.workspace = true
+# Fault-store journal fixtures use typed coordinates and block states.
+ferrumc-math.workspace = true
+ferrumc-world.workspace = true
 
 [lints]
 workspace = true

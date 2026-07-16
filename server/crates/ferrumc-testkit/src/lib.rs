@@ -25,14 +25,23 @@
 //! - [`ScriptedClient`]: an in-memory duplex byte pipe modelling a fake client
 //!   that records its traffic for assertion against a [`PacketScript`]. The
 //!   actual server wiring lands with M09/M11/M22.
+//! - [`FaultInjectingStore`]: an in-memory [`ferrumc_storage::WorldStore`] with
+//!   deterministic commit/response cutpoints, committed-state inspection, and
+//!   an ordered operation trace for crash-consistency tests.
 
 mod client;
+mod fault_store;
 mod hex;
 mod oracle;
 mod roundtrip;
 mod transcript;
 
 pub use client::ScriptedClient;
+pub use fault_store::{
+    FaultGate, FaultInjectingStore, FaultOperation, FaultStage, FaultStoreAttempt,
+    FaultStoreAttemptedState, FaultStoreControlError, FaultStoreSnapshot, FaultTraceEntry,
+    MAX_FAULT_SCHEDULE,
+};
 pub use hex::{hex_diff, parse_hex, to_hex, HexDiff, HexError, HexFixture};
 pub use oracle::{assert_frame_length, assert_wire_frame, frame, FrameOracleError};
 pub use roundtrip::{assert_packet_roundtrip, RoundtripError};
