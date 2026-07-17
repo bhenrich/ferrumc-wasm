@@ -25,6 +25,10 @@
 //!   advanced one tick at a time with **no catch-up**.
 //! - [`SimShard`] — owns a bounded inbox, the player set, and the resident
 //!   chunks, applying inputs only at tick boundaries.
+//! - [`ShardPartitioner`] / [`ShardOwnershipMap`] — deterministic typed 8x8
+//!   region partitioning and overlap-free runtime ownership claims.
+//! - [`ShardLifecycle`] — the explicit lifecycle of a future scheduled shard,
+//!   without introducing a worker pool.
 //! - [`SimHarness`] / [`TickOutcome`] — a deterministic, wall-clock-free driver
 //!   tying a coordinator to one shard, used by tests and replay.
 //!
@@ -48,6 +52,7 @@ mod harness;
 mod loaded;
 mod message;
 mod mutation;
+mod ownership;
 mod region;
 mod shard;
 mod spawn;
@@ -65,6 +70,10 @@ pub use message::{GameInput, GameOutput};
 // Only the cause is public: the structured `MutationResult` stays internal to
 // the shard so the app never confuses it with `ferrumc_observability::MutationResult`.
 pub use mutation::{MutationCause, PendingMutation};
+pub use ownership::{
+    ShardId, ShardLifecycle, ShardLifecycleState, ShardOwnership, ShardOwnershipMap,
+    ShardPartitioner, ShardRegion, MAX_SHARD_COORD, MIN_SHARD_COORD, SHARD_WIDTH_CHUNKS,
+};
 pub use region::{RegionLimits, RegionOp};
 pub use shard::SimShard;
 pub use time::{WorldTime, DAY_LENGTH_TICKS, TIME_DAY, TIME_MIDNIGHT, TIME_NIGHT, TIME_NOON};

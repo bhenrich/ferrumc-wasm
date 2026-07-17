@@ -1,7 +1,9 @@
 //! Error types for the simulation layer.
 
 use ferrumc_core::ServerError;
-use ferrumc_math::ChunkPos;
+use ferrumc_math::{ChunkPos, ShardPos};
+
+use crate::ownership::{ShardId, ShardLifecycleState, ShardRegion};
 
 /// A classifying error returned by simulation operations.
 ///
@@ -52,6 +54,35 @@ pub enum SimError {
         #[source]
         source: ServerError,
     },
+
+    /// A shard-grid position cannot describe a complete 8x8 region in the
+    /// [`ChunkPos`] coordinate domain.
+    #[error("shard position ({},{}) is outside the complete-region range", position.x(), position.z())]
+    ShardRegionOutOfRange {
+        /// The invalid typed shard position.
+        position: ShardPos,
+    },
+
+    /// The same canonical shard region was claimed more than once.
+    #[error("shard region {region} is already claimed by logical shard {shard}")]
+    OverlappingShardOwnership {
+        /// The fixed world/dimension region claimed twice.
+        region: ShardRegion,
+        /// The canonical logical shard whose duplicate claim was rejected.
+        shard: ShardId,
+    },
+
+    /// A shard lifecycle attempted a same-state, backward, skipped, or
+    /// post-terminal transition.
+    #[error("shard {shard} cannot transition from {from} to {to}")]
+    InvalidShardLifecycleTransition {
+        /// The logical shard whose transition was rejected.
+        shard: ShardId,
+        /// The state retained after rejection.
+        from: ShardLifecycleState,
+        /// The rejected target state.
+        to: ShardLifecycleState,
+    },
 }
 
 impl From<SimError> for ServerError {
@@ -65,6 +96,19 @@ impl From<SimError> for ServerError {
             }
             // Preserve the storage classification rather than flatten it.
             SimError::ChunkLoad { source, .. } => source,
+            SimError::ShardRegionOutOfRange { position } => ServerError::invalid_state(format!(
+                "shard position ({},{}) is outside the complete-region range",
+                position.x(),
+                position.z(),
+            )),
+            SimError::OverlappingShardOwnership { region, shard } => ServerError::invalid_state(
+                format!("shard region {region} is already claimed by logical shard {shard}"),
+            ),
+            SimError::InvalidShardLifecycleTransition { shard, from, to } => {
+                ServerError::invalid_state(format!(
+                    "shard {shard} cannot transition from {from} to {to}",
+                ))
+            }
         }
     }
 }

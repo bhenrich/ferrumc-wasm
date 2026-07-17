@@ -32,3 +32,12 @@
 - Resident chunks and their tickets live in ordered containers (`BTreeMap`), so
   the resident set, its iteration order, and dirty batches are deterministic for
   identical acquire/release/mutate sequences.
+- Logical ownership regions are fixed, world/dimension-scoped 8×8 chunk cells.
+  Every typed block/chunk coordinate partitions to exactly one cell; arbitrary
+  `ShardPos` values that cannot describe a complete cell are rejected.
+- `ShardId` canonically includes world, dimension, and `ShardPos`; each id names
+  exactly one logical region. Workers/endpoints are separate runtime concepts
+  and may process or route multiple shard ids.
+- A logical region may have at most one ownership claim.
+- Shard lifecycle is strictly `Created -> Active -> Draining -> Stopped`.
+  Rejected transitions leave the prior state unchanged.
