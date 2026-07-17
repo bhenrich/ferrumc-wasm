@@ -47,7 +47,6 @@ mod inbound;
 mod ip_limit;
 mod limits;
 mod login;
-mod offline;
 mod outbound;
 mod play;
 mod server;
@@ -65,7 +64,6 @@ pub use limits::{
     MAX_LENGTH_PREFIX_BYTES,
 };
 pub use login::{LoginFlowError, LoginServer, LoginServerConfig, DEFAULT_KEEP_ALIVE_ID};
-pub use offline::offline_uuid;
 pub use outbound::{OutboundEncoder, OutboundPacket};
 pub use play::{
     is_movement, BatchLimits, BudgetStatus, ConnectionLiveness, Criticality, DisconnectPolicy,

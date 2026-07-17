@@ -765,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn login_success_uses_canonical_offline_uuid() {
+    fn login_success_uses_canonical_offline_identity() {
         let mut flow = flow_with(None);
         flow.handle(&handshake_packet(NEXT_STATE_LOGIN));
         let step = flow.handle(&login_start_packet("Saad"));

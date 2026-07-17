@@ -15,7 +15,8 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use ferrumc_codec::{write_var_int, BoundedReader, BoundedString};
-use ferrumc_net::{offline_uuid, CompressionState, LoginServer, LoginServerConfig};
+use ferrumc_core::PlayerId;
+use ferrumc_net::{CompressionState, LoginServer, LoginServerConfig};
 use ferrumc_proto::generated::configuration::{
     AckFinishConfiguration, ClientboundConfigurationPacket, ServerboundKnownPacks,
 };
@@ -211,7 +212,7 @@ async fn handshake_login_configuration_reaches_play() {
     match decode_login(&read_frame_body(&mut client).await, &codec) {
         ClientboundLoginPacket::LoginSuccess(success) => {
             assert_eq!(success.name().as_str(), "Saad");
-            assert_eq!(success.uuid(), offline_uuid("Saad"));
+            assert_eq!(success.uuid(), PlayerId::offline("Saad").as_uuid());
         }
         other => panic!("expected Login Success, got {other:?}"),
     }
@@ -292,7 +293,7 @@ async fn login_through_play_with_compression() {
     // Login Success now arrives compressed.
     match decode_login(&read_frame_body(&mut client).await, &codec) {
         ClientboundLoginPacket::LoginSuccess(success) => {
-            assert_eq!(success.uuid(), offline_uuid("Saad"));
+            assert_eq!(success.uuid(), PlayerId::offline("Saad").as_uuid());
         }
         other => panic!("expected Login Success, got {other:?}"),
     }

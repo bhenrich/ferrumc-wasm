@@ -24,10 +24,6 @@ tokio = { workspace = true }
 # zlib (de)compression for the post-SetCompression packet framing (M10). Pulls
 # the pure-Rust miniz_oxide backend by default; version is workspace-pinned.
 flate2 = { workspace = true }
-# UUID type for the login flow (Login Start / Login Success carry a player UUID).
-# Workspace-pinned; only the always-available `from_bytes`/`as_u128` surface is
-# used (no extra crate feature beyond the workspace default is required).
-uuid = { workspace = true }
 [dev-dependencies]
 # Paused-time liveness regressions advance Tokio's deterministic clock without
 # wall-clock sleeps.
