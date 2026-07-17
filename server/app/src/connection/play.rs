@@ -10,8 +10,8 @@ use ferrumc_codec::BoundedString;
 use ferrumc_core::{GameMode, PlayerId};
 use ferrumc_math::Vec3;
 use ferrumc_net::{
-    CompressionState, ConnectionState, Criticality, DisconnectReason, InboundDecoder,
-    InboundPacket, PlayWriter,
+    CompressionState, ConnectionState, Criticality, DecodeError, DisconnectReason,
+    FrameDecodeError, InboundDecoder, InboundPacket, PlayWriter,
 };
 use ferrumc_observability::{PacketState, SessionDebug};
 use ferrumc_proto::generated::play::{ClientboundKeepAlive, ClientboundPlayPacket, GameEvent};
@@ -465,15 +465,39 @@ pub(super) async fn enter_play(
             .await;
     }
 
+    // Preserve a typed peer-decode reason through the session leave event. Both
+    // malformed and protocol-violation paths close immediately on the wire, but
+    // routing them as `ServerShutdown` would erase the classification established
+    // at the app boundary.
+    let disconnect_reason = disconnect_reason_for_result(&result);
+
     // Best-effort despawn notice regardless of how the link ended.
     let _ = ctx
         .commands
         .send(SimCommand::Event {
-            event: NetEvent::disconnected(player, DisconnectReason::ServerShutdown),
+            event: NetEvent::disconnected(player, disconnect_reason),
             acceptance: None,
         })
         .await;
     result
+}
+
+/// Maps a typed decode failure retained in the Play result to its leave reason.
+///
+/// Non-decode exits keep the pre-existing cooperative `ServerShutdown` reason.
+/// `anyhow` preserves the concrete error in its chain, so both app body errors
+/// (`DecodeError`) and framing/compression errors (`FrameDecodeError`) survive.
+fn disconnect_reason_for_result(result: &anyhow::Result<()>) -> DisconnectReason {
+    let Err(error) = result else {
+        return DisconnectReason::ServerShutdown;
+    };
+    if let Some(error) = error.downcast_ref::<DecodeError>() {
+        return DisconnectReason::from_disconnect_class(error.disconnect_class());
+    }
+    if let Some(error) = error.downcast_ref::<FrameDecodeError>() {
+        return DisconnectReason::from_disconnect_class(error.disconnect_class());
+    }
+    DisconnectReason::ServerShutdown
 }
 
 /// Sends a join request to the driver and awaits the session handle.
@@ -659,6 +683,53 @@ fn mirror_game_mode_change(event: &GameEvent, inventory: &mut PlayerInventory) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_decode_failures_reach_the_session_leave_reason() {
+        let malformed: anyhow::Result<()> = Err(DecodeError::MalformedBody {
+            state: ConnectionState::Play,
+        }
+        .into());
+        assert_eq!(
+            disconnect_reason_for_result(&malformed),
+            DisconnectReason::MalformedPacket,
+        );
+
+        let trailing: anyhow::Result<()> = Err(DecodeError::TrailingBytes {
+            state: ConnectionState::Play,
+            trailing: 2,
+        }
+        .into());
+        assert_eq!(
+            disconnect_reason_for_result(&trailing),
+            DisconnectReason::ProtocolViolation,
+        );
+
+        let oversized: anyhow::Result<()> =
+            Err(FrameDecodeError::Decode(DecodeError::FrameTooLarge {
+                state: ConnectionState::Play,
+                length: 2,
+                max: 1,
+            })
+            .into());
+        assert_eq!(
+            disconnect_reason_for_result(&oversized),
+            DisconnectReason::FrameTooLarge,
+        );
+    }
+
+    #[test]
+    fn non_decode_exit_keeps_the_cooperative_leave_reason() {
+        let result: anyhow::Result<()> = Err(anyhow::anyhow!("socket closed"));
+        assert_eq!(
+            disconnect_reason_for_result(&result),
+            DisconnectReason::ServerShutdown,
+        );
+        assert_eq!(
+            disconnect_reason_for_result(&Ok(())),
+            DisconnectReason::ServerShutdown,
+        );
+    }
 
     /// A routed `change_game_mode` event updates the connection-local mode that
     /// both the creative-slot gate (`inventory.game_mode() == Creative`) and the

@@ -81,6 +81,24 @@ impl TestClient {
         Ok(())
     }
 
+    /// Writes several complete frames in one socket operation.
+    ///
+    /// This is used by fail-stop regressions: the malformed frame and its
+    /// following sentinel must already be in one client write so a rejected
+    /// first frame cannot race a separate write of the second.
+    #[allow(dead_code)] // `common` is compiled separately into tests that do not pipeline frames.
+    pub async fn send_frames(&mut self, bodies: &[&[u8]]) -> anyhow::Result<()> {
+        let total_body_bytes = bodies.iter().map(|body| body.len()).sum::<usize>();
+        let mut framed = Vec::with_capacity(total_body_bytes.saturating_add(bodies.len() * 5));
+        for body in bodies {
+            write_var_int(&mut framed, i32::try_from(body.len())?);
+            framed.extend_from_slice(body);
+        }
+        self.writer.write_all(&framed).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
     /// Awaits the next complete frame body (id + fields) from the drainer.
     pub async fn next_frame(&mut self) -> anyhow::Result<Vec<u8>> {
         self.frames.recv().await.ok_or_else(|| {
@@ -94,6 +112,17 @@ impl TestClient {
         let mut reader = BoundedReader::new(&body);
         let id = reader.read_var_int()?;
         Ok(ClientboundPlayPacket::decode(id, &mut reader)?)
+    }
+
+    /// Reads the next clientbound Play packet, or reports that the socket closed.
+    #[allow(dead_code)] // `common` is compiled separately into tests that only expect live frames.
+    pub async fn next_play_or_closed(&mut self) -> anyhow::Result<Option<ClientboundPlayPacket>> {
+        let Some(body) = self.frames.recv().await else {
+            return Ok(None);
+        };
+        let mut reader = BoundedReader::new(&body);
+        let id = reader.read_var_int()?;
+        Ok(Some(ClientboundPlayPacket::decode(id, &mut reader)?))
     }
 
     /// Returns the UUID carried by Login Success after [`login_to_play`].

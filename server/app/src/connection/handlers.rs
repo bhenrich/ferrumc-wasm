@@ -7,7 +7,7 @@ use ferrumc_command::{CommandSource, CommandTree};
 use ferrumc_core::{GameMode, PlayerId, TextColor, TextComponent};
 use ferrumc_items::{left_click_exchange, ItemStack, UntrustedItemStack};
 use ferrumc_math::{BlockPos, Direction, Vec3, WorldIntent};
-use ferrumc_net::{CompressionState, PlayWriter};
+use ferrumc_net::{CompressionState, ConnectionState, DecodeError, PlayWriter};
 use ferrumc_observability::{PacketState, SessionDebug};
 use ferrumc_plugin_api::{
     BlockBreakAttempt, BlockPlaceAttempt, ChatAttempt, InteractAttempt, InteractHand,
@@ -19,6 +19,7 @@ use ferrumc_proto::generated::play::{
     ServerboundPlayPacket, ServerboundSetHeldItem, SetContainerContent, SetContainerSlot,
     SetCreativeSlot, SetPlayerPosition, TabCompleteResponse, UpdateSign, UseItemOn, WindowClick,
 };
+use ferrumc_proto::ProtoError;
 use ferrumc_session::{
     net_event_to_input, open_screen, use_item_on_block, use_item_on_face, use_item_on_target,
     NetEvent,
@@ -40,14 +41,37 @@ use super::outbound::{ack_sequence, enqueue_traced_classified, send_mandatory};
 use super::rate_limiter::ChatRateLimiter;
 use super::{send_sim_command_accepted, spawn_sync, GAME_EVENT_CHANGE_GAMEMODE, JOIN_TELEPORT_ID};
 
+/// Last serverbound Play packet id in protocol 772.
+///
+/// The protocol's ids are contiguous from `0x00` through `0x41`. `FerrumC` models
+/// only the subset it handles, so an in-range generated-enum miss is compatible
+/// unmodelled traffic; an id outside this range is a protocol violation.
+const MAX_PROTOCOL_772_SERVERBOUND_PLAY_ID: i32 = 0x41;
+
+/// One decoded frame body plus its validated nested creative-item payload.
+struct DecodedPlayBody {
+    packet: ServerboundPlayPacket,
+    creative_item: Option<ItemStack>,
+}
+
+/// Result of classifying a complete protocol-772 Play frame body.
+enum PlayBodyDecode {
+    /// A packet `FerrumC` models and can dispatch.
+    Modelled(DecodedPlayBody),
+    /// A protocol-valid id omitted from `FerrumC`'s deliberately partial enum.
+    Unmodelled { id: i32 },
+}
+
 /// Handles one decoded serverbound play-frame body.
 ///
-/// Unknown or malformed play packets are ignored (the slice models only a
-/// subset), as are the teleport confirmation and the Keep Alive echo. A
-/// `ChatCommand` is dispatched locally; every other modelled packet is forwarded
-/// to the simulation unless spawn protection vetoes it. Movement is validated
-/// atomically and admitted to the bounded shard route before it may update any
-/// connection-local stream, plugin, look, or persistence mirror.
+/// Protocol-valid but unmodelled packets are ignored because the generated slice
+/// intentionally covers only what `FerrumC` handles. A malformed modelled packet,
+/// an impossible protocol-772 id, or trailing outer/nested bytes is a classified
+/// fatal decode error. Teleport confirmation and Keep Alive are decoded strictly
+/// but otherwise ignored. A `ChatCommand` is dispatched locally; every other
+/// modelled packet is forwarded to the simulation unless policy vetoes it.
+/// Movement is validated atomically and admitted to the bounded shard route
+/// before it may update any connection-local mirror.
 #[allow(clippy::too_many_arguments)] // one play step: framing + policy + trace state
 #[allow(clippy::too_many_lines)] // one dispatch: chat, inventory, place, movement fallthrough
 pub(super) async fn handle_play_body(
@@ -65,28 +89,31 @@ pub(super) async fn handle_play_body(
     debug: &mut SessionDebug,
     compression: &CompressionState,
 ) -> anyhow::Result<()> {
-    let mut reader = BoundedReader::new(body);
-    let Ok(id) = reader.read_var_int() else {
-        // A play frame whose body has no readable packet id is malformed.
-        ctx.metrics
-            .record_packet_decode_error(PacketState::Play, "bad_packet_id");
-        debug.dump("play_packet_decode_error");
-        return Ok(());
-    };
-    let packet = match ServerboundPlayPacket::decode(id, &mut reader) {
-        Ok(packet) => packet,
-        Err(err) => {
-            // An unknown id is an expected unmodelled packet (counted, not dumped);
-            // a malformed body is a genuine decode error (counted and dumped).
-            let (label, dump) = observe::play_decode_error(&err);
+    let decoded = match decode_play_body(body) {
+        Ok(PlayBodyDecode::Modelled(decoded)) => decoded,
+        Ok(PlayBodyDecode::Unmodelled { id }) => {
+            // A conforming 1.21.8 client can send packets the deliberately partial
+            // generated enum does not model. The complete raw frame has already
+            // been consumed, so skip only this body and keep the next frame intact.
             ctx.metrics
-                .record_packet_decode_error(PacketState::Play, label);
-            if dump {
-                debug.dump("play_packet_decode_error");
-            }
+                .record_packet_decode_error(PacketState::Play, "unknown_play");
+            tracing::trace!(
+                packet_id = id,
+                "ignoring unmodelled protocol-772 Play packet"
+            );
             return Ok(());
         }
+        Err(err) => {
+            ctx.metrics.record_packet_decode_error(
+                PacketState::Play,
+                observe::body_decode_error_label(&err),
+            );
+            debug.dump("play_packet_decode_error");
+            return Err(err.into());
+        }
     };
+    let packet = decoded.packet;
+    let creative_item = decoded.creative_item;
 
     // A movement packet is one atomic hostile observation. Reject it before even
     // tracing it as accepted when any carried coordinate or look component is
@@ -268,6 +295,9 @@ pub(super) async fn handle_play_body(
         // Set Creative Slot (untrusted): validate the hostile item bytes, store the
         // slot, and echo it back so the client view matches the server.
         ServerboundPlayPacket::SetCreativeSlot(p) => {
+            let Some(stack) = creative_item else {
+                anyhow::bail!("strict creative-slot decode omitted its validated item");
+            };
             return handle_set_creative_slot(
                 ctx,
                 player,
@@ -275,6 +305,7 @@ pub(super) async fn handle_play_body(
                 writer,
                 inventory,
                 p,
+                stack,
                 debug,
                 compression,
             )
@@ -351,6 +382,75 @@ pub(super) async fn handle_play_body(
         })
         .await
         .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
+}
+
+/// Decodes one complete serverbound Play body to the generated schema's precision.
+///
+/// Generated packet structs decode fields but deliberately leave frame
+/// exhaustion to their caller. Fields explicitly modelled as opaque remainders,
+/// such as signed-chat tails, remain the packet's payload. `SetCreativeSlot` is
+/// the nested format this boundary owns: its generated item field consumes the
+/// opaque remainder, so this function also decodes, validates, and finishes that
+/// untrusted-slot reader before the packet can reach authorization or inventory
+/// effects.
+fn decode_play_body(body: &[u8]) -> Result<PlayBodyDecode, DecodeError> {
+    let state = ConnectionState::Play;
+    let mut reader = BoundedReader::new(body);
+    let id = reader
+        .read_var_int()
+        .map_err(|_| DecodeError::MalformedBody { state })?;
+
+    let packet = match ServerboundPlayPacket::decode(id, &mut reader) {
+        Ok(packet) => packet,
+        Err(ProtoError::UnknownPacketId { .. })
+            if (0..=MAX_PROTOCOL_772_SERVERBOUND_PLAY_ID).contains(&id) =>
+        {
+            return Ok(PlayBodyDecode::Unmodelled { id });
+        }
+        Err(ProtoError::UnknownPacketId { .. }) => {
+            return Err(DecodeError::UnknownPacket { state, id });
+        }
+        Err(_) => return Err(DecodeError::MalformedBody { state }),
+    };
+
+    match reader.finish() {
+        Ok(()) => {}
+        Err(ferrumc_codec::CodecError::TrailingBytes { remaining }) => {
+            return Err(DecodeError::TrailingBytes {
+                state,
+                trailing: remaining,
+            });
+        }
+        Err(_) => return Err(DecodeError::MalformedBody { state }),
+    }
+
+    let creative_item = if let ServerboundPlayPacket::SetCreativeSlot(packet) = &packet {
+        let mut item_reader = BoundedReader::new(packet.item());
+        let untrusted = UntrustedItemStack::decode(&mut item_reader)
+            .map_err(|_| DecodeError::MalformedBody { state })?;
+        match item_reader.finish() {
+            Ok(()) => {}
+            Err(ferrumc_codec::CodecError::TrailingBytes { remaining }) => {
+                return Err(DecodeError::TrailingBytes {
+                    state,
+                    trailing: remaining,
+                });
+            }
+            Err(_) => return Err(DecodeError::MalformedBody { state }),
+        }
+        Some(
+            untrusted
+                .into_validated()
+                .map_err(|_| DecodeError::MalformedBody { state })?,
+        )
+    } else {
+        None
+    };
+
+    Ok(PlayBodyDecode::Modelled(DecodedPlayBody {
+        packet,
+        creative_item,
+    }))
 }
 
 /// One validated, atomically admitted movement observation.
@@ -1172,10 +1272,12 @@ async fn handle_update_sign(
 /// Requires the player to be authoritatively creative (read from the connection's
 /// drift-free game-mode mirror); a non-creative sender is ignored. The `slot` must
 /// be in `0..=45` (a `-1` "drop outside" or any other out-of-range value is
-/// ignored). The item bytes go through [`UntrustedItemStack::decode`] +
-/// `into_validated` (clamping the count, stripping dangerous/unknown components); a
-/// decode/validate error is logged and ignored, never fatal. On success the slot is
-/// stored, the state id bumped, and a mandatory `SetContainerSlot` echoes the
+/// ignored). The item bytes have already gone through strict
+/// [`UntrustedItemStack::decode`], nested reader exhaustion, and `into_validated`
+/// before this policy handler runs. Validation clamps the count and strips
+/// dangerous/unknown components. A malformed item is therefore fatal before
+/// either the game-mode/slot gate or any inventory effect. On success the slot
+/// is stored, the state id bumped, and a mandatory `SetContainerSlot` echoes the
 /// authoritative slot back so the client view matches the server.
 ///
 /// If the changed slot is mirrored into the player's visible equipment (held main
@@ -1191,6 +1293,7 @@ async fn handle_set_creative_slot(
     writer: &mut PlayWriter,
     inventory: &mut PlayerInventory,
     packet: &SetCreativeSlot,
+    stack: ItemStack,
     debug: &mut SessionDebug,
     compression: &CompressionState,
 ) -> anyhow::Result<()> {
@@ -1209,17 +1312,6 @@ async fn handle_set_creative_slot(
     if index >= SLOT_COUNT {
         return Ok(());
     }
-    // Untrusted bytes -> validated stack; never trust the client's item bytes.
-    let mut reader = BoundedReader::new(packet.item());
-    let stack = match UntrustedItemStack::decode(&mut reader)
-        .and_then(UntrustedItemStack::into_validated)
-    {
-        Ok(stack) => stack,
-        Err(err) => {
-            tracing::debug!(player = name, %err, "ignoring malformed creative slot");
-            return Ok(());
-        }
-    };
     inventory.set_creative_slot(index, stack);
 
     // Echo the authoritative slot (mandatory) so the client view matches.
@@ -1727,7 +1819,7 @@ mod tests {
     use ferrumc_config::AccessConfig;
     use ferrumc_core::{GameMode, PlayerId, PluginId};
     use ferrumc_math::{ShardPos, Vec3, WorldIntent};
-    use ferrumc_net::{CompressionState, ConnectionLimits, PlayWriter};
+    use ferrumc_net::{CompressionState, ConnectionLimits, DisconnectReason, PlayWriter};
     use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock, SessionDebug};
     use ferrumc_plugin_api::{
         Capability, CapabilityManifest, EventContext, EventKind, Plugin, PluginError, PluginEvent,
@@ -1735,14 +1827,16 @@ mod tests {
     };
     use ferrumc_plugin_host::PluginHost;
     use ferrumc_proto::generated::play::{
-        ClientboundPlayPacket, ServerboundPlayPacket, SetCenterChunk, SetPlayerPosition,
-        SetPlayerPositionAndRotation, SetPlayerRotation, UpdateSign,
+        ClientboundPlayPacket, ServerboundKeepAlive, ServerboundPlayPacket, SetCenterChunk,
+        SetCreativeSlot, SetPlayerPosition, SetPlayerPositionAndRotation, SetPlayerRotation,
+        UpdateSign,
     };
     use tokio::sync::mpsc;
 
     use super::{
-        decode_click_prefix, handle_play_body, route_emitted_intents, tab_complete_reply,
-        validated_movement, MovementObservation, MovementValidation,
+        decode_click_prefix, decode_play_body, handle_play_body, route_emitted_intents,
+        tab_complete_reply, validated_movement, MovementObservation, MovementValidation,
+        PlayBodyDecode,
     };
     use crate::command::{build_command_tree, GAMEMODE_COMMAND, SPAWN_COMMAND};
     use crate::config::AppConfig;
@@ -1756,6 +1850,59 @@ mod tests {
     use crate::window::WindowState;
     use crate::world::build_world;
 
+    fn strict_body_disconnect_reason(body: &[u8]) -> DisconnectReason {
+        let Err(error) = decode_play_body(body) else {
+            panic!("body unexpectedly decoded");
+        };
+        DisconnectReason::from_disconnect_class(error.disconnect_class())
+    }
+
+    #[test]
+    fn strict_body_decode_preserves_disconnect_classes_and_compatibility() {
+        assert_eq!(
+            strict_body_disconnect_reason(&[]),
+            DisconnectReason::MalformedPacket,
+        );
+
+        let mut trailing = BytesMut::new();
+        ServerboundKeepAlive::new(9)
+            .encode(&mut trailing)
+            .expect("Keep Alive encodes");
+        trailing.extend_from_slice(&[0xDE, 0xAD]);
+        assert_eq!(
+            strict_body_disconnect_reason(&trailing),
+            DisconnectReason::ProtocolViolation,
+        );
+
+        let mut invalid_id = Vec::new();
+        write_var_int(&mut invalid_id, 0x77);
+        assert_eq!(
+            strict_body_disconnect_reason(&invalid_id),
+            DisconnectReason::ProtocolViolation,
+        );
+
+        let mut nested_item = Vec::new();
+        write_var_int(&mut nested_item, 1);
+        write_var_int(&mut nested_item, 1);
+        write_var_int(&mut nested_item, 0);
+        write_var_int(&mut nested_item, 0);
+        nested_item.extend_from_slice(&[0xDE, 0xAD]);
+        let mut creative = BytesMut::new();
+        SetCreativeSlot::new(9, nested_item)
+            .encode(&mut creative)
+            .expect("creative slot encodes");
+        assert_eq!(
+            strict_body_disconnect_reason(&creative),
+            DisconnectReason::ProtocolViolation,
+        );
+
+        let mut tick_end = Vec::new();
+        write_var_int(&mut tick_end, 0x0c);
+        assert!(matches!(
+            decode_play_body(&tick_end),
+            Ok(PlayBodyDecode::Unmodelled { id: 0x0c })
+        ));
+    }
     /// Test plugin that makes a `PlayerMove` callback observable without changing
     /// production metrics or relying on captured logs.
     struct MoveProbe {

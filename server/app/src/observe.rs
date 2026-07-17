@@ -17,7 +17,6 @@ use ferrumc_proto::generated::handshake::ServerboundHandshakePacket;
 use ferrumc_proto::generated::login::ServerboundLoginPacket;
 use ferrumc_proto::generated::play::{ClientboundPlayPacket, ServerboundPlayPacket};
 use ferrumc_proto::generated::status::ServerboundStatusPacket;
-use ferrumc_proto::ProtoError;
 
 /// Maps a networking [`ConnectionState`] onto the observability [`PacketState`].
 pub(crate) fn state_of(state: ConnectionState) -> PacketState {
@@ -180,41 +179,29 @@ fn serverbound_play_name(packet: &ServerboundPlayPacket) -> &'static str {
     }
 }
 
-/// Classifies a serverbound play-body decode failure into a metric label and
-/// whether it warrants a full session dump.
-///
-/// An unknown packet id is *expected* — the slice models only a subset of
-/// serverbound play packets — so it is counted but not dumped (dumping on every
-/// unmodelled client packet would flood the logs). A byte- or NBT-level failure
-/// on a frame is a genuine decode error: counted and dumped.
-pub(crate) fn play_decode_error(err: &ProtoError) -> (&'static str, bool) {
-    match err {
-        ProtoError::UnknownPacketId { .. } => ("unknown_play", false),
-        ProtoError::Nbt(_) => ("malformed_play_nbt", true),
-        // A byte-level codec failure, plus any future `#[non_exhaustive]` variant,
-        // is treated as a genuine decode error.
-        _ => ("malformed_play", true),
-    }
-}
-
 /// Maps a frame decode failure onto a stable `&'static str` label for
 /// `ferrumc_packet_decode_error_total{state,packet}`.
 pub(crate) fn decode_error_label(err: &FrameDecodeError) -> &'static str {
     match err {
-        FrameDecodeError::Decode(decode) => match decode {
-            DecodeError::FrameTooLarge { .. } => "frame_too_large",
-            DecodeError::BufferOverflow { .. } => "buffer_overflow",
-            DecodeError::BadLengthVarInt => "bad_length_varint",
-            DecodeError::NegativeLength { .. } => "negative_length",
-            DecodeError::UnknownPacket { .. } => "unknown_packet",
-            DecodeError::MalformedBody { .. } => "malformed_body",
-            DecodeError::TrailingBytes { .. } => "trailing_bytes",
-            // `DecodeError` is `#[non_exhaustive]`.
-            _ => "decode",
-        },
+        FrameDecodeError::Decode(decode) => body_decode_error_label(decode),
         FrameDecodeError::Compression(_) => "compression",
         // `FrameDecodeError` is `#[non_exhaustive]`.
         _ => "frame_decode",
+    }
+}
+
+/// Maps one complete-body decode failure onto the canonical metric label.
+pub(crate) fn body_decode_error_label(err: &DecodeError) -> &'static str {
+    match err {
+        DecodeError::FrameTooLarge { .. } => "frame_too_large",
+        DecodeError::BufferOverflow { .. } => "buffer_overflow",
+        DecodeError::BadLengthVarInt => "bad_length_varint",
+        DecodeError::NegativeLength { .. } => "negative_length",
+        DecodeError::UnknownPacket { .. } => "unknown_packet",
+        DecodeError::MalformedBody { .. } => "malformed_body",
+        DecodeError::TrailingBytes { .. } => "trailing_bytes",
+        // `DecodeError` is `#[non_exhaustive]`.
+        _ => "decode",
     }
 }
 
