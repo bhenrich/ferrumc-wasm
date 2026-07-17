@@ -12,8 +12,8 @@ Brigadier `Commands` packet); this crate produces and consumes those bytes.
 
 - `ItemId` — a registry-validated protocol item id (`id()`, `name()`,
   `max_stack()`, `placeable_block()`).
-- `ItemStack` — the canonical, *trusted* item stack (clientbound form) plus its
-  trusted slot encoder.
+- `ItemStack` — the canonical, *trusted* item stack (clientbound form), with a
+  registry-checked constructor and a fail-closed trusted slot encoder.
 - `UntrustedItemStack` — the *untrusted* serverbound wire form (creative slot),
   with `decode` and `into_validated` for hostile-input normalization.
 - `ComponentValue` / `ComponentPatch` / `ComponentTypeId` — the data-component
@@ -36,6 +36,19 @@ data framing**:
 
 They are therefore two separate, self-consistent codecs (each round-trips for its
 own direction), **not** a cross-direction round trip.
+
+## Trusted construction and emission
+
+`ItemStack::try_new` is the checked path for data-driven counts and accepts only
+values in `1..=ItemId::max_stack()`. The source-compatible `ItemStack::new`
+retains its caller-validated `NonZeroU8` contract while callers migrate; it must
+not be used as proof that the registry maximum was checked.
+
+Every trusted `encode_slot` call revalidates the registry count before emission.
+A `max_stack_size` component cannot raise that registry ceiling, and any count
+or component-encoding error restores the output buffer to its original length.
+Container-content encoding routes every list and carried stack through the same
+check.
 
 ## Hostile-input normalization
 

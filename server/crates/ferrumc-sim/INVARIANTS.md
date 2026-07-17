@@ -29,6 +29,11 @@
 - Dirty chunks are *collected* for saving (`take_dirty`, and on unload) but
   never persisted here, and no flush policy is implemented — that is the
   caller's concern.
+- Chunk loading selects a stored full `ChunkRecord` when present, otherwise a
+  deterministic generated base, and then applies the stored overlay. Overlay
+  sections replace only the sections they carry; an empty overlay is a no-op.
+  A non-empty schema-v3 overlay carries the complete block-entity snapshot, so
+  removals persist while imported entities survive legacy and empty overlays.
 - Resident chunks and their tickets live in ordered containers (`BTreeMap`), so
   the resident set, its iteration order, and dirty batches are deterministic for
   identical acquire/release/mutate sequences.
