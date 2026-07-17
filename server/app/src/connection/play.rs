@@ -20,7 +20,9 @@ use ferrumc_session::{NetEvent, PlayerSessionHandle};
 use crate::driver::SimCommand;
 use crate::inventory::PlayerInventory;
 use crate::observe;
-use crate::player_data::{load_player_for_join, PlayerData, PlayerLoad};
+use crate::player_data::{
+    is_valid_restored_position, load_player_for_join, PlayerData, PlayerLoad,
+};
 use crate::window::WindowState;
 
 use super::chunk_stream::{
@@ -84,22 +86,57 @@ pub(super) async fn enter_play(
     // viewers entering view then see it on the spawn rather than only after the next
     // hotbar change. The inventory mirrors the (restored or default-creative) game
     // mode; the connection is the sole writer of both, so the mirror cannot drift.
-    let (position, mut player_yaw, mut player_pitch, game_mode, mut inventory) = match restored {
-        Some((data, game_mode)) => (
-            data.position(),
-            data.yaw(),
-            data.pitch(),
-            game_mode,
-            data.restore_inventory(game_mode),
-        ),
-        None => (
-            ctx.join_kit.spawn_position(),
-            0.0_f32,
-            0.0_f32,
-            GameMode::Creative,
-            PlayerInventory::with_creative_kit(GameMode::Creative),
-        ),
-    };
+    let (position, mut player_yaw, mut player_pitch, game_mode, mut inventory) =
+        if let Some((data, game_mode)) = restored {
+            let stored_position = data.position();
+            let position = if is_valid_restored_position(stored_position) {
+                stored_position
+            } else {
+                // A current-schema record with an unsafe coordinate is recoverable:
+                // retain its decoded inventory/mode/look, join at the configured
+                // spawn, and let the normal leave-save write a normalized snapshot
+                // with the recovered position. This is an explicit reset policy,
+                // not the unreadable-record fallback Packet 24 forbids. If even the
+                // configured recovery point is unsafe, reject admission rather
+                // than route saturated integer coordinates.
+                let recovery = ctx.join_kit.spawn_position();
+                anyhow::ensure!(
+                    is_valid_restored_position(recovery),
+                    "cannot recover invalid player position because configured spawn is unsafe"
+                );
+                tracing::warn!(
+                    player = name.as_str(),
+                    stored_x = stored_position.x,
+                    stored_y = stored_position.y,
+                    stored_z = stored_position.z,
+                    recovery_x = recovery.x,
+                    recovery_y = recovery.y,
+                    recovery_z = recovery.z,
+                    "recovering an invalid persisted player position at spawn"
+                );
+                recovery
+            };
+            (
+                position,
+                data.yaw(),
+                data.pitch(),
+                game_mode,
+                data.restore_inventory(game_mode),
+            )
+        } else {
+            let position = ctx.join_kit.spawn_position();
+            anyhow::ensure!(
+                is_valid_restored_position(position),
+                "configured spawn position is unsafe"
+            );
+            (
+                position,
+                0.0_f32,
+                0.0_f32,
+                GameMode::Creative,
+                PlayerInventory::with_creative_kit(GameMode::Creative),
+            )
+        };
 
     // The opaque equipment body threaded into the join: the player's full visible
     // set (main hand, off hand, and armor), reflecting the restored slots. The kit

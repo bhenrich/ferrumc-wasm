@@ -21,6 +21,7 @@ use ferrumc_core::Result as ServerResult;
 use ferrumc_net::{ConnectionLimits, PerIpConnections};
 use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock, SnapshotPublisher};
 use ferrumc_session::{shard_for_position, SessionRouter};
+use ferrumc_sim::{GameInput, ShardPartitioner, SimShard};
 
 use crate::config::AppConfig;
 use crate::connection::{build_status_response, handle_connection, ConnContext};
@@ -190,6 +191,23 @@ async fn await_server_tasks(
         .context("accept-loop task failed")
 }
 
+/// Registers the current single simulation owner for its complete world scope.
+fn register_world_owner(
+    router: &mut SessionRouter,
+    owner: &SimShard,
+) -> anyhow::Result<mpsc::Receiver<GameInput>> {
+    let home = ShardPartitioner::for_shard(
+        owner.loaded_chunks().world(),
+        owner.loaded_chunks().dimension(),
+        owner.shard_pos(),
+    )
+    .context("spawn shard is outside the representable world region")?;
+    Ok(router
+        .register_world_shard(home)
+        .context("registering the single overworld simulation owner")?
+        .into_receiver())
+}
+
 /// Builds the world, starts the simulation, binds the listener, and begins
 /// accepting connections.
 ///
@@ -233,7 +251,13 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     let mut router = SessionRouter::new();
     // Scope multiplayer visibility to the configured play view distance.
     router.set_view_distance(config.view_distance);
-    let shard_rx = router.register_shard(shard_pos);
+    // The current runtime has one authoritative simulation owner for the entire
+    // overworld, even though its canonical home is the 8x8 region containing
+    // spawn. Register that existing owner as world-covering so a restored player
+    // is bound to it independently of which logical region contains their saved
+    // position. This is still single-shard behavior: no second worker, ownership
+    // claim, or cross-shard transfer is introduced here.
+    let shard_rx = register_world_owner(&mut router, &setup.shard)?;
 
     let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -464,7 +488,8 @@ async fn accept_loop(
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use ferrumc_core::ServerError;
+    use ferrumc_core::{PlayerId, ServerError};
+    use ferrumc_math::{ShardPos, Vec3};
     use tokio::sync::oneshot;
 
     use super::*;
@@ -517,5 +542,54 @@ mod tests {
             !error_chain.contains("driver sentinel"),
             "lower-priority driver failure replaced the storage failure: {error_chain}",
         );
+    }
+
+    #[test]
+    fn single_world_owner_binds_every_boundary_side_to_one_route() {
+        let owner = SimShard::new(ShardPos::new(0, 0));
+        let home = ShardPartitioner::for_shard(
+            owner.loaded_chunks().world(),
+            owner.loaded_chunks().dimension(),
+            owner.shard_pos(),
+        )
+        .expect("owner has a representable home");
+        let mut router = SessionRouter::new();
+        let mut inbox =
+            register_world_owner(&mut router, &owner).expect("register world-covering owner");
+        assert_eq!(router.shard_count(), 1);
+
+        let positions = [
+            ("west", Vec3::new(-0.5, 64.0, 64.5)),
+            ("east", Vec3::new(128.5, 64.0, 64.5)),
+            ("north", Vec3::new(64.5, 64.0, -0.5)),
+            ("south", Vec3::new(64.5, 64.0, 128.5)),
+        ];
+        for (name, position) in positions {
+            let player = PlayerId::offline(name);
+            let handle = router
+                .join_player(player, name, position)
+                .expect("world owner accepts the logical target");
+            assert_eq!(handle.shard_id(), home);
+            assert_eq!(router.player_shard_id(player), Some(home));
+            assert!(matches!(
+                inbox.try_recv(),
+                Ok(GameInput::PlayerJoin {
+                    player: joined,
+                    position: joined_at,
+                }) if joined == player && joined_at == position
+            ));
+
+            assert_eq!(
+                router.disconnect_player(player),
+                Ok(owner.shard_pos()),
+                "leave uses the same world-covering binding",
+            );
+            assert!(matches!(
+                inbox.try_recv(),
+                Ok(GameInput::PlayerLeave { player: left }) if left == player
+            ));
+            assert!(!router.is_player_connected(player));
+            drop(handle);
+        }
     }
 }

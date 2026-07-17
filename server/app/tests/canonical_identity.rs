@@ -91,6 +91,21 @@ async fn observe_target_identity(client: &mut TestClient, target: Uuid) -> anyho
     Ok(())
 }
 
+/// Waits for the driver-queued world-time packet that is drained only after the
+/// complete join kit and the connection's pre-loop streaming pass. It is a
+/// deterministic fence before dropping the socket into the shared leave-save
+/// teardown.
+async fn wait_until_play_loop(client: &mut TestClient) -> anyhow::Result<()> {
+    loop {
+        if matches!(
+            client.next_play().await?,
+            ClientboundPlayPacket::UpdateTime(_)
+        ) {
+            return Ok(());
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn one_username_has_one_canonical_identity_everywhere() {
     let temp = tempfile::tempdir().expect("temporary world directory");
@@ -109,7 +124,7 @@ async fn one_username_has_one_canonical_identity_everywhere() {
         .await
         .expect("viewer login finishes within the guard")
         .expect("UUID-whitelisted viewer reaches play");
-    let target_client = timeout(GUARD, login_to_play(addr, TARGET_NAME))
+    let mut target_client = timeout(GUARD, login_to_play(addr, TARGET_NAME))
         .await
         .expect("target login finishes within the guard")
         .expect("UUID-whitelisted target reaches play");
@@ -123,6 +138,10 @@ async fn one_username_has_one_canonical_identity_everywhere() {
         .await
         .expect("appearance packets arrive within the guard")
         .expect("player-info and spawn packets carry the canonical UUID");
+    timeout(GUARD, wait_until_play_loop(&mut target_client))
+        .await
+        .expect("target reaches the steady Play loop within the guard")
+        .expect("target completes its join kit");
 
     // Graceful shutdown drains both connection teardowns and commits their
     // player records before releasing the redb file.

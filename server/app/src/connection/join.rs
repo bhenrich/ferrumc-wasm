@@ -48,10 +48,11 @@ const ABILITY_WALKING_SPEED: f32 = 0.1;
 /// this (re)join. The round-trip also gives this connection a player ticket on each
 /// spawn column, released on disconnect via the normal `ReleaseChunks` path.
 ///
-/// The position sync goes out *before* the chunks so the client's spawn point is
-/// fixed first: the loading-screen gate releases on the chunk that contains the
-/// player's position, and sending the sync first guarantees that chunk is among
-/// the spawn-area column packets that follow, regardless of where spawn lands.
+/// The position sync goes out *before* the chunks so the client's position is
+/// fixed first. A fresh player's chunk is in the spawn batch that follows. For a
+/// returning player outside that batch, the immediate post-kit streaming pump
+/// recentres and sends the restored-position chunk before waiting for client
+/// movement.
 ///
 /// The sequence is flushed in two stages because the [`PlayWriter`] drains by
 /// priority (State before World): flushing the framing-and-position packets, then
@@ -217,13 +218,14 @@ pub(super) async fn send_join_kit(
 
     flush_writer(writer, stream, compression, ctx.io_timeout).await?;
 
-    // Stage 2: the spawn-area chunk column packets (includes the player's chunk),
-    // fetched LIVE from the resident shard chunks rather than replayed from a
-    // cached snapshot. A `StreamChunks` round-trip acquires a player ticket on each
-    // spawn column and builds its packet from the current chunk state, so a block a
-    // previous session placed in a spawn chunk is present on this (re)join. The
-    // whole batch is still sent up-front here (not re-paced through the streaming
-    // pump) so the loading screen releases as before.
+    // Stage 2: the spawn-area chunk column packets, fetched LIVE from the resident
+    // shard chunks rather than replayed from a cached snapshot. A `StreamChunks`
+    // round-trip acquires a player ticket on each spawn column and builds its
+    // packet from the current chunk state, so a block a previous session placed in
+    // a spawn chunk is present on this (re)join. A restored player outside this
+    // batch is recentered by the immediate streaming pump after this function
+    // returns. The spawn batch remains up-front rather than paced through that
+    // pump so the ordinary spawn join path is unchanged.
     let spawn_positions: Vec<ChunkPos> = kit.chunk_positions().collect();
     let (reply_tx, reply_rx) = oneshot::channel();
     ctx.commands
