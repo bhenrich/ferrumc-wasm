@@ -238,9 +238,9 @@ pub(super) async fn handle_play_body(
             // Strip legacy section-sign (§, U+00A7) codes from the untrusted
             // message first: a client still interprets `§k`/`§l`/§<colour> inside
             // a component's `text`, so leaving them in would let a player inject
-            // colour/obfuscation formatting into the relayed line. The name is
-            // not user-controlled (usernames are `[A-Za-z0-9_]`), so only the
-            // message body needs sanitising.
+            // colour/obfuscation formatting into the relayed line. `name` is the
+            // connection boundary's display-safe projection of an already
+            // validated `[A-Za-z0-9_]{1,16}` identity.
             let sanitized = chat.message().as_str().replace('\u{00A7}', "");
             let line = format!("<{name}> {sanitized}");
             let content = TextComponent::text(line);

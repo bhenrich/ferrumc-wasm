@@ -42,6 +42,7 @@ use ferrumc_proto::generated::play::SynchronizePlayerPosition;
 use ferrumc_proto::generated::status::{
     ClientboundStatusPacket, PongResponse, ServerboundStatusPacket,
 };
+use ferrumc_registry::PROTOCOL_VERSION;
 
 use crate::{driver::SimCommand, observe};
 
@@ -56,6 +57,7 @@ mod serverbound_budget;
 
 pub(crate) use context::{build_status_response, ConnContext};
 
+use context::login_disconnect;
 use play::enter_play;
 
 /// Sends an authoritative driver command and waits until its bounded shard
@@ -89,6 +91,14 @@ const NEXT_STATE_STATUS: i32 = 1;
 
 /// The `next_state` value in a handshake that selects the login branch.
 const NEXT_STATE_LOGIN: i32 = 2;
+
+/// Controlled Login Disconnect for clients on the wrong wire protocol.
+const INCOMPATIBLE_PROTOCOL_REASON: &str =
+    "Incompatible client: FerrumC requires Minecraft 1.21.8 (protocol 772).";
+
+/// Controlled Login Disconnect for a syntactically invalid username.
+const INVALID_USERNAME_REASON: &str =
+    "Invalid username: use 1-16 ASCII letters, digits, or underscores.";
 
 /// Bytes read off the socket per `read` call before decoding.
 const READ_CHUNK: usize = 4096;
@@ -141,7 +151,7 @@ impl LoginPhase {
 enum LoginProgress {
     /// Stay in login; keep reading.
     Continue,
-    /// Close the connection cleanly (a non-login handshake).
+    /// Close cleanly after a completed status flow or controlled rejection.
     Close,
     /// The client reached play.
     Play,
@@ -150,23 +160,99 @@ enum LoginProgress {
 /// The canonical identity established once from Login Start and carried into
 /// every later app-owned identity surface.
 struct LoginIdentity {
-    /// The exact, case-sensitive username supplied by the client.
-    name: BoundedString<16>,
+    /// The exact, case-sensitive username after grammar validation.
+    name: ValidatedUsername,
+    /// A terminal/display-safe projection handed to every Play-era sink.
+    ///
+    /// For an admitted username this is byte-identical to `name`; retaining the
+    /// projection separately makes that display boundary explicit and keeps raw
+    /// hostile input away from logs, chat, metrics, plugins, and dashboards.
+    safe_label: BoundedString<16>,
     /// The canonical offline-mode player identity derived from `name`.
     player: PlayerId,
 }
 
 impl LoginIdentity {
-    /// Derives the canonical offline identity once for a wire-bounded name.
-    fn offline(name: BoundedString<16>) -> Self {
-        let player = PlayerId::offline(name.as_str());
-        Self { name, player }
+    /// Validates `name` before invoking the canonical identity derivation.
+    fn try_offline(name: BoundedString<16>) -> Result<Self, InvalidUsername> {
+        Self::try_offline_with(name, PlayerId::offline)
+    }
+
+    /// Validation/derivation seam used by the ordering regression.
+    fn try_offline_with(
+        name: BoundedString<16>,
+        derive: impl FnOnce(&str) -> PlayerId,
+    ) -> Result<Self, InvalidUsername> {
+        let name = ValidatedUsername::new(name)?;
+        let safe_label =
+            BoundedString::<16>::new(display_safe_username(name.as_str())).map_err(|_| {
+                // The validated grammar is ASCII and at most 16 characters, so
+                // its unchanged safe projection necessarily retains this bound.
+                InvalidUsername
+            })?;
+        let player = derive(name.as_str());
+        debug_assert_eq!(safe_label.as_str(), name.as_str());
+        Ok(Self {
+            name,
+            safe_label,
+            player,
+        })
     }
 
     /// Returns the UUID exposed in Login Success and player-facing packets.
     fn uuid(&self) -> uuid::Uuid {
         self.player.as_uuid()
     }
+}
+
+/// A Login Start name proven to match `[A-Za-z0-9_]{1,16}`.
+struct ValidatedUsername(BoundedString<16>);
+
+impl ValidatedUsername {
+    /// Validates the exact wire spelling without trimming, case-folding, or
+    /// Unicode normalization.
+    fn new(name: BoundedString<16>) -> Result<Self, InvalidUsername> {
+        let value = name.as_str();
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err(InvalidUsername);
+        }
+        Ok(Self(name))
+    }
+
+    /// Returns the exact validated, case-sensitive spelling.
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// Returns the bounded wire representation used by Login Success.
+    fn wire(&self) -> &BoundedString<16> {
+        &self.0
+    }
+}
+
+/// Classified failure to satisfy the Minecraft username grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InvalidUsername;
+
+/// Renders arbitrary untrusted username text as a single printable label.
+///
+/// Valid username characters are preserved. Every other Unicode scalar is
+/// rendered with Rust's visible `\u{...}` notation, so controls, section signs,
+/// and chat delimiters cannot become terminal or display instructions.
+fn display_safe_username(name: &str) -> String {
+    let mut label = String::with_capacity(name.len());
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            label.push(character);
+        } else {
+            label.extend(character.escape_unicode());
+        }
+    }
+    label
 }
 
 /// One connection's mutable framing state during the login handshake.
@@ -231,7 +317,7 @@ impl<'a> Connection<'a> {
         self.send(&OutboundPacket::Login(
             ClientboundLoginPacket::LoginSuccess(LoginSuccess::new(
                 identity.uuid(),
-                identity.name.clone(),
+                identity.name.wire().clone(),
                 Vec::new(),
             )),
         ))
@@ -284,7 +370,12 @@ pub(crate) async fn handle_connection(
 ) -> anyhow::Result<()> {
     let mut conn = Connection::new(stream, ctx);
     match run_login(&mut conn, &mut shutdown).await? {
-        Some(identity) => enter_play(conn, identity.name, identity.player, &mut shutdown).await,
+        Some(identity) => {
+            let LoginIdentity {
+                safe_label, player, ..
+            } = identity;
+            enter_play(conn, safe_label, player, &mut shutdown).await
+        }
         None => Ok(()),
     }
 }
@@ -401,6 +492,11 @@ async fn advance(
             InboundPacket::Handshake(ServerboundHandshakePacket::Handshake(handshake)),
         ) => {
             match handshake.next_state() {
+                NEXT_STATE_LOGIN if handshake.protocol_version() != PROTOCOL_VERSION => {
+                    let disconnect = login_disconnect(INCOMPATIBLE_PROTOCOL_REASON)?;
+                    conn.send(&disconnect).await?;
+                    Ok(LoginProgress::Close)
+                }
                 NEXT_STATE_LOGIN => {
                     *phase = LoginPhase::Login;
                     Ok(LoginProgress::Continue)
@@ -429,7 +525,11 @@ async fn advance(
             Ok(LoginProgress::Close)
         }
         (LoginPhase::Login, InboundPacket::Login(ServerboundLoginPacket::LoginStart(start))) => {
-            let player_identity = LoginIdentity::offline(start.name().clone());
+            let Ok(player_identity) = LoginIdentity::try_offline(start.name().clone()) else {
+                let disconnect = login_disconnect(INVALID_USERNAME_REASON)?;
+                conn.send(&disconnect).await?;
+                return Ok(LoginProgress::Close);
+            };
             // Beta-gate: reject banned / non-whitelisted players before login
             // completes (single additive access check; see ConnContext::login_denial).
             if let Some(disconnect) = conn
@@ -538,15 +638,70 @@ async fn write_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn login_identity_is_derived_once() {
         let name = BoundedString::<16>::new("IdentityProbe".to_string())
             .expect("test username is within the protocol bound");
-        let identity = LoginIdentity::offline(name);
+        let identity = LoginIdentity::try_offline(name).expect("test username is valid");
 
         assert_eq!(identity.player, PlayerId::offline("IdentityProbe"));
         assert_eq!(identity.uuid(), identity.player.as_uuid());
         assert_eq!(identity.name.as_str(), "IdentityProbe");
+        assert_eq!(identity.safe_label.as_str(), "IdentityProbe");
+    }
+
+    #[test]
+    fn username_grammar_covers_boundaries_and_classes() {
+        for valid in ["A", "_", "Alpha_123", "abcdefghijklmnop"] {
+            let name = BoundedString::<16>::new(valid.to_string()).expect("wire-bounded username");
+            assert!(
+                ValidatedUsername::new(name).is_ok(),
+                "{valid:?} should be valid"
+            );
+        }
+
+        for invalid in [
+            "",
+            "玩家",
+            "Bad Name",
+            "Bad\nName",
+            "Bad\u{1b}Name",
+            "<Admin>",
+            "\u{a7}cAdmin",
+            "Bad-Name",
+        ] {
+            let name =
+                BoundedString::<16>::new(invalid.to_string()).expect("semantic invalid is bounded");
+            assert_eq!(
+                ValidatedUsername::new(name).err(),
+                Some(InvalidUsername),
+                "{invalid:?} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_username_cannot_reach_identity_derivation() {
+        let derived = Cell::new(false);
+        let name =
+            BoundedString::<16>::new("Bad Name".to_string()).expect("invalid test name is bounded");
+        let result = LoginIdentity::try_offline_with(name, |value| {
+            derived.set(true);
+            PlayerId::offline(value)
+        });
+
+        assert_eq!(result.err(), Some(InvalidUsername));
+        assert!(!derived.get(), "invalid input reached UUID derivation");
+    }
+
+    #[test]
+    fn display_projection_escapes_every_hostile_name_character() {
+        assert_eq!(
+            display_safe_username("A\n\u{1b}\u{a7}<>_9"),
+            "A\\u{a}\\u{1b}\\u{a7}\\u{3c}\\u{3e}_9"
+        );
+        assert_eq!(display_safe_username("Valid_Name9"), "Valid_Name9");
     }
 }

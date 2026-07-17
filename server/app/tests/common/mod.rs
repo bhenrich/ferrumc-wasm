@@ -99,6 +99,20 @@ impl TestClient {
         Ok(())
     }
 
+    /// Half-closes the client-to-server direction while keeping received frames
+    /// readable.
+    ///
+    /// Login-boundary tests use this after a handshake-only write: a conforming
+    /// server must produce its rejection from that handshake rather than waiting
+    /// for a `LoginStart`. On the old behavior the server instead observes EOF,
+    /// which closes the frame channel immediately and fails the regression
+    /// without relying on a wall-clock delay.
+    #[allow(dead_code)] // `common` is compiled separately into tests that never half-close.
+    pub async fn finish_writes(&mut self) -> anyhow::Result<()> {
+        self.writer.shutdown().await?;
+        Ok(())
+    }
+
     /// Awaits the next complete frame body (id + fields) from the drainer.
     pub async fn next_frame(&mut self) -> anyhow::Result<Vec<u8>> {
         self.frames.recv().await.ok_or_else(|| {

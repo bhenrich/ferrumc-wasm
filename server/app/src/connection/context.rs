@@ -12,6 +12,7 @@ use ferrumc_net::{ConnectionLimits, OutboundPacket, StatusInfo};
 use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock};
 use ferrumc_proto::generated::login::{ClientboundLoginPacket, LoginDisconnect};
 use ferrumc_proto::generated::status::{ClientboundStatusPacket, StatusResponse};
+use ferrumc_registry::PROTOCOL_VERSION;
 use ferrumc_storage::PlayerStore;
 
 use crate::driver::SimCommand;
@@ -21,10 +22,6 @@ use crate::world::JoinKit;
 
 /// Human-readable version label shown in the client's multiplayer list.
 const STATUS_VERSION_NAME: &str = "FerrumC 1.21.8";
-
-/// Wire protocol number advertised in the status response. A client reporting
-/// the same number (772, Minecraft 1.21.8) renders the server as compatible.
-const STATUS_PROTOCOL_VERSION: i32 = 772;
 
 /// MOTD text rendered as the status `description`.
 const STATUS_MOTD: &str = "FerrumC";
@@ -137,13 +134,16 @@ impl ConnContext {
     }
 }
 
-/// Builds a clientbound Login Disconnect carrying `message` as a legacy JSON chat
+/// Builds a clientbound Login Disconnect carrying `message` as a JSON text
 /// component (the login-state disconnect wire format).
 ///
-/// `message` is a controlled, short, static kick reason with no JSON-special
-/// characters, so it is wrapped directly into `{"text":"..."}`.
-fn login_disconnect(message: &str) -> anyhow::Result<OutboundPacket> {
-    let json = format!("{{\"text\":\"{message}\"}}");
+/// The JSON serializer escapes the reason for its final wire context even though
+/// current callers supply short, controlled diagnostics.
+pub(super) fn login_disconnect(message: &str) -> anyhow::Result<OutboundPacket> {
+    // Serialize the component rather than interpolating JSON by hand. Today's
+    // callers use controlled reasons, but this keeps every future diagnostic
+    // safe if it ever contains quotes, controls, or other JSON metacharacters.
+    let json = serde_json::json!({ "text": message }).to_string();
     let reason = BoundedString::<262_144>::new(json)
         .map_err(|err| anyhow::anyhow!("login disconnect reason exceeds the wire bound: {err}"))?;
     Ok(OutboundPacket::Login(
@@ -171,7 +171,7 @@ fn login_disconnect(message: &str) -> anyhow::Result<OutboundPacket> {
 pub(crate) fn build_status_response(max_players: u32) -> anyhow::Result<OutboundPacket> {
     let info = StatusInfo::new(
         STATUS_VERSION_NAME,
-        STATUS_PROTOCOL_VERSION,
+        PROTOCOL_VERSION,
         max_players,
         0,
         STATUS_MOTD,
