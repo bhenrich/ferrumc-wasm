@@ -14,10 +14,16 @@
 - The router exchanges only `GameInput`/`GameOutput`/`ClientboundPlayPacket`
   messages. It never holds a `SimShard`, a `Chunk`, a socket, or a DB handle.
 - All transport is bounded `tokio::sync::mpsc`; routing uses non-blocking
-  `try_send`, so the router never blocks the tick loop. A full channel is a
-  classified `SessionError`, never a silent drop.
+  `try_send`, so the router never blocks the tick loop. Ordinary data stops at a
+  fixed reserved tail for join/leave/reject control traffic. A rejected input is
+  returned with its typed delivery policy and classified `SessionError`, never
+  silently dropped.
+- A lifecycle leave rejected during a slow-client cascade remains represented in
+  a player-bounded pending-disconnect set until an explicit retry accepts it;
+  cascade errors are never reduced to a log line or discarded result.
 - The player<->shard mapping is the single source of truth for player location.
-  `disconnect_player` removes the mapping before anything else, so cleanup holds
-  even if the despawn notice cannot be delivered.
+  `disconnect_player` must enqueue `PlayerLeave` before removing the mapping; if
+  the control lane rejects the leave, the mapping remains available for retry or
+  explicit overload termination.
 - Translation (`net_event_to_input`, `output_to_clientbound`,
   `shard_for_position`) is pure: no channels, maps, or I/O.

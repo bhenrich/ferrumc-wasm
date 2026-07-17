@@ -42,12 +42,14 @@ pub enum SessionError {
         shard: ShardPos,
     },
 
-    /// A shard's bounded input channel was at capacity and rejected the input.
+    /// A shard's bounded input channel had no capacity available to this input.
     ///
     /// This is *reject* backpressure mirroring the simulation inbox: the router
     /// never blocks (it must not stall the tick loop) and never silently drops
-    /// (that would desync clients). The caller decides what to do — retry next
-    /// tick, coalesce, or disconnect a flooding client.
+    /// (that would desync clients). Ordinary data receives this error once only
+    /// the reserved control tail remains; control traffic receives it when the
+    /// physical queue is full. The ownership-preserving routing APIs return the
+    /// rejected input so the caller can retry, coalesce, or disconnect.
     #[error("input channel for shard ({}, {}) is full", shard.x(), shard.z())]
     ShardInboxFull {
         /// The shard whose input channel overflowed.

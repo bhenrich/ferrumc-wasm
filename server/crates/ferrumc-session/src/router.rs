@@ -1,7 +1,7 @@
 //! [`SessionRouter`] and [`PlayerSessionHandle`]: the player<->shard mapping and
 //! the message-based bridge between connections and simulation shards.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tokio::sync::mpsc::{self, error::TrySendError};
 
@@ -11,6 +11,7 @@ use ferrumc_net::{Criticality, OutboundPriority};
 use ferrumc_proto::generated::play::ClientboundPlayPacket;
 use ferrumc_sim::{BlockStateId, GameInput, GameOutput, MutationCause};
 
+use crate::delivery::{DeliveryLane, InputDeliveryError, InputDeliveryPolicy};
 use crate::error::SessionError;
 use crate::event::NetEvent;
 use crate::outbound::OutboundMessage;
@@ -28,6 +29,15 @@ use crate::translate::{
 /// stall or a flood — exactly when [reject backpressure](SessionError::ShardInboxFull)
 /// should engage.
 pub const DEFAULT_SHARD_INPUT_CAPACITY: usize = 1024;
+
+/// Default number of shard-input slots reserved for lifecycle/control traffic.
+///
+/// Sixteen slots are 1.6% of the default 1,024-entry queue: enough headroom for
+/// a bounded burst of joins, leaves, and rejected-edit healing while preserving
+/// almost the entire queue for ordinary state traffic. Control traffic is still
+/// bounded; once these slots are consumed it receives the same explicit full
+/// outcome as every other input.
+pub const DEFAULT_SHARD_CONTROL_RESERVE: usize = 16;
 
 /// Default capacity of each player's outbound channel.
 ///
@@ -178,14 +188,16 @@ impl PlayerSessionHandle {
 /// - [`route_output`](Self::route_output) turns a [`GameOutput`] into the
 ///   clientbound packets it implies and delivers them to the relevant
 ///   connection(s).
-/// - [`disconnect_player`](Self::disconnect_player) drops the mapping and
-///   notifies the shard to despawn the player.
+/// - [`disconnect_player`](Self::disconnect_player) notifies the shard, then
+///   drops the mapping and broadcasts the departure.
 ///
 /// # Backpressure
 ///
 /// Every channel is bounded and routing uses non-blocking sends, so the router
-/// never blocks the tick loop. A full *shard input* channel surfaces as a
-/// classified [`SessionError::ShardInboxFull`] for the caller to act on.
+/// never blocks the tick loop. Each input has an [`InputDeliveryPolicy`]; normal
+/// data stops before consuming the fixed control reserve, while join, leave, and
+/// rejected-edit healing may use that reserved tail. The ownership-preserving
+/// APIs return an [`InputDeliveryError`] carrying the exact rejected input.
 ///
 /// Outbound traffic carries an explicit criticality (see
 /// [`Criticality`](ferrumc_net::Criticality)) tagged onto each packet in an
@@ -227,7 +239,9 @@ impl PlayerSessionHandle {
 pub struct SessionRouter {
     shards: BTreeMap<ShardPos, mpsc::Sender<GameInput>>,
     players: BTreeMap<PlayerId, SessionEntry>,
+    pending_disconnects: BTreeSet<PlayerId>,
     shard_input_capacity: usize,
+    shard_control_reserve: usize,
     outbound_capacity: usize,
     view_distance: i32,
     next_entity_id: i32,
@@ -241,16 +255,40 @@ impl SessionRouter {
         Self::with_capacities(DEFAULT_SHARD_INPUT_CAPACITY, DEFAULT_OUTBOUND_CAPACITY)
     }
 
-    /// Creates an empty router with explicit channel capacities and the default
+    /// Creates an empty router with explicit channel capacities, the default
+    /// [`DEFAULT_SHARD_CONTROL_RESERVE`], and the default
     /// [`DEFAULT_VIEW_DISTANCE`].
     ///
     /// Each capacity is clamped to at least `1`, since a bounded
     /// [`mpsc`] channel cannot have zero capacity.
     pub fn with_capacities(shard_input_capacity: usize, outbound_capacity: usize) -> Self {
+        Self::with_capacities_and_control_reserve(
+            shard_input_capacity,
+            outbound_capacity,
+            DEFAULT_SHARD_CONTROL_RESERVE,
+        )
+    }
+
+    /// Creates an empty router with explicit channel capacities and shard-input
+    /// control reserve.
+    ///
+    /// Channel capacities are clamped to at least `1`. The control reserve is
+    /// clamped below the shard capacity so even the smallest queue retains one
+    /// data slot; a capacity-one queue therefore has no physically reservable
+    /// tail but remains fully bounded.
+    pub fn with_capacities_and_control_reserve(
+        shard_input_capacity: usize,
+        outbound_capacity: usize,
+        shard_control_reserve: usize,
+    ) -> Self {
+        let shard_input_capacity = shard_input_capacity.max(1);
         Self {
             shards: BTreeMap::new(),
             players: BTreeMap::new(),
-            shard_input_capacity: shard_input_capacity.max(1),
+            pending_disconnects: BTreeSet::new(),
+            shard_input_capacity,
+            shard_control_reserve: shard_control_reserve
+                .min(shard_input_capacity.saturating_sub(1)),
             outbound_capacity: outbound_capacity.max(1),
             view_distance: DEFAULT_VIEW_DISTANCE,
             next_entity_id: FIRST_ENTITY_ID,
@@ -260,6 +298,12 @@ impl SessionRouter {
     /// The configured per-shard input channel capacity.
     pub fn shard_input_capacity(&self) -> usize {
         self.shard_input_capacity
+    }
+
+    /// The number of tail slots ordinary data traffic leaves available for
+    /// lifecycle/control inputs in every shard queue.
+    pub fn shard_control_reserve(&self) -> usize {
+        self.shard_control_reserve
     }
 
     /// The configured per-player outbound channel capacity.
@@ -294,6 +338,16 @@ impl SessionRouter {
     /// The number of players with an active session.
     pub fn player_count(&self) -> usize {
         self.players.len()
+    }
+
+    /// The number of overloaded sessions whose control-lane leave is retained
+    /// for an explicit retry.
+    ///
+    /// The set is bounded by [`player_count`](Self::player_count): it stores at
+    /// most one retry marker per connected player and never grows from repeated
+    /// failures for the same session.
+    pub fn pending_disconnect_count(&self) -> usize {
+        self.pending_disconnects.len()
     }
 
     /// `true` if `player` has an active session.
@@ -358,14 +412,17 @@ impl SessionRouter {
     /// - [`SessionError::ShardInboxFull`] / [`SessionError::ShardClosed`] if the
     ///   join could not be delivered to the shard.
     ///
-    /// On any error nothing is registered, so the join can be retried cleanly.
+    /// On any error the joining player is not registered, so its join can be
+    /// retried cleanly. An already-connected slow viewer may have been explicitly
+    /// disconnected during the preflight that makes room for mutual visibility.
     ///
-    /// The joiner's tab-list add and entity spawn are delivered to existing viewers
-    /// as *mandatory* packets: a viewer whose outbound channel cannot accept either
-    /// is disconnected (the slow-client backpressure policy), and that cascade is
-    /// drained iteratively here. The joiner's *own* mandatory visibility is instead
-    /// guaranteed by the capacity staging above — its fresh channel provably holds
-    /// every existing-player add + spawn — so a joiner is never left half-loaded.
+    /// The joiner's tab-list add and entity spawn are delivered to existing
+    /// viewers as *mandatory* packets. A viewer already lacking capacity for the
+    /// pair is disconnected before the join is accepted; a viewer that closes in
+    /// the remaining race is disconnected afterward, with a rejected control-lane
+    /// leave retained for explicit retry. The joiner's *own* mandatory visibility
+    /// is guaranteed by capacity staging — its fresh channel provably holds every
+    /// existing-player add + spawn — so a joiner is never left half-loaded.
     pub fn join_player(
         &mut self,
         player: PlayerId,
@@ -399,6 +456,7 @@ impl SessionRouter {
             return Err(SessionError::DuplicatePlayer { player });
         }
 
+        let joiner_chunk = chunk_for_position(position);
         // Stage the joiner's mandatory existing-player visibility against
         // guaranteed channel capacity. Each in-range existing player costs the
         // joiner two mandatory packets (a tab-list add + an entity spawn) on its
@@ -407,7 +465,6 @@ impl SessionRouter {
         // full visibility (finding #9: a silently dropped mandatory spawn leaves an
         // invisible body), so reject the join up front with ZERO side effects — no
         // shard `PlayerJoin`, no map insert — rather than half-load the world.
-        let joiner_chunk = chunk_for_position(position);
         let in_range = self
             .players
             .values()
@@ -421,6 +478,31 @@ impl SessionRouter {
             .count();
         if in_range.saturating_mul(2) > self.outbound_capacity {
             return Err(SessionError::OutboundFull { player });
+        }
+
+        // Remove an in-range viewer that cannot accept the joiner's mandatory
+        // tab-list add + spawn before admitting the joiner. Otherwise the joiner
+        // would first receive that viewer's spawn and immediately need a
+        // mandatory despawn, doubling the fresh-channel burst and risking a
+        // ghost. The slow viewer's control-lane leave is itself explicit: a full
+        // lane aborts this join before PlayerJoin is sent, with the viewer mapping
+        // retained for retry.
+        let slow_viewers: Vec<_> = self
+            .players
+            .iter()
+            .filter(|(_, entry)| {
+                within_view(
+                    joiner_chunk,
+                    chunk_for_position(entry.position),
+                    self.view_distance,
+                ) && (entry.outbound.is_closed() || entry.outbound.capacity() < 2)
+            })
+            .map(|(viewer, _)| *viewer)
+            .collect();
+        for viewer in slow_viewers {
+            if self.players.contains_key(&viewer) {
+                self.disconnect_player(viewer)?;
+            }
         }
 
         // Notify the shard before recording anything: if the join cannot be
@@ -450,12 +532,11 @@ impl SessionRouter {
         // count). Capacity staging above guarantees the joiner's own channel held
         // its full visibility, so it can no longer surface here; the `== player`
         // skip remains as a defensive guard.
-        while let Some(viewer) = to_disconnect.pop() {
-            if viewer == player {
-                continue;
-            }
-            let _ = self.disconnect_one(viewer, &mut to_disconnect);
-        }
+        to_disconnect.retain(|viewer| *viewer != player);
+        // A full control tail cannot roll back the already accepted join. Every
+        // failed leave is retained in `pending_disconnects`, where the app can
+        // retry it after the shard drains instead of losing it here.
+        let _retained_failure = self.drain_disconnect_worklist(to_disconnect);
         Ok(PlayerSessionHandle {
             player,
             shard,
@@ -609,10 +690,27 @@ impl SessionRouter {
     /// - [`SessionError::ShardInboxFull`] / [`SessionError::ShardClosed`] if the
     ///   input could not be delivered to the shard.
     pub fn route_event(&mut self, event: &NetEvent) -> Result<(), SessionError> {
+        self.route_event_owned(event)
+            .map_err(InputDeliveryError::into_error)
+    }
+
+    /// Translates and routes a [`NetEvent`] while preserving ownership of any
+    /// rejected simulation input.
+    ///
+    /// This is the backpressure-aware counterpart to [`route_event`](Self::route_event).
+    /// Events with no simulation effect still return `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputDeliveryError`] containing the exact undelivered input,
+    /// its typed policy, and the classified [`SessionError`].
+    pub fn route_event_owned(&mut self, event: &NetEvent) -> Result<(), InputDeliveryError> {
         match event {
-            NetEvent::Disconnected { player, .. } => self.disconnect_player(*player).map(|_| ()),
+            NetEvent::Disconnected { player, .. } => {
+                self.disconnect_player_owned(*player).map(|_| ())
+            }
             NetEvent::Play { player, packet } => match play_packet_to_input(*player, packet) {
-                Some(input) => self.route_input(*player, input),
+                Some(input) => self.route_input_owned(*player, input),
                 None => Ok(()),
             },
         }
@@ -632,7 +730,22 @@ impl SessionRouter {
     /// - [`SessionError::ShardInboxFull`] / [`SessionError::ShardClosed`] if the
     ///   input could not be delivered to the shard.
     pub fn route_game_input(&self, player: PlayerId, input: GameInput) -> Result<(), SessionError> {
-        self.route_input(player, input)
+        self.route_game_input_owned(player, input)
+            .map_err(InputDeliveryError::into_error)
+    }
+
+    /// Routes an already-translated input while preserving it on rejection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputDeliveryError`] containing the exact input and its
+    /// policy if the player/shard lookup or bounded send fails.
+    pub fn route_game_input_owned(
+        &self,
+        player: PlayerId,
+        input: GameInput,
+    ) -> Result<(), InputDeliveryError> {
+        self.route_input_owned(player, input)
     }
 
     /// Routes a simulation [`GameOutput`] to its network recipient(s), returning
@@ -1136,52 +1249,143 @@ impl SessionRouter {
         }
     }
 
-    /// Disconnects `player`: removes them from the player list of every remaining
-    /// player, drops the player<->shard mapping, and notifies the shard to
-    /// despawn them. Returns the shard `player` was on.
+    /// Disconnects `player`: first delivers their leave to the shard, then drops
+    /// the player<->shard mapping and removes them from every remaining player's
+    /// view. Returns the shard `player` was on.
     ///
     /// The departure despawn is now **mandatory** (a dropped despawn ghosts the
     /// entity), so a viewer whose outbound channel is full during the leave
     /// broadcast must itself be disconnected — which broadcasts *another* leave.
     /// That cascade is drained here with an iterative worklist (never recursion):
-    /// it is bounded because each player is removed from the session map at most
-    /// once, so the chain terminates even with many slow clients. The worklist is
-    /// drained even when the original despawn fails to reach the shard, so no
-    /// surfaced viewer is leaked.
+    /// it is bounded because each player is attempted at most once per pass. A
+    /// rejected cascade leave keeps that player's mapping and is deduplicated into
+    /// the player-bounded pending set; the rest of the worklist is still drained.
     ///
     /// # Errors
     ///
     /// - [`SessionError::UnknownPlayer`] if `player` had no session.
-    /// - [`SessionError::ShardInboxFull`] / [`SessionError::ShardClosed`] if the
-    ///   despawn could not be delivered (mapping already removed). The error is for
-    ///   `player`'s own despawn; cascade-disconnected viewers are best-effort.
+    /// - [`SessionError::ShardInboxFull`] / [`SessionError::ShardClosed`] if any
+    ///   required leave could not be delivered. That player's mapping remains so
+    ///   the caller can retry or terminate explicitly rather than orphaning a sim
+    ///   entity.
     pub fn disconnect_player(&mut self, player: PlayerId) -> Result<ShardPos, SessionError> {
-        let mut worklist = Vec::new();
-        let result = self.disconnect_one(player, &mut worklist);
-        // Drain the leave-broadcast cascade iteratively. A viewer is queued only
-        // while it still has a session, and disconnect_one removes it, so the loop
-        // visits each player at most once and always terminates.
-        while let Some(next) = worklist.pop() {
-            let _ = self.disconnect_one(next, &mut worklist);
-        }
-        result
+        self.disconnect_player_owned(player)
+            .map_err(InputDeliveryError::into_error)
     }
 
-    /// Removes one player's session and broadcasts their leave, pushing any viewer
-    /// whose mandatory despawn overflowed onto `also_disconnect` (the cascade
-    /// worklist [`disconnect_player`](Self::disconnect_player) drains).
-    fn disconnect_one(
+    /// Disconnects `player` while preserving an undelivered leave input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputDeliveryError`] for the original player or a
+    /// cascade-disconnected slow viewer whose control-lane leave could not be
+    /// accepted. A failed player's mapping remains registered.
+    pub fn disconnect_player_owned(
+        &mut self,
+        player: PlayerId,
+    ) -> Result<ShardPos, InputDeliveryError> {
+        let mut worklist = Vec::new();
+        let shard = match self.disconnect_one_owned(player, &mut worklist) {
+            Ok(shard) => {
+                self.pending_disconnects.remove(&player);
+                shard
+            }
+            Err(err) => {
+                self.pending_disconnects.insert(player);
+                return Err(err);
+            }
+        };
+        if let Some(err) = self.drain_disconnect_worklist(worklist) {
+            return Err(err);
+        }
+        Ok(shard)
+    }
+
+    /// Retries every retained slow-session leave against the bounded control
+    /// lane.
+    ///
+    /// Successful leaves are removed from the pending set. A leave rejected by
+    /// a still-full or closed shard remains pending, and the first exact rejected
+    /// [`GameInput::PlayerLeave`] is returned to the caller. Any additional
+    /// failures from the same bounded pass remain represented by their player id
+    /// for a later retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputDeliveryError`] if at least one retained leave is still
+    /// rejected. The corresponding player mapping remains registered.
+    pub fn retry_pending_disconnects(&mut self) -> Result<(), InputDeliveryError> {
+        let worklist = self.pending_disconnects.iter().copied().collect();
+        if let Some(err) = self.drain_disconnect_worklist(worklist) {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Drains a slow-client leave cascade without ever discarding a rejected
+    /// control input.
+    ///
+    /// Every failure is deduplicated into `pending_disconnects`; the first exact
+    /// rejection is returned for callers that can surface it immediately. The
+    /// worklist and `attempted` set are both bounded by the connected player map.
+    fn drain_disconnect_worklist(
+        &mut self,
+        mut worklist: Vec<PlayerId>,
+    ) -> Option<InputDeliveryError> {
+        let mut attempted = BTreeSet::new();
+        let mut first_error = None;
+        while let Some(next) = worklist.pop() {
+            if !attempted.insert(next) {
+                continue;
+            }
+            if !self.players.contains_key(&next) {
+                self.pending_disconnects.remove(&next);
+                continue;
+            }
+            match self.disconnect_one_owned(next, &mut worklist) {
+                Ok(_) => {
+                    self.pending_disconnects.remove(&next);
+                }
+                Err(err) => {
+                    self.pending_disconnects.insert(next);
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+        first_error
+    }
+
+    /// Delivers one player's leave, removes their session, and broadcasts their
+    /// departure. Viewers whose mandatory despawn overflows are pushed onto the
+    /// cascade worklist [`disconnect_player_owned`](Self::disconnect_player_owned)
+    /// drains.
+    fn disconnect_one_owned(
         &mut self,
         player: PlayerId,
         also_disconnect: &mut Vec<PlayerId>,
-    ) -> Result<ShardPos, SessionError> {
-        let entry = self
-            .players
-            .remove(&player)
-            .ok_or(SessionError::UnknownPlayer { player })?;
+    ) -> Result<ShardPos, InputDeliveryError> {
+        let leave = GameInput::PlayerLeave { player };
+        let policy = InputDeliveryPolicy::for_input(&leave);
+        let entry = self.players.get(&player).ok_or_else(|| {
+            InputDeliveryError::new(
+                leave.clone(),
+                policy,
+                SessionError::UnknownPlayer { player },
+            )
+        })?;
+        let shard = entry.shard;
+        self.send_to_shard_owned(shard, leave, policy)?;
+        let Some(entry) = self.players.remove(&player) else {
+            return Err(InputDeliveryError::new(
+                GameInput::PlayerLeave { player },
+                policy,
+                SessionError::UnknownPlayer { player },
+            ));
+        };
         self.broadcast_leave_visibility(player, entry.entity_id, also_disconnect);
-        self.send_to_shard(entry.shard, GameInput::PlayerLeave { player })?;
-        Ok(entry.shard)
+        Ok(shard)
     }
 
     /// Tells every remaining player that *had `departed` in view* to drop it
@@ -1353,29 +1557,55 @@ impl SessionRouter {
         player: PlayerId,
         position: Vec3,
     ) -> Result<(), SessionError> {
-        let mut to_disconnect = Vec::new();
-        match self.players.get(&player) {
-            Some(entry) => {
-                Self::send_mandatory(entry, move_shell(position), player, &mut to_disconnect);
-            }
-            None => return Err(SessionError::UnknownPlayer { player }),
-        }
-        // Update authoritative position and let in-range viewers see the move via
-        // the simulation at the next tick.
-        let routed = self.route_game_input(
+        self.teleport_player_owned(player, position)
+            .map_err(InputDeliveryError::into_error)
+    }
+
+    /// Teleports `player` while preserving the authoritative move if its bounded
+    /// shard delivery is rejected.
+    ///
+    /// The shard move is accepted before the clientbound position sync is sent,
+    /// so a full shard queue can never preview a teleport that authoritative
+    /// simulation did not accept.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`InputDeliveryError`] for the teleport move or for a required
+    /// slow-client leave that could not enter the control reserve.
+    pub fn teleport_player_owned(
+        &mut self,
+        player: PlayerId,
+        position: Vec3,
+    ) -> Result<(), InputDeliveryError> {
+        let input = GameInput::PlayerMove {
             player,
-            GameInput::PlayerMove {
-                player,
-                position: Some(position),
-                yaw: None,
-                pitch: None,
-            },
-        );
-        // A target that overflowed the mandatory position-sync is torn down.
-        for victim in to_disconnect {
-            let _ = self.disconnect_player(victim);
+            position: Some(position),
+            yaw: None,
+            pitch: None,
+        };
+        let policy = InputDeliveryPolicy::authoritative(DeliveryLane::Data);
+        let Some(outbound) = self
+            .players
+            .get(&player)
+            .map(|entry| entry.outbound.clone())
+        else {
+            return Err(InputDeliveryError::new(
+                input,
+                policy,
+                SessionError::UnknownPlayer { player },
+            ));
+        };
+        self.route_input_with_policy(player, input, policy)?;
+
+        // The target's authoritative move is now accepted. If its mandatory sync
+        // cannot be queued, tear the session down through the control-lane leave.
+        if outbound
+            .try_send(OutboundMessage::mandatory(move_shell(position)))
+            .is_err()
+        {
+            self.disconnect_player_owned(player)?;
         }
-        routed
+        Ok(())
     }
 
     /// Routes an already-translated input to the shard that should apply it.
@@ -1383,11 +1613,29 @@ impl SessionRouter {
     /// A block edit is routed by the *block's* chunk (see
     /// [`shard_for_block`](Self::shard_for_block)); every other input routes to
     /// the player's bound shard.
-    fn route_input(&self, player: PlayerId, input: GameInput) -> Result<(), SessionError> {
-        let entry = self
-            .players
-            .get(&player)
-            .ok_or(SessionError::UnknownPlayer { player })?;
+    fn route_input_owned(
+        &self,
+        player: PlayerId,
+        input: GameInput,
+    ) -> Result<(), InputDeliveryError> {
+        let policy = InputDeliveryPolicy::for_input(&input);
+        self.route_input_with_policy(player, input, policy)
+    }
+
+    /// Routes `input` with an explicit policy override.
+    fn route_input_with_policy(
+        &self,
+        player: PlayerId,
+        input: GameInput,
+        policy: InputDeliveryPolicy,
+    ) -> Result<(), InputDeliveryError> {
+        let Some(entry) = self.players.get(&player) else {
+            return Err(InputDeliveryError::new(
+                input,
+                policy,
+                SessionError::UnknownPlayer { player },
+            ));
+        };
         let shard = match &input {
             GameInput::BlockBreak { position, .. }
             | GameInput::BlockPlace { position, .. }
@@ -1397,7 +1645,7 @@ impl SessionRouter {
             }
             _ => entry.shard,
         };
-        self.send_to_shard(shard, input)
+        self.send_to_shard_owned(shard, input, policy)
     }
 
     /// Resolves the shard that should apply a block edit at `position`.
@@ -1420,13 +1668,44 @@ impl SessionRouter {
 
     /// Non-blocking send of `input` to `shard`'s input channel.
     fn send_to_shard(&self, shard: ShardPos, input: GameInput) -> Result<(), SessionError> {
-        let sender = self
-            .shards
-            .get(&shard)
-            .ok_or(SessionError::UnknownShard { shard })?;
+        let policy = InputDeliveryPolicy::for_input(&input);
+        self.send_to_shard_owned(shard, input, policy)
+            .map_err(InputDeliveryError::into_error)
+    }
+
+    /// Non-blocking shard send that returns the exact input on rejection.
+    fn send_to_shard_owned(
+        &self,
+        shard: ShardPos,
+        input: GameInput,
+        policy: InputDeliveryPolicy,
+    ) -> Result<(), InputDeliveryError> {
+        let Some(sender) = self.shards.get(&shard) else {
+            return Err(InputDeliveryError::new(
+                input,
+                policy,
+                SessionError::UnknownShard { shard },
+            ));
+        };
+
+        // The router is the sole sender. Refusing ordinary data once only the
+        // reserved tail remains cannot race another producer; the receiver may
+        // only free more capacity between this check and `try_send`.
+        if policy.lane() == DeliveryLane::Data && sender.capacity() <= self.shard_control_reserve {
+            return Err(InputDeliveryError::new(
+                input,
+                policy,
+                SessionError::ShardInboxFull { shard },
+            ));
+        }
+
         sender.try_send(input).map_err(|err| match err {
-            TrySendError::Full(_) => SessionError::ShardInboxFull { shard },
-            TrySendError::Closed(_) => SessionError::ShardClosed { shard },
+            TrySendError::Full(input) => {
+                InputDeliveryError::new(input, policy, SessionError::ShardInboxFull { shard })
+            }
+            TrySendError::Closed(input) => {
+                InputDeliveryError::new(input, policy, SessionError::ShardClosed { shard })
+            }
         })
     }
 }
@@ -1481,12 +1760,15 @@ mod tests {
     // comparison is intentional in these assertions.
     #![allow(clippy::float_cmp)]
 
+    use ferrumc_core::GameMode;
+    use ferrumc_math::{Cuboid, Direction};
     use ferrumc_net::DisconnectReason;
     use ferrumc_proto::generated::play::{GameEvent, ServerboundKeepAlive, ServerboundPlayPacket};
-    use ferrumc_sim::{Sign, SignKind};
+    use ferrumc_sim::{RegionOp, Sign, SignKind};
 
     use super::*;
     use crate::translate::PLAYER_INFO_ADD;
+    use crate::DeliveryPolicy;
 
     fn player(name: &str) -> PlayerId {
         PlayerId::offline(name)
@@ -1495,6 +1777,364 @@ mod tests {
     /// Spawn position inside shard (0, 0): chunk 0, well within blocks 0..128.
     fn spawn_pos() -> Vec3 {
         Vec3::new(8.0, 64.0, 8.0)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // The table intentionally enumerates every current input variant.
+    fn input_delivery_policy_classifies_every_current_variant() {
+        let p = player("policy");
+        let block = BlockPos::new(8, 64, 8);
+        let cases = [
+            (
+                GameInput::PlayerJoin {
+                    player: p,
+                    position: spawn_pos(),
+                },
+                DeliveryPolicy::Authoritative,
+                DeliveryLane::Control,
+            ),
+            (
+                GameInput::PlayerMove {
+                    player: p,
+                    position: Some(spawn_pos()),
+                    yaw: None,
+                    pitch: None,
+                },
+                DeliveryPolicy::Coalescible,
+                DeliveryLane::Data,
+            ),
+            (
+                GameInput::PlayerLeave { player: p },
+                DeliveryPolicy::Authoritative,
+                DeliveryLane::Control,
+            ),
+            (
+                GameInput::BlockBreak {
+                    player: p,
+                    position: block,
+                    sequence: 1,
+                },
+                DeliveryPolicy::Authoritative,
+                DeliveryLane::Data,
+            ),
+            (
+                GameInput::BlockPlace {
+                    player: p,
+                    position: block,
+                    sequence: 2,
+                    state: BlockStateId::new(1),
+                    clicked_face: Direction::Up,
+                    cursor_position: Vec3::new(0.5, 1.0, 0.5),
+                    player_yaw: 0.0,
+                },
+                DeliveryPolicy::Authoritative,
+                DeliveryLane::Data,
+            ),
+            (
+                GameInput::SetBlockExact {
+                    player: p,
+                    position: block,
+                    sequence: 3,
+                    state: BlockStateId::new(2),
+                },
+                DeliveryPolicy::Authoritative,
+                DeliveryLane::Data,
+            ),
+            (
+                GameInput::RejectBlockEdit {
+                    player: p,
+                    position: block,
+                    sequence: 4,
+                    requested_state: BlockStateId::AIR,
+                },
+                DeliveryPolicy::Authoritative,
+                DeliveryLane::Control,
+            ),
+            (
+                GameInput::SetGameMode {
+                    player: p,
+                    mode: GameMode::Creative,
+                },
+                DeliveryPolicy::Authoritative,
+                DeliveryLane::Data,
+            ),
+            (
+                GameInput::RegionEdit {
+                    player: p,
+                    region: Cuboid::new(block, block),
+                    op: RegionOp::Fill {
+                        state: BlockStateId::new(3),
+                    },
+                },
+                DeliveryPolicy::Authoritative,
+                DeliveryLane::Data,
+            ),
+            (
+                GameInput::RegionUndo { player: p },
+                DeliveryPolicy::Authoritative,
+                DeliveryLane::Data,
+            ),
+            (
+                GameInput::UpdateSign {
+                    player: p,
+                    position: block,
+                    is_front: true,
+                    lines: std::array::from_fn(|index| format!("line {index}")),
+                },
+                DeliveryPolicy::Authoritative,
+                DeliveryLane::Data,
+            ),
+        ];
+
+        for (input, expected_policy, expected_lane) in cases {
+            let policy = InputDeliveryPolicy::for_input(&input);
+            assert_eq!(policy.policy(), expected_policy, "input: {input:?}");
+            assert_eq!(policy.lane(), expected_lane, "input: {input:?}");
+        }
+        assert_ne!(DeliveryPolicy::BestEffort, DeliveryPolicy::Authoritative,);
+    }
+
+    #[test]
+    fn control_lane_remains_available_after_data_capacity_is_reserved() {
+        let mut router = SessionRouter::with_capacities_and_control_reserve(3, 16, 1);
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let p = player("reserve");
+        let _handle = router.join_player(p, "reserve", spawn_pos()).expect("join");
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerJoin { player, .. }) if player == p
+        ));
+
+        for mode in [GameMode::Survival, GameMode::Creative] {
+            router
+                .route_game_input_owned(p, GameInput::SetGameMode { player: p, mode })
+                .expect("data slot remains");
+        }
+        let rejected = GameInput::SetGameMode {
+            player: p,
+            mode: GameMode::Adventure,
+        };
+        let err = router
+            .route_game_input_owned(p, rejected.clone())
+            .expect_err("data traffic stops at the control reserve");
+        assert_eq!(err.input(), &rejected);
+        assert_eq!(err.policy().policy(), DeliveryPolicy::Authoritative);
+        assert_eq!(err.policy().lane(), DeliveryLane::Data);
+        assert!(matches!(
+            err.error(),
+            SessionError::ShardInboxFull { shard } if *shard == ShardPos::new(0, 0)
+        ));
+
+        let heal = GameInput::RejectBlockEdit {
+            player: p,
+            position: BlockPos::new(8, 64, 8),
+            sequence: 9,
+            requested_state: BlockStateId::AIR,
+        };
+        router
+            .route_game_input_owned(p, heal.clone())
+            .expect("control input consumes the reserved slot");
+
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::SetGameMode {
+                mode: GameMode::Survival,
+                ..
+            })
+        ));
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::SetGameMode {
+                mode: GameMode::Creative,
+                ..
+            })
+        ));
+        assert_eq!(inbox.try_recv(), Ok(heal));
+    }
+
+    #[test]
+    fn join_uses_control_reserve_after_data_lane_stops() {
+        let mut router = SessionRouter::with_capacities_and_control_reserve(2, 16, 1);
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let first = player("first");
+        let second = player("second");
+        let _first_handle = router
+            .join_player(first, "first", spawn_pos())
+            .expect("first join");
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerJoin { player, .. }) if player == first
+        ));
+        router
+            .route_game_input_owned(
+                first,
+                GameInput::SetGameMode {
+                    player: first,
+                    mode: GameMode::Creative,
+                },
+            )
+            .expect("one data slot");
+
+        let rejected = router
+            .route_game_input_owned(first, GameInput::RegionUndo { player: first })
+            .expect_err("ordinary data cannot consume the reserve");
+        assert_eq!(rejected.policy().lane(), DeliveryLane::Data);
+
+        let _second_handle = router
+            .join_player(second, "second", spawn_pos())
+            .expect("join consumes the control reserve");
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::SetGameMode { player, .. }) if player == first
+        ));
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerJoin { player, .. }) if player == second
+        ));
+    }
+
+    #[test]
+    fn route_event_rejection_returns_the_translated_coalescible_input() {
+        let mut router = SessionRouter::with_capacities(1, 16);
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let p = player("event-overload");
+        let _handle = router
+            .join_player(p, "event-overload", spawn_pos())
+            .expect("join");
+        let destination = Vec3::new(12.0, 65.0, 14.0);
+        let event = NetEvent::play(
+            p,
+            ServerboundPlayPacket::SetPlayerPosition(
+                ferrumc_proto::generated::play::SetPlayerPosition::new(
+                    destination.x,
+                    destination.y,
+                    destination.z,
+                    0,
+                ),
+            ),
+        );
+
+        let err = router
+            .route_event_owned(&event)
+            .expect_err("join still occupies the only shard slot");
+        assert_eq!(err.policy().policy(), DeliveryPolicy::Coalescible);
+        assert_eq!(err.policy().lane(), DeliveryLane::Data);
+        assert_eq!(
+            err.input(),
+            &GameInput::PlayerMove {
+                player: p,
+                position: Some(destination),
+                yaw: None,
+                pitch: None,
+            }
+        );
+    }
+
+    #[test]
+    fn closed_shard_returns_the_owned_authoritative_input() {
+        let mut router = SessionRouter::new();
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let p = player("closed-shard");
+        let _handle = router
+            .join_player(p, "closed-shard", spawn_pos())
+            .expect("join");
+        let _ = inbox.try_recv();
+        drop(inbox);
+        let input = GameInput::RegionUndo { player: p };
+
+        let err = router
+            .route_game_input_owned(p, input.clone())
+            .expect_err("closed shard rejects the input");
+        let (returned, policy, error) = err.into_parts();
+        assert_eq!(returned, input);
+        assert_eq!(policy.policy(), DeliveryPolicy::Authoritative);
+        assert_eq!(policy.lane(), DeliveryLane::Data);
+        assert_eq!(
+            error,
+            SessionError::ShardClosed {
+                shard: ShardPos::new(0, 0)
+            }
+        );
+    }
+
+    #[test]
+    fn disconnect_keeps_mapping_until_control_leave_is_accepted() {
+        let mut router = SessionRouter::with_capacities_and_control_reserve(2, 16, 1);
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let p = player("leave-reserve");
+        let _handle = router
+            .join_player(p, "leave-reserve", spawn_pos())
+            .expect("join");
+        let heal = GameInput::RejectBlockEdit {
+            player: p,
+            position: BlockPos::new(8, 64, 8),
+            sequence: 1,
+            requested_state: BlockStateId::AIR,
+        };
+        router
+            .route_game_input_owned(p, heal.clone())
+            .expect("fill final control slot");
+
+        let err = router
+            .disconnect_player_owned(p)
+            .expect_err("full control lane rejects leave explicitly");
+        assert_eq!(err.input(), &GameInput::PlayerLeave { player: p });
+        assert_eq!(err.policy().lane(), DeliveryLane::Control);
+        assert!(router.is_player_connected(p));
+        assert_eq!(router.pending_disconnect_count(), 1);
+
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerJoin { player, .. }) if player == p
+        ));
+        router
+            .retry_pending_disconnects()
+            .expect("explicit retry uses the freed control slot");
+        assert!(!router.is_player_connected(p));
+        assert_eq!(router.pending_disconnect_count(), 0);
+        assert_eq!(inbox.try_recv(), Ok(heal));
+        assert_eq!(inbox.try_recv(), Ok(GameInput::PlayerLeave { player: p }));
+    }
+
+    #[test]
+    fn teleport_preview_waits_for_authoritative_delivery() {
+        let mut router = SessionRouter::with_capacities(1, 16);
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let p = player("teleport-overload");
+        let mut handle = router
+            .join_player(p, "teleport-overload", spawn_pos())
+            .expect("join");
+        let destination = Vec3::new(40.0, 70.0, 24.0);
+
+        let err = router
+            .teleport_player_owned(p, destination)
+            .expect_err("join still occupies the shard queue");
+        assert_eq!(err.policy().policy(), DeliveryPolicy::Authoritative);
+        assert!(matches!(err.input(), GameInput::PlayerMove { .. }));
+        assert!(
+            handle.try_recv().is_none(),
+            "no position sync may precede authoritative acceptance",
+        );
+
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerJoin { player, .. }) if player == p
+        ));
+        router
+            .teleport_player_owned(p, destination)
+            .expect("retry after capacity is accepted");
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerMove { position: Some(position), .. }) if position == destination
+        ));
+        let ClientboundPlayPacket::SynchronizePlayerPosition(sync) = handle
+            .try_recv()
+            .expect("sync follows acceptance")
+            .into_packet()
+        else {
+            panic!("expected a SynchronizePlayerPosition packet");
+        };
+        assert_eq!((sync.x(), sync.y(), sync.z()), (40.0, 70.0, 24.0));
     }
 
     #[test]
@@ -1901,6 +2541,10 @@ mod tests {
     fn defaults_match_documented_capacities() {
         let router = SessionRouter::default();
         assert_eq!(router.shard_input_capacity(), DEFAULT_SHARD_INPUT_CAPACITY);
+        assert_eq!(
+            router.shard_control_reserve(),
+            DEFAULT_SHARD_CONTROL_RESERVE
+        );
         assert_eq!(router.outbound_capacity(), DEFAULT_OUTBOUND_CAPACITY);
         assert_eq!(router.shard_count(), 0);
         assert_eq!(router.player_count(), 0);
@@ -1910,6 +2554,7 @@ mod tests {
     fn zero_capacity_is_clamped_to_one() {
         let router = SessionRouter::with_capacities(0, 0);
         assert_eq!(router.shard_input_capacity(), 1);
+        assert_eq!(router.shard_control_reserve(), 0);
         assert_eq!(router.outbound_capacity(), 1);
     }
 
