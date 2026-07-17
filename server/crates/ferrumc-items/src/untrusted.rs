@@ -17,8 +17,6 @@
 //!
 //! [`ByteArray`]: https://minecraft.wiki/w/Java_Edition_protocol/Slot_data
 
-use std::num::NonZeroU8;
-
 use ferrumc_codec::{BoundedBytes, BoundedReader};
 use ferrumc_nbt::read_network_root;
 
@@ -33,7 +31,8 @@ use crate::wire::{nbt_limits, MAX_COMPONENTS, MAX_COMPONENTS_TOTAL_BYTES, MAX_CO
 /// The maximum modeled `max_stack_size` component value (vanilla allows `1..=99`).
 const MAX_STACK_SIZE_VALUE: i32 = 99;
 
-/// Errors raised while decoding or validating a serverbound item stack.
+/// Errors raised while constructing, decoding, validating, or encoding an item
+/// stack.
 ///
 /// Each variant classifies a distinct failure so callers can react precisely.
 /// The enum is `#[non_exhaustive]`: new failure modes may be added without a
@@ -41,6 +40,18 @@ const MAX_STACK_SIZE_VALUE: i32 = 99;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ItemValidationError {
+    /// A present stack's count was zero or exceeded the registry maximum for
+    /// its item.
+    #[error("item id {item_id} stack count {count} is outside 1..={max}")]
+    StackCountOutOfRange {
+        /// Registry item id whose count was rejected.
+        item_id: i32,
+        /// Rejected stack count.
+        count: u8,
+        /// Registry maximum for this item.
+        max: u8,
+    },
+
     /// The item id is not present in the 1.21.8 registry.
     #[error("item id {0} is not in the 1.21.8 registry")]
     UnknownItemId(i32),
@@ -217,9 +228,8 @@ impl UntrustedItemStack {
             return Ok(ItemStack::empty());
         }
 
-        // Clamp into 1..=max_stack; max_stack is >= 1, so the result is non-zero.
+        // Clamp into 1..=max_stack; max_stack is >= 1.
         let clamped = self.count.clamp(1, item.max_stack());
-        let count = NonZeroU8::new(clamped).unwrap_or(NonZeroU8::MIN);
 
         let limits = nbt_limits();
         let mut added = Vec::new();
@@ -263,11 +273,7 @@ impl UntrustedItemStack {
             .filter(|tid| tid.is_in_range() && !tid.is_dangerous())
             .collect();
 
-        Ok(ItemStack::new(
-            item,
-            count,
-            ComponentPatch::new(added, removed),
-        ))
+        ItemStack::try_new(item, clamped, ComponentPatch::new(added, removed))
     }
 }
 

@@ -1,12 +1,13 @@
 //! The canonical [`ItemStack`] and the *trusted* (clientbound) slot encoder.
 //!
 //! An [`ItemStack`] is the server's authoritative item form: a validated
-//! [`ItemId`], a non-zero count (or the empty slot), and a component patch. Its
-//! trusted encoder emits the count-first `Slot` wire form with *typed,
-//! unprefixed* component data — the form a 1.21.8 client expects on clientbound
-//! packets. The matching decoder lives under `#[cfg(test)]` only, because the
-//! server never decodes a trusted slot in production (clientbound is
-//! server-to-client).
+//! [`ItemId`], a count (or the empty slot), and a component patch. New
+//! data-driven construction uses [`ItemStack::try_new`], which enforces the
+//! item's registry maximum. The trusted encoder revalidates before emitting the
+//! count-first `Slot` wire form with *typed, unprefixed* component data — the
+//! form a 1.21.8 client expects on clientbound packets. The matching decoder
+//! lives under `#[cfg(test)]` only, because the server never decodes a trusted
+//! slot in production (clientbound is server-to-client).
 
 use std::num::NonZeroU8;
 
@@ -21,9 +22,10 @@ use crate::wire::{nbt_limits, write_count};
 /// The canonical (trusted) item stack.
 ///
 /// Either empty (no item, count 0, empty patch) or a present item with a
-/// non-zero count and a component patch. Construct with [`ItemStack::empty`] or
-/// [`ItemStack::new`]; the latter takes a [`NonZeroU8`] so a present stack can
-/// never have a zero count.
+/// count and a component patch. Construct with [`ItemStack::empty`] or the
+/// checked [`ItemStack::try_new`]. The source-compatible [`ItemStack::new`]
+/// accepts a caller-validated [`NonZeroU8`], but [`ItemStack::encode_slot`]
+/// independently rejects a count above the item's registry maximum.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ItemStack {
     item: Option<ItemId>,
@@ -42,7 +44,13 @@ impl ItemStack {
         }
     }
 
-    /// Creates a present stack with a non-zero count and a component patch.
+    /// Creates a present stack from a caller-validated non-zero count.
+    ///
+    /// This source-compatible constructor retains the original trusted-caller
+    /// contract and does not check `count <= item.max_stack()`. Prefer
+    /// [`Self::try_new`] for data-driven counts; regardless of construction
+    /// path, [`Self::encode_slot`] rejects an invalid count without retaining
+    /// any bytes in the output.
     #[must_use]
     pub fn new(item: ItemId, count: NonZeroU8, components: ComponentPatch) -> Self {
         Self {
@@ -50,6 +58,26 @@ impl ItemStack {
             count: count.get(),
             components,
         }
+    }
+
+    /// Creates a present stack after validating `count` against the item's
+    /// registry maximum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ItemValidationError::StackCountOutOfRange`] when `count` is
+    /// zero or greater than [`ItemId::max_stack`].
+    pub fn try_new(
+        item: ItemId,
+        count: u8,
+        components: ComponentPatch,
+    ) -> Result<Self, ItemValidationError> {
+        validate_present_count(item, count)?;
+        Ok(Self {
+            item: Some(item),
+            count,
+            components,
+        })
     }
 
     /// The item, or `None` for the empty slot.
@@ -93,9 +121,25 @@ impl ItemStack {
     /// encodes `itemCount`, `itemId`, the added/removed counts, each added
     /// component as typed unprefixed data, then each removed component type id.
     ///
-    /// Propagates an NBT encoding error if an NBT-valued component exceeds the
-    /// [`NbtLimits`](ferrumc_nbt::NbtLimits) caps.
+    /// Returns [`ItemValidationError::StackCountOutOfRange`] if a present count
+    /// is zero or above the registry maximum. Propagates an NBT encoding error
+    /// if an NBT-valued component exceeds the
+    /// [`NbtLimits`](ferrumc_nbt::NbtLimits) caps. On any error, `out` is
+    /// restored to its original length.
     pub fn encode_slot(&self, out: &mut Vec<u8>) -> Result<(), ItemValidationError> {
+        let start = out.len();
+        let result = self.encode_slot_inner(out);
+        if result.is_err() {
+            out.truncate(start);
+        }
+        result
+    }
+
+    /// Encodes a slot after the public entry point records its rollback point.
+    fn encode_slot_inner(&self, out: &mut Vec<u8>) -> Result<(), ItemValidationError> {
+        if let Some(item) = self.item {
+            validate_present_count(item, self.count)?;
+        }
         match self.item {
             None => {
                 // itemCount 0 marks the empty slot; nothing follows.
@@ -117,6 +161,19 @@ impl ItemStack {
         }
         Ok(())
     }
+}
+
+/// Validates one present stack count against its registry item.
+fn validate_present_count(item: ItemId, count: u8) -> Result<(), ItemValidationError> {
+    let max = item.max_stack();
+    if count == 0 || count > max {
+        return Err(ItemValidationError::StackCountOutOfRange {
+            item_id: item.id(),
+            count,
+            max,
+        });
+    }
+    Ok(())
 }
 
 /// Resolves a vanilla left-click pickup / place / merge / swap between a window
@@ -274,6 +331,26 @@ mod tests {
         NonZeroU8::new(n).unwrap()
     }
 
+    /// Builds an intentionally invalid stack to exercise defensive consumers.
+    fn unchecked_stack(item: ItemId, count: u8, components: ComponentPatch) -> ItemStack {
+        ItemStack {
+            item: Some(item),
+            count,
+            components,
+        }
+    }
+
+    fn assert_count_error(error: &ItemValidationError, item: ItemId, count: u8, max: u8) {
+        assert_eq!(
+            error,
+            &ItemValidationError::StackCountOutOfRange {
+                item_id: item.id(),
+                count,
+                max,
+            }
+        );
+    }
+
     #[test]
     fn empty_slot_round_trips() {
         let stack = ItemStack::empty();
@@ -295,6 +372,112 @@ mod tests {
         let (decoded, consumed) = decode_trusted_slot(&buf).unwrap();
         assert_eq!(decoded, stack);
         assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn trusted_slot_encoder_rejects_count_above_registry_maximum() {
+        let sword = ItemId::from_name("diamond_sword").unwrap();
+        let stack = ItemStack::new(sword, nz(2), ComponentPatch::empty());
+        let mut out = vec![0xAA];
+
+        stack
+            .encode_slot(&mut out)
+            .expect_err("an over-maximum trusted stack must not reach the wire");
+        assert_eq!(
+            out,
+            vec![0xAA],
+            "rejected encoding must leave the caller's buffer unchanged"
+        );
+    }
+
+    #[test]
+    fn checked_constructor_enforces_registry_count_boundaries() {
+        let stone = ItemId::from_name("stone").unwrap();
+
+        for count in [1, stone.max_stack()] {
+            let stack = ItemStack::try_new(stone, count, ComponentPatch::empty()).unwrap();
+            assert_eq!(stack.count(), count);
+            assert!(stack.is_valid());
+        }
+
+        for count in [0, stone.max_stack() + 1, u8::MAX] {
+            let error = ItemStack::try_new(stone, count, ComponentPatch::empty()).unwrap_err();
+            assert_count_error(&error, stone, count, stone.max_stack());
+        }
+
+        let sword = ItemId::from_name("diamond_sword").unwrap();
+        assert_eq!(sword.max_stack(), 1);
+        assert!(ItemStack::try_new(sword, 1, ComponentPatch::empty()).is_ok());
+        for count in [0, 2, u8::MAX] {
+            let error = ItemStack::try_new(sword, count, ComponentPatch::empty()).unwrap_err();
+            assert_count_error(&error, sword, count, sword.max_stack());
+        }
+    }
+
+    #[test]
+    fn trusted_slot_encoder_enforces_count_boundary_battery_atomically() {
+        let stone = ItemId::from_name("stone").unwrap();
+
+        let mut empty = Vec::new();
+        ItemStack::empty().encode_slot(&mut empty).unwrap();
+        assert_eq!(empty, vec![0]);
+
+        for count in [1, stone.max_stack()] {
+            let stack = ItemStack::try_new(stone, count, ComponentPatch::empty()).unwrap();
+            let mut out = Vec::new();
+            stack.encode_slot(&mut out).unwrap();
+            assert_eq!(out.first().copied(), Some(count));
+        }
+
+        for count in [0, stone.max_stack() + 1, u8::MAX] {
+            let stack = unchecked_stack(stone, count, ComponentPatch::empty());
+            let mut out = vec![0xAA, 0xBB];
+            let error = stack.encode_slot(&mut out).unwrap_err();
+            assert_count_error(&error, stone, count, stone.max_stack());
+            assert_eq!(out, vec![0xAA, 0xBB]);
+        }
+    }
+
+    #[test]
+    fn component_max_stack_size_cannot_bypass_registry_maximum() {
+        let sword = ItemId::from_name("diamond_sword").unwrap();
+        let stack = unchecked_stack(
+            sword,
+            2,
+            ComponentPatch::new(vec![ComponentValue::MaxStackSize(99)], Vec::new()),
+        );
+        let mut out = vec![0xAA];
+
+        let error = stack.encode_slot(&mut out).unwrap_err();
+
+        assert_count_error(&error, sword, 2, 1);
+        assert_eq!(out, vec![0xAA]);
+    }
+
+    #[test]
+    fn trusted_slot_encoder_rolls_back_late_nbt_failure() {
+        let stone = ItemId::from_name("stone").unwrap();
+        let overlong = "x".repeat(usize::from(u16::MAX) + 1);
+        let mut name = NbtCompound::new();
+        name.push("text", NbtTag::String(overlong));
+        let stack = ItemStack::try_new(
+            stone,
+            1,
+            ComponentPatch::new(
+                vec![ComponentValue::CustomName(NbtTag::Compound(name))],
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+        let mut out = vec![0xAA, 0xBB];
+
+        assert!(matches!(
+            stack.encode_slot(&mut out),
+            Err(ItemValidationError::Nbt(
+                ferrumc_nbt::NbtError::StringTooLong { .. }
+            ))
+        ));
+        assert_eq!(out, vec![0xAA, 0xBB]);
     }
 
     #[test]
@@ -401,9 +584,9 @@ mod tests {
             ItemStack::new(ItemId::new(1).unwrap(), nz(64), ComponentPatch::empty()).is_valid()
         );
         // diamond_sword max_stack is 1, so a count of 2 is invalid.
-        assert!(!ItemStack::new(
+        assert!(!unchecked_stack(
             ItemId::from_name("diamond_sword").unwrap(),
-            nz(2),
+            2,
             ComponentPatch::empty()
         )
         .is_valid());

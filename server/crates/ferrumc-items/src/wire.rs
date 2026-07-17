@@ -52,7 +52,9 @@ pub(crate) fn write_count(out: &mut Vec<u8>, n: usize) {
 /// and the items array is not last; all per-slot encoding therefore lives here.
 ///
 /// Returns [`ItemValidationError::WindowTooLarge`] if `items` exceeds
-/// [`MAX_WINDOW_SLOTS`], and propagates any NBT encoding error from a component.
+/// [`MAX_WINDOW_SLOTS`]. Propagates
+/// [`ItemValidationError::StackCountOutOfRange`] from an invalid stack and any
+/// NBT encoding error from a component.
 ///
 /// # Examples
 ///
@@ -84,7 +86,10 @@ pub fn encode_container_content_payload(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU8;
+
     use super::*;
+    use crate::{ComponentPatch, ItemId};
 
     #[test]
     fn container_payload_layout() {
@@ -108,5 +113,43 @@ mod tests {
                 max
             } if count == MAX_WINDOW_SLOTS + 1 && max == MAX_WINDOW_SLOTS
         ));
+    }
+
+    #[test]
+    fn container_payload_rejects_invalid_list_slot() {
+        let sword = ItemId::from_name("diamond_sword").unwrap();
+        let invalid = ItemStack::new(sword, NonZeroU8::new(2).unwrap(), ComponentPatch::empty());
+
+        let error = encode_container_content_payload(&[invalid], &ItemStack::empty()).unwrap_err();
+
+        assert_eq!(
+            error,
+            ItemValidationError::StackCountOutOfRange {
+                item_id: sword.id(),
+                count: 2,
+                max: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn container_payload_rejects_invalid_carried_slot() {
+        let sword = ItemId::from_name("diamond_sword").unwrap();
+        let invalid = ItemStack::new(
+            sword,
+            NonZeroU8::new(u8::MAX).unwrap(),
+            ComponentPatch::empty(),
+        );
+
+        let error = encode_container_content_payload(&[], &invalid).unwrap_err();
+
+        assert_eq!(
+            error,
+            ItemValidationError::StackCountOutOfRange {
+                item_id: sword.id(),
+                count: u8::MAX,
+                max: 1,
+            }
+        );
     }
 }
