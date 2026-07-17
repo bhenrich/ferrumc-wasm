@@ -20,7 +20,7 @@ use ferrumc_session::{NetEvent, PlayerSessionHandle};
 use crate::driver::SimCommand;
 use crate::inventory::PlayerInventory;
 use crate::observe;
-use crate::player_data::PlayerData;
+use crate::player_data::{load_player_for_join, PlayerData, PlayerLoad};
 use crate::window::WindowState;
 
 use super::chunk_stream::{
@@ -58,20 +58,23 @@ pub(super) async fn enter_play(
     // login has completed.
     debug.set_session(name.as_str());
 
-    // Restore this player's persisted state if they have a saved record; a fresh
-    // player — or one whose record is corrupt, written under an incompatible schema,
-    // or whose load failed — starts from the spawn defaults. A storage hiccup must
-    // never block login, so any load error is logged and treated as a fresh join.
-    let restored = match ctx.player_store.load_player(player).await {
-        Ok(Some(record)) => {
-            let game_mode = record.game_mode();
-            PlayerData::from_record(&record).map(|data| (data, game_mode))
-        }
-        Ok(None) => None,
-        Err(err) => {
-            tracing::warn!(%err, player = name.as_str(), "failed to load player state; joining fresh");
-            None
-        }
+    // Resolve storage admission before joining simulation or constructing any
+    // teardown state. Only a confirmed store miss may start fresh; backend,
+    // schema, and payload failures return from `enter_play`, close the connection,
+    // and therefore cannot reach the leave-save below.
+    let player_load = load_player_for_join(ctx.player_store.as_ref(), player)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                %error,
+                player = name.as_str(),
+                "rejecting Play admission because persisted player state is unreadable"
+            );
+            error
+        })?;
+    let restored = match player_load {
+        PlayerLoad::Restored { data, game_mode } => Some((data, game_mode)),
+        PlayerLoad::NotFound => None,
     };
     let is_returning = restored.is_some();
 

@@ -117,6 +117,9 @@ ferrumc-core = { workspace = true }
 # Deterministic storage cutpoints and committed-state inspection for the app's
 # durability/retry regressions. Test-only; production never depends on testkit.
 ferrumc-testkit = { workspace = true }
+# Opens the test-local player table directly to preserve and inspect a malformed
+# backend record that the typed storage API correctly refuses to decode.
+redb = { workspace = true }
 
 [lints]
 workspace = true

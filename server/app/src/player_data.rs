@@ -11,10 +11,10 @@
 //! # Versioning and robustness
 //!
 //! Every record is stamped with [`PLAYER_SCHEMA_VERSION`]. A record written under
-//! a different version, or a payload that fails to decode, is treated as *absent*
-//! (the caller falls back to fresh-player defaults) rather than ever panicking —
-//! a hostile or truncated blob can only ever cost a player their saved state, not
-//! crash the server.
+//! a different version, or a payload that fails to decode, is rejected with a
+//! classified [`PlayerLoadError`]. Only a confirmed missing storage record may
+//! use fresh-player defaults, so an unreadable record can never be overwritten by
+//! a later default-state leave save.
 //!
 //! # Inventory fidelity
 //!
@@ -27,23 +27,109 @@
 //! milestone targets; component persistence is a follow-up that would bump
 //! [`PLAYER_SCHEMA_VERSION`].
 
+use std::error::Error;
+use std::fmt;
 use std::num::NonZeroU8;
 
 use serde::{Deserialize, Serialize};
 
-use ferrumc_core::GameMode;
+use ferrumc_core::{GameMode, PlayerId, ServerError};
 use ferrumc_items::{ComponentPatch, ItemId, ItemStack};
 use ferrumc_math::Vec3;
-use ferrumc_storage::{PlayerRecord, SchemaVersion, StorageError};
+use ferrumc_storage::{PlayerRecord, PlayerStore, SchemaVersion, StorageError};
 
 use crate::inventory::{PlayerInventory, SLOT_COUNT};
 
 /// The schema version stamped on every [`PlayerRecord`] this module writes.
 ///
-/// A loaded record carrying any other version is rejected as incompatible and
-/// the player is treated as new, so a future layout change is a safe no-op for
-/// old saves rather than a misread.
+/// A loaded record carrying any other version is rejected as incompatible.
 pub(crate) const PLAYER_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
+
+/// A classified failure to load a player's persisted state for admission.
+#[derive(Debug)]
+pub(crate) enum PlayerLoadError {
+    /// The storage operation itself failed.
+    BackendError {
+        /// The classified storage-layer error.
+        source: ServerError,
+    },
+    /// The record uses a schema this binary cannot interpret.
+    Incompatible {
+        /// Schema version carried by the record.
+        found: SchemaVersion,
+        /// Schema version this binary accepts.
+        expected: SchemaVersion,
+    },
+    /// The current-schema payload is malformed.
+    Corrupt {
+        /// The bounded JSON decoder failure.
+        source: serde_json::Error,
+    },
+}
+
+impl fmt::Display for PlayerLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BackendError { source } => {
+                write!(formatter, "player storage load failed: {source}")
+            }
+            Self::Incompatible { found, expected } => write!(
+                formatter,
+                "incompatible player schema {found}; expected {expected}"
+            ),
+            Self::Corrupt { source } => {
+                write!(formatter, "corrupt player record payload: {source}")
+            }
+        }
+    }
+}
+
+impl Error for PlayerLoadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::BackendError { source } => Some(source),
+            Self::Corrupt { source } => Some(source),
+            Self::Incompatible { .. } => None,
+        }
+    }
+}
+
+/// The only two successful player-load outcomes.
+///
+/// `NotFound` is a confirmed store miss and may start fresh. `Restored` carries
+/// a record whose schema and payload were both validated.
+#[derive(Debug)]
+pub(crate) enum PlayerLoad {
+    /// No record exists for this player.
+    NotFound,
+    /// A current-schema record decoded successfully.
+    Restored {
+        /// The decoded app-owned state.
+        data: PlayerData,
+        /// The typed game mode stored beside the payload.
+        game_mode: GameMode,
+    },
+}
+
+/// Loads and validates the one player record used for Play admission.
+///
+/// Only the storage trait's `Ok(None)` result becomes [`PlayerLoad::NotFound`].
+/// Every error, including a backend that incorrectly reports a not-found error
+/// instead of `Ok(None)`, remains a [`PlayerLoadError::BackendError`].
+pub(crate) async fn load_player_for_join(
+    store: &dyn PlayerStore,
+    player: PlayerId,
+) -> Result<PlayerLoad, PlayerLoadError> {
+    match store.load_player(player).await {
+        Ok(Some(record)) => {
+            let game_mode = record.game_mode();
+            let data = PlayerData::from_record(&record)?;
+            Ok(PlayerLoad::Restored { data, game_mode })
+        }
+        Ok(None) => Ok(PlayerLoad::NotFound),
+        Err(source) => Err(PlayerLoadError::BackendError { source }),
+    }
+}
 
 /// One persisted inventory slot: a registry item id and a stack count.
 ///
@@ -192,28 +278,19 @@ impl PlayerData {
         PlayerRecord::new(PLAYER_SCHEMA_VERSION, game_mode, data)
     }
 
-    /// Decodes a [`PlayerData`] from a loaded [`PlayerRecord`], or `None` if the
-    /// record was written under a different schema version or its payload is
-    /// malformed.
+    /// Decodes a [`PlayerData`] from a loaded [`PlayerRecord`].
     ///
-    /// Decoding never panics: a truncated, hostile, or stale payload yields
-    /// `None`, and the caller restores fresh-player defaults instead.
-    pub(crate) fn from_record(record: &PlayerRecord) -> Option<Self> {
+    /// A stale schema and a malformed current-schema payload remain distinct,
+    /// classified errors. Neither is absence and neither authorizes fresh-player
+    /// defaults.
+    pub(crate) fn from_record(record: &PlayerRecord) -> Result<Self, PlayerLoadError> {
         if record.schema_version() != PLAYER_SCHEMA_VERSION {
-            tracing::warn!(
-                version = %record.schema_version(),
-                expected = %PLAYER_SCHEMA_VERSION,
-                "ignoring player record written under an incompatible schema version"
-            );
-            return None;
+            return Err(PlayerLoadError::Incompatible {
+                found: record.schema_version(),
+                expected: PLAYER_SCHEMA_VERSION,
+            });
         }
-        match serde_json::from_slice(record.data()) {
-            Ok(data) => Some(data),
-            Err(err) => {
-                tracing::warn!(%err, "failed to decode player data; restoring defaults");
-                None
-            }
-        }
+        serde_json::from_slice(record.data()).map_err(|source| PlayerLoadError::Corrupt { source })
     }
 }
 
@@ -287,36 +364,52 @@ mod tests {
             .expect("load")
             .expect("record present");
         assert_eq!(loaded.game_mode(), GameMode::Creative);
-        assert_eq!(PlayerData::from_record(&loaded), Some(data));
+        assert_eq!(PlayerData::from_record(&loaded).expect("decodes"), data);
     }
 
     #[test]
-    fn malformed_payload_decodes_to_none_without_panicking() {
-        // Arbitrary non-JSON bytes must never panic the decoder.
-        let record = PlayerRecord::new(
-            PLAYER_SCHEMA_VERSION,
-            GameMode::Survival,
+    fn malformed_payload_is_classified_as_corrupt_without_panicking() {
+        let malformed = [
+            Vec::new(),
             vec![0xff, 0x00, 0x42],
-        )
-        .expect("within bound");
-        assert!(PlayerData::from_record(&record).is_none());
-
-        // Empty payload is likewise rejected cleanly.
-        let empty = PlayerRecord::new(PLAYER_SCHEMA_VERSION, GameMode::Survival, Vec::new())
-            .expect("within bound");
-        assert!(PlayerData::from_record(&empty).is_none());
+            b"{".to_vec(),
+            b"[]".to_vec(),
+            br#"{"x":"wrong"}"#.to_vec(),
+            br#"{"x":0.0,"y":64.0,"z":0.0,"yaw":0.0,"pitch":0.0,"selected_slot":0,"slots":[]}trailing"#
+                .to_vec(),
+        ];
+        for payload in malformed {
+            let record =
+                PlayerRecord::new(PLAYER_SCHEMA_VERSION, GameMode::Survival, payload.clone())
+                    .expect("malformed payload remains within the storage bound");
+            assert!(
+                matches!(
+                    PlayerData::from_record(&record),
+                    Err(PlayerLoadError::Corrupt { .. })
+                ),
+                "payload {payload:?} was not classified as corrupt",
+            );
+        }
     }
 
     #[test]
-    fn incompatible_schema_version_is_ignored() {
+    fn incompatible_schema_version_is_classified() {
         let inv = sample_inventory();
         let data = PlayerData::capture(Vec3::ZERO, 0.0, 0.0, &inv);
         let bytes = serde_json::to_vec(&data).expect("encodes");
         // A valid payload under a *different* schema version must be treated as
-        // absent rather than misread.
-        let record = PlayerRecord::new(SchemaVersion::new(9999), GameMode::Creative, bytes)
-            .expect("within bound");
-        assert!(PlayerData::from_record(&record).is_none());
+        // incompatible rather than misread.
+        for found in [SchemaVersion::new(0), SchemaVersion::new(9999)] {
+            let record =
+                PlayerRecord::new(found, GameMode::Creative, bytes.clone()).expect("within bound");
+            assert!(matches!(
+                PlayerData::from_record(&record),
+                Err(PlayerLoadError::Incompatible {
+                    found: actual,
+                    expected: PLAYER_SCHEMA_VERSION,
+                }) if actual == found
+            ));
+        }
     }
 
     #[test]

@@ -345,6 +345,7 @@ dependencies = [
  "ferrumc-storage",
  "ferrumc-testkit",
  "ferrumc-world",
+ "redb",
  "serde",
  "serde_json",
  "tempfile",
