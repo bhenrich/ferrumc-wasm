@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 
-use ferrumc_core::{GameMode, PlayerId, TextComponent, Tick};
+use ferrumc_core::{GameMode, PlayerId, Result as ServerResult, ServerError, TextComponent, Tick};
 use ferrumc_items::ItemStack;
 use ferrumc_math::{BlockPos, ChunkPos, Cuboid, Direction, Vec3};
 use ferrumc_observability::{
@@ -595,11 +595,11 @@ fn chunk_block_entity_packets(chunk: &Chunk) -> Vec<ClientboundPlayPacket> {
 /// # Blocking
 ///
 /// A [`SimCommand::StreamChunks`]/[`SimCommand::ReleaseChunks`] is handled inline
-/// with `await`s into the chunk map (load-or-generate, persist-on-unload). With
-/// the current in-memory store these resolve without yielding to real I/O, so the
-/// next tick is not meaningfully delayed; a future disk-backed store would move
-/// that work off the driver. The per-update load count is capped by the
-/// connection (see `connection.rs`), bounding the work one command can request.
+/// with `await`s into the chunk map. Loads use the current in-memory path; ticket
+/// releases await the off-tick storage worker's durability result because a last
+/// ticket cannot safely disappear before its overlay commits. The per-update load
+/// count is capped by the connection (see `connection.rs`), bounding the work one
+/// command can request.
 #[allow(clippy::too_many_arguments)] // the driver owns several distinct pieces wired once at startup
 pub(crate) async fn run(
     mut router: SessionRouter,
@@ -615,8 +615,9 @@ pub(crate) async fn run(
     snapshots: SnapshotPublisher,
     net_telemetry: Arc<NetTelemetryHub>,
     block_events: Arc<BlockEventDispatcher>,
+    fatal_shutdown: watch::Sender<bool>,
     mut shutdown: watch::Receiver<bool>,
-) {
+) -> ServerResult<()> {
     let mut ticker = tokio::time::interval(tick_period);
     // Lag must not trigger catch-up ticks: skip missed deadlines instead.
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -643,12 +644,20 @@ pub(crate) async fn run(
         tokio::select! {
             biased;
             _ = shutdown.changed() => {
-                // Final flush before stopping: capture any remaining persist-dirty
-                // chunks and journal entries and send them, awaiting briefly if the
-                // channel is momentarily full so a graceful shutdown loses nothing.
-                if let Some(request) = build_flush_request(&mut shard, tick, &mut next_mutation_id) {
-                    if let Err(err) = storage_tx.send(request).await {
-                        tracing::warn!(%err, "failed to send final storage flush on shutdown");
+                // Reserve capacity before taking dirty state. If the worker has
+                // failed and closed the channel, the shard keeps its last
+                // recoverable copy and shutdown reports failure.
+                if has_pending_persistence(&shard) {
+                    if let Ok(permit) = storage_tx.reserve().await {
+                        if let Some(request) =
+                            build_flush_request(&mut shard, tick, &mut next_mutation_id)
+                        {
+                            permit.send(request);
+                        }
+                    } else {
+                        let error = storage_worker_closed("final shutdown flush");
+                        let _ = fatal_shutdown.send(true);
+                        return Err(error);
                     }
                 }
                 // Dropping `storage_tx` (on return) closes the channel, which the
@@ -668,11 +677,16 @@ pub(crate) async fn run(
                 );
                 // End-of-tick flush: hand the tick's player edits to the storage
                 // worker without ever blocking the tick (see the helper).
-                try_flush_persist_dirty(&mut shard, &storage_tx, tick, &mut next_mutation_id);
+                if let Err(error) =
+                    try_flush_persist_dirty(&mut shard, &storage_tx, tick, &mut next_mutation_id)
+                {
+                    let _ = fatal_shutdown.send(true);
+                    return Err(error);
+                }
             }
             maybe_command = commands.recv() => match maybe_command {
                 Some(command) => {
-                    handle_command(
+                    if let Err(error) = handle_command(
                         &mut router,
                         &mut shard,
                         &*store,
@@ -684,12 +698,30 @@ pub(crate) async fn run(
                         &mut snap_ctx.roster,
                         command,
                     )
-                    .await;
+                    .await
+                    {
+                        let _ = fatal_shutdown.send(true);
+                        return Err(error);
+                    }
                 }
                 None => break,
             },
         }
     }
+
+    Ok(())
+}
+
+/// Returns whether taking a flush request would remove recoverable shard state.
+fn has_pending_persistence(shard: &SimShard) -> bool {
+    shard.loaded_chunks().has_persist_dirty() || shard.has_pending_mutations()
+}
+
+/// Classifies an unexpectedly unavailable storage worker at a durability edge.
+fn storage_worker_closed(operation: &str) -> ServerError {
+    ServerError::invalid_state(format!(
+        "cannot complete {operation}: storage flush worker channel is closed"
+    ))
 }
 
 /// Builds a [`StorageFlushRequest`] from the shard's pending persist-dirty chunks
@@ -718,13 +750,7 @@ fn build_flush_request(
             build_mutation_record(id, tick_n, &mutation)
         })
         .collect();
-    Some(StorageFlushRequest {
-        overlays,
-        mutations,
-        // Per-tick/shutdown flushes are fire-and-forget; only the disconnect
-        // barrier (`release_chunks_acked`) attaches an ack.
-        ack: None,
-    })
+    Some(StorageFlushRequest::new(overlays, mutations))
 }
 
 /// Maps a sim-layer [`PendingMutation`] (plus an assigned `id` and `tick`) into a
@@ -766,18 +792,23 @@ fn try_flush_persist_dirty(
     storage_tx: &mpsc::Sender<StorageFlushRequest>,
     tick: Tick,
     next_mutation_id: &mut u64,
-) {
-    if !shard.loaded_chunks().has_persist_dirty() && !shard.has_pending_mutations() {
-        return;
+) -> ServerResult<()> {
+    if !has_pending_persistence(shard) {
+        return Ok(());
     }
     match storage_tx.try_reserve() {
         Ok(permit) => {
             if let Some(request) = build_flush_request(shard, tick, next_mutation_id) {
                 permit.send(request);
             }
+            Ok(())
         }
-        Err(_) => {
+        Err(mpsc::error::TrySendError::Full(())) => {
             tracing::trace!("storage flush channel full; deferring dirty chunks to next tick");
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Closed(())) => {
+            Err(storage_worker_closed("end-of-tick flush"))
         }
     }
 }
@@ -796,7 +827,7 @@ async fn handle_command(
     world_time: &mut WorldTime,
     player_roster: &mut BTreeMap<PlayerId, String>,
     command: SimCommand,
-) {
+) -> ServerResult<()> {
     match command {
         SimCommand::Join {
             player,
@@ -835,7 +866,7 @@ async fn handle_command(
         } => {
             // Release first (frees tickets the new view no longer needs) before
             // acquiring, so a chunk that both left and re-entered nets out cleanly.
-            release_chunks(shard, storage_tx, tick, next_mutation_id, &unload).await;
+            release_chunks(shard, storage_tx, tick, next_mutation_id, &unload).await?;
             let packets = load_chunks(shard, store, generator, &load).await;
             // A gone connection just discards the packets; nothing to clean up.
             let _ = reply.send(packets);
@@ -843,7 +874,7 @@ async fn handle_command(
         SimCommand::ReleaseChunks { positions } => {
             // Disconnect path: await the worker's commit before releasing tickets so
             // a fast rejoin cannot read a stale baseline (Bug A barrier).
-            release_chunks_acked(shard, storage_tx, tick, next_mutation_id, &positions).await;
+            release_chunks_acked(shard, storage_tx, tick, next_mutation_id, &positions).await?;
         }
         SimCommand::BroadcastSystemChat { content, overlay } => {
             router.broadcast_system_chat(&content, overlay);
@@ -972,14 +1003,14 @@ async fn handle_command(
             // target is a logged no-op (the issuer already saw optimistic feedback).
             let Some(target_id) = resolve_online_player(player_roster, &target) else {
                 tracing::trace!(%target, "tp target is not online");
-                return;
+                return Ok(());
             };
             let Some(position) = shard
                 .player_position(target_id)
                 .or_else(|| router.player_position(target_id))
             else {
                 tracing::trace!(%target, "tp target has no known position");
-                return;
+                return Ok(());
             };
             if let Err(err) = router.teleport_player(player, position) {
                 tracing::trace!(%err, "dropping teleport-to-player");
@@ -991,7 +1022,7 @@ async fn handle_command(
             // target is a logged no-op.
             let Some(target_id) = resolve_online_player(player_roster, &target) else {
                 tracing::trace!(%target, "gamemode target is not online");
-                return;
+                return Ok(());
             };
             if let Err(err) = router.route_game_input(
                 target_id,
@@ -1099,6 +1130,8 @@ async fn handle_command(
             let _ = reply.send(outcome);
         }
     }
+
+    Ok(())
 }
 
 /// Load-or-generates each chunk in `positions`, acquiring a player ticket on it,
@@ -1148,79 +1181,68 @@ async fn load_chunks(
 
 /// Releases the player ticket on each chunk in `positions`.
 ///
-/// Before dropping any tickets, it flushes the shard's pending player edits to the
-/// storage worker, so a chunk that unloads with unsaved edits has them captured as
-/// an overlay first. A generated-but-unmodified chunk has no persist-dirty
-/// sections, so it produces nothing and unloads for free. Persistence itself
-/// happens off-tick on the storage worker; this only enqueues it.
+/// Before dropping any tickets, it runs the same receipt-backed durability barrier
+/// as disconnect. A movement unload can also remove the last player ticket, so
+/// merely enqueueing an overlay would allow a fast reacquire to read stale storage
+/// if that accepted write then failed.
 async fn release_chunks(
     shard: &mut SimShard,
     storage_tx: &mpsc::Sender<StorageFlushRequest>,
     tick: Tick,
     next_mutation_id: &mut u64,
     positions: &[ChunkPos],
-) {
-    // Capture any unsaved edits (on these chunks or any other resident chunk)
-    // before unloading. `await` here is fine: this runs between ticks on a
-    // command, not on the tick hot path, so blocking briefly is acceptable
-    // backpressure and keeps the flush lossless.
-    if let Some(request) = build_flush_request(shard, tick, next_mutation_id) {
-        if let Err(err) = storage_tx.send(request).await {
-            tracing::warn!(%err, "failed to flush edits before releasing chunks");
-        }
-    }
-
-    let ticket = ChunkTicket::of(TicketReason::Player);
-    for &pos in positions {
-        let _ = shard.loaded_chunks_mut().release(pos, ticket);
-    }
+) -> ServerResult<()> {
+    release_chunks_acked(shard, storage_tx, tick, next_mutation_id, positions).await
 }
 
 /// Releases the player ticket on each chunk in `positions`, but **only after** the
 /// storage worker confirms every buffered edit is committed (the Bug A barrier).
 ///
-/// Used exclusively on the disconnect path ([`SimCommand::ReleaseChunks`]). Unlike
-/// the per-movement [`release_chunks`], this always sends a flush request carrying
-/// a single-shot ack — even when [`build_flush_request`] returns `None`. That is
-/// deliberate: a prior per-tick [`try_flush_persist_dirty`] has usually already
-/// drained the placed-block overlay into the worker's *uncommitted* buffer, so
-/// there may be nothing fresh to capture here yet the write is still not durable.
-/// The worker force-commits its entire pending buffer before acking, and only then
-/// are the tickets dropped — so the next player's `acquire`/`load_or_generate`
-/// reads the freshly persisted baseline instead of the stale one.
+/// Used by both disconnect ([`SimCommand::ReleaseChunks`]) and movement-driven
+/// unloads. It always sends a flush request carrying a single-shot ack — even when
+/// [`build_flush_request`] returns `None`. That is deliberate: a prior per-tick
+/// [`try_flush_persist_dirty`] may already have drained the placed-block overlay
+/// into the worker's *uncommitted* buffer, so there may be nothing fresh to capture
+/// here yet the write is still not durable. The worker force-commits its entire
+/// pending buffer before acking, and only then are tickets dropped — so a later
+/// `acquire`/`load_or_generate` reads the persisted baseline instead of stale data.
 ///
-/// This `await`s a redb commit, which is allowed because it runs off the tick (from
-/// [`handle_command`], never `run_tick`); the per-movement unload deliberately does
-/// **not** route through here, so a chunk-boundary crossing never forces a commit.
+/// This `await`s a redb commit, which is allowed because it runs from
+/// [`handle_command`], never inside [`run_tick`].
 async fn release_chunks_acked(
     shard: &mut SimShard,
     storage_tx: &mpsc::Sender<StorageFlushRequest>,
     tick: Tick,
     next_mutation_id: &mut u64,
     positions: &[ChunkPos],
-) {
+) -> ServerResult<()> {
+    // This admission must happen before `build_flush_request`: a closed worker
+    // cannot consume the batch, so the shard must keep both its dirty state and
+    // final ticket for recovery.
+    let permit = storage_tx
+        .reserve()
+        .await
+        .map_err(|_| storage_worker_closed("chunk-release durability barrier"))?;
     let (ack_tx, ack_rx) = oneshot::channel();
     // Always send an acked request, even with nothing fresh to flush: the overlay
     // may already be buffered uncommitted in the worker.
-    let mut request =
-        build_flush_request(shard, tick, next_mutation_id).unwrap_or(StorageFlushRequest {
-            overlays: Vec::new(),
-            mutations: Vec::new(),
-            ack: None,
-        });
+    let mut request = build_flush_request(shard, tick, next_mutation_id)
+        .unwrap_or_else(|| StorageFlushRequest::new(Vec::new(), Vec::new()));
     request.ack = Some(ack_tx);
+    permit.send(request);
 
-    if storage_tx.send(request).await.is_ok() {
-        // Block this command (not the tick) until the commit lands.
-        let _ = ack_rx.await;
-    } else {
-        tracing::warn!("failed to send acked flush before releasing chunks; releasing best-effort");
-    }
+    // A canceled acknowledgement means the worker terminated without proving
+    // durability. Propagate that failure and retain every requested ticket.
+    ack_rx.await.map_err(|_| {
+        ServerError::invalid_state("chunk-release durability barrier acknowledgement was canceled")
+    })??;
 
     let ticket = ChunkTicket::of(TicketReason::Player);
     for &pos in positions {
         let _ = shard.loaded_chunks_mut().release(pos, ticket);
     }
+
+    Ok(())
 }
 
 /// Drains queued inputs into the shard, advances one tick, and routes outputs.
@@ -1451,16 +1473,23 @@ mod tests {
 
     use std::collections::BTreeMap;
 
-    use ferrumc_core::{GameMode, PlayerId, Tick};
-    use ferrumc_math::{BlockPos, Direction, ShardPos, Vec3};
+    use ferrumc_core::{GameMode, PlayerId, ServerError, Tick};
+    use ferrumc_math::{BlockPos, ChunkPos, Direction, ShardPos, Vec3};
     use ferrumc_proto::generated::play::ClientboundPlayPacket;
     use ferrumc_session::{PlayerSessionHandle, SessionRouter};
-    use ferrumc_sim::{BlockStateId, GameInput, SimShard, WorldTime, TIME_DAY, TIME_NOON};
+    use ferrumc_sim::{
+        BlockStateId, ChunkTicket, GameInput, SimShard, TicketReason, WorldTime, TIME_DAY,
+        TIME_NOON,
+    };
     use ferrumc_storage::InMemoryStore;
     use ferrumc_world::FlatWorldGenerator;
     use tokio::sync::{mpsc, oneshot};
 
-    use super::{handle_command, SimCommand};
+    use crate::storage_worker::StorageFlushRequest;
+
+    use super::{
+        handle_command, release_chunks, release_chunks_acked, try_flush_persist_dirty, SimCommand,
+    };
 
     /// Drains every queued outbound packet on `handle` (used to discard
     /// join-visibility traffic before asserting on a command's effect).
@@ -1491,6 +1520,238 @@ mod tests {
             }
         }
         panic!("expected a queued UpdateTime");
+    }
+
+    /// Builds one edited chunk held by exactly one player ticket.
+    async fn dirty_player_chunk() -> (SimShard, ChunkPos) {
+        let mut shard = SimShard::new(ShardPos::new(0, 0));
+        let store = InMemoryStore::new();
+        let generator = FlatWorldGenerator::new();
+        let pos = ChunkPos::new(0, 0);
+        let ticket = ChunkTicket::of(TicketReason::Player);
+        shard
+            .loaded_chunks_mut()
+            .acquire(&store, &generator, pos, ticket)
+            .await
+            .expect("load deterministic flat chunk");
+
+        let edited = BlockPos::new(1, 65, 1);
+        let chunk = shard
+            .loaded_chunks_mut()
+            .get_mut(pos)
+            .expect("acquired chunk is resident");
+        chunk
+            .set_block(edited, BlockStateId::new(1))
+            .expect("edit is inside the resident chunk");
+        chunk.mark_persist_dirty(edited);
+
+        assert_eq!(shard.loaded_chunks().ticket_count(pos), 1);
+        assert!(shard.loaded_chunks().has_persist_dirty());
+        (shard, pos)
+    }
+
+    #[tokio::test]
+    async fn end_of_tick_flush_defers_full_but_rejects_closed_without_draining() {
+        let (mut shard, _pos) = dirty_player_chunk().await;
+        // One occupied slot deterministically represents storage backpressure
+        // without scheduling a consumer.
+        let (full_tx, _full_rx) = mpsc::channel::<StorageFlushRequest>(1);
+        full_tx
+            .try_send(StorageFlushRequest::new(Vec::new(), Vec::new()))
+            .expect("fill the sole storage slot");
+        let mut next_mutation_id = 0;
+
+        try_flush_persist_dirty(&mut shard, &full_tx, Tick::ZERO, &mut next_mutation_id)
+            .expect("a full queue is lossless backpressure, not worker failure");
+        assert!(shard.loaded_chunks().has_persist_dirty());
+
+        let (closed_tx, closed_rx) = mpsc::channel::<StorageFlushRequest>(1);
+        drop(closed_rx);
+        let error =
+            try_flush_persist_dirty(&mut shard, &closed_tx, Tick::ZERO, &mut next_mutation_id)
+                .expect_err("a closed queue means the worker is unavailable");
+
+        assert!(matches!(error, ServerError::InvalidState(_)));
+        assert!(shard.loaded_chunks().has_persist_dirty());
+    }
+
+    #[tokio::test]
+    async fn release_chunks_closed_channel_retains_dirty_state_and_last_ticket() {
+        let (mut shard, pos) = dirty_player_chunk().await;
+        let (storage_tx, storage_rx) = mpsc::channel::<StorageFlushRequest>(1);
+        drop(storage_rx);
+        let mut next_mutation_id = 0;
+
+        let error = release_chunks(
+            &mut shard,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &[pos],
+        )
+        .await
+        .expect_err("a closed worker must reject the flush");
+
+        assert!(matches!(error, ServerError::InvalidState(_)));
+        assert!(shard.loaded_chunks().has_persist_dirty());
+        assert_eq!(shard.loaded_chunks().ticket_count(pos), 1);
+        assert!(shard.loaded_chunks().is_loaded(pos));
+    }
+
+    #[tokio::test]
+    async fn failed_movement_release_ack_retains_last_ticket() {
+        let (mut shard, pos) = dirty_player_chunk().await;
+        let (storage_tx, mut storage_rx) = mpsc::channel::<StorageFlushRequest>(1);
+        let mut next_mutation_id = 0;
+
+        let worker = tokio::spawn(async move {
+            let mut request = storage_rx.recv().await.expect("movement barrier request");
+            request
+                .ack
+                .take()
+                .expect("movement barrier has an acknowledgement")
+                .send(Err(ServerError::internal(
+                    "injected movement commit failure",
+                )))
+                .expect("driver is awaiting the movement acknowledgement");
+        });
+
+        let error = release_chunks(
+            &mut shard,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &[pos],
+        )
+        .await
+        .expect_err("a failed movement flush cannot release the last ticket");
+
+        assert!(matches!(error, ServerError::Internal { .. }));
+        assert_eq!(shard.loaded_chunks().ticket_count(pos), 1);
+        assert!(shard.loaded_chunks().is_loaded(pos));
+        worker.await.expect("movement worker task completed");
+    }
+
+    #[tokio::test]
+    async fn closed_durability_barrier_retains_dirty_state_and_last_ticket() {
+        let (mut shard, pos) = dirty_player_chunk().await;
+        let (storage_tx, storage_rx) = mpsc::channel::<StorageFlushRequest>(1);
+        drop(storage_rx);
+        let mut next_mutation_id = 0;
+
+        let error = release_chunks_acked(
+            &mut shard,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &[pos],
+        )
+        .await
+        .expect_err("a closed worker cannot prove durability");
+
+        assert!(matches!(error, ServerError::InvalidState(_)));
+        assert!(shard.loaded_chunks().has_persist_dirty());
+        assert_eq!(shard.loaded_chunks().ticket_count(pos), 1);
+        assert!(shard.loaded_chunks().is_loaded(pos));
+    }
+
+    #[tokio::test]
+    async fn failed_durability_ack_retains_last_ticket() {
+        let (mut shard, pos) = dirty_player_chunk().await;
+        let (storage_tx, mut storage_rx) = mpsc::channel::<StorageFlushRequest>(1);
+        let mut next_mutation_id = 0;
+
+        let worker = tokio::spawn(async move {
+            let mut request = storage_rx.recv().await.expect("barrier request");
+            let overlay_count = request.overlays.len();
+            request
+                .ack
+                .take()
+                .expect("barrier has an acknowledgement")
+                .send(Err(ServerError::internal("injected commit failure")))
+                .expect("driver is awaiting the acknowledgement");
+            overlay_count
+        });
+
+        let error = release_chunks_acked(
+            &mut shard,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &[pos],
+        )
+        .await
+        .expect_err("a failed commit must fail the barrier");
+
+        assert!(matches!(error, ServerError::Internal { .. }));
+        assert_eq!(shard.loaded_chunks().ticket_count(pos), 1);
+        assert!(shard.loaded_chunks().is_loaded(pos));
+        assert_eq!(
+            worker.await.expect("worker task completed"),
+            1,
+            "the failed barrier carried the recoverable overlay to the worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_durability_ack_retains_last_ticket() {
+        let (mut shard, pos) = dirty_player_chunk().await;
+        let (storage_tx, mut storage_rx) = mpsc::channel::<StorageFlushRequest>(1);
+        let mut next_mutation_id = 0;
+
+        let worker = tokio::spawn(async move {
+            let request = storage_rx.recv().await.expect("barrier request");
+            assert_eq!(request.overlays.len(), 1);
+            drop(request);
+        });
+
+        let error = release_chunks_acked(
+            &mut shard,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &[pos],
+        )
+        .await
+        .expect_err("a canceled acknowledgement cannot prove durability");
+
+        assert!(matches!(error, ServerError::InvalidState(_)));
+        assert_eq!(shard.loaded_chunks().ticket_count(pos), 1);
+        assert!(shard.loaded_chunks().is_loaded(pos));
+        worker.await.expect("worker task completed");
+    }
+
+    #[tokio::test]
+    async fn successful_durability_ack_releases_last_ticket() {
+        let (mut shard, pos) = dirty_player_chunk().await;
+        let (storage_tx, mut storage_rx) = mpsc::channel::<StorageFlushRequest>(1);
+        let mut next_mutation_id = 0;
+
+        let worker = tokio::spawn(async move {
+            let mut request = storage_rx.recv().await.expect("barrier request");
+            let overlay_count = request.overlays.len();
+            request
+                .ack
+                .take()
+                .expect("barrier has an acknowledgement")
+                .send(Ok(()))
+                .expect("driver is awaiting the acknowledgement");
+            overlay_count
+        });
+
+        release_chunks_acked(
+            &mut shard,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &[pos],
+        )
+        .await
+        .expect("a successful commit permits release");
+
+        assert_eq!(worker.await.expect("worker task completed"), 1);
+        assert_eq!(shard.loaded_chunks().ticket_count(pos), 0);
+        assert!(!shard.loaded_chunks().is_loaded(pos));
     }
 
     #[tokio::test]
@@ -1531,7 +1792,8 @@ mod tests {
                 reply: reply_tx,
             },
         )
-        .await;
+        .await
+        .expect("placement command does not cross a durability barrier");
 
         assert_eq!(
             reply_rx
@@ -1579,7 +1841,8 @@ mod tests {
             &mut roster,
             SimCommand::SetWeather { raining: true },
         )
-        .await;
+        .await
+        .expect("weather command does not cross a durability barrier");
 
         // Both players receive start_raining (reason 1, no value). clear would be 2.
         assert_eq!(next_game_event(&mut a), (1, 0.0));
@@ -1621,7 +1884,8 @@ mod tests {
                 time_of_day: TIME_DAY,
             },
         )
-        .await;
+        .await
+        .expect("time command does not cross a durability barrier");
 
         // `/time set day` sets the authoritative phase to 1000 (age unchanged) ...
         assert_eq!(world_time.time_of_day(), 1_000);
@@ -1666,7 +1930,8 @@ mod tests {
                 reply: reply_tx,
             },
         )
-        .await;
+        .await
+        .expect("join command does not cross a durability barrier");
 
         let mut handle = reply_rx
             .await
@@ -1706,7 +1971,8 @@ mod tests {
             &mut roster,
             SimCommand::QueryTime { player: asker },
         )
-        .await;
+        .await
+        .expect("query command does not cross a durability barrier");
 
         // The driver answers the asker directly with a System Chat Message.
         assert!(matches!(
@@ -1753,7 +2019,8 @@ mod tests {
                 mode: GameMode::Creative,
             },
         )
-        .await;
+        .await
+        .expect("game-mode command does not cross a durability barrier");
 
         // The authoritative change is routed to the target's shard ...
         assert_eq!(
@@ -1806,7 +2073,8 @@ mod tests {
                 target: "Joe".to_string(),
             },
         )
-        .await;
+        .await
+        .expect("teleport command does not cross a durability barrier");
 
         // The issuer's client is snapped to the target's position (the sim has not
         // ticked the join, so resolution falls back to the router's seeded pos).

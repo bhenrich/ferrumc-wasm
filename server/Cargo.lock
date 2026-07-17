@@ -343,6 +343,7 @@ dependencies = [
  "ferrumc-session",
  "ferrumc-sim",
  "ferrumc-storage",
+ "ferrumc-testkit",
  "ferrumc-world",
  "serde",
  "serde_json",

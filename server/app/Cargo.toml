@@ -114,6 +114,9 @@ ferrumc-storage = { workspace = true }
 ferrumc-world = { workspace = true }
 ferrumc-math = { workspace = true }
 ferrumc-core = { workspace = true }
+# Deterministic storage cutpoints and committed-state inspection for the app's
+# durability/retry regressions. Test-only; production never depends on testkit.
+ferrumc-testkit = { workspace = true }
 
 [lints]
 workspace = true

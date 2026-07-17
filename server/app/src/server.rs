@@ -11,11 +11,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
 use ferrumc_config::ResolvedAccess;
+use ferrumc_core::Result as ServerResult;
 use ferrumc_net::{ConnectionLimits, PerIpConnections};
 use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock, SnapshotPublisher};
 use ferrumc_session::{shard_for_position, SessionRouter};
@@ -58,11 +60,11 @@ pub struct RunningServer {
     /// The accept-loop task.
     accept_task: JoinHandle<()>,
     /// The simulation/session driver task.
-    driver_task: JoinHandle<()>,
+    driver_task: JoinHandle<ServerResult<()>>,
     /// The off-tick storage worker task that persists chunk overlays and the
-    /// mutation journal. Awaited *after* the driver on shutdown so the driver's
-    /// final flush is committed before the server returns.
-    storage_worker_task: JoinHandle<()>,
+    /// mutation journal. It stays alive until the driver drops its sender and its
+    /// final flush has been committed or reported as failed.
+    storage_worker_task: JoinHandle<ServerResult<()>>,
     /// The shared metric registry, fed by the driver and every connection task.
     /// Exposed for an on-demand metrics snapshot (see [`metrics`](Self::metrics)).
     metrics: Arc<CounterRegistry>,
@@ -102,17 +104,40 @@ impl RunningServer {
         self.snapshots.clone()
     }
 
+    /// Waits until an internal server task requests a coordinated shutdown.
+    ///
+    /// The storage worker and simulation driver use this path when a terminal
+    /// persistence failure makes it unsafe to continue serving players. The
+    /// returned future also completes immediately when shutdown was requested
+    /// before it began waiting, so callers cannot miss a failure notification.
+    pub async fn wait_for_shutdown_request(&self) {
+        let mut shutdown = self.shutdown.subscribe();
+        if *shutdown.borrow() {
+            return;
+        }
+
+        while shutdown.changed().await.is_ok() {
+            if *shutdown.borrow() {
+                return;
+            }
+        }
+    }
+
     /// Signals shutdown and waits for the accept loop, driver, and storage worker
     /// to finish.
     ///
     /// In-flight connection tasks observe the same signal and end on their own; the
     /// accept loop owns them in a `JoinSet` and drains it, so awaiting the accept
-    /// task blocks until the last connection has run its leave-save teardown — then
-    /// the driver and storage worker are awaited in turn so the final flush commits.
+    /// task blocks until the last connection has run its leave-save teardown. All
+    /// three task handles are then observed before any error is returned, while the
+    /// driver's sender/worker channel ordering still guarantees the final drain.
     ///
     /// # Errors
     ///
-    /// Returns an error only if a joined task panicked.
+    /// Returns an error if a joined task panicked or the driver/storage worker
+    /// reported a terminal failure. Every task is awaited before errors are
+    /// inspected; a storage-worker failure takes precedence because it identifies
+    /// the durability boundary that could not be completed.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         // A send error means every receiver is already gone — also a clean stop.
         let _ = self.shutdown.send(true);
@@ -122,15 +147,47 @@ impl RunningServer {
         // fully dropped. Connection tasks would otherwise be detached, so this is
         // what makes a connected player's state durable across a graceful shutdown —
         // and what releases the redb file before anything reopens it.
-        self.accept_task.await?;
         // The driver performs its final flush and then drops its storage sender;
-        // await it first so that send completes, then await the worker so it
-        // observes the closed channel, drains everything pending, and exits. This
-        // ordering is what makes a graceful shutdown durable.
-        self.driver_task.await?;
-        self.storage_worker_task.await?;
-        Ok(())
+        // the worker observes the closed channel, drains everything pending, and
+        // exits. Polling all joins together does not change that channel ordering,
+        // and guarantees an early failure never detaches another task.
+        await_server_tasks(self.accept_task, self.driver_task, self.storage_worker_task).await
     }
+}
+
+/// Awaits the complete task tree, then applies failures in durability-first
+/// priority order.
+async fn await_server_tasks(
+    accept_task: JoinHandle<()>,
+    driver_task: JoinHandle<ServerResult<()>>,
+    storage_worker_task: JoinHandle<ServerResult<()>>,
+) -> anyhow::Result<()> {
+    let (accept_result, driver_result, storage_result) =
+        tokio::join!(accept_task, driver_task, storage_worker_task);
+
+    match storage_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return Err(anyhow::Error::new(error).context("storage worker failed"));
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context("storage worker task failed"));
+        }
+    }
+
+    match driver_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return Err(anyhow::Error::new(error).context("simulation driver failed"));
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context("simulation driver task failed"));
+        }
+    }
+
+    accept_result
+        .map_err(anyhow::Error::new)
+        .context("accept-loop task failed")
 }
 
 /// Builds the world, starts the simulation, binds the listener, and begins
@@ -210,6 +267,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         Arc::clone(&store),
         Arc::clone(&metrics),
         config.tick_period(),
+        shutdown_tx.clone(),
     ));
 
     let driver_task = tokio::spawn(driver::run(
@@ -226,6 +284,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
         snapshots.clone(),
         Arc::clone(&net_telemetry),
         Arc::clone(&block_events),
+        shutdown_tx.clone(),
         shutdown_rx.clone(),
     ));
 
@@ -399,4 +458,64 @@ async fn accept_loop(
     // Drain in-flight connections so each runs its leave-save and fully drops before
     // shutdown proceeds. The connections already observed the shutdown signal above.
     while connections.join_next().await.is_some() {}
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use ferrumc_core::ServerError;
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_awaits_all_tasks_before_prioritizing_storage_failure() {
+        let accept_task = tokio::spawn(async {});
+        let (release_driver, driver_released) = oneshot::channel();
+        let driver_finished = Arc::new(AtomicBool::new(false));
+        let finished = Arc::clone(&driver_finished);
+        let driver_task = tokio::spawn(async move {
+            let _ = driver_released.await;
+            finished.store(true, Ordering::SeqCst);
+            Err::<(), ServerError>(ServerError::invalid_state("driver sentinel"))
+        });
+        let storage_worker_task = tokio::spawn(async {
+            Err::<(), ServerError>(ServerError::internal("storage sentinel"))
+        });
+
+        let waiter = tokio::spawn(await_server_tasks(
+            accept_task,
+            driver_task,
+            storage_worker_task,
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a storage failure must not detach the still-running driver",
+        );
+
+        release_driver
+            .send(())
+            .expect("release the blocked driver task");
+        let error = waiter
+            .await
+            .expect("join shutdown coordinator")
+            .expect_err("both driver and storage failures must fail shutdown");
+
+        assert!(
+            driver_finished.load(Ordering::SeqCst),
+            "shutdown returned before the driver finished",
+        );
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains("storage worker failed")
+                && error_chain.contains("storage sentinel"),
+            "storage failure must take precedence: {error_chain}",
+        );
+        assert!(
+            !error_chain.contains("driver sentinel"),
+            "lower-priority driver failure replaced the storage failure: {error_chain}",
+        );
+    }
 }

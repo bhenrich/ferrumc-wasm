@@ -1,15 +1,23 @@
 //! `FerrumC` server binary: parse the CLI, load (or first-run init) the config,
 //! start the server, log a startup banner, and run until a shutdown signal.
 //!
-//! Shutdown is triggered by Ctrl-C and, on Unix, also by `SIGTERM` and `SIGHUP`
-//! (so `kill`, container stop, and `systemd stop` flush player/world state
-//! instead of losing recent edits). `SIGKILL` cannot be caught, so it is not
-//! handled; the periodic per-tick/timer storage flush bounds the data lost to a
-//! hard kill.
+//! Shutdown is triggered by a terminal internal task failure, Ctrl-C, and, on
+//! Unix, also by `SIGTERM` and `SIGHUP` (so `kill`, container stop, and
+//! `systemd stop` flush player/world state instead of losing recent edits).
+//! `SIGKILL` cannot be caught, so it is not handled; the periodic per-tick/timer
+//! storage flush bounds the data lost to a hard kill.
 
 use clap::Parser;
 
 use ferrumc_app::{load_or_init_config, AppConfig, Cli, RunningServer};
+
+/// The event that began coordinated server shutdown.
+enum ShutdownTrigger {
+    /// An operating-system signal carrying its display name.
+    OsSignal(&'static str),
+    /// A runtime task encountered a terminal failure.
+    InternalFailure,
+}
 
 /// Installs the tracing subscriber, honouring `RUST_LOG`, defaulting to `info`.
 fn init_tracing() {
@@ -66,8 +74,18 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let signal = wait_for_shutdown_signal().await?;
-    tracing::info!(signal, "shutdown signal received; winding down");
+    let trigger = tokio::select! {
+        signal = wait_for_shutdown_signal() => ShutdownTrigger::OsSignal(signal?),
+        () = server.wait_for_shutdown_request() => ShutdownTrigger::InternalFailure,
+    };
+    match trigger {
+        ShutdownTrigger::OsSignal(signal) => {
+            tracing::info!(signal, "shutdown signal received; winding down");
+        }
+        ShutdownTrigger::InternalFailure => {
+            tracing::error!("internal task requested shutdown; winding down");
+        }
+    }
     server.shutdown().await?;
     tracing::info!("shutdown complete");
     Ok(())
@@ -85,11 +103,10 @@ async fn main() -> anyhow::Result<()> {
 async fn wait_for_shutdown_signal() -> anyhow::Result<&'static str> {
     use tokio::signal::unix::{signal, SignalKind};
 
-    // Registration only fails on a malformed signal kind or exhausted resources,
-    // both of which are unrecoverable at startup — matching the existing
-    // startup-time `expect` style.
-    let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM handler");
-    let mut sighup = signal(SignalKind::hangup()).expect("register SIGHUP handler");
+    let mut sigterm = signal(SignalKind::terminate())
+        .map_err(|error| anyhow::anyhow!("registering SIGTERM handler: {error}"))?;
+    let mut sighup = signal(SignalKind::hangup())
+        .map_err(|error| anyhow::anyhow!("registering SIGHUP handler: {error}"))?;
 
     let signal = tokio::select! {
         result = tokio::signal::ctrl_c() => {
