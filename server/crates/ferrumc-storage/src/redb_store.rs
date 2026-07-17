@@ -26,13 +26,15 @@
 //! is a single atomic commit.
 
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrumc_core::{PlayerId, PluginId, Result, ServerError};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition, TableHandle};
 
 use crate::codec;
 use crate::error::StorageError;
@@ -94,9 +96,85 @@ const MUTATION_BATCH_TABLE: TableDefinition<'_, &[u8], &[u8]> =
 /// `first_id(u64) ++ record_count(u64)`.
 const JOURNAL_RECEIPT_ENCODED_LEN: usize = 16;
 
+/// Whether this process atomically created the database file.
+#[derive(Clone, Copy)]
+enum StoreOrigin {
+    Fresh,
+    Existing,
+}
+
 /// Wraps any redb error as a classified [`ServerError`].
 fn backend_err<E: fmt::Display>(err: E) -> ServerError {
     StorageError::backend(err.to_string()).into()
+}
+
+/// Builds the stable operator-facing refusal for an incompatible durable format.
+fn incompatible_data_err() -> ServerError {
+    StorageError::IncompatiblePreAlphaData.into()
+}
+
+/// Classifies redb's own durable-format mismatch without hiding other backend
+/// failures such as locks or I/O errors.
+fn database_open_err(err: redb::DatabaseError) -> ServerError {
+    match err {
+        redb::DatabaseError::UpgradeRequired(_) => incompatible_data_err(),
+        redb::DatabaseError::Storage(redb::StorageError::Io(io_error))
+            if matches!(
+                io_error.kind(),
+                ErrorKind::InvalidData | ErrorKind::UnexpectedEof
+            ) =>
+        {
+            incompatible_data_err()
+        }
+        other => backend_err(other),
+    }
+}
+
+/// Classifies a known table's shape mismatch as an incompatible `FerrumC`
+/// format, while retaining backend classification for operational failures.
+fn schema_table_err(err: redb::TableError) -> ServerError {
+    match err {
+        redb::TableError::TableTypeMismatch { .. }
+        | redb::TableError::TableIsMultimap(_)
+        | redb::TableError::TableIsNotMultimap(_)
+        | redb::TableError::TypeDefinitionChanged { .. } => incompatible_data_err(),
+        other => backend_err(other),
+    }
+}
+
+/// Rejects an incomplete or unknown table catalog without opening or creating
+/// any data table.
+///
+/// Adding or removing a durable table requires a format-version change, so an
+/// existing current-version file cannot silently grow a missing table.
+fn validate_existing_table_catalog(txn: &redb::WriteTransaction) -> Result<()> {
+    let expected = [
+        META_TABLE.name(),
+        CHUNK_TABLE.name(),
+        ENTITY_TABLE.name(),
+        PLAYER_TABLE.name(),
+        PLUGIN_TABLE.name(),
+        CHUNK_OVERLAY_TABLE.name(),
+        MUTATION_LOG_TABLE.name(),
+        MUTATION_BATCH_TABLE.name(),
+    ];
+    let mut found = 0;
+    for table in txn.list_tables().map_err(backend_err)? {
+        if !expected.contains(&table.name()) {
+            return Err(incompatible_data_err());
+        }
+        found += 1;
+    }
+
+    let has_multimap_tables = txn
+        .list_multimap_tables()
+        .map_err(backend_err)?
+        .next()
+        .is_some();
+    if has_multimap_tables || found != expected.len() {
+        return Err(incompatible_data_err());
+    }
+    Ok(())
 }
 
 /// Wraps a `spawn_blocking` join failure (the blocking task panicked or was
@@ -226,28 +304,72 @@ impl RedbStore {
     /// This is synchronous I/O and must be called outside the async hot path
     /// (for example during startup), not from inside a running tick.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let db = Database::create(path).map_err(backend_err)?;
-        Self::initialize(&db)?;
+        let path = path.as_ref();
+        let (db, origin) = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => (
+                Database::builder().create_file(file).map_err(backend_err)?,
+                StoreOrigin::Fresh,
+            ),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => (
+                Database::open(path).map_err(database_open_err)?,
+                StoreOrigin::Existing,
+            ),
+            Err(err) => return Err(backend_err(err)),
+        };
+        Self::initialize(&db, origin)?;
         Ok(Self { db: Arc::new(db) })
     }
 
     /// Ensures every table exists and the format version is present and
     /// compatible, in a single write transaction.
-    fn initialize(db: &Database) -> Result<()> {
+    fn initialize(db: &Database, origin: StoreOrigin) -> Result<()> {
         let txn = db.begin_write().map_err(backend_err)?;
+        {
+            // The format marker is the gate for every table and record below.
+            // Checking it first prevents corrupt or legacy data from being
+            // interpreted before compatibility is established.
+            let mut meta = txn.open_table(META_TABLE).map_err(schema_table_err)?;
+            let existing = meta
+                .get(META_FORMAT_KEY)
+                .map_err(backend_err)?
+                .map(|guard| guard.value());
+            match (origin, existing) {
+                (_, Some(STORE_FORMAT_VERSION)) => {}
+                (StoreOrigin::Fresh, None) => {
+                    meta.insert(META_FORMAT_KEY, STORE_FORMAT_VERSION)
+                        .map_err(backend_err)?;
+                }
+                (_, Some(_)) | (StoreOrigin::Existing, None) => {
+                    return Err(incompatible_data_err());
+                }
+            }
+        }
+        if matches!(origin, StoreOrigin::Existing) {
+            validate_existing_table_catalog(&txn)?;
+        }
+
         // Create the data tables up front so later read transactions never fail
         // with `TableDoesNotExist` on a brand-new database.
-        txn.open_table(CHUNK_TABLE).map_err(backend_err)?;
-        txn.open_table(ENTITY_TABLE).map_err(backend_err)?;
-        txn.open_table(PLAYER_TABLE).map_err(backend_err)?;
-        txn.open_table(PLUGIN_TABLE).map_err(backend_err)?;
+        txn.open_table(CHUNK_TABLE).map_err(schema_table_err)?;
+        txn.open_table(ENTITY_TABLE).map_err(schema_table_err)?;
+        txn.open_table(PLAYER_TABLE).map_err(schema_table_err)?;
+        txn.open_table(PLUGIN_TABLE).map_err(schema_table_err)?;
         // Keep every current table under the same initialization transaction.
-        // If a later compatibility check rejects the file, dropping this
-        // transaction rolls back any table creation.
-        txn.open_table(CHUNK_OVERLAY_TABLE).map_err(backend_err)?;
-        txn.open_table(MUTATION_BATCH_TABLE).map_err(backend_err)?;
+        // If validation of current-format data fails, dropping this transaction
+        // rolls back table creation and metadata reconciliation.
+        txn.open_table(CHUNK_OVERLAY_TABLE)
+            .map_err(schema_table_err)?;
+        txn.open_table(MUTATION_BATCH_TABLE)
+            .map_err(schema_table_err)?;
         let journal_last_id = {
-            let journal = txn.open_table(MUTATION_LOG_TABLE).map_err(backend_err)?;
+            let journal = txn
+                .open_table(MUTATION_LOG_TABLE)
+                .map_err(schema_table_err)?;
             let last_id = journal
                 .last()
                 .map_err(backend_err)?
@@ -256,22 +378,7 @@ impl RedbStore {
             last_id
         };
         {
-            let mut meta = txn.open_table(META_TABLE).map_err(backend_err)?;
-            let existing = meta
-                .get(META_FORMAT_KEY)
-                .map_err(backend_err)?
-                .map(|guard| guard.value());
-            match existing {
-                Some(found) if found != STORE_FORMAT_VERSION => {
-                    return Err(StorageError::IncompatiblePreAlphaData.into());
-                }
-                Some(_) => {}
-                None => {
-                    meta.insert(META_FORMAT_KEY, STORE_FORMAT_VERSION)
-                        .map_err(backend_err)?;
-                }
-            }
-
+            let mut meta = txn.open_table(META_TABLE).map_err(schema_table_err)?;
             // Older databases have journal rows but no durable sequence key.
             // Reconcile once on open from the B-tree's greatest key; appends
             // thereafter read only this metadata entry inside their write
@@ -817,6 +924,191 @@ mod tests {
     use super::*;
     use crate::{JournalBatchId, MutationActor, MutationLogCause, SchemaVersion};
 
+    const INCOMPATIBLE_PRE_ALPHA_MESSAGE: &str = "This data was created by an incompatible pre-alpha build. Back it up or delete it before starting this release.";
+    const SHORT_META_TABLE: TableDefinition<'_, &str, &[u8]> = TableDefinition::new("ferrumc:meta");
+    const WRONG_CHUNK_TABLE: TableDefinition<'_, &str, u64> = TableDefinition::new("ferrumc:chunk");
+
+    fn assert_incompatible_open(path: &Path) {
+        let error = RedbStore::open(path).expect_err("incompatible store must be refused");
+        match &error {
+            ServerError::InvalidState(message) => {
+                assert_eq!(message, INCOMPATIBLE_PRE_ALPHA_MESSAGE);
+            }
+            other => panic!("expected typed incompatible-data refusal, got {other:?}"),
+        }
+        assert_eq!(
+            error.to_string(),
+            format!("invalid state: {INCOMPATIBLE_PRE_ALPHA_MESSAGE}")
+        );
+    }
+
+    fn seed_store_version(path: &Path, version: u64) {
+        let store = RedbStore::open(path).expect("open current store");
+        let txn = store.db.begin_write().expect("write transaction");
+        {
+            let mut meta = txn.open_table(META_TABLE).expect("metadata table");
+            meta.insert(META_FORMAT_KEY, version)
+                .expect("seed format version");
+        }
+        txn.commit().expect("commit format marker");
+    }
+
+    fn seed_fixture_data_tables(txn: &redb::WriteTransaction, include_chunk: bool) {
+        if include_chunk {
+            txn.open_table(CHUNK_TABLE).expect("chunk table");
+        }
+        txn.open_table(ENTITY_TABLE).expect("entity table");
+        txn.open_table(PLAYER_TABLE).expect("player table");
+        txn.open_table(PLUGIN_TABLE).expect("plugin table");
+        txn.open_table(CHUNK_OVERLAY_TABLE)
+            .expect("chunk overlay table");
+        txn.open_table(MUTATION_LOG_TABLE)
+            .expect("mutation log table");
+        txn.open_table(MUTATION_BATCH_TABLE)
+            .expect("mutation batch table");
+    }
+
+    fn assert_missing_headers_are_refused(dir: &Path) {
+        let path = dir.join("missing-header.redb");
+        {
+            let db = Database::create(&path).expect("create missing-header fixture");
+            let txn = db.begin_write().expect("write transaction");
+            {
+                let mut meta = txn.open_table(META_TABLE).expect("metadata table");
+                meta.insert(META_LAST_MUTATION_ID_KEY, 42)
+                    .expect("seed unrelated metadata");
+            }
+            seed_fixture_data_tables(&txn, true);
+            txn.commit().expect("commit fixture without a header");
+        }
+        assert_incompatible_open(&path);
+
+        let db = Database::open(&path).expect("reopen missing-header fixture");
+        let txn = db.begin_read().expect("read transaction");
+        let meta = txn.open_table(META_TABLE).expect("metadata table remains");
+        assert!(meta
+            .get(META_FORMAT_KEY)
+            .expect("read format marker")
+            .is_none());
+        assert_eq!(
+            meta.get(META_LAST_MUTATION_ID_KEY)
+                .expect("read unrelated metadata")
+                .map(|guard| guard.value()),
+            Some(42)
+        );
+    }
+
+    fn assert_incomplete_current_catalog_is_refused(dir: &Path) {
+        let path = dir.join("missing-chunk-table.redb");
+        {
+            let db = Database::create(&path).expect("create incomplete fixture");
+            let txn = db.begin_write().expect("write transaction");
+            {
+                let mut meta = txn.open_table(META_TABLE).expect("metadata table");
+                meta.insert(META_FORMAT_KEY, STORE_FORMAT_VERSION)
+                    .expect("seed current format version");
+            }
+            seed_fixture_data_tables(&txn, false);
+            txn.commit().expect("commit incomplete fixture");
+        }
+        assert_incompatible_open(&path);
+
+        let db = Database::open(&path).expect("reopen incomplete fixture");
+        let txn = db.begin_read().expect("read transaction");
+        assert!(matches!(
+            txn.open_table(CHUNK_TABLE),
+            Err(redb::TableError::TableDoesNotExist(_))
+        ));
+    }
+
+    fn assert_short_headers_are_refused(dir: &Path) {
+        let path = dir.join("short-metadata-header.redb");
+        {
+            let db = Database::create(&path).expect("create short-header fixture");
+            let txn = db.begin_write().expect("write transaction");
+            {
+                let mut meta = txn
+                    .open_table(SHORT_META_TABLE)
+                    .expect("raw metadata table");
+                meta.insert(META_FORMAT_KEY, &[2_u8][..])
+                    .expect("seed short format header");
+            }
+            seed_fixture_data_tables(&txn, true);
+            txn.commit().expect("commit short format header");
+        }
+        assert_incompatible_open(&path);
+
+        for len in [0_usize, size_of::<u64>() - 1] {
+            let path = dir.join(format!("physical-header-{len}.redb"));
+            std::fs::write(&path, vec![0_u8; len]).expect("seed physical short header");
+            assert_incompatible_open(&path);
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("short-header metadata")
+                    .len(),
+                u64::try_from(len).expect("fixture length fits u64")
+            );
+        }
+    }
+
+    fn assert_wrong_table_shape_is_refused(dir: &Path) {
+        let path = dir.join("wrong-table-shape.redb");
+        {
+            let db = Database::create(&path).expect("create wrong-table fixture");
+            let txn = db.begin_write().expect("write transaction");
+            {
+                let mut meta = txn.open_table(META_TABLE).expect("metadata table");
+                meta.insert(META_FORMAT_KEY, STORE_FORMAT_VERSION)
+                    .expect("seed current format version");
+            }
+            {
+                let mut chunks = txn
+                    .open_table(WRONG_CHUNK_TABLE)
+                    .expect("wrong-shape chunk table");
+                chunks.insert("sentinel", 7).expect("seed sentinel row");
+            }
+            seed_fixture_data_tables(&txn, false);
+            txn.commit().expect("commit wrong-table fixture");
+        }
+        assert_incompatible_open(&path);
+
+        let db = Database::open(&path).expect("reopen wrong-table fixture");
+        let txn = db.begin_read().expect("read transaction");
+        let chunks = txn
+            .open_table(WRONG_CHUNK_TABLE)
+            .expect("wrong-shape chunk table remains");
+        assert_eq!(
+            chunks
+                .get("sentinel")
+                .expect("read sentinel")
+                .map(|guard| guard.value()),
+            Some(7)
+        );
+    }
+
+    fn assert_marker_gate_precedes_data_validation(dir: &Path) {
+        let path = dir.join("future-with-malformed-data.redb");
+        {
+            let store = RedbStore::open(&path).expect("create current store");
+            let txn = store.db.begin_write().expect("write transaction");
+            {
+                let mut meta = txn.open_table(META_TABLE).expect("metadata table");
+                meta.insert(META_FORMAT_KEY, STORE_FORMAT_VERSION + 1)
+                    .expect("seed future format version");
+            }
+            {
+                let mut journal = txn
+                    .open_table(MUTATION_LOG_TABLE)
+                    .expect("mutation journal");
+                journal
+                    .insert(&[0_u8; 9][..], &[][..])
+                    .expect("seed malformed current-format data");
+            }
+            txn.commit().expect("commit incompatible fixture");
+        }
+        assert_incompatible_open(&path);
+    }
+
     fn mutation(local_id: u64, tick: u64) -> BlockMutationLogRecord {
         let coordinate = i32::try_from(tick).expect("test tick fits i32");
         let state = u32::try_from(tick).expect("test tick fits u32");
@@ -1012,24 +1304,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_store_format_uses_the_incompatible_data_refusal() {
+    fn incompatible_schema_version_is_refused_with_exact_message() {
         let dir = TempDir::new().expect("temp dir");
-        let path = dir.path().join("legacy.redb");
-        {
-            let store = RedbStore::open(&path).expect("open current store");
-            let txn = store.db.begin_write().expect("write transaction");
-            {
-                let mut meta = txn.open_table(META_TABLE).expect("metadata table");
-                meta.insert(META_FORMAT_KEY, 1).expect("seed legacy format");
-            }
-            txn.commit().expect("commit legacy marker");
+        for (name, version) in [
+            ("bogus.redb", 0),
+            ("pre-packet-31.redb", 1),
+            ("future.redb", STORE_FORMAT_VERSION + 1),
+        ] {
+            let path = dir.path().join(name);
+            seed_store_version(&path, version);
+            assert_incompatible_open(&path);
         }
 
-        let error = RedbStore::open(&path).expect_err("legacy store must be refused");
-        assert!(matches!(error, ServerError::InvalidState(_)));
-        assert!(error.to_string().contains(
-            "This data was created by an incompatible pre-alpha build. Back it up or delete it before starting this release."
-        ));
+        let current_path = dir.path().join("current.redb");
+        drop(RedbStore::open(&current_path).expect("create current store"));
+        drop(RedbStore::open(&current_path).expect("current store must reopen"));
+
+        assert_missing_headers_are_refused(dir.path());
+        assert_incomplete_current_catalog_is_refused(dir.path());
+        assert_short_headers_are_refused(dir.path());
+        assert_wrong_table_shape_is_refused(dir.path());
+        assert_marker_gate_precedes_data_validation(dir.path());
     }
 
     #[tokio::test]
