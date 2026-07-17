@@ -26,8 +26,9 @@
 //!   that records its traffic for assertion against a [`PacketScript`]. The
 //!   actual server wiring lands with M09/M11/M22.
 //! - [`FaultInjectingStore`]: an in-memory [`ferrumc_storage::WorldStore`] with
-//!   deterministic commit/response cutpoints, committed-state inspection, and
-//!   an ordered operation trace for crash-consistency tests.
+//!   deterministic commit/response cutpoints, idempotent journal-receipt replay,
+//!   committed-state inspection, and an ordered operation trace for
+//!   crash-consistency tests.
 
 mod client;
 mod fault_store;

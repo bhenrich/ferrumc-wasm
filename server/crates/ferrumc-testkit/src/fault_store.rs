@@ -15,9 +15,9 @@ use async_trait::async_trait;
 use ferrumc_core::{Result as ServerResult, ServerError};
 use ferrumc_storage::{
     BlockMutationLogRecord, ChunkKey, ChunkOverlayRecord, ChunkRecord, EntityKey, EntityRecord,
-    StorageError, WorldStore, MAX_SAVE_BATCH,
+    InMemoryStore, JournalAppendReceipt, JournalBatchId, StorageError, WorldStore, MAX_SAVE_BATCH,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 /// Maximum number of not-yet-consumed fault actions in one store.
 ///
@@ -44,6 +44,8 @@ pub enum FaultOperation {
     SaveChunkOverlays,
     /// Append a batch to the block-mutation journal.
     AppendBlockMutations,
+    /// Idempotently append a tokenized batch to the block-mutation journal.
+    AppendBlockMutationBatch,
     /// Load one entity record.
     LoadEntity,
     /// Save one entity record.
@@ -80,6 +82,8 @@ pub enum FaultStage {
     CommitFailure,
     /// A mutating operation changed committed state atomically.
     Committed,
+    /// A tokenized journal retry returned an already-committed receipt.
+    ReceiptReplayed,
     /// The operation committed or read its result, then held the response.
     HeldResponse,
     /// The operation committed, but its acknowledgement was deliberately lost.
@@ -108,6 +112,10 @@ enum FaultAttemptPayload {
     Chunks(Vec<(ChunkKey, ChunkRecord)>),
     Overlays(Vec<(ChunkKey, ChunkOverlayRecord)>),
     Mutations(Vec<BlockMutationLogRecord>),
+    MutationBatch {
+        batch_id: JournalBatchId,
+        mutations: Vec<BlockMutationLogRecord>,
+    },
     EntityKey(EntityKey),
     Entities(Vec<(EntityKey, EntityRecord)>),
 }
@@ -119,6 +127,7 @@ impl FaultAttemptPayload {
             Self::Chunks(records) => records.len(),
             Self::Overlays(records) => records.len(),
             Self::Mutations(records) => records.len(),
+            Self::MutationBatch { mutations, .. } => mutations.len(),
             Self::Entities(records) => records.len(),
         }
     }
@@ -190,7 +199,19 @@ impl FaultStoreAttempt {
     #[must_use]
     pub fn block_mutations(&self) -> Option<&[BlockMutationLogRecord]> {
         match &self.payload {
-            FaultAttemptPayload::Mutations(records) => Some(records),
+            FaultAttemptPayload::Mutations(records)
+            | FaultAttemptPayload::MutationBatch {
+                mutations: records, ..
+            } => Some(records),
+            _ => None,
+        }
+    }
+
+    /// Returns the idempotency token for a tokenized journal append.
+    #[must_use]
+    pub fn journal_batch_id(&self) -> Option<JournalBatchId> {
+        match self.payload {
+            FaultAttemptPayload::MutationBatch { batch_id, .. } => Some(batch_id),
             _ => None,
         }
     }
@@ -387,6 +408,7 @@ pub struct FaultStoreSnapshot {
     chunks: BTreeMap<ChunkKey, ChunkRecord>,
     overlays: BTreeMap<ChunkKey, ChunkOverlayRecord>,
     mutations: Vec<BlockMutationLogRecord>,
+    journal_receipts: BTreeMap<JournalBatchId, JournalAppendReceipt>,
     entities: BTreeMap<EntityKey, EntityRecord>,
     attempted_operations: u64,
     committed_operations: u64,
@@ -410,6 +432,12 @@ impl FaultStoreSnapshot {
     #[must_use]
     pub fn block_mutations(&self) -> &[BlockMutationLogRecord] {
         &self.mutations
+    }
+
+    /// Returns the committed receipt for `batch_id`, if that token has committed.
+    #[must_use]
+    pub fn journal_receipt(&self, batch_id: JournalBatchId) -> Option<JournalAppendReceipt> {
+        self.journal_receipts.get(&batch_id).copied()
     }
 
     /// Returns the committed entity at `key`, if present.
@@ -465,6 +493,7 @@ struct CommittedState {
     overlays: BTreeMap<ChunkKey, ChunkOverlayRecord>,
     mutations: Vec<BlockMutationLogRecord>,
     last_mutation_id: Option<u64>,
+    journal_receipts: BTreeMap<JournalBatchId, JournalAppendReceipt>,
     entities: BTreeMap<EntityKey, EntityRecord>,
 }
 
@@ -492,6 +521,8 @@ struct Inner {
 #[derive(Debug, Default)]
 pub struct FaultInjectingStore {
     inner: Mutex<Inner>,
+    journal: InMemoryStore,
+    journal_commit: AsyncMutex<()>,
 }
 
 impl FaultInjectingStore {
@@ -564,6 +595,7 @@ impl FaultInjectingStore {
             chunks: inner.committed.chunks.clone(),
             overlays: inner.committed.overlays.clone(),
             mutations: inner.committed.mutations.clone(),
+            journal_receipts: inner.committed.journal_receipts.clone(),
             entities: inner.committed.entities.clone(),
             attempted_operations: inner.attempted_operations,
             committed_operations: inner.committed_operations,
@@ -881,6 +913,124 @@ impl FaultInjectingStore {
         self.finish_response(operation_id, operation, item_count, fault.as_ref(), result)
             .await
     }
+
+    async fn execute_journal_append(
+        &self,
+        mutations: Vec<BlockMutationLogRecord>,
+    ) -> ServerResult<()> {
+        let operation = FaultOperation::AppendBlockMutations;
+        let payload = FaultAttemptPayload::Mutations(mutations.clone());
+        let item_count = payload.item_count();
+        let (operation_id, fault) = self.begin_operation(operation, payload)?;
+
+        // Both journal APIs share this authority so their storage-owned IDs
+        // cannot overlap when a test mixes legacy and tokenized appends.
+        let commit_guard = self.journal_commit.lock().await;
+        self.apply_before_commit(operation_id, operation, item_count, fault.as_ref())
+            .await?;
+        if let Err(error) = self.journal.append_block_mutations(mutations.clone()).await {
+            self.record_stage(
+                operation_id,
+                operation,
+                FaultStage::CommitFailure,
+                item_count,
+            )?;
+            return Err(error);
+        }
+        {
+            let mut inner = self.lock_server()?;
+            append_mutations(&mut inner.committed, mutations)?;
+            inner.committed_operations = inner.committed_operations.saturating_add(1);
+            Self::push_trace(
+                &mut inner,
+                operation_id,
+                operation,
+                FaultStage::Committed,
+                item_count,
+            );
+        }
+        drop(commit_guard);
+
+        self.finish_response(operation_id, operation, item_count, fault.as_ref(), ())
+            .await
+    }
+
+    async fn execute_journal_batch(
+        &self,
+        batch_id: JournalBatchId,
+        mutations: Vec<BlockMutationLogRecord>,
+    ) -> ServerResult<JournalAppendReceipt> {
+        let operation = FaultOperation::AppendBlockMutationBatch;
+        let payload = FaultAttemptPayload::MutationBatch {
+            batch_id,
+            mutations: mutations.clone(),
+        };
+        let item_count = payload.item_count();
+        let (operation_id, fault) = self.begin_operation(operation, payload)?;
+
+        let commit_guard = self.journal_commit.lock().await;
+        self.apply_before_commit(operation_id, operation, item_count, fault.as_ref())
+            .await?;
+        let receipt = match self
+            .journal
+            .append_block_mutation_batch(batch_id, mutations.clone())
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.record_stage(
+                    operation_id,
+                    operation,
+                    FaultStage::CommitFailure,
+                    item_count,
+                )?;
+                return Err(error);
+            }
+        };
+        if receipt.batch_id() != batch_id {
+            self.record_stage(
+                operation_id,
+                operation,
+                FaultStage::CommitFailure,
+                item_count,
+            )?;
+            return Err(ServerError::internal(
+                "fault store journal authority returned a receipt for another batch",
+            ));
+        }
+        let normalized = normalize_mutations(receipt, &mutations)?;
+        {
+            let mut inner = self.lock_server()?;
+            let stage = match inner.committed.journal_receipts.get(&batch_id) {
+                Some(committed) if *committed == receipt => FaultStage::ReceiptReplayed,
+                Some(_) => {
+                    Self::push_trace(
+                        &mut inner,
+                        operation_id,
+                        operation,
+                        FaultStage::CommitFailure,
+                        item_count,
+                    );
+                    return Err(ServerError::internal(
+                        "fault store journal authority returned a different receipt",
+                    ));
+                }
+                None => {
+                    inner.committed.mutations.extend(normalized);
+                    inner.committed.last_mutation_id =
+                        receipt.last_id().or(inner.committed.last_mutation_id);
+                    inner.committed.journal_receipts.insert(batch_id, receipt);
+                    inner.committed_operations = inner.committed_operations.saturating_add(1);
+                    FaultStage::Committed
+                }
+            };
+            Self::push_trace(&mut inner, operation_id, operation, stage, item_count);
+        }
+        drop(commit_guard);
+
+        self.finish_response(operation_id, operation, item_count, fault.as_ref(), receipt)
+            .await
+    }
 }
 
 fn validate_batch(len: usize) -> ServerResult<()> {
@@ -942,6 +1092,60 @@ fn append_mutations(
     );
     state.last_mutation_id = Some(final_id);
     Ok(())
+}
+
+fn normalize_mutations(
+    receipt: JournalAppendReceipt,
+    mutations: &[BlockMutationLogRecord],
+) -> ServerResult<Vec<BlockMutationLogRecord>> {
+    if receipt.len() != mutations.len() {
+        return Err(ServerError::internal(
+            "fault store journal authority returned a mismatched receipt length",
+        ));
+    }
+    if mutations.is_empty() {
+        if receipt.first_id().is_none() && receipt.last_id().is_none() {
+            return Ok(Vec::new());
+        }
+        return Err(ServerError::internal(
+            "fault store journal authority returned a range for an empty receipt",
+        ));
+    }
+    let (Some(first_id), Some(last_id)) = (receipt.first_id(), receipt.last_id()) else {
+        return Err(ServerError::internal(
+            "fault store journal authority omitted a non-empty receipt range",
+        ));
+    };
+    let final_offset = u64::try_from(mutations.len() - 1)
+        .map_err(|_| ServerError::internal("fault store journal receipt length did not fit u64"))?;
+    if first_id.checked_add(final_offset) != Some(last_id) {
+        return Err(ServerError::internal(
+            "fault store journal authority returned an inconsistent receipt range",
+        ));
+    }
+
+    mutations
+        .iter()
+        .enumerate()
+        .map(|(offset, record)| {
+            let offset = u64::try_from(offset).map_err(|_| {
+                ServerError::internal("fault store journal receipt offset did not fit u64")
+            })?;
+            let id = first_id.checked_add(offset).ok_or_else(|| {
+                ServerError::internal("fault store journal receipt range overflowed")
+            })?;
+            Ok(BlockMutationLogRecord::new(
+                record.schema_version(),
+                id,
+                record.tick(),
+                record.actor(),
+                record.pos(),
+                record.old_state(),
+                record.new_state(),
+                record.cause(),
+            ))
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -1009,13 +1213,15 @@ impl WorldStore for FaultInjectingStore {
         &self,
         mutations: Vec<BlockMutationLogRecord>,
     ) -> ServerResult<()> {
-        let payload = FaultAttemptPayload::Mutations(mutations.clone());
-        self.execute_write(
-            FaultOperation::AppendBlockMutations,
-            payload,
-            move |state| append_mutations(state, mutations),
-        )
-        .await
+        self.execute_journal_append(mutations).await
+    }
+
+    async fn append_block_mutation_batch(
+        &self,
+        batch_id: JournalBatchId,
+        mutations: Vec<BlockMutationLogRecord>,
+    ) -> ServerResult<JournalAppendReceipt> {
+        self.execute_journal_batch(batch_id, mutations).await
     }
 
     async fn load_entity(&self, key: EntityKey) -> ServerResult<Option<EntityRecord>> {
