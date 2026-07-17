@@ -16,14 +16,24 @@
 //! block name plus its property map to the 1.21.8 protocol id. Blocks unknown to
 //! the pinned registry fall back to air (the import stays version-tolerant
 //! rather than failing the whole region).
+//!
+//! The root `block_entities` list is imported into the same [`Chunk`]. The
+//! current world model represents regular/hanging signs and chests; unknown ids
+//! are skipped, while malformed supported entries, duplicates, out-of-chunk
+//! positions, and payloads that cannot be represented without loss are rejected
+//! with classified errors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ferrumc_math::{BlockPos, ChunkPos};
 use ferrumc_nbt::{NbtCompound, NbtTag};
-use ferrumc_registry::block_state::compute_state_id;
+use ferrumc_registry::block_state::{compute_state_id, state_id_to_block_name};
 use ferrumc_registry::dimension;
-use ferrumc_world::{BlockStateId, Chunk, SECTION_VOLUME};
+use ferrumc_registry::DATA_VERSION;
+use ferrumc_world::{
+    sign_kind_for_state, BlockEntity, BlockStateId, ChestInventory, Chunk, Sign, SignKind,
+    MAX_BLOCK_ENTITIES, MAX_SIGN_COLOR_BYTES, MAX_SIGN_LINE_BYTES, SECTION_VOLUME, SIGN_LINES,
+};
 
 use crate::error::{AnvilError, ChunkCoord};
 
@@ -55,25 +65,445 @@ pub(crate) fn chunk_from_nbt(
     };
 
     let mut chunk = Chunk::new(chunk_pos);
+    let data_version = match unique_field(coord, root, "DataVersion", "DataVersion")? {
+        Some(NbtTag::Int(version)) => Some(*version),
+        Some(_) => {
+            return Err(AnvilError::WrongFieldType {
+                coord,
+                field: "DataVersion",
+            });
+        }
+        None => None,
+    };
 
     // A proto-chunk (not yet fully generated) may legitimately carry no
-    // sections; treat that as an empty column rather than an error.
-    let sections = match root.get("sections") {
-        None => return Ok(chunk),
-        Some(NbtTag::List(sections)) => sections,
+    // sections; treat that as an empty column, but still inspect block entities
+    // below so the optional field can never be bypassed by an early return.
+    match root.get("sections") {
+        None => {}
+        Some(NbtTag::List(sections)) => {
+            for section in sections {
+                import_section(coord, chunk_pos, &mut chunk, section)?;
+            }
+        }
         Some(_) => {
             return Err(AnvilError::WrongFieldType {
                 coord,
                 field: "sections",
-            })
+            });
         }
-    };
-
-    for section in sections {
-        import_section(coord, chunk_pos, &mut chunk, section)?;
     }
 
+    import_block_entities(coord, &mut chunk, root, data_version)?;
     Ok(chunk)
+}
+
+/// Imports every supported block entity from the optional root list.
+///
+/// The raw list is capped before iteration, including entries whose ids are
+/// unknown and skipped. This bounds both work and the duplicate-position set
+/// even when a hostile file repeats one position many times.
+fn import_block_entities(
+    coord: ChunkCoord,
+    chunk: &mut Chunk,
+    root: &NbtCompound,
+    data_version: Option<i32>,
+) -> Result<(), AnvilError> {
+    let Some(tag) = unique_field(coord, root, "block_entities", "block_entities")? else {
+        return Ok(());
+    };
+    let NbtTag::List(entities) = tag else {
+        return Err(AnvilError::WrongFieldType {
+            coord,
+            field: "block_entities",
+        });
+    };
+    if entities.len() > MAX_BLOCK_ENTITIES {
+        return Err(AnvilError::TooManyBlockEntities {
+            coord,
+            count: entities.len(),
+            max: MAX_BLOCK_ENTITIES,
+        });
+    }
+
+    let mut positions = BTreeSet::new();
+    for tag in entities {
+        let Some((pos, entity)) = import_block_entity(coord, chunk, tag, data_version)? else {
+            continue;
+        };
+        if !positions.insert(pos) {
+            return Err(AnvilError::DuplicateBlockEntity { coord, pos });
+        }
+        chunk
+            .set_block_entity(pos, entity)
+            .map_err(|source| AnvilError::BlockEntityPlacement { coord, pos, source })?;
+    }
+    Ok(())
+}
+
+/// Converts one supported block-entity compound, skipping unknown ids for
+/// version tolerance.
+fn import_block_entity(
+    coord: ChunkCoord,
+    chunk: &Chunk,
+    tag: &NbtTag,
+    data_version: Option<i32>,
+) -> Result<Option<(BlockPos, BlockEntity)>, AnvilError> {
+    let NbtTag::Compound(compound) = tag else {
+        return Err(AnvilError::WrongFieldType {
+            coord,
+            field: "block_entities[]",
+        });
+    };
+    let id = required_string(coord, compound, "id", "block_entities[].id")?;
+
+    match id {
+        "minecraft:sign" => {
+            let pos = block_entity_position(coord, compound)?;
+            require_supported_data_version(coord, pos, data_version)?;
+            let entity = import_sign(coord, chunk, compound, pos, id, SignKind::Sign)?;
+            Ok(Some((pos, entity)))
+        }
+        "minecraft:hanging_sign" => {
+            let pos = block_entity_position(coord, compound)?;
+            require_supported_data_version(coord, pos, data_version)?;
+            let entity = import_sign(coord, chunk, compound, pos, id, SignKind::Hanging)?;
+            Ok(Some((pos, entity)))
+        }
+        "minecraft:chest" | "minecraft:trapped_chest" => {
+            let pos = block_entity_position(coord, compound)?;
+            require_supported_data_version(coord, pos, data_version)?;
+            let entity = import_chest(coord, chunk, compound, pos, id)?;
+            Ok(Some((pos, entity)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Requires the pinned 1.21.8 disk schema before interpreting a known payload.
+fn require_supported_data_version(
+    coord: ChunkCoord,
+    pos: BlockPos,
+    data_version: Option<i32>,
+) -> Result<(), AnvilError> {
+    if data_version != Some(DATA_VERSION) {
+        return Err(AnvilError::UnsupportedBlockEntityDataVersion {
+            coord,
+            pos,
+            found: data_version,
+            expected: DATA_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// Imports a sign whose block state and currently representable payload agree
+/// with the world model.
+fn import_sign(
+    coord: ChunkCoord,
+    chunk: &Chunk,
+    compound: &NbtCompound,
+    pos: BlockPos,
+    id: &str,
+    expected_kind: SignKind,
+) -> Result<BlockEntity, AnvilError> {
+    let state = block_entity_state(coord, chunk, pos)?;
+    match sign_kind_for_state(state.as_u32()) {
+        Some(actual_kind) if actual_kind == expected_kind => {}
+        _ => return Err(state_mismatch(coord, pos, id, state)),
+    }
+    reject_present_field(
+        coord,
+        compound,
+        pos,
+        "components",
+        "block_entities[].components",
+    )?;
+
+    let is_waxed = required_byte(coord, compound, "is_waxed", "block_entities[].is_waxed")?;
+    if is_waxed != 0 {
+        return Err(AnvilError::UnsupportedBlockEntityData {
+            coord,
+            pos,
+            field: "block_entities[].is_waxed",
+        });
+    }
+
+    let front = import_sign_face(coord, compound, pos, "front_text")?;
+    let back = import_sign_face(coord, compound, pos, "back_text")?;
+    let mut sign = Sign::new(expected_kind);
+    sign.set_face_lines(true, front);
+    sign.set_face_lines(false, back);
+    Ok(BlockEntity::Sign(sign))
+}
+
+/// Imports one sign face, retaining its four plain-text lines.
+///
+/// Non-default styling is rejected explicitly because this crate cannot call
+/// the world crate's storage-only reconstruction seam. This prevents
+/// colored/glowing data from being silently normalized away.
+fn import_sign_face(
+    coord: ChunkCoord,
+    sign: &NbtCompound,
+    pos: BlockPos,
+    face_name: &'static str,
+) -> Result<[String; SIGN_LINES], AnvilError> {
+    let face_path = match face_name {
+        "front_text" => "block_entities[].front_text",
+        _ => "block_entities[].back_text",
+    };
+    let face = required_compound(coord, sign, face_name, face_path)?;
+    reject_present_field(
+        coord,
+        face,
+        pos,
+        "filtered_messages",
+        match face_name {
+            "front_text" => "block_entities[].front_text.filtered_messages",
+            _ => "block_entities[].back_text.filtered_messages",
+        },
+    )?;
+
+    let color_path = match face_name {
+        "front_text" => "block_entities[].front_text.color",
+        _ => "block_entities[].back_text.color",
+    };
+    let color = required_string(coord, face, "color", color_path)?;
+    if color != "black" || color.len() > MAX_SIGN_COLOR_BYTES {
+        return Err(AnvilError::UnsupportedBlockEntityData {
+            coord,
+            pos,
+            field: color_path,
+        });
+    }
+
+    let glow_path = match face_name {
+        "front_text" => "block_entities[].front_text.has_glowing_text",
+        _ => "block_entities[].back_text.has_glowing_text",
+    };
+    let glowing = required_byte(coord, face, "has_glowing_text", glow_path)?;
+    if glowing != 0 {
+        return Err(AnvilError::UnsupportedBlockEntityData {
+            coord,
+            pos,
+            field: glow_path,
+        });
+    }
+
+    let messages_path = match face_name {
+        "front_text" => "block_entities[].front_text.messages",
+        _ => "block_entities[].back_text.messages",
+    };
+    let messages = required_list(coord, face, "messages", messages_path)?;
+    if messages.len() != SIGN_LINES {
+        return Err(AnvilError::BadSignMessageCount {
+            coord,
+            pos,
+            face: face_name,
+            count: messages.len(),
+            expected: SIGN_LINES,
+        });
+    }
+
+    let mut lines: [String; SIGN_LINES] = std::array::from_fn(|_| String::new());
+    for (index, (line, message)) in lines.iter_mut().zip(messages).enumerate() {
+        *line = decode_sign_line(coord, pos, face_name, index, message)?;
+    }
+    Ok(lines)
+}
+
+/// Imports an empty chest shell.
+///
+/// A non-empty `Items` list is rejected instead of discarded: constructing
+/// canonical `ItemStack`s would require a forbidden `ferrumc-anvil ->
+/// ferrumc-items` dependency that is absent from the crate map.
+fn import_chest(
+    coord: ChunkCoord,
+    chunk: &Chunk,
+    compound: &NbtCompound,
+    pos: BlockPos,
+    id: &str,
+) -> Result<BlockEntity, AnvilError> {
+    let state = block_entity_state(coord, chunk, pos)?;
+    let expected_state_name = match id {
+        "minecraft:chest" => "chest",
+        "minecraft:trapped_chest" => "trapped_chest",
+        _ => return Err(state_mismatch(coord, pos, id, state)),
+    };
+    if state_id_to_block_name(state.as_u32()) != Some(expected_state_name) {
+        return Err(state_mismatch(coord, pos, id, state));
+    }
+
+    for (name, path) in [
+        ("components", "block_entities[].components"),
+        ("LootTable", "block_entities[].LootTable"),
+        ("LootTableSeed", "block_entities[].LootTableSeed"),
+        ("CustomName", "block_entities[].CustomName"),
+        ("Lock", "block_entities[].Lock"),
+    ] {
+        reject_present_field(coord, compound, pos, name, path)?;
+    }
+
+    if let Some(items) = unique_field(coord, compound, "Items", "block_entities[].Items")? {
+        let NbtTag::List(items) = items else {
+            return Err(AnvilError::WrongFieldType {
+                coord,
+                field: "block_entities[].Items",
+            });
+        };
+        if !items.is_empty() {
+            return Err(AnvilError::UnsupportedBlockEntityData {
+                coord,
+                pos,
+                field: "block_entities[].Items",
+            });
+        }
+    }
+    Ok(BlockEntity::Chest(ChestInventory::new()))
+}
+
+/// Rejects a semantic field the current world model cannot retain.
+fn reject_present_field(
+    coord: ChunkCoord,
+    compound: &NbtCompound,
+    pos: BlockPos,
+    name: &str,
+    path: &'static str,
+) -> Result<(), AnvilError> {
+    if unique_field(coord, compound, name, path)?.is_some() {
+        return Err(AnvilError::UnsupportedBlockEntityData {
+            coord,
+            pos,
+            field: path,
+        });
+    }
+    Ok(())
+}
+
+/// Reads the unique absolute position fields of a supported block entity.
+fn block_entity_position(
+    coord: ChunkCoord,
+    compound: &NbtCompound,
+) -> Result<BlockPos, AnvilError> {
+    let x = required_int(coord, compound, "x", "block_entities[].x")?;
+    let y = required_int(coord, compound, "y", "block_entities[].y")?;
+    let z = required_int(coord, compound, "z", "block_entities[].z")?;
+    Ok(BlockPos::new(x, y, z))
+}
+
+/// Returns the imported state under a supported entity, classifying a foreign
+/// column or out-of-height position separately from a type mismatch.
+fn block_entity_state(
+    coord: ChunkCoord,
+    chunk: &Chunk,
+    pos: BlockPos,
+) -> Result<BlockStateId, AnvilError> {
+    chunk
+        .get_block(pos)
+        .ok_or(AnvilError::BlockEntityOutsideChunk { coord, pos })
+}
+
+/// Builds the common known-entity/state mismatch error.
+fn state_mismatch(coord: ChunkCoord, pos: BlockPos, id: &str, state: BlockStateId) -> AnvilError {
+    AnvilError::BlockEntityStateMismatch {
+        coord,
+        id: id.to_owned(),
+        pos,
+        state: state.as_u32(),
+    }
+}
+
+/// Looks up one schema-significant compound field and rejects duplicate names.
+fn unique_field<'a>(
+    coord: ChunkCoord,
+    compound: &'a NbtCompound,
+    name: &str,
+    path: &'static str,
+) -> Result<Option<&'a NbtTag>, AnvilError> {
+    let mut matches = compound
+        .iter()
+        .filter_map(|(candidate, value)| (candidate == name).then_some(value));
+    let value = matches.next();
+    if matches.next().is_some() {
+        return Err(AnvilError::DuplicateNbtField { coord, field: path });
+    }
+    Ok(value)
+}
+
+/// Reads a required schema-significant tag after duplicate-name validation.
+fn required_field<'a>(
+    coord: ChunkCoord,
+    compound: &'a NbtCompound,
+    name: &str,
+    path: &'static str,
+) -> Result<&'a NbtTag, AnvilError> {
+    unique_field(coord, compound, name, path)?
+        .ok_or(AnvilError::MissingField { coord, field: path })
+}
+
+/// Reads a required string field.
+fn required_string<'a>(
+    coord: ChunkCoord,
+    compound: &'a NbtCompound,
+    name: &str,
+    path: &'static str,
+) -> Result<&'a str, AnvilError> {
+    match required_field(coord, compound, name, path)? {
+        NbtTag::String(value) => Ok(value),
+        _ => Err(AnvilError::WrongFieldType { coord, field: path }),
+    }
+}
+
+/// Reads a required compound field.
+fn required_compound<'a>(
+    coord: ChunkCoord,
+    compound: &'a NbtCompound,
+    name: &str,
+    path: &'static str,
+) -> Result<&'a NbtCompound, AnvilError> {
+    match required_field(coord, compound, name, path)? {
+        NbtTag::Compound(value) => Ok(value),
+        _ => Err(AnvilError::WrongFieldType { coord, field: path }),
+    }
+}
+
+/// Reads a required list field.
+fn required_list<'a>(
+    coord: ChunkCoord,
+    compound: &'a NbtCompound,
+    name: &str,
+    path: &'static str,
+) -> Result<&'a [NbtTag], AnvilError> {
+    match required_field(coord, compound, name, path)? {
+        NbtTag::List(value) => Ok(value),
+        _ => Err(AnvilError::WrongFieldType { coord, field: path }),
+    }
+}
+
+/// Reads a required byte field.
+fn required_byte(
+    coord: ChunkCoord,
+    compound: &NbtCompound,
+    name: &str,
+    path: &'static str,
+) -> Result<i8, AnvilError> {
+    match required_field(coord, compound, name, path)? {
+        NbtTag::Byte(value) => Ok(*value),
+        _ => Err(AnvilError::WrongFieldType { coord, field: path }),
+    }
+}
+
+/// Reads a required 32-bit integer field.
+fn required_int(
+    coord: ChunkCoord,
+    compound: &NbtCompound,
+    name: &str,
+    path: &'static str,
+) -> Result<i32, AnvilError> {
+    match required_field(coord, compound, name, path)? {
+        NbtTag::Int(value) => Ok(*value),
+        _ => Err(AnvilError::WrongFieldType { coord, field: path }),
+    }
 }
 
 /// Imports a single section compound into `chunk`.
@@ -315,6 +745,70 @@ fn place(
     chunk
         .set_block(pos, state)
         .map_err(|source| AnvilError::Placement { coord, source })
+}
+
+/// Decodes one 1.21.8 structured-NBT text component into bounded plain text.
+///
+/// A direct NBT string is the literal-text shorthand. A compound is retained
+/// only when it consists solely of one string-valued `text` field; styling,
+/// translated text, siblings, and list components are rejected rather than
+/// flattened with semantic loss.
+fn decode_sign_line(
+    coord: ChunkCoord,
+    pos: BlockPos,
+    face: &'static str,
+    line: usize,
+    component: &NbtTag,
+) -> Result<String, AnvilError> {
+    let text = match component {
+        NbtTag::String(text) => text,
+        NbtTag::Compound(fields) => {
+            let Some(value) = unique_field(
+                coord,
+                fields,
+                "text",
+                "block_entities[].text_component.text",
+            )?
+            else {
+                return Err(AnvilError::UnsupportedBlockEntityData {
+                    coord,
+                    pos,
+                    field: "block_entities[].text_component",
+                });
+            };
+            if fields.len() != 1 {
+                return Err(AnvilError::UnsupportedBlockEntityData {
+                    coord,
+                    pos,
+                    field: "block_entities[].text_component",
+                });
+            }
+            let NbtTag::String(text) = value else {
+                return Err(AnvilError::WrongFieldType {
+                    coord,
+                    field: "block_entities[].text_component.text",
+                });
+            };
+            text
+        }
+        _ => {
+            return Err(AnvilError::WrongFieldType {
+                coord,
+                field: "block_entities[].text_component",
+            });
+        }
+    };
+    if text.len() > MAX_SIGN_LINE_BYTES {
+        return Err(AnvilError::SignTextTooLong {
+            coord,
+            pos,
+            face,
+            line,
+            len: text.len(),
+            max: MAX_SIGN_LINE_BYTES,
+        });
+    }
+    Ok(text.to_owned())
 }
 
 /// Bits-per-entry for a section's packed block-state data given its palette

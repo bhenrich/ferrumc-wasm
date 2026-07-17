@@ -141,6 +141,139 @@ pub enum AnvilError {
         field: &'static str,
     },
 
+    /// A schema-significant compound field appeared more than once.
+    ///
+    /// `ferrumc-nbt` intentionally preserves duplicate compound names, so the
+    /// importer rejects ambiguity instead of silently taking the first value.
+    #[error("chunk {coord:?} NBT field '{field}' appears more than once")]
+    DuplicateNbtField {
+        /// The region-local chunk coordinate.
+        coord: ChunkCoord,
+        /// The duplicated field path.
+        field: &'static str,
+    },
+
+    /// A known block entity came from a world-data schema this importer does
+    /// not interpret.
+    #[error(
+        "chunk {coord:?} block entity at {pos:?} uses data version {found:?}, expected {expected}"
+    )]
+    UnsupportedBlockEntityDataVersion {
+        /// The region-local chunk coordinate.
+        coord: ChunkCoord,
+        /// The sign or chest position.
+        pos: ferrumc_math::BlockPos,
+        /// The root `DataVersion`, or `None` when it was absent.
+        found: Option<i32>,
+        /// The pinned 1.21.8 data version.
+        expected: i32,
+    },
+
+    /// The raw block-entity list exceeded the world model's per-chunk cap.
+    #[error(
+        "chunk {coord:?} carries {count} block entities, exceeding the per-chunk cap of {max}"
+    )]
+    TooManyBlockEntities {
+        /// The region-local chunk coordinate.
+        coord: ChunkCoord,
+        /// The rejected raw list length.
+        count: usize,
+        /// The maximum accepted list length.
+        max: usize,
+    },
+
+    /// Two supported block entities claimed the same absolute block position.
+    #[error("chunk {coord:?} carries duplicate block entities at {pos:?}")]
+    DuplicateBlockEntity {
+        /// The region-local chunk coordinate.
+        coord: ChunkCoord,
+        /// The duplicated absolute position.
+        pos: ferrumc_math::BlockPos,
+    },
+
+    /// A supported block entity named a position outside the target chunk.
+    #[error("chunk {coord:?} block entity at {pos:?} is outside the target chunk")]
+    BlockEntityOutsideChunk {
+        /// The region-local chunk coordinate.
+        coord: ChunkCoord,
+        /// The offending absolute position.
+        pos: ferrumc_math::BlockPos,
+    },
+
+    /// A supported block entity did not agree with the imported block state.
+    #[error(
+        "chunk {coord:?} block entity '{id}' at {pos:?} does not match block-state id {state}"
+    )]
+    BlockEntityStateMismatch {
+        /// The region-local chunk coordinate.
+        coord: ChunkCoord,
+        /// The block-entity resource location.
+        id: String,
+        /// The entity's absolute position.
+        pos: ferrumc_math::BlockPos,
+        /// The imported numeric block-state id.
+        state: u32,
+    },
+
+    /// A sign face did not carry exactly four message entries.
+    #[error(
+        "chunk {coord:?} sign at {pos:?} face '{face}' has {count} messages, expected {expected}"
+    )]
+    BadSignMessageCount {
+        /// The region-local chunk coordinate.
+        coord: ChunkCoord,
+        /// The sign's absolute position.
+        pos: ferrumc_math::BlockPos,
+        /// The face field (`front_text` or `back_text`).
+        face: &'static str,
+        /// The rejected message count.
+        count: usize,
+        /// The required fixed message count.
+        expected: usize,
+    },
+
+    /// One literal sign line exceeded the world model's byte ceiling.
+    #[error(
+        "chunk {coord:?} sign at {pos:?} face '{face}' line {line} is {len} bytes, exceeding the {max}-byte cap"
+    )]
+    SignTextTooLong {
+        /// The region-local chunk coordinate.
+        coord: ChunkCoord,
+        /// The sign's absolute position.
+        pos: ferrumc_math::BlockPos,
+        /// The face field (`front_text` or `back_text`).
+        face: &'static str,
+        /// The zero-based line number.
+        line: usize,
+        /// The rejected literal's encoded byte length.
+        len: usize,
+        /// The maximum accepted encoded byte length.
+        max: usize,
+    },
+
+    /// A supported payload contains data the current public world-model API
+    /// cannot represent without loss.
+    #[error("chunk {coord:?} block entity at {pos:?} has unsupported non-default field '{field}'")]
+    UnsupportedBlockEntityData {
+        /// The region-local chunk coordinate.
+        coord: ChunkCoord,
+        /// The entity's absolute position.
+        pos: ferrumc_math::BlockPos,
+        /// The unsupported field path.
+        field: &'static str,
+    },
+
+    /// Inserting a decoded block entity into the bounded world chunk failed.
+    #[error("chunk {coord:?} failed to place a block entity at {pos:?}: {source}")]
+    BlockEntityPlacement {
+        /// The region-local chunk coordinate.
+        coord: ChunkCoord,
+        /// The entity's absolute position.
+        pos: ferrumc_math::BlockPos,
+        /// The underlying world-model error.
+        source: ferrumc_world::WorldError,
+    },
+
     /// A section's block-state palette was empty (every section must name at
     /// least one block state).
     #[error("chunk {coord:?} section {section_y} has an empty block-state palette")]
