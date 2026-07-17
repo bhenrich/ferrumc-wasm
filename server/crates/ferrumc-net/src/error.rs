@@ -252,6 +252,18 @@ pub enum CompressionError {
         threshold: usize,
     },
 
+    /// A packet used the uncompressed marker even though its body was at or
+    /// above the negotiated compression threshold.
+    #[error(
+        "uncompressed packet has {actual} bytes, at or above the compression threshold of {threshold}"
+    )]
+    UncompressedAtOrAboveThreshold {
+        /// The actual uncompressed packet size.
+        actual: usize,
+        /// The active compression threshold.
+        threshold: usize,
+    },
+
     /// The declared uncompressed size exceeds the decompressed-output cap. The
     /// frame is rejected before its output buffer is allocated, so a single
     /// frame can never drive an out-of-memory condition (zip-bomb defense). On
@@ -293,7 +305,9 @@ impl CompressionError {
     pub fn disconnect_class(&self) -> DisconnectClass {
         match self {
             Self::DeclaredTooLarge { .. } => DisconnectClass::FrameTooLarge,
-            Self::BelowThreshold { .. } => DisconnectClass::ProtocolViolation,
+            Self::BelowThreshold { .. } | Self::UncompressedAtOrAboveThreshold { .. } => {
+                DisconnectClass::ProtocolViolation
+            }
             Self::BadDataLength
             | Self::NegativeDataLength { .. }
             | Self::SizeMismatch { .. }

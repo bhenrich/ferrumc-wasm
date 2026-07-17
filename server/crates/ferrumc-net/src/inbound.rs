@@ -11,7 +11,7 @@
 //!    over the *exact* frame body. Because the whole frame is present by this
 //!    point, any short read is a malformed body, never "need more".
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 
 use ferrumc_codec::{BoundedReader, CodecError, FrameLengthReader};
 use ferrumc_proto::generated::{configuration, handshake, login, status};
@@ -106,6 +106,29 @@ pub(crate) struct FrameSpan {
     pub body_start: usize,
     /// Offset one past the last body byte; equals the bytes consumed.
     pub body_end: usize,
+}
+
+/// One complete, bounded outer frame removed from an inbound accumulator.
+///
+/// The body retains the compressed wire representation when compression is
+/// enabled. `wire_len` includes both the outer length prefix and that body so a
+/// strict consumer can charge the exact received span before decompression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawInboundFrame {
+    body: Bytes,
+    wire_len: usize,
+}
+
+impl RawInboundFrame {
+    /// The outer frame body, excluding its length prefix.
+    pub(crate) fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// The complete on-wire span, including the outer length prefix.
+    pub(crate) fn wire_len(&self) -> usize {
+        self.wire_len
+    }
 }
 
 /// Locates one complete length-delimited frame at the front of `buf`.
@@ -246,6 +269,34 @@ impl InboundDecoder {
     /// The number of buffered bytes not yet consumed by a decoded frame.
     pub fn buffered_len(&self) -> usize {
         self.buffer.len()
+    }
+
+    /// Removes one complete bounded frame without interpreting its body.
+    ///
+    /// This is the strict-ingress seam between frame acquisition and
+    /// decompression. The returned body remains in its compressed wire form so
+    /// the caller can apply byte admission before any inflation work. An
+    /// incomplete frame returns `Ok(None)` without consuming bytes.
+    pub(crate) fn acquire_raw_frame(
+        &mut self,
+        state: ConnectionState,
+    ) -> Result<Option<RawInboundFrame>, DecodeError> {
+        let max = self.limits.max_frame_size(state);
+        let Some(span) = locate_frame(&self.buffer, state, max)? else {
+            return Ok(None);
+        };
+        if span.body_start > span.body_end || span.body_end > self.buffer.len() {
+            return Err(DecodeError::MalformedBody { state });
+        }
+
+        // `split_to` transfers the bounded frame allocation without copying;
+        // slicing retains only its body while the exact outer span stays known.
+        let wire = self.buffer.split_to(span.body_end).freeze();
+        let body = wire.slice(span.body_start..span.body_end);
+        Ok(Some(RawInboundFrame {
+            body,
+            wire_len: span.body_end,
+        }))
     }
 
     /// Appends freshly read bytes to the accumulation buffer.

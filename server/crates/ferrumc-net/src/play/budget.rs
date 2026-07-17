@@ -47,6 +47,74 @@ impl BudgetStatus {
     }
 }
 
+/// A byte-denominated token bucket for pre-decompression wire admission.
+///
+/// This is deliberately distinct from [`PacketBudget`]: packet-budget tokens
+/// represent complete frames and overage is advisory, while this bucket charges
+/// the exact outer wire span and a [`PlayIngress`](crate::PlayIngress) treats
+/// overage as fatal before attempting decompression.
+#[derive(Debug, Clone)]
+pub struct WireByteBudget {
+    bucket: PacketBudget,
+    admitted_bytes: u64,
+}
+
+impl WireByteBudget {
+    /// Creates a byte budget starting with `burst_bytes` available.
+    ///
+    /// `bytes_per_sec` is the sustained byte refill rate and `burst_bytes` the
+    /// maximum accumulated allowance. Invalid numeric inputs fail closed through
+    /// the same sanitization as [`PacketBudget::new`].
+    pub fn new(now: Instant, bytes_per_sec: f64, burst_bytes: f64) -> Self {
+        Self {
+            bucket: PacketBudget::new(now, bytes_per_sec, burst_bytes),
+            admitted_bytes: 0,
+        }
+    }
+
+    /// The sustained refill rate in wire bytes per second.
+    pub fn bytes_per_sec(&self) -> f64 {
+        self.bucket.rate_per_sec()
+    }
+
+    /// The maximum accumulated wire-byte allowance.
+    pub fn burst_bytes(&self) -> f64 {
+        self.bucket.burst()
+    }
+
+    /// The currently available wire-byte allowance.
+    pub fn available_bytes(&self) -> f64 {
+        self.bucket.available_tokens()
+    }
+
+    /// The total successfully admitted wire bytes, saturating at `u64::MAX`.
+    pub fn admitted_bytes(&self) -> u64 {
+        self.admitted_bytes
+    }
+
+    /// Refills the byte allowance for elapsed caller-supplied time.
+    pub fn refill(&mut self, now: Instant) {
+        self.bucket.refill(now);
+    }
+
+    /// Charges one complete outer frame span.
+    ///
+    /// A span too large for the underlying integer cost fails closed. Failed
+    /// admission does not deduct tokens or increment the admitted-byte counter.
+    pub(crate) fn admit(&mut self, now: Instant, wire_bytes: usize) -> BudgetStatus {
+        let Ok(cost) = u32::try_from(wire_bytes) else {
+            self.bucket.refill(now);
+            return BudgetStatus::OverBudget;
+        };
+        let status = self.bucket.charge(now, cost);
+        if status.is_within_budget() {
+            let wire_bytes = u64::try_from(wire_bytes).unwrap_or(u64::MAX);
+            self.admitted_bytes = self.admitted_bytes.saturating_add(wire_bytes);
+        }
+        status
+    }
+}
+
 /// A token bucket that rate-limits serverbound play frames.
 ///
 /// Tokens refill continuously at [`rate_per_sec`](Self::rate_per_sec) and are

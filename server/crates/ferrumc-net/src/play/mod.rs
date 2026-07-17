@@ -7,6 +7,9 @@
 //!   inbound byte stream and charges each against a per-connection
 //!   [`PacketBudget`] (a token bucket, ~300 frames/sec sustained) that classifies
 //!   over-budget frames.
+//! - [`PlayIngress`] is the strict successor contract: it adds a fatal
+//!   pre-decompression [`WireByteBudget`], explicit idle/partial/valid activity,
+//!   and fail-stop typed errors with no recovery parser.
 //! - [`PlayWriter`] queues clientbound [`ClientboundPlayPacket`]s into bounded
 //!   per-[`OutboundPriority`] queues (`Critical > State > World > Cosmetic`) and
 //!   drains them, highest priority first, into encoded frame batches bounded by a
@@ -29,15 +32,21 @@
 mod budget;
 mod coalesce;
 mod disconnect;
+mod ingress;
 mod liveness;
 mod metrics;
 mod priority;
 mod reader;
 mod writer;
 
-pub use budget::{BudgetStatus, PacketBudget, DEFAULT_PLAY_FRAME_BURST, DEFAULT_PLAY_FRAME_RATE};
+pub use budget::{
+    BudgetStatus, PacketBudget, WireByteBudget, DEFAULT_PLAY_FRAME_BURST, DEFAULT_PLAY_FRAME_RATE,
+};
 pub use coalesce::{is_movement, MovementCoalescer, OfferOutcome};
 pub use disconnect::{DisconnectPolicy, DisconnectReason};
+pub use ingress::{
+    PlayIngress, PlayIngressActivity, PlayIngressError, PlayIngressPacket, PlayIngressPoll,
+};
 pub use liveness::{
     ConnectionLiveness, KeepAliveError, LivenessActivityError, LivenessConfig, LivenessDeadline,
     LivenessTimeout, DEFAULT_FRAME_COMPLETION_TIMEOUT, DEFAULT_KEEP_ALIVE_TIMEOUT,

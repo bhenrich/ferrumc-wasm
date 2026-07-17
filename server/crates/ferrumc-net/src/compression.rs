@@ -21,6 +21,8 @@
 //!
 //! Decompression is hostile-input hardened:
 //!
+//! - a nonempty uncompressed payload at or above the negotiated threshold is a
+//!   protocol violation;
 //! - a declared size below the threshold is a protocol violation;
 //! - a declared size above the
 //!   [`max_decompressed`](CompressionState::max_decompressed) cap is rejected
@@ -181,11 +183,16 @@ impl CompressionState {
     /// uncompressed size of the `zlib` stream that follows.
     ///
     /// The validation order is: a malformed or negative `data_length` is
-    /// rejected first; a non-zero declared size below the threshold is a
-    /// protocol violation; a declared size above
-    /// [`max_decompressed`](Self::max_decompressed) is rejected before any
-    /// allocation; and the inflated output must equal the declared size with no
-    /// trailing bytes.
+    /// rejected first; a nonempty uncompressed payload at or above the
+    /// threshold and a non-zero declared size below it are protocol violations;
+    /// a declared size above [`max_decompressed`](Self::max_decompressed) is
+    /// rejected before any allocation; and the inflated output must equal the
+    /// declared size with no trailing bytes.
+    ///
+    /// An empty transform payload remains accepted at threshold zero so
+    /// [`compress`](Self::compress) and this method stay round-trippable. Strict
+    /// packet ingress rejects that empty result because it contains no packet
+    /// id.
     pub fn decompress(&self, frame: &[u8]) -> Result<Vec<u8>, CompressionError> {
         let Some(threshold) = self.threshold else {
             // Compression not negotiated: the frame body is the raw packet.
@@ -202,8 +209,15 @@ impl CompressionState {
         let payload = frame.get(reader.position()..).unwrap_or_default();
 
         if declared == 0 {
-            // Below-threshold marker: the remainder is the raw, uncompressed
-            // packet. Its size is already bounded by the frame cap upstream.
+            // An actual packet always contains at least its id. Keep the empty
+            // special case round-trippable at threshold zero, but require every
+            // nonempty uncompressed payload to be strictly below the threshold.
+            if !payload.is_empty() && payload.len() >= threshold {
+                return Err(CompressionError::UncompressedAtOrAboveThreshold {
+                    actual: payload.len(),
+                    threshold,
+                });
+            }
             return Ok(payload.to_vec());
         }
 
@@ -355,6 +369,24 @@ mod tests {
             }
         );
         assert_eq!(err.disconnect_class(), DisconnectClass::ProtocolViolation);
+    }
+
+    #[test]
+    fn uncompressed_payload_must_be_strictly_below_threshold() {
+        let payload = [0x01, 0x02, 0x03, 0x04];
+        let exact = CompressionState::enabled(payload.len());
+        let err = exact.decompress(&frame(0, &payload)).unwrap_err();
+        assert_eq!(
+            err,
+            CompressionError::UncompressedAtOrAboveThreshold {
+                actual: payload.len(),
+                threshold: payload.len(),
+            },
+        );
+        assert_eq!(err.disconnect_class(), DisconnectClass::ProtocolViolation);
+
+        let below = CompressionState::enabled(payload.len() + 1);
+        assert_eq!(below.decompress(&frame(0, &payload)).unwrap(), payload);
     }
 
     #[test]
