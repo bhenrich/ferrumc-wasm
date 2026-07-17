@@ -38,6 +38,7 @@ use ferrumc_sim::{BlockStateId, RegionOp, TIME_DAY, TIME_MIDNIGHT, TIME_NIGHT, T
 use uuid::Uuid;
 
 use crate::driver::SimCommand;
+use crate::player_data::is_valid_player_position;
 
 /// The literal name of the teleport-to-spawn command.
 pub const SPAWN_COMMAND: &str = "spawn";
@@ -462,17 +463,17 @@ enum TpTarget {
 }
 
 /// Parses a `/tp` argument tail: a single token is a player name, exactly three
-/// tokens are `f64` coordinates, and anything else (zero, two, or 4+ tokens, or a
-/// non-numeric coordinate) is `None`.
+/// tokens are safe finite/in-range `f64` coordinates, and anything else (zero,
+/// two, or 4+ tokens, a non-numeric coordinate, or an unsafe destination) is
+/// `None`.
 fn parse_tp(args: &str) -> Option<TpTarget> {
     let tokens: Vec<&str> = args.split_whitespace().collect();
     match tokens.as_slice() {
         [name] => Some(TpTarget::Player((*name).to_owned())),
-        [x, y, z] => Some(TpTarget::Coords(Vec3::new(
-            x.parse().ok()?,
-            y.parse().ok()?,
-            z.parse().ok()?,
-        ))),
+        [x, y, z] => {
+            let position = Vec3::new(x.parse().ok()?, y.parse().ok()?, z.parse().ok()?);
+            is_valid_player_position(position).then_some(TpTarget::Coords(position))
+        }
         _ => None,
     }
 }
@@ -2010,6 +2011,11 @@ mod tests {
             "tp 1 2",     // partial coordinate triple
             "tp 1 2 x",   // non-numeric coordinate
             "tp 1 2 3 4", // too many tokens
+            "tp NaN 64 0",
+            "tp inf 64 0",
+            "tp -inf 64 0",
+            "tp 30000001 64 0",
+            "tp -30000001 64 0",
         ] {
             assert!(
                 !tree

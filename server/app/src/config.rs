@@ -129,11 +129,11 @@ pub struct AppConfig {
     pub region_undo_history: usize,
     /// Interval between clientbound play-phase Keep Alive pings.
     pub keep_alive_interval: Duration,
-    /// How often a standing player's view is pumped toward the full advertised
-    /// view distance. The chunk stream otherwise only advances on a movement
-    /// packet, so without this a non-moving joiner would never receive chunks past
-    /// the initial spawn batch. Each pump is bounded by the per-update load cap, so
-    /// a short interval drains the backlog promptly without flooding the socket.
+    /// How often a player's view is pumped toward the full advertised view
+    /// distance. Movement only replaces the pending target; this fixed cadence
+    /// consumes the latest target and advances a non-moving joiner's initial
+    /// backlog. Each pump is bounded by the per-update load and unload caps, so a
+    /// short interval drains work promptly without flooding the socket.
     pub chunk_stream_interval: Duration,
     /// Names of players granted operator status (permission level 4), letting
     /// them run operator-gated commands such as `/gamemode`. Everyone else acts

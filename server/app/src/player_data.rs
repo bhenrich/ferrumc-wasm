@@ -45,17 +45,17 @@ use crate::inventory::{PlayerInventory, SLOT_COUNT};
 /// A loaded record carrying any other version is rejected as incompatible.
 pub(crate) const PLAYER_SCHEMA_VERSION: SchemaVersion = SchemaVersion::new(1);
 
-/// Largest magnitude accepted for a restored player coordinate.
+/// Largest magnitude accepted for a player coordinate.
 ///
-/// This mirrors the simulation's move sanity boundary. Restoration must apply it
-/// before shard selection and float-to-integer chunk conversion, because a saved
-/// value bypasses the normal serverbound movement validator.
-const MAX_RESTORED_POSITION_MAGNITUDE: f64 = 3.0e7;
+/// This mirrors the simulation's move sanity boundary. Both restoration and live
+/// serverbound movement apply it before shard selection, connection-side state,
+/// or float-to-integer chunk conversion.
+const MAX_PLAYER_POSITION_MAGNITUDE: f64 = 3.0e7;
 
-/// Returns whether a persisted position is safe to route and admit.
-pub(crate) fn is_valid_restored_position(position: Vec3) -> bool {
+/// Returns whether a player position is safe to route and admit.
+pub(crate) fn is_valid_player_position(position: Vec3) -> bool {
     let valid_axis = |coordinate: f64| {
-        coordinate.is_finite() && coordinate.abs() <= MAX_RESTORED_POSITION_MAGNITUDE
+        coordinate.is_finite() && coordinate.abs() <= MAX_PLAYER_POSITION_MAGNITUDE
     };
     valid_axis(position.x) && valid_axis(position.y) && valid_axis(position.z)
 }
@@ -420,8 +420,8 @@ mod tests {
     }
 
     #[test]
-    fn restored_position_validation_is_finite_and_inclusive_on_every_axis() {
-        let edge = MAX_RESTORED_POSITION_MAGNITUDE;
+    fn player_position_validation_is_finite_and_inclusive_on_every_axis() {
+        let edge = MAX_PLAYER_POSITION_MAGNITUDE;
         for position in [
             Vec3::ZERO,
             Vec3::new(edge, 0.0, 0.0),
@@ -432,7 +432,7 @@ mod tests {
             Vec3::new(0.0, 0.0, -edge),
         ] {
             assert!(
-                is_valid_restored_position(position),
+                is_valid_player_position(position),
                 "boundary position {position:?} should be accepted",
             );
         }
@@ -450,7 +450,7 @@ mod tests {
             Vec3::new(0.0, 0.0, f64::NEG_INFINITY),
         ] {
             assert!(
-                !is_valid_restored_position(position),
+                !is_valid_player_position(position),
                 "unsafe position {position:?} should be rejected",
             );
         }

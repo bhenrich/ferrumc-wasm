@@ -45,12 +45,10 @@ pub(super) fn ack_sequence(
 /// Enqueues a mandatory clientbound packet, escalating a tail-drop at a full queue
 /// to an outbound overflow (see [`is_mandatory_overflow`]).
 ///
-/// The connection-originated inventory packets (join container content, the
-/// creative-slot echo, the click resync) are authoritative state: a silent drop
-/// would desync the client's inventory view, so a dropped mandatory frame here is
-/// the same fatal condition the keep-alive and router paths already enforce. The
-/// block-action heal-ack ([`ack_sequence`]) routes through here for the same
-/// reason: dropping it strands the client's optimistic block prediction as a ghost.
+/// Connection-originated authoritative packets—including inventory state, stream
+/// centres, teleports, and block-action heal acknowledgements—must not disappear
+/// on a full writer queue. A dropped mandatory frame here is the same fatal
+/// condition the keep-alive and router paths already enforce.
 pub(super) fn send_mandatory(
     writer: &mut PlayWriter,
     debug: &mut SessionDebug,
@@ -62,7 +60,7 @@ pub(super) fn send_mandatory(
     let outcome = enqueue_traced_classified(writer, debug, compression, clock, packet);
     if is_mandatory_overflow(criticality, outcome) {
         return Err(anyhow::anyhow!(
-            "outbound overflow: a mandatory inventory packet was dropped at the connection writer"
+            "outbound overflow: a mandatory clientbound packet was dropped at the connection writer"
         ));
     }
     Ok(())

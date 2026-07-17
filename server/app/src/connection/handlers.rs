@@ -30,6 +30,7 @@ use crate::command::{parse_gamemode, GAMEMODE_COMMAND, SPAWN_COMMAND};
 use crate::driver::SimCommand;
 use crate::inventory::{PlayerInventory, SLOT_COUNT, WINDOW_ID};
 use crate::observe;
+use crate::player_data::is_valid_player_position;
 use crate::plugins::PermissionFacade;
 use crate::window::{OpenContainer, WindowSlot, WindowState, GENERIC_9X3_TYPE};
 
@@ -44,9 +45,9 @@ use super::{send_sim_command_accepted, spawn_sync, GAME_EVENT_CHANGE_GAMEMODE, J
 /// Unknown or malformed play packets are ignored (the slice models only a
 /// subset), as are the teleport confirmation and the Keep Alive echo. A
 /// `ChatCommand` is dispatched locally; every other modelled packet is forwarded
-/// to the simulation unless spawn protection vetoes it. A position packet is also
-/// recorded on the chunk stream so the post-drain pass can react to a boundary
-/// crossing.
+/// to the simulation unless spawn protection vetoes it. Movement is validated
+/// atomically and admitted to the bounded shard route before it may update any
+/// connection-local stream, plugin, look, or persistence mirror.
 #[allow(clippy::too_many_arguments)] // one play step: framing + policy + trace state
 #[allow(clippy::too_many_lines)] // one dispatch: chat, inventory, place, movement fallthrough
 pub(super) async fn handle_play_body(
@@ -87,6 +88,17 @@ pub(super) async fn handle_play_body(
         }
     };
 
+    // A movement packet is one atomic hostile observation. Reject it before even
+    // tracing it as accepted when any carried coordinate or look component is
+    // unsafe: a valid position paired with NaN yaw (or an invalid position paired
+    // with finite look) must not partially update a mirror, call a plugin, route
+    // to the shard, or trigger chunk work.
+    let movement = match validated_movement(&packet) {
+        MovementValidation::NotMovement => None,
+        MovementValidation::Valid(movement) => Some(movement),
+        MovementValidation::Invalid => return Ok(()),
+    };
+
     // Record the inbound play trace with the exact frame-body size.
     debug.record_inbound(observe::trace_inbound_play(
         &packet,
@@ -95,37 +107,40 @@ pub(super) async fn handle_play_body(
         &ctx.clock,
     ));
 
-    // Track the client's reported position for chunk streaming. The packet is
-    // still forwarded to the simulation below — this only mirrors the position the
-    // stream centres on; the simulation stays authoritative.
-    if let Some(position) = reported_position(&packet) {
-        chunk_stream.observe(position);
-        // Fire the observe-only PlayerMove plugin event, throttled to block
-        // granularity: only when the player crosses into a NEW block (sub-block
-        // jitter is debounced by the last-reported block). Movement cannot be
-        // vetoed through this surface, so any decision is ignored — only the
-        // emitted intents are routed.
-        if let Some((from, to)) = chunk_stream.block_crossing(position) {
-            let perms = PermissionFacade::new(ctx.policy.permissions());
-            let intents = ctx
-                .block_events
-                .player_move(player, from, to, Some(position), &perms);
-            route_emitted_intents(ctx, player, writer, 0, intents, debug, compression).await?;
+    if let Some(movement) = movement {
+        // The router must own the exact movement before any connection-local
+        // state advances. A full/closed shard route returns a classified failure
+        // (and may terminate the overloaded session), leaving the stream centre,
+        // plugin baseline, and leave-save candidate untouched.
+        send_sim_command_accepted(
+            ctx,
+            SimCommand::Event {
+                event: NetEvent::play(player, packet),
+                acceptance: None,
+            },
+        )
+        .await?;
+
+        if let Some(position) = movement.position {
+            chunk_stream.observe(position);
+            // Fire the observe-only PlayerMove plugin event only for a validated,
+            // admitted move, throttled to block granularity. Movement cannot be
+            // vetoed through this surface; only emitted intents are routed.
+            if let Some((from, to)) = chunk_stream.block_crossing(position) {
+                let perms = PermissionFacade::new(ctx.policy.permissions());
+                let intents =
+                    ctx.block_events
+                        .player_move(player, from, to, Some(position), &perms);
+                route_emitted_intents(ctx, player, writer, 0, intents, debug, compression).await?;
+            }
         }
-    }
-
-    // Mirror the client's reported yaw so a later place can derive facing. Yaw is
-    // not otherwise tracked; it carries no simulation input on its own and defaults
-    // to 0.0 (south-ish) until the first look packet.
-    if let Some(yaw) = reported_yaw(&packet) {
-        *player_yaw = yaw;
-    }
-
-    // Mirror the client's reported pitch alongside the yaw. Pitch carries no
-    // simulation input either; it is tracked here solely so it can be persisted and
-    // restored on rejoin, and defaults to 0.0 (level) until the first look packet.
-    if let Some(pitch) = reported_pitch(&packet) {
-        *player_pitch = pitch;
+        if let Some(yaw) = movement.yaw {
+            *player_yaw = yaw;
+        }
+        if let Some(pitch) = movement.pitch {
+            *player_pitch = pitch;
+        }
+        return Ok(());
     }
 
     match &packet {
@@ -310,8 +325,9 @@ pub(super) async fn handle_play_body(
     let event = NetEvent::play(player, packet);
     // A block break crosses the plugin intent boundary: the loaded plugins'
     // `before_block_break` decision hooks decide whether (and how) it proceeds.
-    // Every other event (movement, disconnect) carries no block decision and routes
-    // straight to the simulation.
+    // Every other event reaching this fallthrough carries no block decision and
+    // routes straight to the simulation; movement returned through its validated
+    // admission path above.
     if let Some(GameInput::BlockBreak {
         position, sequence, ..
     }) = net_event_to_input(&event)
@@ -337,45 +353,70 @@ pub(super) async fn handle_play_body(
         .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
 }
 
-/// The absolute position a serverbound play packet reports, if any.
-///
-/// Both absolute-move packets carry a position; the rotation-only and other
-/// packets do not move the player and so report nothing.
-fn reported_position(packet: &ServerboundPlayPacket) -> Option<Vec3> {
-    match packet {
-        ServerboundPlayPacket::SetPlayerPosition(p) => Some(Vec3::new(p.x(), p.y(), p.z())),
-        ServerboundPlayPacket::SetPlayerPositionAndRotation(p) => {
-            Some(Vec3::new(p.x(), p.y(), p.z()))
-        }
-        _ => None,
-    }
+/// One validated, atomically admitted movement observation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MovementObservation {
+    /// Absolute position, absent on a rotation-only packet.
+    position: Option<Vec3>,
+    /// Body yaw, absent on a position-only packet.
+    yaw: Option<f32>,
+    /// Pitch, absent on a position-only packet.
+    pitch: Option<f32>,
 }
 
-/// The yaw (degrees) a serverbound play packet reports, if any.
-///
-/// Both look-carrying packets report a yaw: `SetPlayerPositionAndRotation` (move +
-/// look) and `SetPlayerRotation` (a turn in place). Position-only and other
-/// packets do not rotate the player and so report nothing. Mirroring the yaw from
-/// a turn-in-place too lets a place right after one use the correct facing.
-fn reported_yaw(packet: &ServerboundPlayPacket) -> Option<f32> {
-    match packet {
-        ServerboundPlayPacket::SetPlayerPositionAndRotation(p) => Some(p.yaw()),
-        ServerboundPlayPacket::SetPlayerRotation(p) => Some(p.yaw()),
-        _ => None,
-    }
+/// Classification of one decoded packet at the client-movement trust boundary.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MovementValidation {
+    /// This packet carries no player movement.
+    NotMovement,
+    /// Every carried component is finite and any position is in range.
+    Valid(MovementObservation),
+    /// At least one carried component is unsafe; the whole packet is rejected.
+    Invalid,
 }
 
-/// The pitch (degrees) a serverbound play packet reports, if any.
+/// Validates one decoded movement packet atomically.
 ///
-/// The same two look-carrying packets that report a yaw also report a pitch:
-/// `SetPlayerPositionAndRotation` (move + look) and `SetPlayerRotation` (a turn in
-/// place). Other packets do not rotate the player and report nothing. The mirrored
-/// pitch is persisted so a rejoining player keeps looking where they left off.
-fn reported_pitch(packet: &ServerboundPlayPacket) -> Option<f32> {
-    match packet {
-        ServerboundPlayPacket::SetPlayerPositionAndRotation(p) => Some(p.pitch()),
-        ServerboundPlayPacket::SetPlayerRotation(p) => Some(p.pitch()),
-        _ => None,
+/// Coordinates use the same inclusive finite/range predicate as restoration and
+/// the simulation. Look angles may be arbitrary finite degrees—the protocol and
+/// simulation allow wrapping—but NaN and infinities are rejected so they cannot
+/// poison routing, placement, or persistence. A combined packet is all-or-nothing.
+fn validated_movement(packet: &ServerboundPlayPacket) -> MovementValidation {
+    let movement = match packet {
+        ServerboundPlayPacket::SetPlayerPosition(p) => MovementObservation {
+            position: Some(Vec3::new(p.x(), p.y(), p.z())),
+            yaw: None,
+            pitch: None,
+        },
+        ServerboundPlayPacket::SetPlayerPositionAndRotation(p) => MovementObservation {
+            position: Some(Vec3::new(p.x(), p.y(), p.z())),
+            yaw: Some(p.yaw()),
+            pitch: Some(p.pitch()),
+        },
+        ServerboundPlayPacket::SetPlayerRotation(p) => MovementObservation {
+            position: None,
+            yaw: Some(p.yaw()),
+            pitch: Some(p.pitch()),
+        },
+        _ => return MovementValidation::NotMovement,
+    };
+
+    let valid_position = match movement.position {
+        Some(position) => is_valid_player_position(position),
+        None => true,
+    };
+    let valid_yaw = match movement.yaw {
+        Some(yaw) => yaw.is_finite(),
+        None => true,
+    };
+    let valid_pitch = match movement.pitch {
+        Some(pitch) => pitch.is_finite(),
+        None => true,
+    };
+    if valid_position && valid_yaw && valid_pitch {
+        MovementValidation::Valid(movement)
+    } else {
+        MovementValidation::Invalid
     }
 }
 
@@ -627,6 +668,16 @@ async fn route_emitted_intents(
                 }
             }
             WorldIntent::Teleport { player, position } => {
+                if !is_valid_player_position(position) {
+                    tracing::warn!(
+                        %player,
+                        x = position.x,
+                        y = position.y,
+                        z = position.z,
+                        "plugin supplied an unsafe teleport destination; skipping the teleport"
+                    );
+                    continue;
+                }
                 // The connection cannot reach another player's channel; the
                 // driver-owned router snaps the target and routes the authoritative
                 // move.
@@ -754,13 +805,13 @@ async fn handle_command(
         // teleport. A rejected route terminates the overloaded session above and
         // never reaches these effects.
         mirror_server_teleport(chunk_stream, player_yaw, player_pitch, &sync);
-        enqueue_traced_classified(
+        send_mandatory(
             writer,
             debug,
             compression,
             &ctx.clock,
             ClientboundPlayPacket::SynchronizePlayerPosition(sync),
-        );
+        )?;
     } else if first_token == Some(GAMEMODE_COMMAND) {
         if let Some(mode) = parse_gamemode(command) {
             send_sim_command_accepted(
@@ -1667,13 +1718,119 @@ fn tab_complete_reply(
 
 #[cfg(test)]
 mod tests {
-    use ferrumc_codec::{write_var_int, BoundedReader};
-    use ferrumc_proto::generated::play::{
-        ServerboundPlayPacket, SetPlayerPosition, SetPlayerRotation, UpdateSign,
-    };
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-    use super::{decode_click_prefix, reported_yaw, tab_complete_reply};
+    use bytes::BytesMut;
+    use ferrumc_codec::{write_var_int, BoundedReader};
+    use ferrumc_config::AccessConfig;
+    use ferrumc_core::{GameMode, PlayerId, PluginId};
+    use ferrumc_math::{ShardPos, Vec3, WorldIntent};
+    use ferrumc_net::{CompressionState, ConnectionLimits, PlayWriter};
+    use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock, SessionDebug};
+    use ferrumc_plugin_api::{
+        Capability, CapabilityManifest, EventContext, EventKind, Plugin, PluginError, PluginEvent,
+        PluginMetadata, SetupContext, Version,
+    };
+    use ferrumc_plugin_host::PluginHost;
+    use ferrumc_proto::generated::play::{
+        ClientboundPlayPacket, ServerboundPlayPacket, SetCenterChunk, SetPlayerPosition,
+        SetPlayerPositionAndRotation, SetPlayerRotation, UpdateSign,
+    };
+    use tokio::sync::mpsc;
+
+    use super::{
+        decode_click_prefix, handle_play_body, route_emitted_intents, tab_complete_reply,
+        validated_movement, MovementObservation, MovementValidation,
+    };
     use crate::command::{build_command_tree, GAMEMODE_COMMAND, SPAWN_COMMAND};
+    use crate::config::AppConfig;
+    use crate::connection::chunk_stream::{apply_chunk_stream, ChunkStream};
+    use crate::connection::context::{build_status_response, ConnContext};
+    use crate::connection::rate_limiter::ChatRateLimiter;
+    use crate::driver::SimCommand;
+    use crate::inventory::PlayerInventory;
+    use crate::plugins::{build_play_policy, BlockEventDispatcher};
+    use crate::registries::ConfigRegistries;
+    use crate::window::WindowState;
+    use crate::world::build_world;
+
+    /// Test plugin that makes a `PlayerMove` callback observable without changing
+    /// production metrics or relying on captured logs.
+    struct MoveProbe {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Plugin for MoveProbe {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata::new(
+                PluginId::new("packet26-move-probe"),
+                "packet26-move-probe",
+                Version::new(0, 1, 0),
+                CapabilityManifest::empty().with(Capability::ReceiveEvents),
+            )
+        }
+
+        fn on_enable(&mut self, ctx: &mut SetupContext<'_>) -> Result<(), PluginError> {
+            ctx.events()?.subscribe(EventKind::PlayerMove);
+            Ok(())
+        }
+
+        fn on_event(&mut self, event: &PluginEvent, _ctx: &mut EventContext<'_>) {
+            if matches!(event, PluginEvent::PlayerMove { .. }) {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Builds the real handler context around a bounded command spy and a
+    /// movement-notification probe.
+    async fn movement_handler_context(
+        commands: mpsc::Sender<SimCommand>,
+        move_calls: Arc<AtomicUsize>,
+    ) -> ConnContext {
+        let config = AppConfig {
+            spawn_chunk_radius: 0,
+            view_distance: 0,
+            ..AppConfig::default()
+        };
+        let setup = build_world(&config, ShardPos::new(0, 0))
+            .await
+            .expect("build one-column handler world");
+        let (policy, _default_dispatcher) =
+            build_play_policy(&config).expect("build handler policy");
+
+        let mut host = PluginHost::in_memory();
+        let probe = host
+            .register(Box::new(MoveProbe { calls: move_calls }))
+            .expect("register movement probe");
+        host.enable(&probe).expect("enable movement probe");
+
+        let access = AccessConfig::default()
+            .resolve(Path::new("."))
+            .expect("resolve default access policy");
+        ConnContext {
+            limits: ConnectionLimits::default(),
+            io_timeout: config.io_timeout,
+            compression_threshold: config.compression_threshold,
+            join_kit: setup.join_kit,
+            config: Arc::new(ConfigRegistries::build().expect("build registries")),
+            keep_alive_interval: config.keep_alive_interval,
+            chunk_stream_interval: config.chunk_stream_interval,
+            commands,
+            player_store: setup.player_store,
+            policy: Arc::new(policy),
+            block_events: Arc::new(BlockEventDispatcher::new(host)),
+            status_response: Arc::new(build_status_response(1).expect("build status response")),
+            view_distance: config.view_distance,
+            metrics: Arc::new(CounterRegistry::new()),
+            clock: ServerClock::new(),
+            net_telemetry: Arc::new(NetTelemetryHub::new()),
+            access: Arc::new(access),
+            budget: config.budget,
+        }
+    }
 
     #[test]
     fn decode_click_prefix_parses_valid_and_rejects_malformed_without_panicking() {
@@ -1703,18 +1860,350 @@ mod tests {
     const MEMBER_LEVEL: u8 = 0;
 
     #[test]
-    fn reported_yaw_tracks_rotation_only_turn_in_place() {
+    fn movement_validation_preserves_packet_component_shape() {
         // A turn-in-place (SetPlayerRotation) updates the yaw the placement path
         // reads, so rotating then placing orients stairs/furnaces correctly. This
         // locks in that the rotation-only packet feeds the place yaw.
         let turn = ServerboundPlayPacket::SetPlayerRotation(SetPlayerRotation::new(90.0, -10.0, 1));
-        assert_eq!(reported_yaw(&turn), Some(90.0));
+        assert_eq!(
+            validated_movement(&turn),
+            MovementValidation::Valid(MovementObservation {
+                position: None,
+                yaw: Some(90.0),
+                pitch: Some(-10.0),
+            })
+        );
 
         // A position-only move carries no yaw, so it must leave the mirrored yaw
         // untouched (None), not reset it to 0.
         let strafe =
             ServerboundPlayPacket::SetPlayerPosition(SetPlayerPosition::new(1.0, 2.0, 3.0, 0));
-        assert_eq!(reported_yaw(&strafe), None);
+        assert_eq!(
+            validated_movement(&strafe),
+            MovementValidation::Valid(MovementObservation {
+                position: Some(Vec3::new(1.0, 2.0, 3.0)),
+                yaw: None,
+                pitch: None,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_movement_components_are_rejected_before_observation() {
+        for (label, coordinate) in [
+            ("NaN", f64::NAN),
+            ("positive infinity", f64::INFINITY),
+            ("negative infinity", f64::NEG_INFINITY),
+            ("above the positive boundary", 30_000_001.0),
+            ("below the negative boundary", -30_000_001.0),
+        ] {
+            let packet = ServerboundPlayPacket::SetPlayerPosition(SetPlayerPosition::new(
+                coordinate, 64.0, 8.0, 0,
+            ));
+            assert_eq!(
+                validated_movement(&packet),
+                MovementValidation::Invalid,
+                "{label} reached the connection's stateful movement path"
+            );
+        }
+
+        for coordinate in [-30_000_000.0, 30_000_000.0] {
+            let packet = ServerboundPlayPacket::SetPlayerPosition(SetPlayerPosition::new(
+                coordinate, 64.0, 8.0, 0,
+            ));
+            assert_eq!(
+                validated_movement(&packet),
+                MovementValidation::Valid(MovementObservation {
+                    position: Some(Vec3::new(coordinate, 64.0, 8.0)),
+                    yaw: None,
+                    pitch: None,
+                }),
+                "the inclusive simulation boundary must stay accepted",
+            );
+        }
+
+        let invalid_yaw =
+            ServerboundPlayPacket::SetPlayerRotation(SetPlayerRotation::new(f32::NAN, 0.0, 0));
+        assert_eq!(
+            validated_movement(&invalid_yaw),
+            MovementValidation::Invalid,
+            "a non-finite yaw must not enter the persistence mirror"
+        );
+
+        let invalid_pitch = ServerboundPlayPacket::SetPlayerPositionAndRotation(
+            SetPlayerPositionAndRotation::new(8.0, 64.0, 8.0, 0.0, f32::NEG_INFINITY, 0),
+        );
+        assert_eq!(
+            validated_movement(&invalid_pitch),
+            MovementValidation::Invalid,
+            "a non-finite pitch must not enter the persistence mirror"
+        );
+
+        let valid_position_invalid_look = ServerboundPlayPacket::SetPlayerPositionAndRotation(
+            SetPlayerPositionAndRotation::new(8.0, 64.0, 8.0, f32::INFINITY, 15.0, 0),
+        );
+        assert_eq!(
+            validated_movement(&valid_position_invalid_look),
+            MovementValidation::Invalid,
+            "a combined packet is rejected atomically instead of applying its position"
+        );
+
+        let invalid_position_valid_look = ServerboundPlayPacket::SetPlayerPositionAndRotation(
+            SetPlayerPositionAndRotation::new(30_000_001.0, 64.0, 8.0, 90.0, 15.0, 0),
+        );
+        assert_eq!(
+            validated_movement(&invalid_position_valid_look),
+            MovementValidation::Invalid,
+            "a combined packet is rejected atomically instead of applying its look"
+        );
+
+        let wrapped_finite_look = ServerboundPlayPacket::SetPlayerRotation(SetPlayerRotation::new(
+            100_000.0, -100_000.0, 0,
+        ));
+        assert_eq!(
+            validated_movement(&wrapped_finite_look),
+            MovementValidation::Valid(MovementObservation {
+                position: None,
+                yaw: Some(100_000.0),
+                pitch: Some(-100_000.0),
+            }),
+            "finite angles remain protocol-valid and may wrap"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one ordered trust-boundary transaction and its spies
+    async fn movement_handler_rejects_before_every_observable_side_effect() {
+        // At most two sequential positive controls are emitted. Eight slots keep
+        // diagnostic headroom while the active receiver makes queue saturation
+        // impossible, and the capacity remains explicitly bounded.
+        const COMMAND_CAPACITY: usize = 8;
+
+        let command_calls = Arc::new(AtomicUsize::new(0));
+        let move_calls = Arc::new(AtomicUsize::new(0));
+        let (commands_tx, mut commands_rx) = mpsc::channel(COMMAND_CAPACITY);
+        let command_calls_for_task = Arc::clone(&command_calls);
+        let command_task = tokio::spawn(async move {
+            while let Some(command) = commands_rx.recv().await {
+                command_calls_for_task.fetch_add(1, Ordering::Relaxed);
+                let (SimCommand::Event { acceptance, .. }
+                | SimCommand::TeleportPlayer { acceptance, .. }) = command
+                else {
+                    panic!("movement test emitted an unexpected command");
+                };
+                if let Some(reply) = acceptance {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        });
+
+        let ctx = movement_handler_context(commands_tx, Arc::clone(&move_calls)).await;
+        let player = PlayerId::offline("MovementHandlerProbe");
+        let mut writer = PlayWriter::with_defaults(ctx.limits);
+        let mut chunk_stream = ChunkStream::new(&ctx);
+        let base = Vec3::new(8.5, 64.0, 8.5);
+        chunk_stream.observe(base);
+        assert_eq!(chunk_stream.block_crossing(base), None);
+        let mut chat_limiter = ChatRateLimiter::new(ctx.clock.now());
+        let mut inventory = PlayerInventory::with_creative_kit(GameMode::Creative);
+        let mut window_state = WindowState::new();
+        let mut yaw = 15.0;
+        let mut pitch = -10.0;
+        let mut debug = SessionDebug::new("movement-handler-probe");
+        let compression = CompressionState::disabled();
+
+        let invalid =
+            [
+                ServerboundPlayPacket::SetPlayerPosition(SetPlayerPosition::new(
+                    f64::NAN,
+                    64.0,
+                    8.5,
+                    0,
+                )),
+                ServerboundPlayPacket::SetPlayerRotation(SetPlayerRotation::new(
+                    f32::INFINITY,
+                    20.0,
+                    0,
+                )),
+                ServerboundPlayPacket::SetPlayerPositionAndRotation(
+                    SetPlayerPositionAndRotation::new(9.5, 64.0, 8.5, 30.0, f32::NEG_INFINITY, 0),
+                ),
+                ServerboundPlayPacket::SetPlayerPositionAndRotation(
+                    SetPlayerPositionAndRotation::new(30_000_001.0, 64.0, 8.5, 120.0, 30.0, 0),
+                ),
+            ];
+        for packet in invalid {
+            let mut body = BytesMut::new();
+            packet.encode(&mut body).expect("encode hostile movement");
+            handle_play_body(
+                &ctx,
+                player,
+                "MovementHandlerProbe",
+                &mut writer,
+                &mut chunk_stream,
+                &mut chat_limiter,
+                &mut inventory,
+                &mut window_state,
+                &mut yaw,
+                &mut pitch,
+                &body,
+                &mut debug,
+                &compression,
+            )
+            .await
+            .expect("reject hostile movement cleanly");
+        }
+        assert_eq!(command_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(move_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(chunk_stream.last_position(), Some(base));
+        assert_eq!(chunk_stream.pending_position_for_test(), Some(base));
+        assert_eq!((yaw, pitch), (15.0, -10.0));
+        assert_eq!(writer.total_queued(), 0);
+
+        // The probe is not vacuous: a valid admitted crossing reaches exactly one
+        // driver event and one plugin notification, and updates every local mirror.
+        let accepted = Vec3::new(9.5, 64.0, 8.5);
+        let packet =
+            SetPlayerPositionAndRotation::new(accepted.x, accepted.y, accepted.z, 45.0, -25.0, 0);
+        let mut body = BytesMut::new();
+        packet.encode(&mut body).expect("encode accepted movement");
+        handle_play_body(
+            &ctx,
+            player,
+            "MovementHandlerProbe",
+            &mut writer,
+            &mut chunk_stream,
+            &mut chat_limiter,
+            &mut inventory,
+            &mut window_state,
+            &mut yaw,
+            &mut pitch,
+            &body,
+            &mut debug,
+            &compression,
+        )
+        .await
+        .expect("admit valid movement");
+        assert_eq!(command_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(move_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(chunk_stream.last_position(), Some(accepted));
+        assert_eq!(chunk_stream.pending_position_for_test(), Some(accepted));
+        assert_eq!((yaw, pitch), (45.0, -25.0));
+
+        // A later hostile combined packet cannot partially replace the accepted
+        // position, look, plugin baseline, or routed event.
+        let packet = SetPlayerPositionAndRotation::new(10.5, 64.0, 8.5, f32::NAN, -30.0, 0);
+        let mut body = BytesMut::new();
+        packet
+            .encode(&mut body)
+            .expect("encode later hostile movement");
+        handle_play_body(
+            &ctx,
+            player,
+            "MovementHandlerProbe",
+            &mut writer,
+            &mut chunk_stream,
+            &mut chat_limiter,
+            &mut inventory,
+            &mut window_state,
+            &mut yaw,
+            &mut pitch,
+            &body,
+            &mut debug,
+            &compression,
+        )
+        .await
+        .expect("reject later hostile movement");
+        assert_eq!(command_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(move_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(chunk_stream.last_position(), Some(accepted));
+        assert_eq!(chunk_stream.pending_position_for_test(), Some(accepted));
+        assert_eq!((yaw, pitch), (45.0, -25.0));
+        assert_eq!(writer.total_queued(), 0);
+
+        for position in [
+            Vec3::new(f64::NAN, 64.0, 8.0),
+            Vec3::new(30_000_001.0, 64.0, 8.0),
+        ] {
+            route_emitted_intents(
+                &ctx,
+                player,
+                &mut writer,
+                0,
+                vec![WorldIntent::Teleport { player, position }],
+                &mut debug,
+                &compression,
+            )
+            .await
+            .expect("skip unsafe plugin teleport cleanly");
+        }
+        assert_eq!(
+            command_calls.load(Ordering::Relaxed),
+            1,
+            "unsafe plugin teleports never reach the driver"
+        );
+
+        route_emitted_intents(
+            &ctx,
+            player,
+            &mut writer,
+            0,
+            vec![WorldIntent::Teleport {
+                player,
+                position: Vec3::new(20.0, 70.0, -5.0),
+            }],
+            &mut debug,
+            &compression,
+        )
+        .await
+        .expect("route a safe plugin teleport");
+        assert_eq!(
+            command_calls.load(Ordering::Relaxed),
+            2,
+            "the plugin teleport gate is not vacuously dropping every intent"
+        );
+
+        let mut overflow_stream = ChunkStream::new(&ctx);
+        overflow_stream.observe(Vec3::new(40.5, 64.0, 8.5));
+        let mut fills = 0usize;
+        loop {
+            let outcome = writer.enqueue_classified(ClientboundPlayPacket::SetCenterChunk(
+                SetCenterChunk::new(0, 0),
+            ));
+            if outcome.is_dropped() {
+                break;
+            }
+            fills += 1;
+            assert!(
+                fills < 1_000,
+                "the bounded State queue must eventually fill"
+            );
+        }
+        let error = apply_chunk_stream(
+            &ctx,
+            &mut writer,
+            &mut overflow_stream,
+            &mut debug,
+            &compression,
+        )
+        .await
+        .expect_err("a dropped mandatory stream centre terminates the session");
+        assert!(error.to_string().contains("mandatory clientbound packet"));
+        assert_eq!(
+            overflow_stream.center_for_test(),
+            ctx.join_kit.spawn_chunk(),
+            "a dropped centre cannot commit app-side stream ownership"
+        );
+        assert_eq!(
+            command_calls.load(Ordering::Relaxed),
+            2,
+            "a dropped centre cannot proceed into chunk ticket work"
+        );
+
+        drop(ctx);
+        command_task
+            .await
+            .expect("bounded movement command spy shuts down");
     }
 
     #[test]

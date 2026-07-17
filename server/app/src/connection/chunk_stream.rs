@@ -13,9 +13,10 @@ use ferrumc_proto::generated::play::{
 };
 
 use crate::driver::SimCommand;
+use crate::player_data::is_valid_player_position;
 
 use super::context::ConnContext;
-use super::outbound::{enqueue_traced, enqueue_traced_classified};
+use super::outbound::{enqueue_traced, send_mandatory};
 
 /// Maximum number of `ChunkDataAndLight` packets a single streaming evaluation
 /// will request and send for one player.
@@ -24,12 +25,20 @@ use super::outbound::{enqueue_traced, enqueue_traced_classified};
 /// an uncapped burst — a teleport that makes the whole view square new, or the
 /// initial gap between the small spawn batch and a large view distance — could
 /// dump megabytes onto one socket at once. Capping the per-update load count
-/// paces the stream: the leftover chunks are picked up on the next position
-/// update (the desired-vs-loaded diff is recomputed every move), nearest-first,
-/// so the player always gets the chunks closest to them first. Unloads are tiny
-/// (8 bytes) and are not capped. `16` keeps a normal single-chunk step fully
-/// served in one update while bounding a teleport flood.
+/// paces the stream: the leftover chunks are picked up on the next stream
+/// cadence (the desired-vs-loaded diff is recomputed every pump), nearest-first,
+/// so the player always gets the chunks closest to them first. `16` keeps a
+/// normal single-chunk step fully served in one update while bounding a teleport
+/// flood.
 const MAX_CHUNK_LOADS_PER_UPDATE: usize = 16;
+
+/// Maximum number of departed chunk columns released by one stream pump.
+///
+/// Releasing a player ticket crosses the driver's durability barrier and can
+/// evict a chunk, so the tiny `UnloadChunk` wire size is irrelevant to the true
+/// cost. Matching the load bound limits one pump to at most 32 chunk mutations.
+/// The remainder is recomputed from the latest centre on the next cadence tick.
+const MAX_CHUNK_UNLOADS_PER_UPDATE: usize = 16;
 
 /// Upper bound applied to the configured view distance when streaming chunks.
 ///
@@ -55,18 +64,20 @@ pub(super) struct ChunkStream {
     /// The chunk columns the client currently holds (spawn batch + streamed in),
     /// bounded by `(2 * view_distance + 1)^2`.
     pub(super) loaded: BTreeSet<ChunkPos>,
-    /// The latest position reported by the client since the last evaluation, or
-    /// `None` if nothing new — coalescing many move packets in one read into a
-    /// single streaming pass.
+    /// The latest accepted client position or authoritative server teleport since
+    /// the last fixed-cadence evaluation. Replacing this slot coalesces every
+    /// superseded target into one streaming pass.
     pending_position: Option<Vec3>,
-    /// The most recent position the client ever reported (never cleared), used to
-    /// persist where the player was standing when they leave. `None` until the
-    /// first move packet, in which case the join position is persisted instead.
+    /// The latest accepted client position or authoritative server teleport
+    /// (never cleared), used to persist where the player was standing when they
+    /// leave. If neither occurs, it remains `None` and the join position is
+    /// persisted instead.
     last_position: Option<Vec3>,
-    /// The integer block the player was last reported standing in, used to throttle
-    /// the `PlayerMove` plugin event to block granularity. `None` until the first
-    /// reported position establishes a baseline (so the very first packet only seeds
-    /// it and does not fire), see [`block_crossing`](ChunkStream::block_crossing).
+    /// The integer block of the latest accepted client position or authoritative
+    /// teleport, used to throttle the `PlayerMove` plugin event to block
+    /// granularity. `None` until the first accepted position establishes a baseline
+    /// (so the very first packet only seeds it and does not fire), see
+    /// [`block_crossing`](ChunkStream::block_crossing).
     last_move_block: Option<BlockPos>,
 }
 
@@ -84,16 +95,29 @@ impl ChunkStream {
         }
     }
 
-    /// Records the client's latest reported position for the next evaluation.
+    /// Records the client's latest validated and admitted position.
     pub(super) fn observe(&mut self, position: Vec3) {
         self.pending_position = Some(position);
         self.last_position = Some(position);
     }
 
-    /// The most recent position the client reported, or `None` if it never moved
-    /// (in which case the caller persists the join position).
+    /// The latest accepted client position or authoritative server teleport, or
+    /// `None` if neither occurred (in which case the caller persists the join
+    /// position).
     pub(super) fn last_position(&self) -> Option<Vec3> {
         self.last_position
+    }
+
+    /// Returns the coalesced target for handler-boundary regression tests.
+    #[cfg(test)]
+    pub(super) fn pending_position_for_test(&self) -> Option<Vec3> {
+        self.pending_position
+    }
+
+    /// Returns the delivered stream centre for queue-overflow regression tests.
+    #[cfg(test)]
+    pub(super) fn center_for_test(&self) -> ChunkPos {
+        self.center
     }
 
     /// Records `position` and returns the `(from, to)` block crossing if the player
@@ -120,16 +144,19 @@ impl ChunkStream {
         crossing
     }
 
-    /// Records `position` as the persistence mirror *without* recentering the
-    /// streamed view.
+    /// Records one authoritative server teleport for persistence and streaming.
     ///
-    /// Unlike [`observe`](Self::observe), this advances only `last_position` (what a
-    /// leave-save persists), not `pending_position` (what the stream recenters on):
-    /// a server-driven teleport must immediately become the position a leave-save
-    /// captures, while the view still recentres off the client's own follow-up
-    /// movement like any other move.
+    /// A server-driven teleport is already authoritative, so waiting for a client
+    /// echo would leave simulation/router/save at the destination while tickets
+    /// remain at the old centre. The fixed-cadence pump coalesces this pending
+    /// destination with any later accepted observation.
     pub(super) fn mirror_teleport(&mut self, position: Vec3) {
+        self.pending_position = Some(position);
         self.last_position = Some(position);
+        // A server teleport establishes a new plugin movement baseline. Retaining
+        // the pre-teleport block would turn the first client echo or tiny step at
+        // the destination into one false world-spanning PlayerMove notification.
+        self.last_move_block = Some(block_of(position));
     }
 }
 
@@ -139,33 +166,37 @@ impl ChunkStream {
 ///
 /// The server snaps a player with an authoritative `SynchronizePlayerPosition` for
 /// `/spawn`, a routed plugin `Teleport`, or an anti-cheat correction. The mirror is
-/// otherwise advanced only by the client's own movement packets, so a player who
-/// disconnects after such a teleport but before reporting a move would be saved at
-/// their pre-teleport spot. Only fully-absolute syncs (`flags == 0`, the only kind
-/// the server emits) are mirrored; a partially-relative sync is left untouched
-/// because its absolute target cannot be reconstructed here.
+/// otherwise advanced only by validated client movement packets. Only safe,
+/// fully-absolute syncs (`flags == 0`, the only kind the server emits) are
+/// mirrored; a partially-relative or non-finite/out-of-range sync is left
+/// untouched because it is not a trustworthy absolute destination.
 pub(super) fn mirror_server_teleport(
     chunk_stream: &mut ChunkStream,
     player_yaw: &mut f32,
     player_pitch: &mut f32,
     sync: &SynchronizePlayerPosition,
 ) {
-    if sync.flags() != 0 {
+    let position = Vec3::new(sync.x(), sync.y(), sync.z());
+    if sync.flags() != 0
+        || !is_valid_player_position(position)
+        || !sync.yaw().is_finite()
+        || !sync.pitch().is_finite()
+    {
         return;
     }
-    chunk_stream.mirror_teleport(Vec3::new(sync.x(), sync.y(), sync.z()));
+    chunk_stream.mirror_teleport(position);
     *player_yaw = sync.yaw();
     *player_pitch = sync.pitch();
 }
 
-/// Streams chunks to follow the client's latest reported position, then advances
-/// the view toward the full view distance.
+/// Streams chunks toward the latest accepted movement or authoritative teleport,
+/// then advances the view toward the full view distance.
 ///
-/// If the client reported a new position since the last call, this recenters on it
-/// (sending `Set Center Chunk` on a chunk-boundary crossing). Either way it then
-/// runs [`pump_chunk_stream`] against the current center, so the view advances even
-/// when no position packet arrived (a freshly-joined or standing player). A chunk
-/// already in the loaded set is never re-requested or re-sent.
+/// If a new target arrived since the last call, this recenters on it (sending
+/// `Set Center Chunk` on a chunk-boundary crossing). Either way it then runs
+/// [`pump_chunk_stream`] against the current center, so the view advances even
+/// when no target arrived (a freshly-joined or standing player). A chunk already
+/// in the loaded set is never re-requested or re-sent.
 ///
 /// The connection never generates chunks itself: it only decides the desired set
 /// and renders the packets the driver returns.
@@ -176,12 +207,14 @@ pub(super) async fn apply_chunk_stream(
     debug: &mut SessionDebug,
     compression: &CompressionState,
 ) -> anyhow::Result<()> {
-    // Position path: recenter on the latest reported position, if any.
+    // Position path: recenter on the latest accepted target, if any.
     if let Some(position) = chunk_stream.pending_position.take() {
         let new_center = chunk_of(position);
         if new_center != chunk_stream.center {
-            chunk_stream.center = new_center;
-            enqueue_traced_classified(
+            // The centre is mandatory client state. Do not advance internal
+            // ownership/tickets if a full State queue drops it; fail the session
+            // before the load/unload command instead.
+            send_mandatory(
                 writer,
                 debug,
                 compression,
@@ -190,7 +223,8 @@ pub(super) async fn apply_chunk_stream(
                     new_center.x(),
                     new_center.z(),
                 )),
-            );
+            )?;
+            chunk_stream.center = new_center;
         }
     }
 
@@ -206,9 +240,10 @@ pub(super) async fn apply_chunk_stream(
 /// sends `Unload Chunk` for any column that left the radius, and asks the driver
 /// (via [`SimCommand::StreamChunks`]) to load-or-generate the columns newly in
 /// range — nearest-first and capped at [`MAX_CHUNK_LOADS_PER_UPDATE`] per call (see
-/// [`next_chunk_batch`]), with the remainder caught on a later pump. Driven both
-/// after a position update and on the standing-player pump interval, so a
-/// non-moving joiner still fills out to the advertised view distance.
+/// [`next_chunk_transition`]), with the remainder caught on a later pump. Driven
+/// at the fixed stream cadence, so a non-moving joiner still fills out to the
+/// advertised view distance while a packet flood cannot run this work once per
+/// socket read.
 pub(super) async fn pump_chunk_stream(
     ctx: &ConnContext,
     writer: &mut PlayWriter,
@@ -220,15 +255,18 @@ pub(super) async fn pump_chunk_stream(
     let center = chunk_stream.center;
 
     let desired = desired_chunks(center, chunk_stream.view_distance);
-    let to_unload: Vec<ChunkPos> = chunk_stream.loaded.difference(&desired).copied().collect();
-    // Nearest-first, bounded batch of newly-in-range columns (the pure helper
-    // computes the desired-vs-loaded diff, sorts center-out, and truncates).
-    let to_load = next_chunk_batch(
+    // Both sides of the transition are bounded. The pure helper recomputes from
+    // the latest centre each pump, so a superseding move discards stale planned
+    // work rather than draining an old teleport's queue.
+    let transition = next_chunk_transition(
         center,
-        chunk_stream.view_distance,
+        &desired,
         &chunk_stream.loaded,
         MAX_CHUNK_LOADS_PER_UPDATE,
+        MAX_CHUNK_UNLOADS_PER_UPDATE,
     );
+    let to_load = transition.load;
+    let to_unload = transition.unload;
     if to_load.is_empty() && to_unload.is_empty() {
         return Ok(());
     }
@@ -305,12 +343,16 @@ pub(super) async fn pump_chunk_stream(
 /// The chunk column the world `position` falls in (flooring so negatives land on
 /// the correct column).
 fn chunk_of(position: Vec3) -> ChunkPos {
+    block_of(position).to_chunk_pos()
+}
+
+/// The integer block containing a validated world position.
+fn block_of(position: Vec3) -> BlockPos {
     BlockPos::new(
         position.x.floor() as i32,
         position.y.floor() as i32,
         position.z.floor() as i32,
     )
-    .to_chunk_pos()
 }
 
 /// The `(2 * radius + 1)` square of chunk columns centred on `center`.
@@ -340,25 +382,41 @@ fn chebyshev_distance(a: ChunkPos, b: ChunkPos) -> i64 {
     dx.max(dz)
 }
 
-/// The next bounded, nearest-first batch of chunk columns to load around `center`.
+/// One bounded transition toward the latest desired chunk square.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChunkTransition {
+    /// Missing desired columns to acquire, nearest-first.
+    load: Vec<ChunkPos>,
+    /// Stale held columns to release, in deterministic coordinate order.
+    unload: Vec<ChunkPos>,
+}
+
+/// Computes one bounded load/unload transition toward `desired`.
 ///
-/// Diffs the `(2 * view_distance + 1)` desired square against the already-`loaded`
-/// set, sorts the missing columns center-out by [`chebyshev_distance`] (with a
-/// coordinate tiebreak for determinism), and truncates to `bound`. Pure (no I/O),
-/// so each pump — whether driven by a position update or the standing-player
-/// interval — makes bounded, center-out progress toward the full view distance, and
-/// the policy is unit-testable without a live socket.
-fn next_chunk_batch(
+/// The desired set is built once by the caller. Missing columns are sorted
+/// center-out for useful visual progress; stale columns already come from a
+/// `BTreeSet` difference, so taking its prefix is deterministic without sorting
+/// all 4,225 maximum-radius candidates. No queue is retained: every call
+/// recomputes against the newest centre, which coalesces superseded teleports.
+fn next_chunk_transition(
     center: ChunkPos,
-    view_distance: i32,
+    desired: &BTreeSet<ChunkPos>,
     loaded: &BTreeSet<ChunkPos>,
-    bound: usize,
-) -> Vec<ChunkPos> {
-    let desired = desired_chunks(center, view_distance);
+    load_bound: usize,
+    unload_bound: usize,
+) -> ChunkTransition {
     let mut to_load: Vec<ChunkPos> = desired.difference(loaded).copied().collect();
     to_load.sort_by_key(|pos| (chebyshev_distance(center, *pos), pos.x(), pos.z()));
-    to_load.truncate(bound);
-    to_load
+    to_load.truncate(load_bound);
+    let to_unload = loaded
+        .difference(desired)
+        .take(unload_bound)
+        .copied()
+        .collect();
+    ChunkTransition {
+        load: to_load,
+        unload: to_unload,
+    }
 }
 
 #[cfg(test)]
@@ -370,7 +428,8 @@ mod tests {
         use ferrumc_math::ChunkPos;
 
         use super::{
-            chebyshev_distance, desired_chunks, next_chunk_batch, MAX_CHUNK_LOADS_PER_UPDATE,
+            chebyshev_distance, desired_chunks, next_chunk_transition, MAX_CHUNK_LOADS_PER_UPDATE,
+            MAX_CHUNK_UNLOADS_PER_UPDATE,
         };
 
         let center = ChunkPos::new(0, 0);
@@ -381,24 +440,38 @@ mod tests {
 
         // The first batch is the nearest ring (center-out): every column sits at the
         // closest missing Chebyshev distance — 3, just outside the spawn batch.
-        let first = next_chunk_batch(center, view_distance, &loaded, MAX_CHUNK_LOADS_PER_UPDATE);
-        assert_eq!(first.len(), MAX_CHUNK_LOADS_PER_UPDATE);
+        let desired = desired_chunks(center, view_distance);
+        let first = next_chunk_transition(
+            center,
+            &desired,
+            &loaded,
+            MAX_CHUNK_LOADS_PER_UPDATE,
+            MAX_CHUNK_UNLOADS_PER_UPDATE,
+        );
+        assert_eq!(first.load.len(), MAX_CHUNK_LOADS_PER_UPDATE);
+        assert!(first.unload.is_empty());
         assert!(first
+            .load
             .iter()
             .all(|pos| chebyshev_distance(center, *pos) == 3));
 
         // Driving the pump repeatedly — with NO position packet ever — fills the
         // whole advertised view square. Each call simulates the driver loading the
         // returned batch.
-        let desired = desired_chunks(center, view_distance);
         let mut iterations = 0;
         loop {
-            let batch =
-                next_chunk_batch(center, view_distance, &loaded, MAX_CHUNK_LOADS_PER_UPDATE);
-            if batch.is_empty() {
+            let transition = next_chunk_transition(
+                center,
+                &desired,
+                &loaded,
+                MAX_CHUNK_LOADS_PER_UPDATE,
+                MAX_CHUNK_UNLOADS_PER_UPDATE,
+            );
+            if transition.load.is_empty() {
                 break;
             }
-            for pos in batch {
+            assert!(transition.unload.is_empty());
+            for pos in transition.load {
                 loaded.insert(pos);
             }
             iterations += 1;
@@ -410,6 +483,116 @@ mod tests {
         );
         // 441 desired - 25 seeded = 416 columns, in bounded batches of 16 -> 26 pumps.
         assert_eq!(iterations, 26);
+    }
+
+    #[test]
+    fn maximum_loaded_square_has_a_bounded_unload_batch() {
+        use ferrumc_math::ChunkPos;
+
+        use super::{
+            desired_chunks, next_chunk_transition, MAX_CHUNK_LOADS_PER_UPDATE,
+            MAX_CHUNK_UNLOADS_PER_UPDATE, STREAM_VIEW_DISTANCE_MAX,
+        };
+
+        let mut loaded = desired_chunks(ChunkPos::ORIGIN, STREAM_VIEW_DISTANCE_MAX);
+        let superseding_center = ChunkPos::new(10_000, -10_000);
+        let desired = desired_chunks(superseding_center, STREAM_VIEW_DISTANCE_MAX);
+
+        assert_eq!(
+            loaded.len(),
+            65 * 65,
+            "the fixture exercises the maximum streamed square"
+        );
+        let first = next_chunk_transition(
+            superseding_center,
+            &desired,
+            &loaded,
+            MAX_CHUNK_LOADS_PER_UPDATE,
+            MAX_CHUNK_UNLOADS_PER_UPDATE,
+        );
+        assert_eq!(first.load.len(), MAX_CHUNK_LOADS_PER_UPDATE);
+        assert_eq!(first.unload.len(), MAX_CHUNK_UNLOADS_PER_UPDATE);
+        assert_eq!(
+            first,
+            next_chunk_transition(
+                superseding_center,
+                &desired,
+                &loaded,
+                MAX_CHUNK_LOADS_PER_UPDATE,
+                MAX_CHUNK_UNLOADS_PER_UPDATE,
+            ),
+            "the same state always plans the same bounded transition"
+        );
+
+        let mut pumps = 0usize;
+        while loaded != desired {
+            let transition = next_chunk_transition(
+                superseding_center,
+                &desired,
+                &loaded,
+                MAX_CHUNK_LOADS_PER_UPDATE,
+                MAX_CHUNK_UNLOADS_PER_UPDATE,
+            );
+            assert!(transition.load.len() <= MAX_CHUNK_LOADS_PER_UPDATE);
+            assert!(transition.unload.len() <= MAX_CHUNK_UNLOADS_PER_UPDATE);
+            assert!(
+                transition.load.len() + transition.unload.len()
+                    <= MAX_CHUNK_LOADS_PER_UPDATE + MAX_CHUNK_UNLOADS_PER_UPDATE
+            );
+            assert!(
+                !transition.load.is_empty() || !transition.unload.is_empty(),
+                "a non-converged stream must make progress"
+            );
+            for pos in transition.unload {
+                assert!(loaded.remove(&pos), "only held columns may be released");
+            }
+            for pos in transition.load {
+                assert!(desired.contains(&pos), "only desired columns may load");
+                assert!(loaded.insert(pos), "a load cannot duplicate a held column");
+            }
+            assert!(
+                loaded.len() <= 65 * 65,
+                "equal load/unload caps prevent ticket-set growth"
+            );
+            pumps += 1;
+            assert!(pumps <= 265, "the bounded transition must converge");
+        }
+        assert_eq!(pumps, 265, "4,225 disjoint columns drain in ceil(n/16)");
+    }
+
+    #[test]
+    fn superseding_center_discards_the_stale_transition() {
+        use ferrumc_math::ChunkPos;
+
+        use super::{
+            desired_chunks, next_chunk_transition, MAX_CHUNK_LOADS_PER_UPDATE,
+            MAX_CHUNK_UNLOADS_PER_UPDATE, STREAM_VIEW_DISTANCE_MAX,
+        };
+
+        let loaded = desired_chunks(ChunkPos::ORIGIN, STREAM_VIEW_DISTANCE_MAX);
+        let stale_center = ChunkPos::new(10_000, 10_000);
+        let stale_desired = desired_chunks(stale_center, STREAM_VIEW_DISTANCE_MAX);
+        let stale = next_chunk_transition(
+            stale_center,
+            &stale_desired,
+            &loaded,
+            MAX_CHUNK_LOADS_PER_UPDATE,
+            MAX_CHUNK_UNLOADS_PER_UPDATE,
+        );
+        assert!(!stale.load.is_empty() && !stale.unload.is_empty());
+
+        // Before any stale plan is applied, a latest-wins observation returns to
+        // the already-loaded origin. Recomputing has no old backlog to drain.
+        let latest_desired = desired_chunks(ChunkPos::ORIGIN, STREAM_VIEW_DISTANCE_MAX);
+        let latest = next_chunk_transition(
+            ChunkPos::ORIGIN,
+            &latest_desired,
+            &loaded,
+            MAX_CHUNK_LOADS_PER_UPDATE,
+            MAX_CHUNK_UNLOADS_PER_UPDATE,
+        );
+        assert!(latest.load.is_empty());
+        assert!(latest.unload.is_empty());
     }
 
     /// Builds a bare [`ChunkStream`] for the block-crossing test without a
@@ -456,5 +639,78 @@ mod tests {
             stream.block_crossing(Vec3::new(-0.1, 64.0, 0.5)),
             Some((BlockPos::new(1, 64, 0), BlockPos::new(-1, 64, 0)))
         );
+    }
+
+    #[test]
+    fn pending_stream_position_is_latest_wins() {
+        use ferrumc_math::Vec3;
+
+        let mut stream = bare_stream();
+        let first = Vec3::new(128.5, 64.0, 8.5);
+        let second = Vec3::new(-128.5, 64.0, 8.5);
+        let latest = Vec3::new(8.5, 64.0, 256.5);
+
+        stream.observe(first);
+        stream.observe(second);
+        stream.observe(latest);
+
+        assert_eq!(stream.pending_position, Some(latest));
+        assert_eq!(stream.last_position(), Some(latest));
+    }
+
+    #[test]
+    fn authoritative_teleport_recenters_only_when_fully_safe() {
+        use ferrumc_math::Vec3;
+        use ferrumc_proto::generated::play::SynchronizePlayerPosition;
+
+        use super::mirror_server_teleport;
+
+        let mut stream = bare_stream();
+        let mut yaw = 5.0;
+        let mut pitch = -5.0;
+        let target = Vec3::new(128.5, 70.0, -64.5);
+        let safe = SynchronizePlayerPosition::new(
+            7, target.x, target.y, target.z, 0.0, 0.0, 0.0, 90.0, -30.0, 0,
+        );
+        mirror_server_teleport(&mut stream, &mut yaw, &mut pitch, &safe);
+        assert_eq!(stream.pending_position, Some(target));
+        assert_eq!(stream.last_position(), Some(target));
+        assert_eq!((yaw, pitch), (90.0, -30.0));
+        assert_eq!(
+            stream.block_crossing(Vec3::new(128.9, 70.1, -64.1)),
+            None,
+            "a client echo in the destination block is not a giant move event",
+        );
+        assert_eq!(
+            stream.block_crossing(Vec3::new(129.1, 70.1, -64.1)),
+            Some((
+                ferrumc_math::BlockPos::new(128, 70, -65),
+                ferrumc_math::BlockPos::new(129, 70, -65),
+            )),
+            "the next real block crossing starts at the teleport destination",
+        );
+
+        let invalid = [
+            SynchronizePlayerPosition::new(8, f64::NAN, 64.0, 8.0, 0.0, 0.0, 0.0, 10.0, 20.0, 0),
+            SynchronizePlayerPosition::new(
+                9,
+                8.0,
+                64.0,
+                8.0,
+                0.0,
+                0.0,
+                0.0,
+                f32::INFINITY,
+                20.0,
+                0,
+            ),
+            SynchronizePlayerPosition::new(10, 8.0, 64.0, 8.0, 0.0, 0.0, 0.0, 10.0, 20.0, 1),
+        ];
+        for sync in invalid {
+            mirror_server_teleport(&mut stream, &mut yaw, &mut pitch, &sync);
+            assert_eq!(stream.pending_position, Some(target));
+            assert_eq!(stream.last_position(), Some(target));
+            assert_eq!((yaw, pitch), (90.0, -30.0));
+        }
     }
 }

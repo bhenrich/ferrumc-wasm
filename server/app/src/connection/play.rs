@@ -20,14 +20,10 @@ use ferrumc_session::{NetEvent, PlayerSessionHandle};
 use crate::driver::SimCommand;
 use crate::inventory::PlayerInventory;
 use crate::observe;
-use crate::player_data::{
-    is_valid_restored_position, load_player_for_join, PlayerData, PlayerLoad,
-};
+use crate::player_data::{is_valid_player_position, load_player_for_join, PlayerData, PlayerLoad};
 use crate::window::WindowState;
 
-use super::chunk_stream::{
-    apply_chunk_stream, mirror_server_teleport, pump_chunk_stream, ChunkStream,
-};
+use super::chunk_stream::{apply_chunk_stream, mirror_server_teleport, ChunkStream};
 use super::context::ConnContext;
 use super::handlers::handle_play_body;
 use super::join::send_join_kit;
@@ -89,7 +85,7 @@ pub(super) async fn enter_play(
     let (position, mut player_yaw, mut player_pitch, game_mode, mut inventory) =
         if let Some((data, game_mode)) = restored {
             let stored_position = data.position();
-            let position = if is_valid_restored_position(stored_position) {
+            let position = if is_valid_player_position(stored_position) {
                 stored_position
             } else {
                 // A current-schema record with an unsafe coordinate is recoverable:
@@ -101,7 +97,7 @@ pub(super) async fn enter_play(
                 // than route saturated integer coordinates.
                 let recovery = ctx.join_kit.spawn_position();
                 anyhow::ensure!(
-                    is_valid_restored_position(recovery),
+                    is_valid_player_position(recovery),
                     "cannot recover invalid player position because configured spawn is unsafe"
                 );
                 tracing::warn!(
@@ -126,7 +122,7 @@ pub(super) async fn enter_play(
         } else {
             let position = ctx.join_kit.spawn_position();
             anyhow::ensure!(
-                is_valid_restored_position(position),
+                is_valid_player_position(position),
                 "configured spawn position is unsafe"
             );
             (
@@ -235,6 +231,23 @@ pub(super) async fn enter_play(
         deferred_break = Some(err);
     }
     if deferred_break.is_none() {
+        // The join position (or the latest valid movement pipelined during the
+        // handoff) is the first fixed-cadence stream target. This one eager pass
+        // releases the loading screen; steady-state socket reads only update the
+        // coalesced pending target and never run chunk work themselves.
+        if let Err(err) = apply_chunk_stream(
+            ctx,
+            &mut writer,
+            &mut chunk_stream,
+            &mut debug,
+            &compression,
+        )
+        .await
+        {
+            deferred_break = Some(err);
+        }
+    }
+    if deferred_break.is_none() {
         match flush_writer(&mut writer, &mut stream, &compression, ctx.io_timeout).await {
             Ok(()) => observe_queue_len(&mut debug, ctx, &writer, budget.over_budget()),
             Err(err) => deferred_break = Some(err),
@@ -253,9 +266,10 @@ pub(super) async fn enter_play(
 
     // Chunk-stream pump: advance a standing player's view toward the full
     // advertised view distance without waiting for a movement packet. The initial
-    // fill already ran in the first `pump_serverbound` above; this drains the
-    // remaining backlog one bounded batch per interval. `Delay` skips missed ticks
-    // under load rather than bursting to catch up.
+    // fill already ran in the eager post-handoff stream pass above; this drains
+    // the remaining backlog one bounded batch per interval and consumes only the
+    // latest accepted target. `Delay` skips missed ticks under load rather than
+    // bursting to catch up.
     let mut chunk_pump = interval_at(
         Instant::now() + ctx.chunk_stream_interval,
         ctx.chunk_stream_interval,
@@ -300,7 +314,7 @@ pub(super) async fn enter_play(
                 // the current center, even if the player never moved. Bounded per
                 // pump, so this paces the backlog out without flooding the socket.
                 if let Err(err) =
-                    pump_chunk_stream(ctx, &mut writer, &mut chunk_stream, &mut debug, &compression).await
+                    apply_chunk_stream(ctx, &mut writer, &mut chunk_stream, &mut debug, &compression).await
                 {
                     break Err(err);
                 }
@@ -409,9 +423,10 @@ pub(super) async fn enter_play(
     // driver): the save is durable on the shared store the instant it returns (the
     // in-memory backend inserts inline; a redb backend commits), so a fast rejoin —
     // and the post-shutdown drain that waits on this connection's concurrency permit
-    // — reads the just-saved state rather than a stale one. The saved position is the
-    // last one the client reported, or the join position if it never moved. Failures
-    // are logged, never fatal: a connection ending must always run its teardown.
+    // — reads the just-saved state rather than a stale one. The saved position is
+    // the latest accepted client move or authoritative server teleport, falling
+    // back to the join position if neither occurred. Failures are logged, never
+    // fatal: a connection ending must always run its teardown.
     // If the player disconnects with a container open, return any carried (cursor)
     // item to the inventory before the leave-save so it is persisted, not lost. The
     // client cleared its own cursor on disconnect, so no clientbound sync is needed.
@@ -491,6 +506,10 @@ async fn join_simulation(
 
 /// Pushes freshly read bytes through the decoder, handles every complete play
 /// frame, then flushes any clientbound responses queued while handling them.
+///
+/// Movement only replaces a coalesced pending stream target here. Chunk
+/// load/unload work runs on the fixed stream interval, so attacker-controlled TCP
+/// read boundaries cannot multiply driver/store work.
 #[allow(clippy::too_many_arguments)] // one play step: framing + policy + I/O + trace state
 async fn read_and_pump(
     decoder: &mut InboundDecoder,
@@ -536,9 +555,9 @@ async fn read_and_pump(
 /// into `writer`), a spawn-protected break/place is vetoed, and anything else is
 /// forwarded to the simulation as a [`NetEvent`].
 ///
-/// After the whole buffered batch is drained, a single chunk-streaming pass runs
-/// against the latest position the batch reported, so many coalesced move packets
-/// trigger at most one streaming evaluation per read.
+/// Valid movement is admitted before it replaces the connection's one pending
+/// stream target. The fixed-cadence chunk timer consumes that latest target;
+/// this drain never performs chunk work itself.
 #[allow(clippy::too_many_arguments)] // one play drain: framing + policy + trace state
 async fn pump_serverbound(
     decoder: &mut InboundDecoder,
@@ -615,7 +634,7 @@ async fn pump_serverbound(
         )
         .await?;
     }
-    apply_chunk_stream(ctx, writer, chunk_stream, debug, compression).await
+    Ok(())
 }
 
 /// Mirrors a server-driven game-mode change into the connection-local game-mode.
