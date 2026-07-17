@@ -16,9 +16,11 @@
 //!   prefix makes the `(plugin, key)` split unambiguous, so two plugins can
 //!   never collide and a prefix scan over `plugin_len ++ plugin_id_bytes`
 //!   enumerates exactly one plugin's keys.
-//! - chunk value: `schema(u32) ++ x(i32) ++ z(i32) ++ section_count(u8)` then,
-//!   per section, a tag byte (`0` = all air, `1` = a dense list of
-//!   [`ferrumc_world::SECTION_VOLUME`] block-state ids as `u32`).
+//! - chunk value: `schema(u32) ++ x(i32) ++ z(i32) ++ magic(4) ++
+//!   format_version(u32) ++ section_count(u8)` then, per section, a tag byte
+//!   (`0` = all air, `1` = a dense list of
+//!   [`ferrumc_world::SECTION_VOLUME`] block-state ids as `u32`), followed by
+//!   the complete bounded block-entity set.
 //! - entity value: `schema(u32) ++ opaque_payload`
 //! - player value: `schema(u32) ++ game_mode(u8) ++ opaque_payload`
 //!
@@ -29,7 +31,8 @@
 use ferrumc_core::{GameMode, PlayerId, PluginId};
 use ferrumc_math::{BlockPos, ChunkPos, LocalBlockPos};
 use ferrumc_world::{
-    BlockStateId, Chunk, MAX_BLOCK_ENTITY_PAYLOAD_LEN, SECTION_COUNT, SECTION_VOLUME,
+    decode_block_entity, encode_block_entity, BlockStateId, Chunk, MAX_BLOCK_ENTITIES,
+    MAX_BLOCK_ENTITY_PAYLOAD_LEN, SECTION_COUNT, SECTION_VOLUME,
 };
 
 use crate::error::StorageError;
@@ -50,6 +53,20 @@ use crate::schema::SchemaVersion;
 /// sections, so a drift in this constant would fail loudly rather than silently
 /// corrupt data.
 const WORLD_FLOOR_Y: i32 = -64;
+
+/// Discriminator for the self-versioned full chunk-record envelope.
+///
+/// It occupies legacy byte offset 12, where every valid pre-envelope record has
+/// the one-byte section count `24`. Since the first magic byte is `F` rather
+/// than `24`, the old and current grammars are disjoint even though the
+/// caller-owned [`SchemaVersion`] and chunk coordinates may contain any bits.
+const CHUNK_RECORD_MAGIC: [u8; 4] = *b"FCHK";
+
+/// Current private full chunk-record byte-layout version.
+///
+/// Version 1 was the implicit, un-enveloped layout that omitted block entities.
+/// The no-migration pre-alpha policy refuses it rather than reinterpreting it.
+const CHUNK_RECORD_FORMAT_VERSION: u32 = 2;
 
 /// Section tag: every block in the section is [`BlockStateId::AIR`].
 const SECTION_TAG_AIR: u8 = 0;
@@ -220,8 +237,13 @@ fn local_pos(index: usize) -> LocalBlockPos {
     LocalBlockPos::new(x, y, z).unwrap_or(LocalBlockPos::from_block(BlockPos::new(0, 0, 0)))
 }
 
-/// Encodes a [`ChunkRecord`] to bytes.
-pub(crate) fn encode_chunk_record(record: &ChunkRecord) -> Vec<u8> {
+/// Encodes a [`ChunkRecord`] to the current full-snapshot format.
+///
+/// Encoding is fallible because the world-owned block-entity payload codec has
+/// explicit bounds and currently cannot represent every possible in-memory
+/// item component. A full snapshot rejects such an entity instead of silently
+/// dropping or rewriting it.
+pub(crate) fn encode_chunk_record(record: &ChunkRecord) -> Result<Vec<u8>, StorageError> {
     let chunk = record.chunk();
     let sections = chunk.sections();
 
@@ -229,6 +251,8 @@ pub(crate) fn encode_chunk_record(record: &ChunkRecord) -> Vec<u8> {
     out.extend_from_slice(&record.schema_version().get().to_be_bytes());
     out.extend_from_slice(&chunk.pos().x().to_be_bytes());
     out.extend_from_slice(&chunk.pos().z().to_be_bytes());
+    out.extend_from_slice(&CHUNK_RECORD_MAGIC);
+    out.extend_from_slice(&CHUNK_RECORD_FORMAT_VERSION.to_be_bytes());
     // `as u8`: `SECTION_COUNT` is 24, well within `u8`.
     out.push(sections.len() as u8);
 
@@ -243,16 +267,56 @@ pub(crate) fn encode_chunk_record(record: &ChunkRecord) -> Vec<u8> {
             }
         }
     }
-    out
+
+    // A Chunk enforces MAX_BLOCK_ENTITIES on insertion, so this conversion is
+    // lossless. The explicit count still lets the decoder reject hostile bytes
+    // before doing any per-entry work.
+    out.extend_from_slice(&(chunk.block_entity_count() as u32).to_be_bytes());
+    for (pos, entity) in chunk.block_entities() {
+        let mut payload = Vec::new();
+        encode_block_entity(entity, &mut payload);
+        if payload.len() > MAX_BLOCK_ENTITY_PAYLOAD_LEN {
+            return Err(StorageError::ChunkBlockEntityTooLarge {
+                pos,
+                len: payload.len(),
+                max: MAX_BLOCK_ENTITY_PAYLOAD_LEN,
+            });
+        }
+        let decoded = decode_block_entity(&payload)
+            .map_err(|_| StorageError::ChunkBlockEntityNotRepresentable { pos })?;
+        if &decoded != entity {
+            return Err(StorageError::ChunkBlockEntityNotRepresentable { pos });
+        }
+
+        out.extend_from_slice(&pos.x().to_be_bytes());
+        out.extend_from_slice(&pos.y().to_be_bytes());
+        out.extend_from_slice(&pos.z().to_be_bytes());
+        // The length was bounded by 16 KiB above, so this cast is lossless.
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(&payload);
+    }
+    Ok(out)
 }
 
 /// Decodes a [`ChunkRecord`] from bytes, rejecting malformed input with
-/// [`StorageError::Backend`].
+/// a classified [`StorageError`].
 pub(crate) fn decode_chunk_record(bytes: &[u8]) -> Result<ChunkRecord, StorageError> {
     let mut reader = Reader::new(bytes);
     let schema = SchemaVersion::new(reader.read_u32()?);
     let x = reader.read_i32()?;
     let z = reader.read_i32()?;
+    let magic = reader
+        .take(CHUNK_RECORD_MAGIC.len())
+        .map_err(|_| StorageError::IncompatiblePreAlphaData)?;
+    if magic != CHUNK_RECORD_MAGIC {
+        return Err(StorageError::IncompatiblePreAlphaData);
+    }
+    let format_version = reader
+        .read_u32()
+        .map_err(|_| StorageError::IncompatiblePreAlphaData)?;
+    if format_version != CHUNK_RECORD_FORMAT_VERSION {
+        return Err(StorageError::IncompatiblePreAlphaData);
+    }
     let section_count = usize::from(reader.read_u8()?);
     if section_count != SECTION_COUNT {
         return Err(corrupt(format!(
@@ -291,6 +355,53 @@ pub(crate) fn decode_chunk_record(bytes: &[u8]) -> Result<ChunkRecord, StorageEr
             }
             other => return Err(corrupt(format!("unknown chunk section tag {other}"))),
         }
+    }
+
+    let block_entity_count = usize::try_from(reader.read_u32()?)
+        .map_err(|_| corrupt("chunk block-entity count overflow"))?;
+    if block_entity_count > MAX_BLOCK_ENTITIES {
+        return Err(corrupt(format!(
+            "chunk declares {block_entity_count} block entities (maximum {MAX_BLOCK_ENTITIES})"
+        )));
+    }
+    for _ in 0..block_entity_count {
+        let entity_pos = BlockPos::new(reader.read_i32()?, reader.read_i32()?, reader.read_i32()?);
+        if chunk.block_entity(entity_pos).is_some() {
+            return Err(corrupt(format!(
+                "duplicate chunk block entity at {entity_pos:?}"
+            )));
+        }
+        let payload_len = usize::try_from(reader.read_u32()?)
+            .map_err(|_| corrupt("chunk block-entity payload length overflow"))?;
+        if payload_len > MAX_BLOCK_ENTITY_PAYLOAD_LEN {
+            return Err(corrupt(format!(
+                "chunk block-entity payload is {payload_len} bytes (maximum {MAX_BLOCK_ENTITY_PAYLOAD_LEN})"
+            )));
+        }
+        let payload = reader.take(payload_len)?;
+        let entity = decode_block_entity(payload).map_err(|error| {
+            corrupt(format!(
+                "invalid chunk block entity at {entity_pos:?}: {error}"
+            ))
+        })?;
+        let replaced = chunk
+            .set_block_entity(entity_pos, entity)
+            .map_err(|error| {
+                corrupt(format!(
+                    "chunk block entity at {entity_pos:?} is out of range: {error}"
+                ))
+            })?;
+        if replaced.is_some() {
+            return Err(corrupt(format!(
+                "duplicate chunk block entity at {entity_pos:?}"
+            )));
+        }
+    }
+
+    if reader.remaining() != 0 {
+        return Err(StorageError::TrailingChunkRecordBytes {
+            remaining: reader.remaining(),
+        });
     }
 
     // A chunk freshly read from disk has no writes pending a flush.
@@ -548,6 +659,37 @@ mod tests {
     use crate::record::MutationLogCause;
     use ferrumc_core::{DimensionId, EntityId, WorldId};
 
+    /// Offset of the section-count byte in the current full-record envelope.
+    const CHUNK_SECTION_COUNT_OFFSET: usize = 20;
+
+    /// Offset of the block-entity count in a current all-air chunk record.
+    const EMPTY_CHUNK_BLOCK_ENTITY_COUNT_OFFSET: usize =
+        CHUNK_SECTION_COUNT_OFFSET + 1 + SECTION_COUNT;
+
+    /// Encodes one empty origin chunk with the requested caller-owned schema.
+    fn empty_chunk_record_bytes(schema: u32) -> Vec<u8> {
+        encode_chunk_record(&ChunkRecord::new(
+            SchemaVersion::new(schema),
+            Chunk::new(ChunkPos::ORIGIN),
+        ))
+        .expect("empty chunk encodes")
+    }
+
+    /// Encodes one origin chunk containing a default sign at `(0, 0, 0)`.
+    fn sign_chunk_record_bytes() -> Vec<u8> {
+        use ferrumc_world::{BlockEntity, Sign, SignKind};
+
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        chunk
+            .set_block_entity(
+                BlockPos::new(0, 0, 0),
+                BlockEntity::Sign(Sign::new(SignKind::Sign)),
+            )
+            .expect("sign position is in the chunk");
+        encode_chunk_record(&ChunkRecord::new(SchemaVersion::new(1), chunk))
+            .expect("sign chunk encodes")
+    }
+
     #[test]
     fn chunk_key_bytes_are_stable_and_ordered_by_field() {
         let key = ChunkKey::new(WorldId::new(1), DimensionId::new(2), ChunkPos::new(-1, 3));
@@ -600,7 +742,8 @@ mod tests {
         }
         let record = ChunkRecord::new(SchemaVersion::new(9), chunk.clone());
 
-        let decoded = decode_chunk_record(&encode_chunk_record(&record)).expect("decode");
+        let encoded = encode_chunk_record(&record).expect("encode");
+        let decoded = decode_chunk_record(&encoded).expect("decode");
         assert_eq!(decoded.schema_version(), SchemaVersion::new(9));
         assert_eq!(decoded.chunk().pos(), ChunkPos::new(2, -5));
         for (block, raw) in [
@@ -620,8 +763,221 @@ mod tests {
     #[test]
     fn empty_chunk_round_trips() {
         let record = ChunkRecord::new(SchemaVersion::new(1), Chunk::new(ChunkPos::ORIGIN));
-        let decoded = decode_chunk_record(&encode_chunk_record(&record)).expect("decode");
+        let encoded = encode_chunk_record(&record).expect("encode");
+        let decoded = decode_chunk_record(&encoded).expect("decode");
         assert_eq!(decoded.chunk(), &Chunk::new(ChunkPos::ORIGIN));
+    }
+
+    #[test]
+    fn full_chunk_record_envelope_is_versioned_independently_of_schema() {
+        for schema in [1, 37, u32::MAX] {
+            let encoded = empty_chunk_record_bytes(schema);
+            assert_eq!(&encoded[0..4], &schema.to_be_bytes());
+            assert_eq!(&encoded[12..16], &CHUNK_RECORD_MAGIC);
+            assert_eq!(&encoded[16..20], &CHUNK_RECORD_FORMAT_VERSION.to_be_bytes());
+            assert_eq!(
+                encoded[CHUNK_SECTION_COUNT_OFFSET],
+                u8::try_from(SECTION_COUNT).expect("section count fits")
+            );
+
+            let decoded = decode_chunk_record(&encoded).expect("current format decodes");
+            assert_eq!(decoded.schema_version(), SchemaVersion::new(schema));
+        }
+    }
+
+    #[test]
+    fn chunk_decoder_refuses_legacy_unknown_and_short_envelopes() {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&CHUNK_RECORD_FORMAT_VERSION.to_be_bytes());
+        legacy.extend_from_slice(&0i32.to_be_bytes());
+        legacy.extend_from_slice(&0i32.to_be_bytes());
+        legacy.push(u8::try_from(SECTION_COUNT).expect("section count fits"));
+        legacy.extend(std::iter::repeat_n(SECTION_TAG_AIR, SECTION_COUNT));
+        assert!(matches!(
+            decode_chunk_record(&legacy),
+            Err(StorageError::IncompatiblePreAlphaData)
+        ));
+
+        let mut future = empty_chunk_record_bytes(1);
+        future[16..20].copy_from_slice(&(CHUNK_RECORD_FORMAT_VERSION + 1).to_be_bytes());
+        assert!(matches!(
+            decode_chunk_record(&future),
+            Err(StorageError::IncompatiblePreAlphaData)
+        ));
+
+        let current = empty_chunk_record_bytes(1);
+        for end in 12..20 {
+            assert!(matches!(
+                decode_chunk_record(&current[..end]),
+                Err(StorageError::IncompatiblePreAlphaData)
+            ));
+        }
+
+        assert_eq!(
+            StorageError::IncompatiblePreAlphaData.to_string(),
+            "This data was created by an incompatible pre-alpha build. Back it up or delete it before starting this release."
+        );
+    }
+
+    #[test]
+    fn chunk_decoder_rejects_trailing_bytes_with_typed_error() {
+        let mut encoded = empty_chunk_record_bytes(1);
+        encoded.extend_from_slice(&[0xAA, 0xBB]);
+        assert!(matches!(
+            decode_chunk_record(&encoded),
+            Err(StorageError::TrailingChunkRecordBytes { remaining: 2 })
+        ));
+    }
+
+    #[test]
+    fn chunk_decoder_rejects_every_truncated_block_entity_record_prefix() {
+        let encoded = sign_chunk_record_bytes();
+        for end in 0..encoded.len() {
+            assert!(
+                decode_chunk_record(&encoded[..end]).is_err(),
+                "prefix ending at byte {end} was accepted"
+            );
+        }
+        assert!(decode_chunk_record(&encoded).is_ok());
+    }
+
+    #[test]
+    fn chunk_decoder_accepts_the_maximum_block_entity_count() {
+        use ferrumc_world::{BlockEntity, ChestInventory};
+
+        let mut chest_payload = Vec::new();
+        encode_block_entity(
+            &BlockEntity::Chest(ChestInventory::new()),
+            &mut chest_payload,
+        );
+        let mut encoded =
+            empty_chunk_record_bytes(1)[..EMPTY_CHUNK_BLOCK_ENTITY_COUNT_OFFSET].to_vec();
+        encoded.extend_from_slice(&(MAX_BLOCK_ENTITIES as u32).to_be_bytes());
+        for index in 0..MAX_BLOCK_ENTITIES {
+            let layer = index / 256;
+            let within_layer = index % 256;
+            let x = i32::try_from(within_layer % 16).expect("x fits");
+            let z = i32::try_from(within_layer / 16).expect("z fits");
+            let y = WORLD_FLOOR_Y + i32::try_from(layer).expect("layer fits");
+            encoded.extend_from_slice(&x.to_be_bytes());
+            encoded.extend_from_slice(&y.to_be_bytes());
+            encoded.extend_from_slice(&z.to_be_bytes());
+            encoded.extend_from_slice(&(chest_payload.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(&chest_payload);
+        }
+
+        let decoded = decode_chunk_record(&encoded).expect("maximum count is valid");
+        assert_eq!(decoded.chunk().block_entity_count(), MAX_BLOCK_ENTITIES);
+    }
+
+    #[test]
+    fn chunk_decoder_rejects_hostile_block_entity_shapes() {
+        // Count is checked before any per-entry work.
+        let mut over_count = empty_chunk_record_bytes(1);
+        over_count
+            [EMPTY_CHUNK_BLOCK_ENTITY_COUNT_OFFSET..EMPTY_CHUNK_BLOCK_ENTITY_COUNT_OFFSET + 4]
+            .copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_chunk_record(&over_count).is_err());
+
+        // A length above the world payload cap is rejected before attempting to
+        // read the claimed bytes.
+        let mut over_payload =
+            empty_chunk_record_bytes(1)[..EMPTY_CHUNK_BLOCK_ENTITY_COUNT_OFFSET].to_vec();
+        over_payload.extend_from_slice(&1u32.to_be_bytes());
+        over_payload.extend_from_slice(&0i32.to_be_bytes());
+        over_payload.extend_from_slice(&0i32.to_be_bytes());
+        over_payload.extend_from_slice(&0i32.to_be_bytes());
+        over_payload.extend_from_slice(&(MAX_BLOCK_ENTITY_PAYLOAD_LEN as u32 + 1).to_be_bytes());
+        assert!(decode_chunk_record(&over_payload).is_err());
+
+        let valid = sign_chunk_record_bytes();
+        let entry_offset = EMPTY_CHUNK_BLOCK_ENTITY_COUNT_OFFSET + 4;
+        let payload_len_offset = entry_offset + 12;
+        let payload_offset = payload_len_offset + 4;
+
+        let mut unknown_tag = valid.clone();
+        unknown_tag[payload_offset] = u8::MAX;
+        assert!(decode_chunk_record(&unknown_tag).is_err());
+
+        let mut duplicate = valid.clone();
+        duplicate[EMPTY_CHUNK_BLOCK_ENTITY_COUNT_OFFSET..EMPTY_CHUNK_BLOCK_ENTITY_COUNT_OFFSET + 4]
+            .copy_from_slice(&2u32.to_be_bytes());
+        duplicate.extend_from_slice(&valid[entry_offset..]);
+        assert!(decode_chunk_record(&duplicate).is_err());
+
+        let mut foreign = valid.clone();
+        foreign[entry_offset..entry_offset + 4].copy_from_slice(&16i32.to_be_bytes());
+        assert!(decode_chunk_record(&foreign).is_err());
+
+        let payload_len = u32::from_be_bytes(
+            valid[payload_len_offset..payload_offset]
+                .try_into()
+                .expect("payload length field"),
+        );
+        let mut inner_trailing = valid;
+        inner_trailing[payload_len_offset..payload_offset]
+            .copy_from_slice(&(payload_len + 1).to_be_bytes());
+        inner_trailing.push(0xFF);
+        assert!(decode_chunk_record(&inner_trailing).is_err());
+    }
+
+    #[test]
+    fn chunk_encoder_rejects_unrepresentable_block_entities() {
+        use ferrumc_world::{BlockEntity, Sign, SignKind};
+
+        let pos = BlockPos::new(0, 0, 0);
+        let mut invalid_line = Sign::new(SignKind::Sign);
+        invalid_line.set_face_lines(
+            true,
+            [
+                "x".repeat(1025),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+        );
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        chunk
+            .set_block_entity(pos, BlockEntity::Sign(invalid_line))
+            .expect("sign position is in the chunk");
+        assert!(matches!(
+            encode_chunk_record(&ChunkRecord::new(SchemaVersion::new(1), chunk)),
+            Err(StorageError::ChunkBlockEntityNotRepresentable { pos: found }) if found == pos
+        ));
+
+        let mut maximum_line = Sign::new(SignKind::Sign);
+        maximum_line.set_face_lines(
+            true,
+            [
+                "x".repeat(1024),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+        );
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        chunk
+            .set_block_entity(pos, BlockEntity::Sign(maximum_line))
+            .expect("sign position is in the chunk");
+        encode_chunk_record(&ChunkRecord::new(SchemaVersion::new(1), chunk))
+            .expect("maximum valid line encodes");
+
+        let mut oversized = Sign::new(SignKind::Sign);
+        oversized.set_face_lines(
+            true,
+            std::array::from_fn(|_| "x".repeat(MAX_BLOCK_ENTITY_PAYLOAD_LEN)),
+        );
+        let mut chunk = Chunk::new(ChunkPos::ORIGIN);
+        chunk
+            .set_block_entity(pos, BlockEntity::Sign(oversized))
+            .expect("sign position is in the chunk");
+        assert!(matches!(
+            encode_chunk_record(&ChunkRecord::new(SchemaVersion::new(1), chunk)),
+            Err(StorageError::ChunkBlockEntityTooLarge {
+                pos: found,
+                ..
+            }) if found == pos
+        ));
     }
 
     #[test]
@@ -655,12 +1011,8 @@ mod tests {
 
     #[test]
     fn chunk_decoder_rejects_wrong_section_count() {
-        // schema + x + z + a section count that is not SECTION_COUNT.
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&1u32.to_be_bytes());
-        bytes.extend_from_slice(&0i32.to_be_bytes());
-        bytes.extend_from_slice(&0i32.to_be_bytes());
-        bytes.push(1);
+        let mut bytes = empty_chunk_record_bytes(1);
+        bytes[CHUNK_SECTION_COUNT_OFFSET] = 1;
         assert!(decode_chunk_record(&bytes).is_err());
     }
 

@@ -8,7 +8,7 @@ use ferrumc_storage::{
     ChunkKey, ChunkRecord, EntityKey, EntityRecord, PlayerRecord, PlayerStore, PluginStore,
     RedbStore, SchemaVersion, StorageKey, WorldStore, MAX_PLUGIN_VALUE_LEN, MAX_SAVE_BATCH,
 };
-use ferrumc_world::{BlockStateId, Chunk};
+use ferrumc_world::{BlockEntity, BlockStateId, ChestInventory, Chunk, Sign, SignKind};
 use tempfile::TempDir;
 
 fn world() -> WorldId {
@@ -74,6 +74,63 @@ async fn chunk_round_trips_and_preserves_schema() {
     assert_eq!(loaded.schema_version(), SchemaVersion::new(11));
     assert_chunk_blocks_eq(loaded.chunk(), &chunk);
     assert_eq!(loaded.chunk().get_block(block), Some(BlockStateId::new(1)));
+}
+
+#[tokio::test]
+async fn full_chunk_round_trips_block_entities_and_schema_version() {
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("block-entities.redb");
+    let chunk_pos = ChunkPos::new(2, -5);
+    let key = ChunkKey::new(world(), overworld(), chunk_pos);
+    let sign_pos = BlockPos::new(33, 64, -79);
+    let chest_pos = BlockPos::new(34, 64, -79);
+
+    let mut sign = Sign::new(SignKind::Sign);
+    sign.set_face_lines(
+        true,
+        [
+            "FerrumC".to_owned(),
+            "survives".to_owned(),
+            "a durable".to_owned(),
+            "round trip".to_owned(),
+        ],
+    );
+    let mut chunk = Chunk::new(chunk_pos);
+    chunk
+        .set_block_entity(sign_pos, BlockEntity::Sign(sign))
+        .expect("sign is inside the chunk");
+    chunk
+        .set_block_entity(chest_pos, BlockEntity::Chest(ChestInventory::new()))
+        .expect("chest is inside the chunk");
+
+    {
+        let store = RedbStore::open(&path).expect("open store");
+        store
+            .save_chunks(vec![(
+                key,
+                ChunkRecord::new(SchemaVersion::new(37), chunk.clone()),
+            )])
+            .await
+            .expect("save chunk");
+    }
+
+    let store = RedbStore::open(&path).expect("reopen store");
+    let loaded = store
+        .load_chunk(key)
+        .await
+        .expect("load chunk")
+        .expect("chunk is present");
+
+    assert_eq!(loaded.schema_version(), SchemaVersion::new(37));
+    assert_eq!(loaded.chunk().block_entity_count(), 2);
+    assert_eq!(
+        loaded.chunk().block_entity(sign_pos),
+        chunk.block_entity(sign_pos)
+    );
+    assert_eq!(
+        loaded.chunk().block_entity(chest_pos),
+        chunk.block_entity(chest_pos)
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 //! The classifying error type for the storage layer.
 
 use ferrumc_core::ServerError;
+use ferrumc_math::BlockPos;
 
 use crate::JournalBatchId;
 
@@ -48,6 +49,39 @@ pub enum StorageError {
         /// Maximum accepted payload length, in bytes.
         max: usize,
     },
+
+    /// A block entity in a full chunk snapshot exceeded the storage codec's
+    /// maximum payload length.
+    #[error("chunk block entity at {pos:?} is {len} bytes when encoded (maximum {max})")]
+    ChunkBlockEntityTooLarge {
+        /// Position of the block entity whose payload exceeded the bound.
+        pos: BlockPos,
+        /// Encoded payload length, in bytes.
+        len: usize,
+        /// Maximum accepted encoded payload length, in bytes.
+        max: usize,
+    },
+
+    /// A block entity cannot be represented losslessly by the world-owned
+    /// persistence payload codec.
+    #[error("chunk block entity at {pos:?} cannot be represented losslessly by the storage codec")]
+    ChunkBlockEntityNotRepresentable {
+        /// Position of the block entity that would lose data.
+        pos: BlockPos,
+    },
+
+    /// Bytes remained after a complete full chunk record.
+    #[error("trailing bytes after full chunk record: {remaining}")]
+    TrailingChunkRecordBytes {
+        /// Number of bytes left after the complete record.
+        remaining: usize,
+    },
+
+    /// Persisted bytes were written by an incompatible pre-alpha format.
+    #[error(
+        "This data was created by an incompatible pre-alpha build. Back it up or delete it before starting this release."
+    )]
+    IncompatiblePreAlphaData,
 
     /// A batched save request carried more items than the backend accepts in one
     /// call and was rejected before any item was processed.
@@ -156,6 +190,7 @@ impl From<StorageError> for ServerError {
             StorageError::KeyTooLong { .. }
             | StorageError::ValueTooLarge { .. }
             | StorageError::RecordTooLarge { .. }
+            | StorageError::ChunkBlockEntityTooLarge { .. }
             | StorageError::BatchTooLarge { .. }
             | StorageError::JournalSequenceExhausted { .. } => Self::capacity(message),
             // A backend failure is an internal invariant violation.
@@ -164,8 +199,12 @@ impl From<StorageError> for ServerError {
             | StorageError::InvalidJournalReceiptRange { .. }
             | StorageError::JournalReceiptMissingRecord { .. }
             | StorageError::MalformedJournalKey { .. }
+            | StorageError::ChunkBlockEntityNotRepresentable { .. }
+            | StorageError::TrailingChunkRecordBytes { .. }
             | StorageError::Backend(_) => Self::internal(message),
-            StorageError::JournalBatchConflict { .. } => Self::invalid_state(message),
+            StorageError::JournalBatchConflict { .. } | StorageError::IncompatiblePreAlphaData => {
+                Self::invalid_state(message)
+            }
         }
     }
 }
@@ -180,6 +219,11 @@ mod tests {
             StorageError::KeyTooLong { len: 9, max: 8 },
             StorageError::ValueTooLarge { len: 9, max: 8 },
             StorageError::RecordTooLarge { len: 9, max: 8 },
+            StorageError::ChunkBlockEntityTooLarge {
+                pos: BlockPos::new(0, 0, 0),
+                len: 9,
+                max: 8,
+            },
             StorageError::BatchTooLarge { len: 9, max: 8 },
             StorageError::JournalSequenceExhausted {
                 last_id: u64::MAX,

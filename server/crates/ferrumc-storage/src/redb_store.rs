@@ -50,7 +50,7 @@ use crate::{JournalAppendReceipt, JournalBatchId};
 /// Distinct from a record's [`crate::SchemaVersion`]: this versions the overall
 /// table/byte layout of the database file. Opening a file written under a
 /// different value fails rather than risking a misread.
-const STORE_FORMAT_VERSION: u64 = 1;
+const STORE_FORMAT_VERSION: u64 = 2;
 
 /// Metadata key under which [`STORE_FORMAT_VERSION`] is stored.
 const META_FORMAT_KEY: &str = "format_version";
@@ -219,8 +219,9 @@ impl RedbStore {
     /// On a fresh file the metadata and data tables are created and the
     /// [format version](STORE_FORMAT_VERSION) is stamped. On an existing file the
     /// recorded version is checked and a mismatch is rejected with
-    /// [`ServerError::Internal`] (via [`StorageError::Backend`]) rather than
-    /// risking a misread of an incompatible layout.
+    /// [`ServerError::InvalidState`] (via
+    /// [`StorageError::IncompatiblePreAlphaData`]) rather than risking a misread
+    /// of an incompatible layout.
     ///
     /// This is synchronous I/O and must be called outside the async hot path
     /// (for example during startup), not from inside a running tick.
@@ -240,10 +241,9 @@ impl RedbStore {
         txn.open_table(ENTITY_TABLE).map_err(backend_err)?;
         txn.open_table(PLAYER_TABLE).map_err(backend_err)?;
         txn.open_table(PLUGIN_TABLE).map_err(backend_err)?;
-        // Overlay, journal, and receipt tables are created lazily here too. They are purely
-        // additive to the v1 layout (no existing table changes shape), so opening
-        // a pre-existing v1 database simply gains empty tables rather than
-        // tripping a format-version mismatch — see docs/adr/0007 for the rationale.
+        // Keep every current table under the same initialization transaction.
+        // If a later compatibility check rejects the file, dropping this
+        // transaction rolls back any table creation.
         txn.open_table(CHUNK_OVERLAY_TABLE).map_err(backend_err)?;
         txn.open_table(MUTATION_BATCH_TABLE).map_err(backend_err)?;
         let journal_last_id = {
@@ -263,10 +263,7 @@ impl RedbStore {
                 .map(|guard| guard.value());
             match existing {
                 Some(found) if found != STORE_FORMAT_VERSION => {
-                    return Err(StorageError::backend(format!(
-                        "unsupported store format version {found} (expected {STORE_FORMAT_VERSION})"
-                    ))
-                    .into());
+                    return Err(StorageError::IncompatiblePreAlphaData.into());
                 }
                 Some(_) => {}
                 None => {
@@ -323,7 +320,7 @@ impl WorldStore for RedbStore {
             {
                 let mut table = txn.open_table(CHUNK_TABLE).map_err(backend_err)?;
                 let key_bytes = codec::chunk_key_bytes(key);
-                let value = codec::encode_chunk_record(&record);
+                let value = codec::encode_chunk_record(&record)?;
                 table
                     .insert(key_bytes.as_slice(), value.as_slice())
                     .map_err(backend_err)?;
@@ -351,7 +348,7 @@ impl WorldStore for RedbStore {
                 let mut table = txn.open_table(CHUNK_TABLE).map_err(backend_err)?;
                 for (key, record) in &chunks {
                     let key_bytes = codec::chunk_key_bytes(*key);
-                    let value = codec::encode_chunk_record(record);
+                    let value = codec::encode_chunk_record(record)?;
                     table
                         .insert(key_bytes.as_slice(), value.as_slice())
                         .map_err(backend_err)?;
@@ -809,8 +806,11 @@ impl PluginStore for RedbStore {
 mod tests {
     use std::sync::Arc;
 
-    use ferrumc_math::BlockPos;
-    use ferrumc_world::BlockStateId;
+    use ferrumc_core::{DimensionId, WorldId};
+    use ferrumc_math::{BlockPos, ChunkPos};
+    use ferrumc_world::{
+        BlockEntity, BlockStateId, Chunk, Sign, SignKind, MAX_BLOCK_ENTITY_PAYLOAD_LEN,
+    };
     use tempfile::TempDir;
     use tokio::sync::Barrier;
 
@@ -908,6 +908,128 @@ mod tests {
 
     fn batch_id(byte: u8) -> JournalBatchId {
         JournalBatchId::from_bytes([byte; 16])
+    }
+
+    fn chunk_key(pos: ChunkPos) -> ChunkKey {
+        ChunkKey::new(WorldId::new(0), DimensionId::new(0), pos)
+    }
+
+    #[tokio::test]
+    async fn redb_chunk_load_rejects_trailing_record_corruption() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = RedbStore::open(dir.path().join("chunk.redb")).expect("open store");
+        let key = chunk_key(ChunkPos::ORIGIN);
+        store
+            .save_chunk(
+                key,
+                ChunkRecord::new(SchemaVersion::new(7), Chunk::new(ChunkPos::ORIGIN)),
+            )
+            .await
+            .expect("save chunk");
+
+        let txn = store.db.begin_write().expect("write transaction");
+        {
+            let mut table = txn.open_table(CHUNK_TABLE).expect("chunk table");
+            let key_bytes = codec::chunk_key_bytes(key);
+            let mut corrupted = table
+                .get(key_bytes.as_slice())
+                .expect("read chunk")
+                .expect("stored chunk")
+                .value()
+                .to_vec();
+            corrupted.extend_from_slice(&[0xAA, 0xBB]);
+            table
+                .insert(key_bytes.as_slice(), corrupted.as_slice())
+                .expect("replace with corrupt bytes");
+        }
+        txn.commit().expect("commit corruption");
+
+        let error = store
+            .load_chunk(key)
+            .await
+            .expect_err("trailing bytes must reject the whole value");
+        assert!(matches!(error, ServerError::Internal { .. }));
+        assert!(error
+            .to_string()
+            .contains("trailing bytes after full chunk record"));
+    }
+
+    #[tokio::test]
+    async fn failed_chunk_batch_encoding_rolls_back_prior_replacement() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = RedbStore::open(dir.path().join("chunk.redb")).expect("open store");
+        let existing_key = chunk_key(ChunkPos::ORIGIN);
+        store
+            .save_chunk(
+                existing_key,
+                ChunkRecord::new(SchemaVersion::new(7), Chunk::new(ChunkPos::ORIGIN)),
+            )
+            .await
+            .expect("seed existing chunk");
+
+        let replacement = ChunkRecord::new(SchemaVersion::new(8), Chunk::new(ChunkPos::ORIGIN));
+        let invalid_pos = ChunkPos::new(1, 0);
+        let mut invalid_chunk = Chunk::new(invalid_pos);
+        let mut oversized = Sign::new(SignKind::Sign);
+        oversized.set_face_lines(
+            true,
+            std::array::from_fn(|_| "x".repeat(MAX_BLOCK_ENTITY_PAYLOAD_LEN)),
+        );
+        invalid_chunk
+            .set_block_entity(invalid_pos.origin_block(0), BlockEntity::Sign(oversized))
+            .expect("sign is in invalid fixture chunk");
+
+        let error = store
+            .save_chunks(vec![
+                (existing_key, replacement),
+                (
+                    chunk_key(invalid_pos),
+                    ChunkRecord::new(SchemaVersion::new(8), invalid_chunk),
+                ),
+            ])
+            .await
+            .expect_err("an unencodable member must reject the batch");
+        assert!(matches!(error, ServerError::Capacity(_)));
+
+        let existing = store
+            .load_chunk(existing_key)
+            .await
+            .expect("load existing chunk")
+            .expect("existing chunk remains");
+        assert_eq!(existing.schema_version(), SchemaVersion::new(7));
+        assert_eq!(
+            store
+                .load_chunk(chunk_key(invalid_pos))
+                .await
+                .expect("load absent invalid chunk"),
+            None
+        );
+    }
+
+    #[test]
+    fn current_store_format_is_v2() {
+        assert_eq!(STORE_FORMAT_VERSION, 2);
+    }
+
+    #[test]
+    fn legacy_store_format_uses_the_incompatible_data_refusal() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("legacy.redb");
+        {
+            let store = RedbStore::open(&path).expect("open current store");
+            let txn = store.db.begin_write().expect("write transaction");
+            {
+                let mut meta = txn.open_table(META_TABLE).expect("metadata table");
+                meta.insert(META_FORMAT_KEY, 1).expect("seed legacy format");
+            }
+            txn.commit().expect("commit legacy marker");
+        }
+
+        let error = RedbStore::open(&path).expect_err("legacy store must be refused");
+        assert!(matches!(error, ServerError::InvalidState(_)));
+        assert!(error.to_string().contains(
+            "This data was created by an incompatible pre-alpha build. Back it up or delete it before starting this release."
+        ));
     }
 
     #[tokio::test]
