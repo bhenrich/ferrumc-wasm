@@ -962,14 +962,30 @@ async fn handle_command(
     Ok(())
 }
 
+/// Validates an untrusted `UseItemOn` hit point before any interaction effect.
+///
+/// The placement rules currently read only the vertical component for some
+/// families, but all three coordinates cross the same protocol trust boundary.
+/// Rejecting rather than clamping keeps malformed input from selecting a valid
+/// placement state the client did not actually send.
+fn validated_placement_cursor(packet: &UseItemOn) -> Option<Vec3> {
+    let [x, y, z] = [packet.cursor_x(), packet.cursor_y(), packet.cursor_z()];
+    [x, y, z]
+        .into_iter()
+        .all(|component| component.is_finite() && (0.0..=1.0).contains(&component))
+        .then(|| Vec3::new(f64::from(x), f64::from(y), f64::from(z)))
+}
+
 /// Handles a serverbound `UseItemOn`: place the held block at the targeted cell,
 /// after consulting the loaded plugins at the intent boundary.
 ///
 /// Resolves the held hotbar stack to a block-state. An empty hand, a non-placeable
-/// item, or a malformed face places nothing but still acknowledges the
-/// block-action sequence so the client's optimistic prediction ends. A placeable
-/// block is offered to the plugins' `before_block_place` hooks (off the tick); the
-/// combined decision is then resolved:
+/// item, or a malformed face places nothing but still acknowledges the block-action
+/// sequence so the client's optimistic prediction ends. A non-finite or
+/// out-of-range cursor is discarded earlier, before any acknowledgement, plugin
+/// effect, preview, or simulation command. A placeable block is offered to the
+/// plugins' `before_block_place` hooks (off the tick); the combined decision is
+/// then resolved:
 ///
 /// - [`Deny`](ResolvedDecision::Deny): nothing is placed; the actor is healed
 ///   through the single reject funnel ([`reject_block_edit`]) — the sim reads the
@@ -1001,6 +1017,9 @@ async fn handle_use_item_on(
     debug: &mut SessionDebug,
     compression: &CompressionState,
 ) -> anyhow::Result<()> {
+    let Some(cursor_position) = validated_placement_cursor(packet) else {
+        return Ok(());
+    };
     let sequence = packet.sequence();
     // A malformed face index yields no target: just ack so the prediction ends.
     let Some(position) = use_item_on_target(packet) else {
@@ -1010,13 +1029,6 @@ async fn handle_use_item_on(
     // The clicked face shares `use_item_on_target`'s face decoding, so a `Some`
     // target guarantees a `Some` face; the fallback is unreachable but fails safe.
     let clicked_face = use_item_on_face(packet).unwrap_or(Direction::Up);
-    // The cursor hit point inside the clicked block (`0.0..=1.0`), widened to the
-    // f64 the placement context uses.
-    let cursor_position = Vec3::new(
-        f64::from(packet.cursor_x()),
-        f64::from(packet.cursor_y()),
-        f64::from(packet.cursor_z()),
-    );
 
     let perms = PermissionFacade::new(ctx.policy.permissions());
 
@@ -1812,25 +1824,29 @@ fn tab_complete_reply(
 mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use bytes::BytesMut;
     use ferrumc_codec::{write_var_int, BoundedReader};
     use ferrumc_config::AccessConfig;
     use ferrumc_core::{GameMode, PlayerId, PluginId};
-    use ferrumc_math::{ShardPos, Vec3, WorldIntent};
+    use ferrumc_items::{ComponentPatch, ItemId, ItemStack};
+    use ferrumc_math::{BlockPos, Direction, ShardPos, Vec3, WorldIntent};
     use ferrumc_net::{CompressionState, ConnectionLimits, DisconnectReason, PlayWriter};
     use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock, SessionDebug};
     use ferrumc_plugin_api::{
-        Capability, CapabilityManifest, EventContext, EventKind, Plugin, PluginError, PluginEvent,
-        PluginMetadata, SetupContext, Version,
+        BlockPlaceAttempt, Capability, CapabilityManifest, EventContext, EventKind,
+        InteractAttempt, Plugin, PluginBlockDecision, PluginError, PluginEvent,
+        PluginEventDecision, PluginMetadata, SetupContext, Version,
     };
     use ferrumc_plugin_host::PluginHost;
     use ferrumc_proto::generated::play::{
         ClientboundPlayPacket, ServerboundKeepAlive, ServerboundPlayPacket, SetCenterChunk,
         SetCreativeSlot, SetPlayerPosition, SetPlayerPositionAndRotation, SetPlayerRotation,
-        UpdateSign,
+        UpdateSign, UseItemOn,
     };
+    use ferrumc_proto::types::BlockPosition;
+    use ferrumc_sim::SimShard;
     use tokio::sync::mpsc;
 
     use super::{
@@ -1844,7 +1860,7 @@ mod tests {
     use crate::connection::context::{build_status_response, ConnContext};
     use crate::connection::rate_limiter::ChatRateLimiter;
     use crate::driver::SimCommand;
-    use crate::inventory::PlayerInventory;
+    use crate::inventory::{PlayerInventory, HOTBAR_START};
     use crate::plugins::{build_play_policy, BlockEventDispatcher};
     use crate::registries::ConfigRegistries;
     use crate::window::WindowState;
@@ -1931,25 +1947,16 @@ mod tests {
         }
     }
 
-    /// Builds the real handler context around a bounded command spy and a
-    /// movement-notification probe.
-    async fn movement_handler_context(
-        commands: mpsc::Sender<SimCommand>,
-        move_calls: Arc<AtomicUsize>,
-    ) -> ConnContext {
+    /// Builds the real handler context around a caller-supplied bounded command
+    /// route and plugin host.
+    async fn handler_context(commands: mpsc::Sender<SimCommand>, host: PluginHost) -> ConnContext {
         let config = AppConfig::from_toml_str("spawn_chunk_radius = 0\nview_distance = 0\n")
-            .expect("movement-handler test config is valid");
+            .expect("handler test config is valid");
         let setup = build_world(&config, ShardPos::new(0, 0))
             .await
             .expect("build one-column handler world");
         let (policy, _default_dispatcher) =
             build_play_policy(&config).expect("build handler policy");
-
-        let mut host = PluginHost::in_memory();
-        let probe = host
-            .register(Box::new(MoveProbe { calls: move_calls }))
-            .expect("register movement probe");
-        host.enable(&probe).expect("enable movement probe");
 
         let access = AccessConfig::default()
             .resolve(Path::new("."))
@@ -1974,6 +1981,113 @@ mod tests {
             access: Arc::new(access),
             budget: config.budget(),
         }
+    }
+
+    /// Builds the real handler context around a bounded command spy and a
+    /// movement-notification probe.
+    async fn movement_handler_context(
+        commands: mpsc::Sender<SimCommand>,
+        move_calls: Arc<AtomicUsize>,
+    ) -> ConnContext {
+        let mut host = PluginHost::in_memory();
+        let probe = host
+            .register(Box::new(MoveProbe { calls: move_calls }))
+            .expect("register movement probe");
+        host.enable(&probe).expect("enable movement probe");
+
+        handler_context(commands, host).await
+    }
+
+    #[derive(Default)]
+    struct PlacementProbeCalls {
+        interact: AtomicUsize,
+        before_place: AtomicUsize,
+        after_place: AtomicUsize,
+        after_states: Mutex<Vec<u32>>,
+    }
+
+    /// Makes every plugin boundary in a placement observable without emitting
+    /// additional intents.
+    struct PlacementProbe {
+        calls: Arc<PlacementProbeCalls>,
+    }
+
+    impl Plugin for PlacementProbe {
+        fn metadata(&self) -> PluginMetadata {
+            PluginMetadata::new(
+                PluginId::new("packet35-placement-probe"),
+                "packet35-placement-probe",
+                Version::new(0, 1, 0),
+                CapabilityManifest::empty()
+                    .with(Capability::ReceiveEvents)
+                    .with(Capability::VetoEvents)
+                    .with(Capability::VetoBlockEdits),
+            )
+        }
+
+        fn on_enable(&mut self, ctx: &mut SetupContext<'_>) -> Result<(), PluginError> {
+            ctx.events()?.subscribe(EventKind::AfterBlockPlace);
+            Ok(())
+        }
+
+        fn on_event(&mut self, event: &PluginEvent, _ctx: &mut EventContext<'_>) {
+            if let PluginEvent::AfterBlockPlace { block_state_id, .. } = event {
+                self.calls.after_place.fetch_add(1, Ordering::Relaxed);
+                self.calls
+                    .after_states
+                    .lock()
+                    .expect("placement-probe state lock")
+                    .push(*block_state_id);
+            }
+        }
+
+        fn before_block_place(
+            &mut self,
+            _event: &BlockPlaceAttempt,
+            _ctx: &mut EventContext<'_>,
+        ) -> PluginBlockDecision {
+            self.calls.before_place.fetch_add(1, Ordering::Relaxed);
+            PluginBlockDecision::Allow
+        }
+
+        fn before_interact(
+            &mut self,
+            _event: &InteractAttempt,
+            _ctx: &mut EventContext<'_>,
+        ) -> PluginEventDecision {
+            self.calls.interact.fetch_add(1, Ordering::Relaxed);
+            PluginEventDecision::Allow
+        }
+    }
+
+    async fn placement_handler_context(
+        commands: mpsc::Sender<SimCommand>,
+        calls: Arc<PlacementProbeCalls>,
+    ) -> ConnContext {
+        let mut host = PluginHost::in_memory();
+        let probe = host
+            .register(Box::new(PlacementProbe { calls }))
+            .expect("register placement probe");
+        host.enable(&probe).expect("enable placement probe");
+        handler_context(commands, host).await
+    }
+
+    #[derive(Default)]
+    struct PlacementCommandCalls {
+        total: AtomicUsize,
+        open_container: AtomicUsize,
+        place_block: AtomicUsize,
+        preview: AtomicUsize,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct PlacementPreview {
+        requested: u32,
+        computed: u32,
+        position: BlockPos,
+        face: Direction,
+        cursor: Vec3,
+        yaw: f32,
     }
 
     #[test]
@@ -2348,6 +2462,275 @@ mod tests {
         command_task
             .await
             .expect("bounded movement command spy shuts down");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one ordered trust-boundary battery and its effect spies
+    async fn use_item_on_rejects_invalid_cursor_before_every_observable_effect() {
+        // Commands are consumed one at a time as each packet waits for its reply.
+        // Eight bounded slots leave diagnostic headroom for the two valid controls
+        // without weakening the production backpressure contract.
+        const COMMAND_CAPACITY: usize = 8;
+
+        let plugin_calls = Arc::new(PlacementProbeCalls::default());
+        let command_calls = Arc::new(PlacementCommandCalls::default());
+        let previews = Arc::new(Mutex::new(Vec::new()));
+        let (commands_tx, mut commands_rx) = mpsc::channel(COMMAND_CAPACITY);
+        let command_calls_for_task = Arc::clone(&command_calls);
+        let previews_for_task = Arc::clone(&previews);
+        let command_task = tokio::spawn(async move {
+            let shard = SimShard::new(ShardPos::new(0, 0));
+            while let Some(command) = commands_rx.recv().await {
+                command_calls_for_task.total.fetch_add(1, Ordering::Relaxed);
+                match command {
+                    SimCommand::OpenContainer { reply, .. } => {
+                        command_calls_for_task
+                            .open_container
+                            .fetch_add(1, Ordering::Relaxed);
+                        let _ = reply.send(None);
+                    }
+                    SimCommand::PlaceBlock {
+                        position,
+                        state,
+                        clicked_face,
+                        cursor_position,
+                        player_yaw,
+                        reply,
+                        ..
+                    } => {
+                        command_calls_for_task
+                            .place_block
+                            .fetch_add(1, Ordering::Relaxed);
+                        let computed = shard.preview_placement(
+                            state,
+                            clicked_face,
+                            cursor_position,
+                            player_yaw,
+                            position,
+                        );
+                        command_calls_for_task
+                            .preview
+                            .fetch_add(1, Ordering::Relaxed);
+                        previews_for_task
+                            .lock()
+                            .expect("placement preview lock")
+                            .push(PlacementPreview {
+                                requested: state.as_u32(),
+                                computed: computed.as_u32(),
+                                position,
+                                face: clicked_face,
+                                cursor: cursor_position,
+                                yaw: player_yaw,
+                            });
+                        let _ = reply.send(Ok(computed));
+                    }
+                    _ => panic!("placement test emitted an unexpected command"),
+                }
+            }
+        });
+
+        let ctx = placement_handler_context(commands_tx, Arc::clone(&plugin_calls)).await;
+        let player = PlayerId::offline("PlacementHandlerProbe");
+        let mut writer = PlayWriter::with_defaults(ctx.limits);
+        let mut chunk_stream = ChunkStream::new(&ctx);
+        let player_position = Vec3::new(8.5, 64.0, 8.5);
+        chunk_stream.observe(player_position);
+        let mut chat_limiter = ChatRateLimiter::new(ctx.clock.now());
+        let mut inventory = PlayerInventory::with_creative_kit(GameMode::Creative);
+        let mut window_state = WindowState::new();
+        let mut yaw = 0.0;
+        let mut pitch = 0.0;
+        let mut debug = SessionDebug::new("placement-handler-probe");
+        let compression = CompressionState::disabled();
+
+        // Every hostile value is injected independently into x, y, and z. The
+        // other two components remain valid so a missing per-axis check is visible.
+        let mut sequence = 1;
+        for axis in 0..3 {
+            for invalid in [
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                -f32::EPSILON,
+                1.0 + f32::EPSILON,
+            ] {
+                let mut cursor = [0.5; 3];
+                cursor[axis] = invalid;
+                let packet = UseItemOn::new(
+                    0,
+                    BlockPosition::new(8, 63, 8),
+                    1,
+                    cursor[0],
+                    cursor[1],
+                    cursor[2],
+                    false,
+                    false,
+                    sequence,
+                );
+                sequence += 1;
+                let mut body = BytesMut::new();
+                packet
+                    .encode(&mut body)
+                    .expect("encode hostile placement cursor");
+                handle_play_body(
+                    &ctx,
+                    player,
+                    "PlacementHandlerProbe",
+                    &mut writer,
+                    &mut chunk_stream,
+                    &mut chat_limiter,
+                    &mut inventory,
+                    &mut window_state,
+                    &mut yaw,
+                    &mut pitch,
+                    &body,
+                    &mut debug,
+                    &compression,
+                )
+                .await
+                .expect("reject hostile placement cursor cleanly");
+            }
+        }
+
+        // Cursor validation also precedes the malformed-face acknowledgement.
+        // Otherwise a packet invalid in both fields would still create an
+        // observable clientbound effect.
+        let packet = UseItemOn::new(
+            0,
+            BlockPosition::new(8, 63, 8),
+            99,
+            f32::NAN,
+            0.5,
+            0.5,
+            false,
+            false,
+            sequence,
+        );
+        sequence += 1;
+        let mut body = BytesMut::new();
+        packet
+            .encode(&mut body)
+            .expect("encode invalid cursor with malformed face");
+        handle_play_body(
+            &ctx,
+            player,
+            "PlacementHandlerProbe",
+            &mut writer,
+            &mut chunk_stream,
+            &mut chat_limiter,
+            &mut inventory,
+            &mut window_state,
+            &mut yaw,
+            &mut pitch,
+            &body,
+            &mut debug,
+            &compression,
+        )
+        .await
+        .expect("cursor rejection precedes malformed-face acknowledgement");
+
+        assert_eq!(plugin_calls.interact.load(Ordering::Relaxed), 0);
+        assert_eq!(plugin_calls.before_place.load(Ordering::Relaxed), 0);
+        assert_eq!(plugin_calls.after_place.load(Ordering::Relaxed), 0);
+        assert_eq!(command_calls.total.load(Ordering::Relaxed), 0);
+        assert_eq!(command_calls.open_container.load(Ordering::Relaxed), 0);
+        assert_eq!(command_calls.place_block.load(Ordering::Relaxed), 0);
+        assert_eq!(command_calls.preview.load(Ordering::Relaxed), 0);
+        assert!(previews.lock().expect("placement preview lock").is_empty());
+        assert!(plugin_calls
+            .after_states
+            .lock()
+            .expect("placement-probe state lock")
+            .is_empty());
+        assert_eq!(writer.total_queued(), 0);
+        assert!(window_state.open().is_none());
+        assert_eq!(chunk_stream.last_position(), Some(player_position));
+
+        // Positive controls cover all inclusive endpoints across the two packets
+        // and run the real placement preview: a high side-click makes a top slab,
+        // while yaw zero plus a low east-face click makes south/bottom stairs.
+        for (item_name, location, direction, cursor) in [
+            ("oak_slab", BlockPosition::new(8, 64, 9), 2, [0.0, 1.0, 1.0]),
+            (
+                "oak_stairs",
+                BlockPosition::new(7, 64, 8),
+                5,
+                [1.0, 0.0, 0.0],
+            ),
+        ] {
+            let item = ItemId::from_name(item_name).expect("known placeable item");
+            let stack = ItemStack::try_new(item, 1, ComponentPatch::empty())
+                .expect("one-item stack is valid");
+            inventory.set_creative_slot(HOTBAR_START, stack);
+            let packet = UseItemOn::new(
+                0, location, direction, cursor[0], cursor[1], cursor[2], false, false, sequence,
+            );
+            sequence += 1;
+            let mut body = BytesMut::new();
+            packet
+                .encode(&mut body)
+                .expect("encode accepted placement cursor");
+            handle_play_body(
+                &ctx,
+                player,
+                "PlacementHandlerProbe",
+                &mut writer,
+                &mut chunk_stream,
+                &mut chat_limiter,
+                &mut inventory,
+                &mut window_state,
+                &mut yaw,
+                &mut pitch,
+                &body,
+                &mut debug,
+                &compression,
+            )
+            .await
+            .expect("admit valid placement cursor");
+        }
+
+        assert_eq!(plugin_calls.interact.load(Ordering::Relaxed), 2);
+        assert_eq!(plugin_calls.before_place.load(Ordering::Relaxed), 2);
+        assert_eq!(plugin_calls.after_place.load(Ordering::Relaxed), 2);
+        assert_eq!(command_calls.total.load(Ordering::Relaxed), 4);
+        assert_eq!(command_calls.open_container.load(Ordering::Relaxed), 2);
+        assert_eq!(command_calls.place_block.load(Ordering::Relaxed), 2);
+        assert_eq!(command_calls.preview.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            *previews.lock().expect("placement preview lock"),
+            [
+                PlacementPreview {
+                    requested: 12054,
+                    computed: 12052,
+                    position: BlockPos::new(8, 64, 8),
+                    face: Direction::North,
+                    cursor: Vec3::new(0.0, 1.0, 1.0),
+                    yaw: 0.0,
+                },
+                PlacementPreview {
+                    requested: 2949,
+                    computed: 2969,
+                    position: BlockPos::new(8, 64, 8),
+                    face: Direction::East,
+                    cursor: Vec3::new(1.0, 0.0, 0.0),
+                    yaw: 0.0,
+                },
+            ]
+        );
+        assert_eq!(
+            *plugin_calls
+                .after_states
+                .lock()
+                .expect("placement-probe state lock"),
+            [12052, 2969],
+        );
+        assert_eq!(writer.total_queued(), 0);
+        assert!(window_state.open().is_none());
+
+        drop(ctx);
+        command_task
+            .await
+            .expect("bounded placement command spy shuts down");
     }
 
     #[test]
