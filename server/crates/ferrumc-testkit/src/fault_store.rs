@@ -1,10 +1,10 @@
 //! Deterministic storage fault injection for durability tests.
 //!
-//! [`FaultInjectingStore`] implements [`WorldStore`] entirely in memory and
-//! exposes explicit FIFO cutpoints around each operation. Tests can distinguish
-//! an attempted request from committed state, stop an operation immediately
-//! before commit, hold either side of the commit boundary without a sleep, and
-//! model a commit whose acknowledgement never reaches the caller.
+//! [`FaultInjectingStore`] implements [`WorldStore`] and [`PlayerStore`] entirely
+//! in memory and exposes explicit FIFO cutpoints around each operation. Tests
+//! can distinguish an attempted request from committed state, stop an operation
+//! immediately before commit, hold either side of the commit boundary without a
+//! sleep, and model a commit whose acknowledgement never reaches the caller.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -12,10 +12,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
-use ferrumc_core::{Result as ServerResult, ServerError};
+use ferrumc_core::{PlayerId, Result as ServerResult, ServerError};
 use ferrumc_storage::{
     BlockMutationLogRecord, ChunkKey, ChunkOverlayRecord, ChunkRecord, EntityKey, EntityRecord,
-    InMemoryStore, JournalAppendReceipt, JournalBatchId, StorageError, WorldStore, MAX_SAVE_BATCH,
+    InMemoryStore, JournalAppendReceipt, JournalBatchId, PlayerRecord, PlayerStore, StorageError,
+    WorldStore, MAX_SAVE_BATCH,
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
@@ -54,6 +55,12 @@ pub enum FaultOperation {
     SaveEntities,
     /// Delete one entity record.
     DeleteEntity,
+    /// Load one player record.
+    LoadPlayer,
+    /// Save one player record.
+    SavePlayer,
+    /// Delete one player record.
+    DeletePlayer,
 }
 
 impl FaultOperation {
@@ -61,7 +68,7 @@ impl FaultOperation {
     fn is_mutating(self) -> bool {
         !matches!(
             self,
-            Self::LoadChunk | Self::LoadChunkOverlay | Self::LoadEntity
+            Self::LoadChunk | Self::LoadChunkOverlay | Self::LoadEntity | Self::LoadPlayer
         )
     }
 }
@@ -106,7 +113,7 @@ pub struct FaultTraceEntry {
     item_count: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum FaultAttemptPayload {
     ChunkKey(ChunkKey),
     Chunks(Vec<(ChunkKey, ChunkRecord)>),
@@ -118,17 +125,20 @@ enum FaultAttemptPayload {
     },
     EntityKey(EntityKey),
     Entities(Vec<(EntityKey, EntityRecord)>),
+    PlayerId(PlayerId),
+    Players(Vec<(PlayerId, PlayerRecord)>),
 }
 
 impl FaultAttemptPayload {
     fn item_count(&self) -> usize {
         match self {
-            Self::ChunkKey(_) | Self::EntityKey(_) => 1,
+            Self::ChunkKey(_) | Self::EntityKey(_) | Self::PlayerId(_) => 1,
             Self::Chunks(records) => records.len(),
             Self::Overlays(records) => records.len(),
             Self::Mutations(records) => records.len(),
             Self::MutationBatch { mutations, .. } => mutations.len(),
             Self::Entities(records) => records.len(),
+            Self::Players(records) => records.len(),
         }
     }
 }
@@ -138,7 +148,7 @@ impl FaultAttemptPayload {
 /// This record is captured before any injected failure or commit validation.
 /// Use [`FaultInjectingStore::attempted_state`] to distinguish what callers
 /// tried from the durable values returned by [`FaultInjectingStore::snapshot`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FaultStoreAttempt {
     operation_id: u64,
     operation: FaultOperation,
@@ -233,10 +243,28 @@ impl FaultStoreAttempt {
             _ => None,
         }
     }
+
+    /// Returns the requested player ID for a player load or delete.
+    #[must_use]
+    pub fn player_id(&self) -> Option<PlayerId> {
+        match self.payload {
+            FaultAttemptPayload::PlayerId(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Returns the caller-supplied player record for a player save.
+    #[must_use]
+    pub fn players(&self) -> Option<&[(PlayerId, PlayerRecord)]> {
+        match &self.payload {
+            FaultAttemptPayload::Players(records) => Some(records),
+            _ => None,
+        }
+    }
 }
 
 /// An immutable snapshot of all accepted calls, independent of commit outcome.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FaultStoreAttemptedState {
     operations: Vec<FaultStoreAttempt>,
 }
@@ -403,13 +431,14 @@ impl FaultStoreControlError {
 ///
 /// This snapshot intentionally excludes attempted-but-failed values. Pair it
 /// with [`FaultInjectingStore::trace`] to compare attempts with durable facts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FaultStoreSnapshot {
     chunks: BTreeMap<ChunkKey, ChunkRecord>,
     overlays: BTreeMap<ChunkKey, ChunkOverlayRecord>,
     mutations: Vec<BlockMutationLogRecord>,
     journal_receipts: BTreeMap<JournalBatchId, JournalAppendReceipt>,
     entities: BTreeMap<EntityKey, EntityRecord>,
+    players: BTreeMap<PlayerId, PlayerRecord>,
     attempted_operations: u64,
     committed_operations: u64,
     successful_responses: u64,
@@ -444,6 +473,12 @@ impl FaultStoreSnapshot {
     #[must_use]
     pub fn entity(&self, key: EntityKey) -> Option<&EntityRecord> {
         self.entities.get(&key)
+    }
+
+    /// Returns the committed player at `id`, if present.
+    #[must_use]
+    pub fn player(&self, id: PlayerId) -> Option<&PlayerRecord> {
+        self.players.get(&id)
     }
 
     /// Returns the number of operations accepted by the request side.
@@ -495,6 +530,7 @@ struct CommittedState {
     last_mutation_id: Option<u64>,
     journal_receipts: BTreeMap<JournalBatchId, JournalAppendReceipt>,
     entities: BTreeMap<EntityKey, EntityRecord>,
+    players: BTreeMap<PlayerId, PlayerRecord>,
 }
 
 #[derive(Debug, Default)]
@@ -511,7 +547,8 @@ struct Inner {
     responses_closed: bool,
 }
 
-/// A deterministic, in-memory [`WorldStore`] with explicit commit cutpoints.
+/// A deterministic, in-memory [`WorldStore`] and [`PlayerStore`] with explicit
+/// commit cutpoints.
 ///
 /// Fault actions form a bounded FIFO schedule. Commit-specific actions wait at
 /// the front until the next mutating operation; reads may pass without consuming
@@ -597,6 +634,7 @@ impl FaultInjectingStore {
             mutations: inner.committed.mutations.clone(),
             journal_receipts: inner.committed.journal_receipts.clone(),
             entities: inner.committed.entities.clone(),
+            players: inner.committed.players.clone(),
             attempted_operations: inner.attempted_operations,
             committed_operations: inner.committed_operations,
             successful_responses: inner.successful_responses,
@@ -1257,6 +1295,36 @@ impl WorldStore for FaultInjectingStore {
             FaultOperation::DeleteEntity,
             FaultAttemptPayload::EntityKey(key),
             move |state| Ok(state.entities.remove(&key).is_some()),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl PlayerStore for FaultInjectingStore {
+    async fn load_player(&self, id: PlayerId) -> ServerResult<Option<PlayerRecord>> {
+        self.execute_read(
+            FaultOperation::LoadPlayer,
+            FaultAttemptPayload::PlayerId(id),
+            move |state| Ok(state.players.get(&id).cloned()),
+        )
+        .await
+    }
+
+    async fn save_player(&self, id: PlayerId, record: PlayerRecord) -> ServerResult<()> {
+        let payload = FaultAttemptPayload::Players(vec![(id, record.clone())]);
+        self.execute_write(FaultOperation::SavePlayer, payload, move |state| {
+            state.players.insert(id, record);
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_player(&self, id: PlayerId) -> ServerResult<bool> {
+        self.execute_write(
+            FaultOperation::DeletePlayer,
+            FaultAttemptPayload::PlayerId(id),
+            move |state| Ok(state.players.remove(&id).is_some()),
         )
         .await
     }

@@ -1,13 +1,15 @@
 use std::sync::Arc;
 
-use ferrumc_core::{DimensionId, ServerError, WorldId};
+use ferrumc_core::{DimensionId, GameMode, PlayerId, ServerError, WorldId};
 use ferrumc_math::{BlockPos, ChunkPos};
 use ferrumc_storage::{
     BlockMutationLogRecord, ChunkKey, JournalBatchId, MutationActor, MutationLogCause,
-    SchemaVersion, WorldStore, MAX_SAVE_BATCH,
+    PlayerRecord, PlayerStore, SchemaVersion, WorldStore, MAX_SAVE_BATCH,
 };
 use ferrumc_testkit::{
-    FaultInjectingStore, FaultStage, FaultStoreAttempt, FaultTraceEntry, MAX_FAULT_SCHEDULE,
+    DurabilityCaseReport, DurabilityFaultBattery, DurabilityOutcome, DurabilityScenario,
+    DurabilitySurface, FaultInjectingStore, FaultOperation, FaultStage, FaultStoreAttempt,
+    FaultTraceEntry, MAX_FAULT_SCHEDULE,
 };
 use ferrumc_world::BlockStateId;
 
@@ -30,6 +32,554 @@ fn mutation(tick: u64) -> BlockMutationLogRecord {
 
 fn chunk_key() -> ChunkKey {
     ChunkKey::new(WorldId::new(1), DimensionId::new(2), ChunkPos::new(3, 4))
+}
+
+fn assert_first_attempt_committed(case: &DurabilityCaseReport) {
+    let attempt = &case.attempted().operations()[0];
+    match case.surface() {
+        DurabilitySurface::World => {
+            let records = attempt.entities().expect("world entity attempt");
+            assert!(records
+                .iter()
+                .all(|(key, record)| case.committed().entity(*key) == Some(record)));
+        }
+        DurabilitySurface::Player => {
+            let records = attempt.players().expect("player attempt");
+            assert!(records
+                .iter()
+                .all(|(id, record)| case.committed().player(*id) == Some(record)));
+        }
+        DurabilitySurface::Journal => {
+            let attempted = attempt.block_mutations().expect("journal attempt");
+            let committed = case.committed().block_mutations();
+            assert_eq!(committed.len(), attempted.len());
+            for (actual, expected) in committed.iter().zip(attempted) {
+                assert_eq!(actual.schema_version(), expected.schema_version());
+                assert_eq!(actual.tick(), expected.tick());
+                assert_eq!(actual.actor(), expected.actor());
+                assert_eq!(actual.pos(), expected.pos());
+                assert_eq!(actual.old_state(), expected.old_state());
+                assert_eq!(actual.new_state(), expected.new_state());
+                assert_eq!(actual.cause(), expected.cause());
+            }
+        }
+        _ => panic!("battery returned an unknown storage surface"),
+    }
+}
+
+fn assert_first_attempt_not_committed(case: &DurabilityCaseReport) {
+    let attempt = &case.attempted().operations()[0];
+    match case.surface() {
+        DurabilitySurface::World => {
+            assert!(attempt
+                .entities()
+                .expect("world entity attempt")
+                .iter()
+                .all(|(key, _)| case.committed().entity(*key).is_none()));
+        }
+        DurabilitySurface::Player => {
+            assert!(attempt
+                .players()
+                .expect("player attempt")
+                .iter()
+                .all(|(id, _)| case.committed().player(*id).is_none()));
+        }
+        DurabilitySurface::Journal => {
+            assert!(case.committed().block_mutations().is_empty());
+            assert!(case
+                .committed()
+                .journal_receipt(attempt.journal_batch_id().expect("journal batch id"))
+                .is_none());
+        }
+        _ => panic!("battery returned an unknown storage surface"),
+    }
+}
+
+fn committed_journal_receipt(case: &DurabilityCaseReport) -> ferrumc_storage::JournalAppendReceipt {
+    let batch_id = case.attempted().operations()[0]
+        .journal_batch_id()
+        .expect("journal batch id");
+    case.committed()
+        .journal_receipt(batch_id)
+        .expect("committed journal receipt")
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)] // One table-style test pins the complete reusable report contract.
+async fn reusable_durability_battery_is_seeded_complete_and_deterministic() {
+    let seed = 0x0123_4567_89ab_cdef;
+    let first = DurabilityFaultBattery::new(seed, mutation(100))
+        .run()
+        .await
+        .expect("first battery run");
+    let second = DurabilityFaultBattery::new(seed, mutation(100))
+        .run()
+        .await
+        .expect("second battery run");
+    assert_eq!(first, second, "the seed must reproduce the full report");
+
+    let required = [
+        (
+            DurabilitySurface::World,
+            DurabilityScenario::FailBeforeCommit,
+        ),
+        (DurabilitySurface::World, DurabilityScenario::CommitError),
+        (DurabilitySurface::World, DurabilityScenario::AckLoss),
+        (
+            DurabilitySurface::World,
+            DurabilityScenario::RequestCloseWhileHeld,
+        ),
+        (
+            DurabilitySurface::World,
+            DurabilityScenario::ResponseCloseWhileHeld,
+        ),
+        (DurabilitySurface::World, DurabilityScenario::EmptyBatch),
+        (DurabilitySurface::World, DurabilityScenario::MaximumBatch),
+        (DurabilitySurface::World, DurabilityScenario::OversizedBatch),
+        (
+            DurabilitySurface::Player,
+            DurabilityScenario::FailBeforeCommit,
+        ),
+        (DurabilitySurface::Player, DurabilityScenario::CommitError),
+        (DurabilitySurface::Player, DurabilityScenario::AckLoss),
+        (
+            DurabilitySurface::Player,
+            DurabilityScenario::RequestCloseWhileHeld,
+        ),
+        (
+            DurabilitySurface::Player,
+            DurabilityScenario::ResponseCloseWhileHeld,
+        ),
+        (
+            DurabilitySurface::Journal,
+            DurabilityScenario::FailBeforeCommit,
+        ),
+        (DurabilitySurface::Journal, DurabilityScenario::CommitError),
+        (DurabilitySurface::Journal, DurabilityScenario::AckLoss),
+        (
+            DurabilitySurface::Journal,
+            DurabilityScenario::ReceiptReplay,
+        ),
+        (
+            DurabilitySurface::Journal,
+            DurabilityScenario::PayloadMismatch,
+        ),
+        (
+            DurabilitySurface::Journal,
+            DurabilityScenario::RequestCloseWhileHeld,
+        ),
+        (
+            DurabilitySurface::Journal,
+            DurabilityScenario::ResponseCloseWhileHeld,
+        ),
+        (DurabilitySurface::Journal, DurabilityScenario::EmptyBatch),
+        (DurabilitySurface::Journal, DurabilityScenario::MaximumBatch),
+        (
+            DurabilitySurface::Journal,
+            DurabilityScenario::OversizedBatch,
+        ),
+    ];
+    assert_eq!(first.seed(), seed);
+    assert_eq!(
+        first
+            .cases()
+            .iter()
+            .map(|case| (case.surface(), case.scenario()))
+            .collect::<Vec<_>>(),
+        required,
+        "the seeded battery case order is fixed"
+    );
+
+    for case in first.cases() {
+        assert!(!case.attempted().operations().is_empty());
+        assert!(case
+            .trace()
+            .windows(2)
+            .all(|pair| pair[0].sequence() < pair[1].sequence()));
+        let mut active_operation = None;
+        for entry in case.trace() {
+            if matches!(
+                entry.stage(),
+                FaultStage::Attempted | FaultStage::RequestClosed
+            ) {
+                assert_eq!(entry.operation_id(), entry.sequence());
+                active_operation = Some(entry.operation_id());
+            }
+            assert_eq!(active_operation, Some(entry.operation_id()));
+            assert!(case.trace().iter().all(|candidate| {
+                candidate.operation_id() != entry.operation_id()
+                    || candidate.operation() == entry.operation()
+            }));
+        }
+
+        match case.scenario() {
+            DurabilityScenario::FailBeforeCommit => {
+                assert!(matches!(
+                    case.outcome(),
+                    DurabilityOutcome::Failed(ServerError::Internal { .. })
+                ));
+                assert_eq!(case.committed().committed_operations(), 0);
+                assert_eq!(case.committed().successful_responses(), 0);
+                assert_first_attempt_not_committed(case);
+                assert_eq!(
+                    case.trace()
+                        .iter()
+                        .map(FaultTraceEntry::stage)
+                        .collect::<Vec<_>>(),
+                    [FaultStage::Attempted, FaultStage::BeforeCommitFailure]
+                );
+            }
+            DurabilityScenario::CommitError => {
+                assert!(matches!(
+                    case.outcome(),
+                    DurabilityOutcome::Failed(ServerError::Internal { .. })
+                ));
+                assert_eq!(case.committed().committed_operations(), 0);
+                assert_eq!(case.committed().successful_responses(), 0);
+                assert_first_attempt_not_committed(case);
+                assert_eq!(
+                    case.trace()
+                        .iter()
+                        .map(FaultTraceEntry::stage)
+                        .collect::<Vec<_>>(),
+                    [FaultStage::Attempted, FaultStage::CommitFailure]
+                );
+            }
+            DurabilityScenario::AckLoss => {
+                assert!(matches!(
+                    case.outcome(),
+                    DurabilityOutcome::Failed(ServerError::Internal { .. })
+                ));
+                assert_eq!(case.committed().committed_operations(), 1);
+                assert_eq!(case.committed().successful_responses(), 0);
+                assert_first_attempt_committed(case);
+                assert_eq!(
+                    case.trace()
+                        .iter()
+                        .map(FaultTraceEntry::stage)
+                        .collect::<Vec<_>>(),
+                    [
+                        FaultStage::Attempted,
+                        FaultStage::Committed,
+                        FaultStage::AcknowledgementLost,
+                    ]
+                );
+            }
+            DurabilityScenario::ReceiptReplay => {
+                let committed_receipt = committed_journal_receipt(case);
+                assert_eq!(
+                    case.outcome(),
+                    &DurabilityOutcome::Receipt(committed_receipt)
+                );
+                assert!(matches!(
+                    case.outcomes()[0],
+                    DurabilityOutcome::Failed(ServerError::Internal { .. })
+                ));
+                assert_eq!(
+                    case.outcomes()[1].receipt(),
+                    Some(committed_receipt),
+                    "the replay must return the original committed range"
+                );
+                assert_eq!(case.committed().committed_operations(), 1);
+                assert_eq!(case.committed().successful_responses(), 1);
+                assert_eq!(case.attempted().operations().len(), 2);
+                assert!(case
+                    .trace()
+                    .iter()
+                    .any(|entry| entry.stage() == FaultStage::ReceiptReplayed));
+                assert_first_attempt_committed(case);
+                assert_eq!(
+                    case.trace()
+                        .iter()
+                        .map(FaultTraceEntry::stage)
+                        .collect::<Vec<_>>(),
+                    [
+                        FaultStage::Attempted,
+                        FaultStage::Committed,
+                        FaultStage::AcknowledgementLost,
+                        FaultStage::Attempted,
+                        FaultStage::ReceiptReplayed,
+                        FaultStage::Succeeded,
+                    ]
+                );
+            }
+            DurabilityScenario::PayloadMismatch => {
+                let committed_receipt = committed_journal_receipt(case);
+                assert!(matches!(
+                    case.outcome(),
+                    DurabilityOutcome::Failed(ServerError::InvalidState(_))
+                ));
+                assert_eq!(
+                    case.outcomes(),
+                    [
+                        DurabilityOutcome::Receipt(committed_receipt),
+                        case.outcome().clone(),
+                    ]
+                );
+                assert_eq!(case.committed().committed_operations(), 1);
+                assert_eq!(case.committed().successful_responses(), 1);
+                assert_eq!(case.attempted().operations().len(), 2);
+                assert_first_attempt_committed(case);
+                assert_eq!(
+                    case.trace()
+                        .iter()
+                        .map(FaultTraceEntry::stage)
+                        .collect::<Vec<_>>(),
+                    [
+                        FaultStage::Attempted,
+                        FaultStage::Committed,
+                        FaultStage::Succeeded,
+                        FaultStage::Attempted,
+                        FaultStage::CommitFailure,
+                    ]
+                );
+            }
+            DurabilityScenario::RequestCloseWhileHeld => {
+                assert!(matches!(
+                    case.outcome(),
+                    DurabilityOutcome::Failed(ServerError::InvalidState(_))
+                ));
+                assert_eq!(case.committed().committed_operations(), 1);
+                assert_eq!(case.committed().successful_responses(), 1);
+                assert_eq!(case.attempted().operations().len(), 1);
+                let accepted = match case.surface() {
+                    DurabilitySurface::Journal => {
+                        DurabilityOutcome::Receipt(committed_journal_receipt(case))
+                    }
+                    DurabilitySurface::World | DurabilitySurface::Player => {
+                        DurabilityOutcome::Succeeded
+                    }
+                    _ => panic!("battery returned an unknown storage surface"),
+                };
+                assert_eq!(
+                    case.outcomes(),
+                    [
+                        accepted,
+                        DurabilityOutcome::Failed(ServerError::invalid_state(
+                            "fault store request side is closed"
+                        )),
+                    ]
+                );
+                assert_first_attempt_committed(case);
+                assert_eq!(
+                    case.trace()
+                        .iter()
+                        .map(FaultTraceEntry::stage)
+                        .collect::<Vec<_>>(),
+                    [
+                        FaultStage::Attempted,
+                        FaultStage::HeldBeforeCommit,
+                        FaultStage::Committed,
+                        FaultStage::Succeeded,
+                        FaultStage::RequestClosed,
+                    ]
+                );
+            }
+            DurabilityScenario::ResponseCloseWhileHeld => {
+                assert!(matches!(
+                    case.outcome(),
+                    DurabilityOutcome::Failed(ServerError::InvalidState(_))
+                ));
+                assert_eq!(case.committed().committed_operations(), 1);
+                assert_eq!(case.committed().successful_responses(), 0);
+                assert_first_attempt_committed(case);
+                assert_eq!(
+                    case.trace()
+                        .iter()
+                        .map(FaultTraceEntry::stage)
+                        .collect::<Vec<_>>(),
+                    [
+                        FaultStage::Attempted,
+                        FaultStage::Committed,
+                        FaultStage::HeldResponse,
+                        FaultStage::ResponseClosed,
+                    ]
+                );
+            }
+            DurabilityScenario::EmptyBatch | DurabilityScenario::MaximumBatch => {
+                let expected = match case.surface() {
+                    DurabilitySurface::World => DurabilityOutcome::Succeeded,
+                    DurabilitySurface::Journal => {
+                        DurabilityOutcome::Receipt(committed_journal_receipt(case))
+                    }
+                    DurabilitySurface::Player => {
+                        panic!("player surface has no batch boundary cases")
+                    }
+                    _ => panic!("battery returned an unknown storage surface"),
+                };
+                assert_eq!(case.outcome(), &expected);
+                assert_eq!(case.committed().successful_responses(), 1);
+                assert_first_attempt_committed(case);
+                assert_eq!(
+                    case.trace()
+                        .iter()
+                        .map(FaultTraceEntry::stage)
+                        .collect::<Vec<_>>(),
+                    [
+                        FaultStage::Attempted,
+                        FaultStage::Committed,
+                        FaultStage::Succeeded,
+                    ]
+                );
+            }
+            DurabilityScenario::OversizedBatch => {
+                assert!(matches!(
+                    case.outcome(),
+                    DurabilityOutcome::Failed(ServerError::Capacity(_))
+                ));
+                assert_eq!(case.committed().committed_operations(), 0);
+                assert_eq!(case.committed().successful_responses(), 0);
+                assert_first_attempt_not_committed(case);
+                assert_eq!(
+                    case.trace()
+                        .iter()
+                        .map(FaultTraceEntry::stage)
+                        .collect::<Vec<_>>(),
+                    [FaultStage::Attempted, FaultStage::CommitFailure]
+                );
+            }
+            _ => panic!("battery returned an unknown scenario"),
+        }
+    }
+
+    let world_maximum = first
+        .case(DurabilitySurface::World, DurabilityScenario::MaximumBatch)
+        .expect("world maximum");
+    assert_eq!(
+        world_maximum.committed().committed_operations(),
+        1,
+        "the exact maximum commits atomically"
+    );
+    assert_eq!(
+        world_maximum.attempted().operations()[0]
+            .entities()
+            .expect("maximum entities")
+            .len(),
+        MAX_SAVE_BATCH
+    );
+    let journal_maximum = first
+        .case(DurabilitySurface::Journal, DurabilityScenario::MaximumBatch)
+        .expect("journal maximum");
+    let maximum_batch_id = journal_maximum.attempted().operations()[0]
+        .journal_batch_id()
+        .expect("maximum batch id");
+    let maximum_receipt = journal_maximum
+        .committed()
+        .journal_receipt(maximum_batch_id)
+        .expect("maximum receipt");
+    assert_eq!(
+        journal_maximum.committed().block_mutations().len(),
+        MAX_SAVE_BATCH
+    );
+    assert_eq!(maximum_receipt.first_id(), Some(0));
+    assert_eq!(
+        maximum_receipt.last_id(),
+        Some(u64::try_from(MAX_SAVE_BATCH - 1).expect("maximum fits u64"))
+    );
+    assert_eq!(maximum_receipt.len(), MAX_SAVE_BATCH);
+    assert_eq!(journal_maximum.committed().block_mutations()[0].id(), 0);
+    assert_eq!(
+        journal_maximum.committed().block_mutations()[MAX_SAVE_BATCH - 1].id(),
+        u64::try_from(MAX_SAVE_BATCH - 1).expect("maximum fits u64")
+    );
+
+    let journal_empty = first
+        .case(DurabilitySurface::Journal, DurabilityScenario::EmptyBatch)
+        .expect("journal empty");
+    let empty_batch_id = journal_empty.attempted().operations()[0]
+        .journal_batch_id()
+        .expect("empty batch id");
+    assert!(journal_empty
+        .committed()
+        .journal_receipt(empty_batch_id)
+        .expect("empty receipt")
+        .is_empty());
+    assert!(journal_empty.committed().block_mutations().is_empty());
+
+    for surface in [DurabilitySurface::World, DurabilitySurface::Journal] {
+        assert_eq!(
+            first
+                .case(surface, DurabilityScenario::EmptyBatch)
+                .expect("empty boundary")
+                .attempted()
+                .operations()[0]
+                .item_count(),
+            0
+        );
+        assert_eq!(
+            first
+                .case(surface, DurabilityScenario::MaximumBatch)
+                .expect("maximum boundary")
+                .attempted()
+                .operations()[0]
+                .item_count(),
+            MAX_SAVE_BATCH
+        );
+        assert_eq!(
+            first
+                .case(surface, DurabilityScenario::OversizedBatch)
+                .expect("oversized boundary")
+                .attempted()
+                .operations()[0]
+                .item_count(),
+            MAX_SAVE_BATCH + 1
+        );
+    }
+}
+
+#[tokio::test]
+async fn player_store_exposes_exact_attempted_committed_and_trace_views() {
+    let store = FaultInjectingStore::new();
+    let player = PlayerId::offline("packet33-player");
+    let record = PlayerRecord::new(SchemaVersion::new(3), GameMode::Adventure, vec![1, 3, 3, 7])
+        .expect("bounded player record");
+
+    store
+        .save_player(player, record.clone())
+        .await
+        .expect("save player");
+    assert_eq!(
+        store.snapshot().expect("saved snapshot").player(player),
+        Some(&record)
+    );
+    assert_eq!(
+        store.load_player(player).await.expect("load player"),
+        Some(record.clone())
+    );
+    assert!(store.delete_player(player).await.expect("delete player"));
+
+    let attempts = store.attempted_state().expect("player attempts");
+    assert_eq!(attempts.operations().len(), 3);
+    assert_eq!(
+        attempts.operations()[0].players(),
+        Some(&[(player, record)][..])
+    );
+    assert_eq!(attempts.operations()[1].player_id(), Some(player));
+    assert_eq!(attempts.operations()[2].player_id(), Some(player));
+
+    let snapshot = store.snapshot().expect("deleted snapshot");
+    assert!(snapshot.player(player).is_none());
+    assert_eq!(snapshot.attempted_operations(), 3);
+    assert_eq!(snapshot.committed_operations(), 2);
+    assert_eq!(snapshot.successful_responses(), 3);
+
+    let trace = store.trace().expect("player trace");
+    assert_eq!(
+        trace
+            .iter()
+            .map(|entry| (entry.operation(), entry.stage()))
+            .collect::<Vec<_>>(),
+        [
+            (FaultOperation::SavePlayer, FaultStage::Attempted),
+            (FaultOperation::SavePlayer, FaultStage::Committed),
+            (FaultOperation::SavePlayer, FaultStage::Succeeded),
+            (FaultOperation::LoadPlayer, FaultStage::Attempted),
+            (FaultOperation::LoadPlayer, FaultStage::Succeeded),
+            (FaultOperation::DeletePlayer, FaultStage::Attempted),
+            (FaultOperation::DeletePlayer, FaultStage::Committed),
+            (FaultOperation::DeletePlayer, FaultStage::Succeeded),
+        ]
+    );
 }
 
 #[tokio::test]

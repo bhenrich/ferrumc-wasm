@@ -25,12 +25,17 @@
 //! - [`ScriptedClient`]: an in-memory duplex byte pipe modelling a fake client
 //!   that records its traffic for assertion against a [`PacketScript`]. The
 //!   actual server wiring lands with M09/M11/M22.
-//! - [`FaultInjectingStore`]: an in-memory [`ferrumc_storage::WorldStore`] with
+//! - [`FaultInjectingStore`]: an in-memory
+//!   [`ferrumc_storage::WorldStore`]/[`ferrumc_storage::PlayerStore`] with
 //!   deterministic commit/response cutpoints, idempotent journal-receipt replay,
 //!   committed-state inspection, and an ordered operation trace for
 //!   crash-consistency tests.
+//! - [`DurabilityFaultBattery`]: a fixed, seeded matrix that applies those
+//!   cutpoints to world, player, and journal writes and returns exact attempted,
+//!   committed, outcome, and trace reports.
 
 mod client;
+mod durability_battery;
 mod fault_store;
 mod hex;
 mod oracle;
@@ -38,6 +43,10 @@ mod roundtrip;
 mod transcript;
 
 pub use client::ScriptedClient;
+pub use durability_battery::{
+    DurabilityBatteryError, DurabilityBatteryReport, DurabilityCaseReport, DurabilityFaultBattery,
+    DurabilityOutcome, DurabilityScenario, DurabilitySurface,
+};
 pub use fault_store::{
     FaultGate, FaultInjectingStore, FaultOperation, FaultStage, FaultStoreAttempt,
     FaultStoreAttemptedState, FaultStoreControlError, FaultStoreSnapshot, FaultTraceEntry,
