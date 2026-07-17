@@ -15,7 +15,8 @@
 //! The driver advances the shard on a fixed interval with **no catch-up**
 //! ([`MissedTickBehavior::Skip`]), matching the project's overload rule, and
 //! never blocks: channel sends are non-blocking inside the router, and a full
-//! inbox defers inputs rather than stalling.
+//! simulation inbox leaves excess inputs in the bounded router channel for the
+//! next tick rather than consuming and dropping them.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
@@ -36,7 +37,8 @@ use ferrumc_proto::generated::play::{
     ChunkDataAndLight, ClientboundPlayPacket, GameEvent, UpdateTime,
 };
 use ferrumc_session::{
-    sign_block_entity_data, NetEvent, PlayerSessionHandle, SessionError, SessionRouter,
+    sign_block_entity_data, DeliveryPolicy, InputDeliveryError, NetEvent, PlayerSessionHandle,
+    SessionError, SessionRouter,
 };
 use ferrumc_sim::{
     BlockStateId, ChunkTicket, GameInput, GameOutput, MutationCause, PendingMutation, RegionOp,
@@ -200,6 +202,9 @@ fn update_time_packet(world_time: &WorldTime) -> ClientboundPlayPacket {
     ))
 }
 
+/// A one-shot acknowledgement of bounded shard-input admission.
+type DeliveryReply = oneshot::Sender<Result<(), SessionError>>;
+
 /// A request from a connection task to the simulation/session driver.
 ///
 /// The enum is the only way a connection influences simulation state; it carries
@@ -225,7 +230,13 @@ pub(crate) enum SimCommand {
     },
     /// Route a translated network event (a play packet or a disconnect) to the
     /// player's shard.
-    Event(NetEvent),
+    Event {
+        /// The validated network event to route.
+        event: NetEvent,
+        /// Optional acceptance reply used when a caller must not publish an
+        /// after-event or client preview before bounded shard admission.
+        acceptance: Option<DeliveryReply>,
+    },
     /// Stream chunks around a moving player: release the player tickets on every
     /// chunk in `unload`, then load-or-generate every chunk in `load` (acquiring a
     /// player ticket on each) and reply with the freshly built chunk packets.
@@ -277,18 +288,21 @@ pub(crate) enum SimCommand {
         player: PlayerId,
         /// The new game mode.
         mode: GameMode,
+        /// Optional bounded-shard acceptance reply.
+        acceptance: Option<DeliveryReply>,
     },
     /// Place the held block at `position` after a player `UseItemOn` (the only
     /// caller — plugin/command exact writes use [`SetBlockExact`](Self::SetBlockExact)).
     ///
     /// The connection resolved `state` from the player's selected hotbar slot
     /// (the simulation stays inventory-free), then routed it here. The driver
-    /// previews the refined placement on the resident chunk, replies with the
-    /// final computed state over `reply` (so the connection can fire its
-    /// `after_block_place` hook with the state the world will hold), then forwards
-    /// the edit to the block's owning shard as a [`GameInput::BlockPlace`], which
-    /// validates it (actor present, chunk resident, in reach) at the tick boundary
-    /// and, on acceptance, writes the refined state. Spawn-protection veto and the
+    /// first admits the edit to the block's owning shard as a
+    /// [`GameInput::BlockPlace`]. Only after bounded admission does it preview the
+    /// refined placement on the resident chunk and reply with the final computed
+    /// state (so the connection can fire its `after_block_place` hook with the
+    /// state the world will hold). The simulation validates the admitted input
+    /// (actor present, chunk resident, in reach) at the tick boundary and, on
+    /// acceptance, writes the refined state. Spawn-protection veto and the
     /// empty-hand / non-placeable cases are handled at the connection before this
     /// command is ever sent.
     PlaceBlock {
@@ -307,12 +321,10 @@ pub(crate) enum SimCommand {
         cursor_position: Vec3,
         /// The player's yaw in degrees at place time.
         player_yaw: f32,
-        /// One-shot reply carrying the final computed block-state (the refinement
-        /// the tick will apply), so the connection fires `after_block_place` with
-        /// the state the world holds rather than the held default. `None` is never
-        /// sent today (an unsupported block previews to the held state), but the
-        /// channel is `Option` so a dropped reply still has a safe fallback.
-        reply: oneshot::Sender<Option<BlockStateId>>,
+        /// One-shot reply carrying the final computed block-state only after
+        /// bounded shard acceptance, or the classified rejection that terminated
+        /// the overloaded session.
+        reply: oneshot::Sender<Result<BlockStateId, SessionError>>,
     },
     /// Write an exact, authoritative block-state at `position`, applied verbatim
     /// (NOT refined by `compute_placement`).
@@ -333,6 +345,8 @@ pub(crate) enum SimCommand {
         sequence: i32,
         /// The exact block-state to write, applied verbatim.
         state: BlockStateId,
+        /// Optional bounded-shard acceptance reply.
+        acceptance: Option<DeliveryReply>,
     },
     /// Apply a region (cuboid) block edit on behalf of `player` — the `/fill` and
     /// `/replace` commands.
@@ -349,6 +363,8 @@ pub(crate) enum SimCommand {
         region: Cuboid,
         /// How every block in the cuboid changes.
         op: RegionOp,
+        /// Optional bounded-shard acceptance reply.
+        acceptance: Option<DeliveryReply>,
     },
     /// Undo `player`'s most recent region edit — the `/undo` command.
     ///
@@ -358,6 +374,8 @@ pub(crate) enum SimCommand {
     RegionUndo {
         /// The player whose most recent region edit is undone.
         player: PlayerId,
+        /// Optional bounded-shard acceptance reply.
+        acceptance: Option<DeliveryReply>,
     },
     /// Resync + acknowledge a block edit refused at the connection (a plugin
     /// `Deny` / spawn-protection veto) without mutating the world.
@@ -380,6 +398,8 @@ pub(crate) enum SimCommand {
         /// The state the client predicted (air for a break, the held block for a
         /// place); used only to classify the metric.
         requested_state: BlockStateId,
+        /// Optional bounded-shard acceptance reply.
+        acceptance: Option<DeliveryReply>,
     },
     /// Teleport `player` to `position`.
     ///
@@ -393,6 +413,8 @@ pub(crate) enum SimCommand {
         player: PlayerId,
         /// The destination position.
         position: Vec3,
+        /// Optional bounded-shard acceptance reply.
+        acceptance: Option<DeliveryReply>,
     },
     /// Teleport `player` to the current position of the online player named
     /// `target` — the `/tp <player>` command.
@@ -408,6 +430,8 @@ pub(crate) enum SimCommand {
         player: PlayerId,
         /// The display name of the online player to teleport to.
         target: String,
+        /// Optional bounded-shard acceptance reply.
+        acceptance: Option<DeliveryReply>,
     },
     /// Set the authoritative game mode of the online player named `target` and
     /// switch their client — the `/gamemode <mode> <player>` command.
@@ -424,6 +448,8 @@ pub(crate) enum SimCommand {
         target: String,
         /// The new game mode.
         mode: GameMode,
+        /// Optional bounded-shard acceptance reply.
+        acceptance: Option<DeliveryReply>,
     },
     /// Broadcast a weather change to every connected player — the `/weather`
     /// command.
@@ -511,6 +537,8 @@ pub(crate) enum SimCommand {
         is_front: bool,
         /// The four new text lines, top to bottom.
         lines: [String; ferrumc_world::SIGN_LINES],
+        /// Optional bounded-shard acceptance reply.
+        acceptance: Option<DeliveryReply>,
     },
     /// Probe whether the block at `position` is an openable chest and, if so,
     /// return a snapshot of its container for the player to open.
@@ -553,6 +581,53 @@ pub(crate) enum SimCommand {
         /// if the click could not be applied (the caller keeps its cursor).
         reply: oneshot::Sender<Option<(ItemStack, Vec<ItemStack>)>>,
     },
+}
+
+impl SimCommand {
+    /// Returns whether this command crosses the bounded shard-input boundary and
+    /// can acknowledge that admission to its caller.
+    pub(crate) fn supports_delivery_acceptance(&self) -> bool {
+        matches!(
+            self,
+            Self::Event { .. }
+                | Self::SetGameMode { .. }
+                | Self::SetBlockExact { .. }
+                | Self::RegionEdit { .. }
+                | Self::RegionUndo { .. }
+                | Self::RejectBlockEdit { .. }
+                | Self::TeleportPlayer { .. }
+                | Self::TeleportToPlayer { .. }
+                | Self::SetGameModeFor { .. }
+                | Self::UpdateSign { .. }
+        )
+    }
+
+    /// Attaches a one-shot bounded-shard acceptance reply.
+    ///
+    /// Returns the untouched sender when this command has no shard-input
+    /// admission step. Callers use
+    /// [`supports_delivery_acceptance`](Self::supports_delivery_acceptance)
+    /// before requesting one.
+    pub(crate) fn request_delivery_acceptance(
+        &mut self,
+        reply: DeliveryReply,
+    ) -> Result<(), DeliveryReply> {
+        let (Self::Event { acceptance, .. }
+        | Self::SetGameMode { acceptance, .. }
+        | Self::SetBlockExact { acceptance, .. }
+        | Self::RegionEdit { acceptance, .. }
+        | Self::RegionUndo { acceptance, .. }
+        | Self::RejectBlockEdit { acceptance, .. }
+        | Self::TeleportPlayer { acceptance, .. }
+        | Self::TeleportToPlayer { acceptance, .. }
+        | Self::SetGameModeFor { acceptance, .. }
+        | Self::UpdateSign { acceptance, .. }) = self
+        else {
+            return Err(reply);
+        };
+        *acceptance = Some(reply);
+        Ok(())
+    }
 }
 
 /// One chunk built for a [`SimCommand::StreamChunks`] request: the column
@@ -674,7 +749,7 @@ pub(crate) async fn run(
                     &mut tick,
                     &mut world_time,
                     &mut snap_ctx,
-                );
+                )?;
                 // End-of-tick flush: hand the tick's player edits to the storage
                 // worker without ever blocking the tick (see the helper).
                 if let Err(error) =
@@ -813,6 +888,94 @@ fn try_flush_persist_dirty(
     }
 }
 
+/// Turns one router delivery into either acceptance, a classified caller
+/// rejection after explicit session teardown, or a fatal driver error.
+fn enforce_input_delivery(
+    router: &mut SessionRouter,
+    player: PlayerId,
+    delivery: Result<(), InputDeliveryError>,
+    allow_retained_leave: bool,
+    operation: &str,
+) -> ServerResult<Result<(), SessionError>> {
+    let Err(rejection) = delivery else {
+        return Ok(Ok(()));
+    };
+    let policy = rejection.policy().policy();
+    let is_leave = matches!(rejection.input(), GameInput::PlayerLeave { .. });
+    let error = rejection.into_error();
+
+    if matches!(&error, SessionError::UnknownPlayer { .. }) {
+        return Ok(Err(error));
+    }
+    if !matches!(&error, SessionError::ShardInboxFull { .. }) {
+        return Err(ServerError::invalid_state(format!(
+            "{operation} could not reach its shard: {error}"
+        )));
+    }
+
+    // A connection teardown already has no live source to stop. SessionRouter
+    // retained its leave and mapping in the player-bounded pending set; the tick
+    // loop retries it after freeing shard capacity.
+    if is_leave && allow_retained_leave {
+        return Ok(Err(error));
+    }
+    if is_leave {
+        return Err(ServerError::capacity(format!(
+            "{operation} was accepted by simulation but its overloaded session could not enqueue PlayerLeave: {error}"
+        )));
+    }
+
+    match policy {
+        DeliveryPolicy::BestEffort => Ok(Ok(())),
+        DeliveryPolicy::Authoritative | DeliveryPolicy::Coalescible => {
+            match router.disconnect_player_owned(player) {
+                Ok(_) => Ok(Err(error)),
+                Err(disconnect_error) => Err(ServerError::capacity(format!(
+                    "{operation} was rejected by bounded shard capacity and the overloaded session could not enqueue PlayerLeave: {disconnect_error}"
+                ))),
+            }
+        }
+    }
+}
+
+/// Sends an optional caller acknowledgement for one classified delivery result.
+fn reply_delivery(acceptance: Option<DeliveryReply>, outcome: Result<(), SessionError>) {
+    if let Some(reply) = acceptance {
+        // A gone connection no longer needs the classification; the router has
+        // already accepted the input or enforced its overload outcome.
+        let _ = reply.send(outcome);
+    }
+}
+
+/// Routes an ordinary simulation input and enforces its typed overload policy.
+fn route_input_command(
+    router: &mut SessionRouter,
+    player: PlayerId,
+    input: GameInput,
+    acceptance: Option<DeliveryReply>,
+    operation: &str,
+) -> ServerResult<()> {
+    let delivery = router.route_game_input_owned(player, input);
+    let outcome = enforce_input_delivery(router, player, delivery, false, operation)?;
+    reply_delivery(acceptance, outcome);
+    Ok(())
+}
+
+/// Routes a server-driven teleport and withholds its client sync until bounded
+/// shard admission succeeds.
+fn route_teleport_command(
+    router: &mut SessionRouter,
+    player: PlayerId,
+    position: Vec3,
+    acceptance: Option<DeliveryReply>,
+    operation: &str,
+) -> ServerResult<()> {
+    let delivery = router.teleport_player_owned(player, position);
+    let outcome = enforce_input_delivery(router, player, delivery, false, operation)?;
+    reply_delivery(acceptance, outcome);
+    Ok(())
+}
+
 /// Applies one command against the router and/or the shard's chunk map.
 #[allow(clippy::too_many_arguments)] // threads the storage flush channel + tick context through
 #[allow(clippy::too_many_lines)] // one dispatch over every SimCommand variant
@@ -854,10 +1017,18 @@ async fn handle_command(
             // means the join handle is simply discarded.
             let _ = reply.send(result);
         }
-        SimCommand::Event(event) => {
-            if let Err(err) = router.route_event(&event) {
-                tracing::trace!(%err, "dropping network event");
-            }
+        SimCommand::Event { event, acceptance } => {
+            let player = event.player();
+            let allow_retained_leave = matches!(&event, NetEvent::Disconnected { .. });
+            let delivery = router.route_event_owned(&event);
+            let outcome = enforce_input_delivery(
+                router,
+                player,
+                delivery,
+                allow_retained_leave,
+                "network event",
+            )?;
+            reply_delivery(acceptance, outcome);
         }
         SimCommand::StreamChunks {
             load,
@@ -879,14 +1050,18 @@ async fn handle_command(
         SimCommand::BroadcastSystemChat { content, overlay } => {
             router.broadcast_system_chat(&content, overlay);
         }
-        SimCommand::SetGameMode { player, mode } => {
-            // Route the authoritative mode change to the player's shard. A gone
-            // player (already disconnected) simply has no shard to route to.
-            if let Err(err) =
-                router.route_game_input(player, GameInput::SetGameMode { player, mode })
-            {
-                tracing::trace!(%err, "dropping set-game-mode");
-            }
+        SimCommand::SetGameMode {
+            player,
+            mode,
+            acceptance,
+        } => {
+            route_input_command(
+                router,
+                player,
+                GameInput::SetGameMode { player, mode },
+                acceptance,
+                "set game mode",
+            )?;
         }
         SimCommand::PlaceBlock {
             player,
@@ -898,21 +1073,7 @@ async fn handle_command(
             player_yaw,
             reply,
         } => {
-            // Preview the refined placement against the resident chunk and hand it
-            // back to the connection BEFORE routing, so its after_block_place hook
-            // fires with the final computed state (not the held default). The
-            // preview shares run_tick's refinement helper and chunks mutate only at
-            // tick boundaries, so it matches what the tick applies for this single
-            // edit. The reply is sent here, off the tick — the connection does not
-            // wait ~50 ms for the next tick.
-            let computed =
-                shard.preview_placement(state, clicked_face, cursor_position, player_yaw, position);
-            let _ = reply.send(Some(computed));
-            // Route the UNCHANGED place to the block's owning shard (the same
-            // routing as any other block edit); the tick recomputes via the shared
-            // helper to an identical result, with the fence-neighbour pass intact. A
-            // gone player has no shard to route to.
-            if let Err(err) = router.route_game_input(
+            let delivery = router.route_game_input_owned(
                 player,
                 GameInput::BlockPlace {
                     player,
@@ -923,8 +1084,26 @@ async fn handle_command(
                     cursor_position,
                     player_yaw,
                 },
-            ) {
-                tracing::trace!(%err, "dropping block place");
+            );
+            let outcome =
+                enforce_input_delivery(router, player, delivery, false, "block placement")?;
+            match outcome {
+                Ok(()) => {
+                    // Preview only after admission. The tick recomputes through the
+                    // same helper, so the after-hook receives the final refined
+                    // state without previewing a rejected mutation.
+                    let computed = shard.preview_placement(
+                        state,
+                        clicked_face,
+                        cursor_position,
+                        player_yaw,
+                        position,
+                    );
+                    let _ = reply.send(Ok(computed));
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
             }
         }
         SimCommand::SetBlockExact {
@@ -932,10 +1111,10 @@ async fn handle_command(
             position,
             sequence,
             state,
+            acceptance,
         } => {
-            // Route the exact write to the block's owning shard as a verbatim
-            // SetBlockExact (no compute_placement). A gone player has no shard.
-            if let Err(err) = router.route_game_input(
+            route_input_command(
+                router,
                 player,
                 GameInput::SetBlockExact {
                     player,
@@ -943,40 +1122,42 @@ async fn handle_command(
                     sequence,
                     state,
                 },
-            ) {
-                tracing::trace!(%err, "dropping exact block set");
-            }
+                acceptance,
+                "exact block set",
+            )?;
         }
-        SimCommand::RegionEdit { player, region, op } => {
-            // Route the whole cuboid as one input so it applies at a single tick
-            // boundary (and never blows the bounded shard inbox). A gone player has
-            // no shard to route to.
-            if let Err(err) =
-                router.route_game_input(player, GameInput::RegionEdit { player, region, op })
-            {
-                tracing::trace!(%err, "dropping region edit");
-            }
+        SimCommand::RegionEdit {
+            player,
+            region,
+            op,
+            acceptance,
+        } => {
+            route_input_command(
+                router,
+                player,
+                GameInput::RegionEdit { player, region, op },
+                acceptance,
+                "region edit",
+            )?;
         }
-        SimCommand::RegionUndo { player } => {
-            // Route the undo to the player's shard, which restores the prior states
-            // its last region edit captured. A gone player has no shard to route to.
-            if let Err(err) = router.route_game_input(player, GameInput::RegionUndo { player }) {
-                tracing::trace!(%err, "dropping region undo");
-            }
+        SimCommand::RegionUndo { player, acceptance } => {
+            route_input_command(
+                router,
+                player,
+                GameInput::RegionUndo { player },
+                acceptance,
+                "region undo",
+            )?;
         }
         SimCommand::RejectBlockEdit {
             player,
             position,
             sequence,
             requested_state,
+            acceptance,
         } => {
-            // Route the refusal to the block's owning shard, which reads the
-            // authoritative state and emits a BlockChangeRejected (the actor's
-            // mandatory resync + ack). A gone player has no shard to route to.
-            // Best-effort: if the shard inbox is saturated the rejection is dropped
-            // (the ghost then persists until the client's next interaction), exactly
-            // as the original BlockBreak/BlockPlace inputs behave under the same load.
-            if let Err(err) = router.route_game_input(
+            route_input_command(
+                router,
                 player,
                 GameInput::RejectBlockEdit {
                     player,
@@ -984,25 +1165,31 @@ async fn handle_command(
                     sequence,
                     requested_state,
                 },
-            ) {
-                tracing::trace!(%err, "dropping block-edit rejection");
-            }
+                acceptance,
+                "block-edit rejection",
+            )?;
         }
-        SimCommand::TeleportPlayer { player, position } => {
-            // Snap the target's client and route an authoritative move. A gone
-            // player simply has no session to teleport.
-            if let Err(err) = router.teleport_player(player, position) {
-                tracing::trace!(%err, "dropping teleport");
-            }
+        SimCommand::TeleportPlayer {
+            player,
+            position,
+            acceptance,
+        } => {
+            route_teleport_command(router, player, position, acceptance, "teleport")?;
         }
-        SimCommand::TeleportToPlayer { player, target } => {
+        SimCommand::TeleportToPlayer {
+            player,
+            target,
+            acceptance,
+        } => {
             // Resolve the destination player by name against the live roster, read
             // their authoritative position (sim first, then the router's
             // join-seeded fallback for the tick before the join applies), and reuse
             // the teleport path to snap the issuer. An offline or position-less
-            // target is a logged no-op (the issuer already saw optimistic feedback).
+            // target is a logged no-op; the acceptance reply lets command feedback
+            // follow only after that outcome is known.
             let Some(target_id) = resolve_online_player(player_roster, &target) else {
                 tracing::trace!(%target, "tp target is not online");
+                reply_delivery(acceptance, Ok(()));
                 return Ok(());
             };
             let Some(position) = shard
@@ -1010,36 +1197,48 @@ async fn handle_command(
                 .or_else(|| router.player_position(target_id))
             else {
                 tracing::trace!(%target, "tp target has no known position");
+                reply_delivery(acceptance, Ok(()));
                 return Ok(());
             };
-            if let Err(err) = router.teleport_player(player, position) {
-                tracing::trace!(%err, "dropping teleport-to-player");
-            }
+            route_teleport_command(router, player, position, acceptance, "teleport to player")?;
         }
-        SimCommand::SetGameModeFor { target, mode } => {
+        SimCommand::SetGameModeFor {
+            target,
+            mode,
+            acceptance,
+        } => {
             // Resolve the target by name, route the authoritative mode change to
             // their shard, then switch their client with a GameEvent. An offline
             // target is a logged no-op.
             let Some(target_id) = resolve_online_player(player_roster, &target) else {
                 tracing::trace!(%target, "gamemode target is not online");
+                reply_delivery(acceptance, Ok(()));
                 return Ok(());
             };
-            if let Err(err) = router.route_game_input(
+            let delivery = router.route_game_input_owned(
                 target_id,
                 GameInput::SetGameMode {
                     player: target_id,
                     mode,
                 },
-            ) {
-                tracing::trace!(%err, "dropping targeted set-game-mode");
-            }
-            router.send_play_packet_to(
-                target_id,
-                ClientboundPlayPacket::GameEvent(GameEvent::new(
-                    GAME_EVENT_CHANGE_GAMEMODE,
-                    f32::from(mode.as_id()),
-                )),
             );
+            let outcome = enforce_input_delivery(
+                router,
+                target_id,
+                delivery,
+                false,
+                "targeted set game mode",
+            )?;
+            if outcome.is_ok() {
+                router.send_play_packet_to(
+                    target_id,
+                    ClientboundPlayPacket::GameEvent(GameEvent::new(
+                        GAME_EVENT_CHANGE_GAMEMODE,
+                        f32::from(mode.as_id()),
+                    )),
+                );
+            }
+            reply_delivery(acceptance, outcome);
         }
         SimCommand::SetWeather { raining } => {
             // Server-wide, client-visible weather toggle (no rain simulation in this
@@ -1088,11 +1287,10 @@ async fn handle_command(
             position,
             is_front,
             lines,
+            acceptance,
         } => {
-            // Route the sign edit to the block's owning shard. A gone player has no
-            // shard to route to; a full inbox drops it (the client's next edit
-            // retries), exactly like any other block-edit input under load.
-            if let Err(err) = router.route_game_input(
+            route_input_command(
+                router,
                 player,
                 GameInput::UpdateSign {
                     player,
@@ -1100,9 +1298,9 @@ async fn handle_command(
                     is_front,
                     lines,
                 },
-            ) {
-                tracing::trace!(%err, "dropping sign update");
-            }
+                acceptance,
+                "sign update",
+            )?;
         }
         SimCommand::OpenContainer {
             player,
@@ -1261,19 +1459,13 @@ fn run_tick(
     tick: &mut Tick,
     world_time: &mut WorldTime,
     snap: &mut SnapshotCtx,
-) {
+) -> ServerResult<()> {
     let start = Instant::now();
 
-    // Move everything the router queued since the last tick into the inbox; a
-    // full inbox stops the drain (reject backpressure) and retries next tick.
-    let mut inputs_drained = 0usize;
-    while let Ok(input) = shard_rx.try_recv() {
-        if let Err(err) = shard.enqueue(input) {
-            tracing::warn!(%err, "shard inbox full; deferring inputs to next tick");
-            break;
-        }
-        inputs_drained += 1;
-    }
+    // Move only what the simulation inbox can accept. Capacity is checked before
+    // receiving, so an excess authoritative input remains owned by the bounded
+    // router channel and is retried next tick.
+    let inputs_drained = drain_shard_inputs(shard, shard_rx)?;
     let inbox_len = shard.inbox_len();
 
     let outputs = shard.run_tick();
@@ -1314,7 +1506,34 @@ fn run_tick(
         closed.extend(router.route_output(output));
     }
     for player in closed {
-        let _ = router.disconnect_player(player);
+        if let Err(error) = router.disconnect_player_owned(player) {
+            match error.error() {
+                SessionError::ShardInboxFull { .. } | SessionError::UnknownPlayer { .. } => {
+                    // A full leave is retained in SessionRouter's player-bounded
+                    // pending set. The retry below (and each later tick) owns the
+                    // outcome; an already-gone player needs no further action.
+                }
+                _ => {
+                    return Err(ServerError::invalid_state(format!(
+                        "mandatory outbound teardown could not reach its shard: {error}"
+                    )));
+                }
+            }
+        }
+    }
+
+    // The channel was drained at the start of this tick, so retry retained
+    // lifecycle leaves now. A still-full control lane remains explicitly pending
+    // for the next tick; a closed/invalid shard is fatal rather than log-only.
+    if let Err(error) = router.retry_pending_disconnects() {
+        match error.error() {
+            SessionError::ShardInboxFull { .. } | SessionError::UnknownPlayer { .. } => {}
+            _ => {
+                return Err(ServerError::invalid_state(format!(
+                    "retained PlayerLeave retry could not reach its shard: {error}"
+                )));
+            }
+        }
     }
 
     // Advance and publish the authoritative tick (saturating: it never wraps
@@ -1360,6 +1579,31 @@ fn run_tick(
     // of the tick and only swaps an `Arc` pointer, so it never holds a lock across
     // the simulation work above.
     publish_snapshot(router, shard, metrics, *tick, snap);
+    Ok(())
+}
+
+/// Transfers bounded router inputs without consuming past the simulation
+/// inbox's available capacity.
+fn drain_shard_inputs(
+    shard: &mut SimShard,
+    shard_rx: &mut mpsc::Receiver<GameInput>,
+) -> ServerResult<usize> {
+    let mut inputs_drained = 0usize;
+    while !shard.is_inbox_full() {
+        let Ok(input) = shard_rx.try_recv() else {
+            break;
+        };
+        shard.enqueue(input).map_err(|error| {
+            // This task is the shard's sole owner, so no producer can fill the
+            // inbox between the capacity check and enqueue. Treat any violation
+            // as fatal instead of logging and continuing after consuming input.
+            ServerError::invalid_state(format!(
+                "simulation inbox rejected input after reporting capacity: {error}"
+            ))
+        })?;
+        inputs_drained += 1;
+    }
+    Ok(inputs_drained)
 }
 
 /// Builds and publishes the read-only [`ServerSnapshot`] for this tick.
@@ -1472,14 +1716,16 @@ mod tests {
     #![allow(clippy::similar_names)]
 
     use std::collections::BTreeMap;
+    use std::num::NonZeroUsize;
 
     use ferrumc_core::{GameMode, PlayerId, ServerError, Tick};
-    use ferrumc_math::{BlockPos, ChunkPos, Direction, ShardPos, Vec3};
+    use ferrumc_math::{BlockPos, ChunkPos, Cuboid, Direction, ShardPos, Vec3};
+    use ferrumc_net::DisconnectReason;
     use ferrumc_proto::generated::play::ClientboundPlayPacket;
-    use ferrumc_session::{PlayerSessionHandle, SessionRouter};
+    use ferrumc_session::{NetEvent, PlayerSessionHandle, SessionError, SessionRouter};
     use ferrumc_sim::{
-        BlockStateId, ChunkTicket, GameInput, SimShard, TicketReason, WorldTime, TIME_DAY,
-        TIME_NOON,
+        BlockStateId, ChunkTicket, GameInput, RegionOp, SimShard, TicketReason, WorldTime,
+        TIME_DAY, TIME_NOON,
     };
     use ferrumc_storage::InMemoryStore;
     use ferrumc_world::FlatWorldGenerator;
@@ -1488,13 +1734,81 @@ mod tests {
     use crate::storage_worker::StorageFlushRequest;
 
     use super::{
-        handle_command, release_chunks, release_chunks_acked, try_flush_persist_dirty, SimCommand,
+        drain_shard_inputs, handle_command, release_chunks, release_chunks_acked,
+        route_input_command, try_flush_persist_dirty, SimCommand,
     };
+
+    /// Builds one shard-mutating driver command for the saturation matrix.
+    type CommandBuilder = fn(PlayerId) -> SimCommand;
+
+    /// Builds one direct simulation input for the saturation matrix.
+    type InputBuilder = fn(PlayerId) -> GameInput;
 
     /// Drains every queued outbound packet on `handle` (used to discard
     /// join-visibility traffic before asserting on a command's effect).
     fn drain(handle: &mut PlayerSessionHandle) {
         while handle.try_recv().is_some() {}
+    }
+
+    /// Runs one driver command with deterministic in-memory dependencies.
+    async fn dispatch_test_command(
+        router: &mut SessionRouter,
+        roster: &mut BTreeMap<PlayerId, String>,
+        command: SimCommand,
+    ) -> Result<(), ServerError> {
+        let mut shard = SimShard::new(ShardPos::new(0, 0));
+        let store = InMemoryStore::new();
+        let generator = FlatWorldGenerator::new();
+        let (storage_tx, _storage_rx) = mpsc::channel(1);
+        let mut next_mutation_id = 0u64;
+        let mut world_time = WorldTime::new();
+        handle_command(
+            router,
+            &mut shard,
+            &store,
+            &generator,
+            &storage_tx,
+            Tick::ZERO,
+            &mut next_mutation_id,
+            &mut world_time,
+            roster,
+            command,
+        )
+        .await
+    }
+
+    /// Builds a connected player whose tiny data lane is stopped at one reserved
+    /// control slot.
+    fn data_saturated_router(
+        label: &str,
+    ) -> (
+        SessionRouter,
+        mpsc::Receiver<GameInput>,
+        PlayerSessionHandle,
+        PlayerId,
+    ) {
+        let mut router = SessionRouter::with_capacities_and_control_reserve(2, 8, 1);
+        let inbox = router.register_shard(ShardPos::new(0, 0));
+        let player = PlayerId::offline(label);
+        let handle = router
+            .join_player(player, label, spawn())
+            .expect("join occupies the data portion of the tiny queue");
+        (router, inbox, handle, player)
+    }
+
+    /// Proves an overload path enqueued no mutation: only the original join and
+    /// the reserved-lane leave reached the shard.
+    fn assert_join_then_overload_leave(inbox: &mut mpsc::Receiver<GameInput>, player: PlayerId) {
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerJoin { player: joined, .. }) if joined == player
+        ));
+        assert_eq!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerLeave { player }),
+            "the rejected mutation is replaced only by explicit session teardown",
+        );
+        assert!(inbox.try_recv().is_err());
     }
 
     /// The `(reason, value)` of the next outbound `GameEvent` on `handle`.
@@ -1755,13 +2069,295 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one named regression covers every authoritative input family
+    async fn full_shard_queue_never_silently_drops_authoritative_input() {
+        // Placement has a success-preview reply. Saturation must classify it as
+        // rejected, send no preview, and terminate through the reserved leave.
+        let (mut router, mut inbox, _handle, player) = data_saturated_router("overloaded-placer");
+        let mut roster = BTreeMap::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        dispatch_test_command(
+            &mut router,
+            &mut roster,
+            SimCommand::PlaceBlock {
+                player,
+                position: BlockPos::new(8, 65, 8),
+                sequence: 7,
+                state: BlockStateId::new(137),
+                clicked_face: Direction::East,
+                cursor_position: Vec3::new(0.5, 0.5, 0.5),
+                player_yaw: 0.0,
+                reply: reply_tx,
+            },
+        )
+        .await
+        .expect("overload is handled without killing the driver");
+
+        let rejection = reply_rx
+            .await
+            .expect("the driver classifies the placement outcome")
+            .expect_err("a success preview must not precede shard acceptance");
+        assert!(
+            matches!(rejection, SessionError::ShardInboxFull { .. }),
+            "the caller receives the classified capacity rejection",
+        );
+        assert!(
+            !router.is_player_connected(player),
+            "an authoritative overload must explicitly terminate the session",
+        );
+        assert_join_then_overload_leave(&mut inbox, player);
+
+        // Every command/input branch that mutates simulation state uses the same
+        // enforcement funnel. Each fresh tiny queue proves the rejected command
+        // itself never appears between PlayerJoin and PlayerLeave.
+        let command_cases: [(&str, CommandBuilder); 6] = [
+            ("exact-edit", |player| SimCommand::SetBlockExact {
+                player,
+                position: BlockPos::new(8, 65, 8),
+                sequence: 11,
+                state: BlockStateId::new(1),
+                acceptance: None,
+            }),
+            ("game-mode", |player| SimCommand::SetGameMode {
+                player,
+                mode: GameMode::Adventure,
+                acceptance: None,
+            }),
+            ("region-edit", |player| SimCommand::RegionEdit {
+                player,
+                region: Cuboid::new(BlockPos::new(8, 65, 8), BlockPos::new(9, 65, 9)),
+                op: RegionOp::Fill {
+                    state: BlockStateId::new(1),
+                },
+                acceptance: None,
+            }),
+            ("region-undo", |player| SimCommand::RegionUndo {
+                player,
+                acceptance: None,
+            }),
+            ("sign-edit", |player| SimCommand::UpdateSign {
+                player,
+                position: BlockPos::new(8, 65, 8),
+                is_front: true,
+                lines: std::array::from_fn(|index| format!("line {index}")),
+                acceptance: None,
+            }),
+            ("teleport-command", |player| SimCommand::TeleportPlayer {
+                player,
+                position: Vec3::new(24.0, 70.0, 24.0),
+                acceptance: None,
+            }),
+        ];
+        for (label, build) in command_cases {
+            let (mut router, mut inbox, mut handle, player) = data_saturated_router(label);
+            dispatch_test_command(&mut router, &mut BTreeMap::new(), build(player))
+                .await
+                .expect("data-lane overload is a session outcome, not a driver failure");
+            assert!(!router.is_player_connected(player), "{label}");
+            if label == "teleport-command" {
+                assert!(
+                    handle.try_recv().is_none(),
+                    "a rejected teleport must not preview a position sync",
+                );
+            }
+            assert_join_then_overload_leave(&mut inbox, player);
+        }
+
+        // The raw break/movement event classes also cannot disappear. Movement is
+        // coalescible by policy; this app deliberately classifies saturation as a
+        // flooding-session disconnect rather than retaining an unbounded latest
+        // value.
+        let input_cases: [(&str, InputBuilder); 2] = [
+            ("block-break", |player| GameInput::BlockBreak {
+                player,
+                position: BlockPos::new(8, 65, 8),
+                sequence: 13,
+            }),
+            ("movement", |player| GameInput::PlayerMove {
+                player,
+                position: Some(Vec3::new(9.0, 64.0, 9.0)),
+                yaw: None,
+                pitch: None,
+            }),
+        ];
+        for (label, build) in input_cases {
+            let (mut router, mut inbox, _handle, player) = data_saturated_router(label);
+            route_input_command(&mut router, player, build(player), None, label)
+                .expect("overload explicitly disconnects the source");
+            assert!(!router.is_player_connected(player), "{label}");
+            assert_join_then_overload_leave(&mut inbox, player);
+        }
+
+        // Rejection healing is control traffic: after ordinary data has stopped,
+        // it consumes the reserve instead of being dropped and leaves the session
+        // connected for the sim's resync+ack output.
+        let (mut router, mut inbox, _handle, player) = data_saturated_router("rejection-control");
+        let rejection = GameInput::RejectBlockEdit {
+            player,
+            position: BlockPos::new(8, 65, 8),
+            sequence: 17,
+            requested_state: BlockStateId::AIR,
+        };
+        route_input_command(
+            &mut router,
+            player,
+            rejection.clone(),
+            None,
+            "block-edit rejection",
+        )
+        .expect("the reserved control slot accepts rejection healing");
+        assert!(router.is_player_connected(player));
+        assert!(matches!(inbox.try_recv(), Ok(GameInput::PlayerJoin { .. })));
+        assert_eq!(inbox.try_recv(), Ok(rejection));
+
+        // A second join has no session to terminate; it is explicitly rejected
+        // through the existing join reply while the first mapping stays intact.
+        let mut router = SessionRouter::with_capacities(1, 8);
+        let _inbox = router.register_shard(ShardPos::new(0, 0));
+        let first = PlayerId::offline("first-join");
+        let _first_handle = router
+            .join_player(first, "first-join", spawn())
+            .expect("first join fills the tiny control queue");
+        let second = PlayerId::offline("second-join");
+        let (reply_tx, reply_rx) = oneshot::channel();
+        dispatch_test_command(
+            &mut router,
+            &mut BTreeMap::new(),
+            SimCommand::Join {
+                player: second,
+                name: "second-join".to_string(),
+                position: spawn(),
+                equipment: Vec::new(),
+                reply: reply_tx,
+            },
+        )
+        .await
+        .expect("join rejection is returned to its caller");
+        assert!(matches!(
+            reply_rx.await.expect("join reply"),
+            Err(SessionError::ShardInboxFull { .. })
+        ));
+        assert!(router.is_player_connected(first));
+        assert!(!router.is_player_connected(second));
+    }
+
+    #[test]
+    fn simulation_handoff_leaves_excess_authoritative_input_queued() {
+        let capacity = NonZeroUsize::new(1).expect("test capacity is non-zero");
+        let mut shard = SimShard::with_inbox_capacity(ShardPos::new(0, 0), capacity);
+        let (tx, mut rx) = mpsc::channel(2);
+        let player = PlayerId::offline("handoff");
+        let first = GameInput::PlayerJoin {
+            player,
+            position: spawn(),
+        };
+        let second = GameInput::SetGameMode {
+            player,
+            mode: GameMode::Adventure,
+        };
+        tx.try_send(first).expect("first bounded input");
+        tx.try_send(second.clone()).expect("second bounded input");
+
+        assert_eq!(
+            drain_shard_inputs(&mut shard, &mut rx).expect("handoff respects capacity"),
+            1,
+        );
+        assert_eq!(shard.inbox_len(), 1);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(second),
+            "the input beyond simulation capacity remains in the router channel",
+        );
+    }
+
+    #[test]
+    fn exhausted_control_lane_fails_closed_and_retains_the_leave() {
+        let mut router = SessionRouter::with_capacities(1, 8);
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let player = PlayerId::offline("control-exhausted");
+        let _handle = router
+            .join_player(player, "control-exhausted", spawn())
+            .expect("join physically fills the capacity-one queue");
+
+        let error = route_input_command(
+            &mut router,
+            player,
+            GameInput::RejectBlockEdit {
+                player,
+                position: BlockPos::new(8, 65, 8),
+                sequence: 19,
+                requested_state: BlockStateId::AIR,
+            },
+            None,
+            "block-edit rejection",
+        )
+        .expect_err("physical control-lane exhaustion must fail the driver closed");
+        assert!(matches!(error, ServerError::Capacity(_)));
+        assert!(router.is_player_connected(player));
+        assert_eq!(router.pending_disconnect_count(), 1);
+
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerJoin { player: joined, .. }) if joined == player
+        ));
+        router
+            .retry_pending_disconnects()
+            .expect("freed capacity accepts the retained leave");
+        assert!(!router.is_player_connected(player));
+        assert_eq!(router.pending_disconnect_count(), 0);
+        assert_eq!(inbox.try_recv(), Ok(GameInput::PlayerLeave { player }),);
+    }
+
+    #[tokio::test]
+    async fn full_disconnect_is_retained_until_control_capacity_returns() {
+        let mut router = SessionRouter::with_capacities(1, 8);
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let player = PlayerId::offline("disconnect-retry");
+        let _handle = router
+            .join_player(player, "disconnect-retry", spawn())
+            .expect("join physically fills the capacity-one queue");
+
+        dispatch_test_command(
+            &mut router,
+            &mut BTreeMap::new(),
+            SimCommand::Event {
+                event: NetEvent::disconnected(player, DisconnectReason::ServerShutdown),
+                acceptance: None,
+            },
+        )
+        .await
+        .expect("a saturated teardown remains explicit pending work");
+        assert!(router.is_player_connected(player));
+        assert_eq!(router.pending_disconnect_count(), 1);
+
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerJoin { player: joined, .. }) if joined == player
+        ));
+        router
+            .retry_pending_disconnects()
+            .expect("freed capacity accepts the retained disconnect");
+        assert!(!router.is_player_connected(player));
+        assert_eq!(inbox.try_recv(), Ok(GameInput::PlayerLeave { player }),);
+    }
+
+    #[tokio::test]
     async fn place_block_command_replies_with_the_refined_state() {
-        // The driver previews the placement and replies with the FINAL computed
-        // state (an east-face oak_log refines to axis=x, state 136) BEFORE routing
-        // the tick edit, so the connection fires after_block_place with the state
-        // the world will hold rather than the held default (137). An empty shard is
-        // enough: the axis-from-face rule consults the clicked face, not neighbours.
+        // After bounded routing succeeds, the driver previews the FINAL computed
+        // state (an east-face oak_log refines to axis=x, state 136), so the
+        // connection fires after_block_place with the state the world will hold
+        // rather than the held default (137). An empty shard is enough: the
+        // axis-from-face rule consults the clicked face, not neighbours.
         let mut router = SessionRouter::new();
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let player = PlayerId::offline("placer");
+        let _handle = router
+            .join_player(player, "placer", spawn())
+            .expect("join placer");
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerJoin { player: joined, .. }) if joined == player
+        ));
         let mut shard = SimShard::new(ShardPos::new(0, 0));
         let store = InMemoryStore::new();
         let generator = FlatWorldGenerator::new();
@@ -1782,7 +2378,7 @@ mod tests {
             &mut world_time,
             &mut player_roster,
             SimCommand::PlaceBlock {
-                player: PlayerId::offline("placer"),
+                player,
                 position: BlockPos::new(8, 65, 8),
                 sequence: 1,
                 state: BlockStateId::new(137), // oak_log default (axis=y)
@@ -1799,7 +2395,7 @@ mod tests {
             reply_rx
                 .await
                 .expect("driver replied with the computed state"),
-            Some(BlockStateId::new(136)),
+            Ok(BlockStateId::new(136)),
         );
     }
 
@@ -2003,6 +2599,7 @@ mod tests {
         let mut world_time = WorldTime::new();
         let mut roster = BTreeMap::new();
         roster.insert(target, "Joe".to_string());
+        let (acceptance_tx, acceptance_rx) = oneshot::channel();
 
         handle_command(
             &mut router,
@@ -2017,10 +2614,15 @@ mod tests {
             SimCommand::SetGameModeFor {
                 target: "Joe".to_string(),
                 mode: GameMode::Creative,
+                acceptance: Some(acceptance_tx),
             },
         )
         .await
         .expect("game-mode command does not cross a durability barrier");
+        assert_eq!(
+            acceptance_rx.await.expect("driver replies to command"),
+            Ok(())
+        );
 
         // The authoritative change is routed to the target's shard ...
         assert_eq!(
@@ -2033,6 +2635,59 @@ mod tests {
         // ... and the target's client is switched with change_game_mode (reason 3)
         // carrying creative (1.0).
         assert_eq!(next_game_event(&mut joe), (3, 1.0));
+    }
+
+    #[tokio::test]
+    async fn targeted_game_mode_preview_waits_for_shard_acceptance() {
+        let mut router = SessionRouter::with_capacities_and_control_reserve(3, 8, 1);
+        let mut inbox = router.register_shard(ShardPos::new(0, 0));
+        let issuer = PlayerId::offline("ModeOp");
+        let target = PlayerId::offline("ModeTarget");
+        let mut op = router
+            .join_player(issuer, "ModeOp", spawn())
+            .expect("join issuer");
+        let mut target_handle = router
+            .join_player(target, "ModeTarget", spawn())
+            .expect("join target");
+        drain(&mut op);
+        drain(&mut target_handle);
+        let mut roster = BTreeMap::new();
+        roster.insert(target, "ModeTarget".to_string());
+        let (acceptance_tx, acceptance_rx) = oneshot::channel();
+
+        dispatch_test_command(
+            &mut router,
+            &mut roster,
+            SimCommand::SetGameModeFor {
+                target: "ModeTarget".to_string(),
+                mode: GameMode::Adventure,
+                acceptance: Some(acceptance_tx),
+            },
+        )
+        .await
+        .expect("data-lane overload terminates only the target session");
+
+        assert!(matches!(
+            acceptance_rx.await.expect("classified command reply"),
+            Err(SessionError::ShardInboxFull { .. })
+        ));
+        assert!(!router.is_player_connected(target));
+        assert!(
+            target_handle.try_recv().is_none(),
+            "the client mode switch must not precede authoritative acceptance",
+        );
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerJoin { player, .. }) if player == issuer
+        ));
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerJoin { player, .. }) if player == target
+        ));
+        assert_eq!(
+            inbox.try_recv(),
+            Ok(GameInput::PlayerLeave { player: target })
+        );
     }
 
     #[tokio::test]
@@ -2071,6 +2726,7 @@ mod tests {
             SimCommand::TeleportToPlayer {
                 player: issuer,
                 target: "Joe".to_string(),
+                acceptance: None,
             },
         )
         .await

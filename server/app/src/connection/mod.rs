@@ -19,7 +19,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 
 use ferrumc_codec::BoundedString;
@@ -43,7 +43,7 @@ use ferrumc_proto::generated::status::{
     ClientboundStatusPacket, PongResponse, ServerboundStatusPacket,
 };
 
-use crate::observe;
+use crate::{driver::SimCommand, observe};
 
 mod chunk_stream;
 mod context;
@@ -57,6 +57,31 @@ mod serverbound_budget;
 pub(crate) use context::{build_status_response, ConnContext};
 
 use play::enter_play;
+
+/// Sends an authoritative driver command and waits until its bounded shard
+/// admission is known.
+///
+/// The driver either accepts the exact input or explicitly tears down the
+/// overloaded session before returning a classified rejection. Connection code
+/// uses this barrier before publishing success feedback, client previews, or
+/// plugin after-events.
+async fn send_sim_command_accepted(
+    ctx: &ConnContext,
+    mut command: SimCommand,
+) -> anyhow::Result<()> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    command
+        .request_delivery_acceptance(reply_tx)
+        .map_err(|_| anyhow::anyhow!("driver command has no shard-acceptance boundary"))?;
+    ctx.commands
+        .send(command)
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+    reply_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("simulation driver dropped the acceptance reply"))?
+        .map_err(|err| anyhow::anyhow!("simulation input rejected: {err}"))
+}
 
 /// The `next_state` value in a handshake that selects the status branch
 /// (server-list ping).

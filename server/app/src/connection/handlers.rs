@@ -37,7 +37,7 @@ use super::chunk_stream::{mirror_server_teleport, ChunkStream};
 use super::context::ConnContext;
 use super::outbound::{ack_sequence, enqueue_traced_classified, send_mandatory};
 use super::rate_limiter::ChatRateLimiter;
-use super::{spawn_sync, GAME_EVENT_CHANGE_GAMEMODE, JOIN_TELEPORT_ID};
+use super::{send_sim_command_accepted, spawn_sync, GAME_EVENT_CHANGE_GAMEMODE, JOIN_TELEPORT_ID};
 
 /// Handles one decoded serverbound play-frame body.
 ///
@@ -329,7 +329,10 @@ pub(super) async fn handle_play_body(
         .await;
     }
     ctx.commands
-        .send(SimCommand::Event(event))
+        .send(SimCommand::Event {
+            event,
+            acceptance: None,
+        })
         .await
         .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
 }
@@ -459,21 +462,27 @@ async fn handle_block_break(
                     .await?;
                 return Ok(());
             }
-            ctx.commands
-                .send(SimCommand::SetBlockExact {
+            send_sim_command_accepted(
+                ctx,
+                SimCommand::SetBlockExact {
                     player,
                     position,
                     sequence,
                     state: BlockStateId::new(block_state_id),
-                })
-                .await
-                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+                    acceptance: None,
+                },
+            )
+            .await?;
         }
         _ => {
-            ctx.commands
-                .send(SimCommand::Event(event))
-                .await
-                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+            send_sim_command_accepted(
+                ctx,
+                SimCommand::Event {
+                    event,
+                    acceptance: None,
+                },
+            )
+            .await?;
         }
     }
 
@@ -518,12 +527,10 @@ fn deliver_deny_message(
 /// the held block for a refused place); it is used only to classify the block-edit
 /// metric on the resulting rejection, never applied to the world.
 ///
-/// The heal is best-effort under overload: the [`SimCommand`] send is awaited (so it
-/// backpressures rather than drops), but the driver's onward route to the block's
-/// owning shard can still fail if that shard's inbox is saturated, in which case the
-/// rejection is dropped and the ghost persists until the client's next interaction —
-/// the same behaviour the original `BlockBreak` / `BlockPlace` inputs exhibit under
-/// the same sustained backpressure.
+/// The call waits for bounded shard admission. Rejection healing uses the
+/// control-reserved lane; if even that lane is physically full, the driver fails
+/// closed and retains a `PlayerLeave` retry rather than acknowledging or silently
+/// dropping the heal.
 async fn reject_block_edit(
     ctx: &ConnContext,
     player: PlayerId,
@@ -531,21 +538,23 @@ async fn reject_block_edit(
     sequence: i32,
     requested_state: BlockStateId,
 ) -> anyhow::Result<()> {
-    ctx.commands
-        .send(SimCommand::RejectBlockEdit {
+    send_sim_command_accepted(
+        ctx,
+        SimCommand::RejectBlockEdit {
             player,
             position,
             sequence,
             requested_state,
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
+            acceptance: None,
+        },
+    )
+    .await
 }
 
 /// Routes the [`WorldIntent`]s a plugin emitted from a block decision (or an
 /// after-* notification).
 ///
-/// Mapping (best-effort; the emitted-intent surface is dev-only and bounded):
+/// Mapping (bounded; world-changing intents wait for shard admission):
 /// - [`WorldIntent::SetBlock`] -> [`SimCommand::SetBlockExact`] by the acting
 ///   player (an exact write applied verbatim, never refined by `compute_placement`).
 /// - [`WorldIntent::Message`] -> a system chat to the acting player's own writer
@@ -582,15 +591,17 @@ async fn route_emitted_intents(
                     );
                     continue;
                 }
-                ctx.commands
-                    .send(SimCommand::SetBlockExact {
+                send_sim_command_accepted(
+                    ctx,
+                    SimCommand::SetBlockExact {
                         player: actor,
                         position: pos,
                         sequence,
                         state: BlockStateId::new(block_state_id),
-                    })
-                    .await
-                    .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+                        acceptance: None,
+                    },
+                )
+                .await?;
             }
             WorldIntent::Message { player, message } => {
                 if player == actor {
@@ -619,10 +630,15 @@ async fn route_emitted_intents(
                 // The connection cannot reach another player's channel; the
                 // driver-owned router snaps the target and routes the authoritative
                 // move.
-                ctx.commands
-                    .send(SimCommand::TeleportPlayer { player, position })
-                    .await
-                    .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+                send_sim_command_accepted(
+                    ctx,
+                    SimCommand::TeleportPlayer {
+                        player,
+                        position,
+                        acceptance: None,
+                    },
+                )
+                .await?;
             }
             _ => {
                 tracing::debug!("plugin emitted an intent with no connection-side route; skipping");
@@ -643,13 +659,13 @@ async fn route_emitted_intents(
 /// its [`CommandResult`](ferrumc_command::CommandResult) feedback (for success or
 /// logical failure).
 ///
-/// On a successful `/spawn` the player is also teleported: a
-/// `SynchronizePlayerPosition` is queued to their socket and a move is sent to the
-/// simulation so the authoritative position updates and viewers see the teleport.
-/// On a successful `/gamemode <id>` a `GameEvent` with reason `3`
-/// (`change_game_mode`) carrying the mode id is queued so the client actually
-/// switches mode.
+/// On a successful `/spawn`, the authoritative move is admitted before
+/// `SynchronizePlayerPosition` is queued to the socket. On a successful
+/// `/gamemode <id>`, the authoritative mode change is admitted before the
+/// `GameEvent` with reason `3` (`change_game_mode`) switches the client. Command
+/// success feedback and plugin after-effects follow the same admission barrier.
 #[allow(clippy::too_many_arguments)] // one command step: dispatch + feedback + side effects + I/O
+#[allow(clippy::too_many_lines)] // one ordered transaction keeps admission before every visible success
 async fn handle_command(
     ctx: &ConnContext,
     player: PlayerId,
@@ -686,49 +702,32 @@ async fn handle_command(
         }
     };
 
-    // The handler ran: show its feedback to the issuer (covers both a success and a
-    // `CommandResult::failure`). A handler may return empty feedback to suppress its
-    // own line — e.g. `/time query daytime`, whose authoritative answer the driver
-    // sends — so skip enqueuing a blank chat line in that case.
-    if !result.feedback().to_plain_string().is_empty() {
-        enqueue_traced_classified(
-            writer,
-            debug,
-            compression,
-            &ctx.clock,
-            ferrumc_session::system_chat(result.feedback(), false),
-        );
-    }
     if !result.is_success() {
+        if !result.feedback().to_plain_string().is_empty() {
+            enqueue_traced_classified(
+                writer,
+                debug,
+                compression,
+                &ctx.clock,
+                ferrumc_session::system_chat(result.feedback(), false),
+            );
+        }
         return Ok(());
     }
 
-    // Presentation commands (/title, /subtitle, /actionbar, /playsound, /particle)
-    // carry their clientbound effect as one or more packets; enqueue each.
-    // `presentation_packets` returns empty for every other command, so this is a
-    // no-op for the /spawn and /gamemode side effects handled below.
-    for packet in crate::command::presentation_packets(command, policy.spawn()) {
-        enqueue_traced_classified(writer, debug, compression, &ctx.clock, packet);
-    }
-
-    // Scoreboard/team/boss-bar commands likewise carry their clientbound effect as
-    // one or more packets, built (and NBT-encoded) here; `scoreboard_packets`
-    // returns empty for every other command. `name` is the issuer, the default
-    // target of `/team join`.
-    for packet in crate::command::scoreboard_packets(command, name)? {
-        enqueue_traced_classified(writer, debug, compression, &ctx.clock, packet);
-    }
-
-    // Region build commands (/fill, /replace, /undo) carry their effect as block
-    // mutations the simulation owns; route each to the issuer's shard through the
-    // block-mutation funnel (the same path single edits use). `region_commands`
-    // returns empty for every other command — and for an over-cap region, which
-    // the executor already rejected above with a clear error.
+    // Route every driver-owned command effect before publishing success feedback.
+    // Shard-mutating commands wait for their explicit bounded admission; pure
+    // driver-owned presentation/time commands need only cross the already-bounded
+    // app command channel.
     for sim_command in crate::command::region_commands(command, player) {
-        ctx.commands
-            .send(sim_command)
-            .await
-            .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+        if sim_command.supports_delivery_acceptance() {
+            send_sim_command_accepted(ctx, sim_command).await?;
+        } else {
+            ctx.commands
+                .send(sim_command)
+                .await
+                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+        }
     }
 
     let first_token = command.split_whitespace().next();
@@ -737,9 +736,23 @@ async fn handle_command(
         // Snap the player to spawn at their CURRENT look: the previous `0.0/0.0`
         // reset them to facing south and level on every `/spawn`.
         let sync = spawn_sync(JOIN_TELEPORT_ID, spawn, *player_yaw, *player_pitch);
-        // Mirror this server-driven teleport into the persistence state so a
-        // leave-save before the client confirms and reports a follow-up move still
-        // captures the spawn position, not the pre-`/spawn` one.
+        let move_event = NetEvent::play(
+            player,
+            ServerboundPlayPacket::SetPlayerPosition(SetPlayerPosition::new(
+                spawn.x, spawn.y, spawn.z, 0,
+            )),
+        );
+        send_sim_command_accepted(
+            ctx,
+            SimCommand::Event {
+                event: move_event,
+                acceptance: None,
+            },
+        )
+        .await?;
+        // Only after admission may the client/persistence mirrors preview the
+        // teleport. A rejected route terminates the overloaded session above and
+        // never reaches these effects.
         mirror_server_teleport(chunk_stream, player_yaw, player_pitch, &sync);
         enqueue_traced_classified(
             writer,
@@ -748,21 +761,19 @@ async fn handle_command(
             &ctx.clock,
             ClientboundPlayPacket::SynchronizePlayerPosition(sync),
         );
-        let move_event = NetEvent::play(
-            player,
-            ServerboundPlayPacket::SetPlayerPosition(SetPlayerPosition::new(
-                spawn.x, spawn.y, spawn.z, 0,
-            )),
-        );
-        ctx.commands
-            .send(SimCommand::Event(move_event))
-            .await
-            .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
     } else if first_token == Some(GAMEMODE_COMMAND) {
-        // Make the mode change observable: a GameEvent (reason 3 = change_game_mode)
-        // carrying the mode id switches the client's mode. The argument is parsed
-        // the same way the handler validated it so the two always agree.
         if let Some(mode) = parse_gamemode(command) {
+            send_sim_command_accepted(
+                ctx,
+                SimCommand::SetGameMode {
+                    player,
+                    mode,
+                    acceptance: None,
+                },
+            )
+            .await?;
+            // Switch both client-side mirrors only after authoritative shard
+            // admission, so saturation cannot split visual and simulation modes.
             enqueue_traced_classified(
                 writer,
                 debug,
@@ -773,19 +784,29 @@ async fn handle_command(
                     f32::from(mode.as_id()),
                 )),
             );
-            // The GameEvent only switches the CLIENT. Also mutate the authoritative
-            // server-side mode (in the sim's PlayerState) so future enforcement
-            // (creative no-decrement, break speed, flight) reads the right mode; the
-            // visual switch and the authoritative state must not diverge.
-            ctx.commands
-                .send(SimCommand::SetGameMode { player, mode })
-                .await
-                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
-            // Keep the connection-local mirror in lockstep: it is the synchronous
-            // source the creative-slot gate reads, and the connection is its sole
-            // writer, so it must update here too.
             inventory.set_game_mode(mode);
         }
+    }
+
+    // The handler ran and every authoritative side effect above was accepted:
+    // only now may the issuer receive success feedback.
+    if !result.feedback().to_plain_string().is_empty() {
+        enqueue_traced_classified(
+            writer,
+            debug,
+            compression,
+            &ctx.clock,
+            ferrumc_session::system_chat(result.feedback(), false),
+        );
+    }
+
+    // Presentation and scoreboard commands have no shard mutation. Enqueue their
+    // clientbound effects after the same successful dispatch point.
+    for packet in crate::command::presentation_packets(command, policy.spawn()) {
+        enqueue_traced_classified(writer, debug, compression, &ctx.clock, packet);
+    }
+    for packet in crate::command::scoreboard_packets(command, name)? {
+        enqueue_traced_classified(writer, debug, compression, &ctx.clock, packet);
     }
     Ok(())
 }
@@ -1003,15 +1024,17 @@ async fn handle_use_item_on(
                 )
                 .await;
             }
-            ctx.commands
-                .send(SimCommand::SetBlockExact {
+            send_sim_command_accepted(
+                ctx,
+                SimCommand::SetBlockExact {
                     player,
                     position,
                     sequence,
                     state: BlockStateId::new(block_state_id),
-                })
-                .await
-                .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+                    acceptance: None,
+                },
+            )
+            .await?;
             route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression)
                 .await?;
             // The exact replacement state IS the final state, so the after-hook
@@ -1025,10 +1048,11 @@ async fn handle_use_item_on(
             // Allow: a player placement refined by compute_placement (the ONLY path
             // that runs it). Creative places the held block without touching the
             // stack; the clicked face, cursor hit point, and player yaw ride along
-            // so the sim derives the correct rotated/faced/halved state. The driver
-            // previews that final state and replies with it BEFORE the tick, so the
-            // after-hook fires with the state the world will hold (e.g. a side-faced
-            // log's axis=x), not the held default.
+            // so the sim derives the correct rotated/faced/halved state. After
+            // bounded shard admission, the driver previews that final state and
+            // replies before the tick, so the after-hook fires with the state the
+            // world will hold (e.g. a side-faced log's axis=x), not the held
+            // default.
             let (reply_tx, reply_rx) = oneshot::channel();
             ctx.commands
                 .send(SimCommand::PlaceBlock {
@@ -1043,11 +1067,10 @@ async fn handle_use_item_on(
                 })
                 .await
                 .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
-            // Falls back to the held state if the driver never replies (it is gone).
             let computed = reply_rx
                 .await
                 .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?
-                .unwrap_or_else(|| BlockStateId::new(held_state));
+                .map_err(|err| anyhow::anyhow!("block placement rejected: {err}"))?;
             route_emitted_intents(ctx, player, writer, sequence, emitted, debug, compression)
                 .await?;
             let after =
@@ -1079,15 +1102,17 @@ async fn handle_update_sign(
         packet.line_3().as_str().to_owned(),
         packet.line_4().as_str().to_owned(),
     ];
-    ctx.commands
-        .send(SimCommand::UpdateSign {
+    send_sim_command_accepted(
+        ctx,
+        SimCommand::UpdateSign {
             player,
             position,
             is_front: packet.is_front_text(),
             lines,
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))
+            acceptance: None,
+        },
+    )
+    .await
 }
 
 /// Handles a serverbound Set Creative Slot: validate the untrusted item bytes,

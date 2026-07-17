@@ -35,7 +35,7 @@ use super::outbound::{
 };
 use super::rate_limiter::ChatRateLimiter;
 use super::serverbound_budget::ServerboundBudget;
-use super::{Connection, GAME_EVENT_CHANGE_GAMEMODE, READ_CHUNK};
+use super::{send_sim_command_accepted, Connection, GAME_EVENT_CHANGE_GAMEMODE, READ_CHUNK};
 
 /// Joins the simulation and replays the join kit, then pumps the play link until
 /// the client disconnects or the server shuts down.
@@ -136,13 +136,15 @@ pub(super) async fn enter_play(
     // Make the sim's authoritative mode match the restored (or default-creative)
     // mode so the creative-slot gate accepts this player and later enforcement
     // (creative no-decrement, break speed, flight) reads the right mode.
-    ctx.commands
-        .send(SimCommand::SetGameMode {
+    send_sim_command_accepted(
+        ctx,
+        SimCommand::SetGameMode {
             player,
             mode: game_mode,
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("simulation driver is gone"))?;
+            acceptance: None,
+        },
+    )
+    .await?;
 
     // Replay the keystone payload, restoring the look and — for a returning player —
     // the game mode and held slot, then drain any already-buffered play frames.
@@ -411,10 +413,10 @@ pub(super) async fn enter_play(
     // Best-effort despawn notice regardless of how the link ended.
     let _ = ctx
         .commands
-        .send(SimCommand::Event(NetEvent::disconnected(
-            player,
-            DisconnectReason::ServerShutdown,
-        )))
+        .send(SimCommand::Event {
+            event: NetEvent::disconnected(player, DisconnectReason::ServerShutdown),
+            acceptance: None,
+        })
         .await;
     result
 }

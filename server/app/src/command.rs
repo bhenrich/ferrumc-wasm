@@ -1233,6 +1233,7 @@ pub(crate) fn region_commands(command: &str, player: PlayerId) -> Vec<SimCommand
                 player,
                 region,
                 op: RegionOp::Fill { state },
+                acceptance: None,
             }],
             None => Vec::new(),
         },
@@ -1241,22 +1242,36 @@ pub(crate) fn region_commands(command: &str, player: PlayerId) -> Vec<SimCommand
                 player,
                 region,
                 op: RegionOp::Replace { from, to },
+                acceptance: None,
             }],
             None => Vec::new(),
         },
         // `/undo` takes no arguments; a trailing token makes it a parse miss.
-        UNDO_COMMAND if args.is_empty() => vec![SimCommand::RegionUndo { player }],
+        UNDO_COMMAND if args.is_empty() => vec![SimCommand::RegionUndo {
+            player,
+            acceptance: None,
+        }],
         TP_COMMAND => match parse_tp(args) {
-            Some(TpTarget::Coords(position)) => {
-                vec![SimCommand::TeleportPlayer { player, position }]
-            }
-            Some(TpTarget::Player(target)) => vec![SimCommand::TeleportToPlayer { player, target }],
+            Some(TpTarget::Coords(position)) => vec![SimCommand::TeleportPlayer {
+                player,
+                position,
+                acceptance: None,
+            }],
+            Some(TpTarget::Player(target)) => vec![SimCommand::TeleportToPlayer {
+                player,
+                target,
+                acceptance: None,
+            }],
             None => Vec::new(),
         },
         // Only the targeted form routes here; the self form is applied by the
         // connection via `parse_gamemode`.
         GAMEMODE_COMMAND => match parse_gamemode_target(args) {
-            Some((mode, target)) => vec![SimCommand::SetGameModeFor { target, mode }],
+            Some((mode, target)) => vec![SimCommand::SetGameModeFor {
+                target,
+                mode,
+                acceptance: None,
+            }],
             None => Vec::new(),
         },
         WEATHER_COMMAND => match parse_weather(args) {
@@ -1422,7 +1437,7 @@ mod tests {
         // here (the connection applies it via parse_gamemode).
         let player = PlayerId::offline("Op");
         let cmds = region_commands("gamemode creative Joe", player);
-        let [SimCommand::SetGameModeFor { target, mode }] = cmds.as_slice() else {
+        let [SimCommand::SetGameModeFor { target, mode, .. }] = cmds.as_slice() else {
             panic!("/gamemode <mode> <player> builds one SetGameModeFor");
         };
         assert_eq!(target, "Joe");
@@ -1831,6 +1846,7 @@ mod tests {
             player: p,
             region,
             op,
+            ..
         }] = cmds.as_slice()
         else {
             panic!("/fill builds one RegionEdit");
@@ -1883,7 +1899,7 @@ mod tests {
         let player = region_player();
         assert!(matches!(
             region_commands("undo", player).as_slice(),
-            [SimCommand::RegionUndo { player: p }] if *p == player
+            [SimCommand::RegionUndo { player: p, .. }] if *p == player
         ));
         // A trailing token makes /undo a parse miss for the side effect.
         assert!(region_commands("undo now", player).is_empty());
@@ -1958,6 +1974,7 @@ mod tests {
         let [SimCommand::TeleportPlayer {
             player: p,
             position,
+            ..
         }] = cmds.as_slice()
         else {
             panic!("/tp <x y z> builds one TeleportPlayer");
@@ -1976,7 +1993,10 @@ mod tests {
 
         let player = PlayerId::offline("Op");
         let cmds = region_commands("tp Joe", player);
-        let [SimCommand::TeleportToPlayer { player: p, target }] = cmds.as_slice() else {
+        let [SimCommand::TeleportToPlayer {
+            player: p, target, ..
+        }] = cmds.as_slice()
+        else {
             panic!("/tp <player> builds one TeleportToPlayer");
         };
         assert_eq!(*p, player);
