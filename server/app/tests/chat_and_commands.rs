@@ -148,8 +148,11 @@ async fn chat_relays_to_all(addr: SocketAddr) -> anyhow::Result<()> {
 /// Command feedback reaches the issuer and *only* the issuer: a rejection meant
 /// for one player must never be broadcast to other connected players.
 async fn command_feedback_reaches_only_the_issuer(addr: SocketAddr) -> anyhow::Result<()> {
-    let mut alice = login_to_play(addr, "Alice").await?;
-    let mut bob = login_to_play(addr, "Bob").await?;
+    // Use identities distinct from the preceding relay flow. Dropping a socket
+    // queues its leave asynchronously, so reusing an identity before that leave
+    // reaches the router can make the stale leave tear down the replacement.
+    let mut alice = login_to_play(addr, "CmdAlice").await?;
+    let mut bob = login_to_play(addr, "CmdBob").await?;
 
     // Alice is not an operator, so `/gamemode` is refused; the rejection is
     // enqueued on Alice's own writer and is never routed to Bob.
@@ -172,7 +175,7 @@ async fn command_feedback_reaches_only_the_issuer(addr: SocketAddr) -> anyhow::R
                 !text.contains("permission denied"),
                 "command feedback must reach only the issuer, but Bob saw {text:?}"
             );
-            if text.contains("<Bob> fence") {
+            if text.contains("<CmdBob> fence") {
                 return Ok(());
             }
         }
