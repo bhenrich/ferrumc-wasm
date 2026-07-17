@@ -58,3 +58,19 @@
   their tick work is quiescent.
 - A worker failure after dispatch permanently poisons that scheduler. A partial
   tick is fail-stop and must never be retried.
+- Cross-shard workers emit destination-only intents; only the scheduler may
+  stamp their source, source-local sequence, and completed tick. Workers never
+  access or send directly to another shard.
+- Accepted cross-shard envelopes produced in tick N apply exactly once as a
+  separate prefix to the destination's tick N+1 execution. They never compete
+  with the ordinary shard inbox. The prefix can enter `SimShard` only through
+  an unforgeable scheduler-owned tick capability; sibling modules have no
+  constructor or mid-tick mutation path.
+- Central admission is bounded (1,024 envelopes by default), nonblocking, and
+  reject-newest after sorting by destination `ShardId`, source `ShardId`, then
+  source-local FIFO sequence. Rejections return the intact owned envelope.
+- Boundary preparation is non-mutating. Tick overflow or pre-dispatch failure
+  leaves ready envelopes queued; a successful tick commits exactly the
+  prepared scheduler metadata identities, never floating-point payload
+  equality. A draining destination cannot stop while an admitted envelope still
+  targets it.

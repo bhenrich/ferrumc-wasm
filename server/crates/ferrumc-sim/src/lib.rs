@@ -9,8 +9,10 @@
 //! it, and shards that apply inputs at tick boundaries. The application still
 //! drives one authoritative shard; a crate-internal, non-default shadow
 //! scheduler prepares deterministic multi-shard worker ownership without
-//! changing that runtime. There is no networking, no storage handle, and no
-//! plugin dispatch here yet.
+//! changing that runtime. The same internal seam owns a bounded typed
+//! cross-shard queue whose messages apply only at the next tick boundary; this
+//! is transport preparation, not an enabled entity-transfer feature. There is
+//! no networking, no storage handle, and no plugin dispatch here yet.
 //!
 //! The pieces fit together as a one-way pipeline driven entirely by explicit
 //! `tick` calls (never a wall clock):
@@ -32,6 +34,8 @@
 //!   region partitioning and overlap-free runtime ownership claims.
 //! - [`ShardLifecycle`] — the explicit eligibility lifecycle used by the
 //!   crate-internal shadow scheduler's logical worker plan.
+//! - The crate-internal cross-shard envelope queue — canonical reject-newest
+//!   admission after tick N and application as a separate prefix in tick N+1.
 //! - [`SimHarness`] / [`TickOutcome`] — a deterministic, wall-clock-free driver
 //!   tying a coordinator to one shard, used by tests and replay.
 //!
@@ -50,6 +54,7 @@
 //! [`Tick`]: ferrumc_core::Tick
 
 mod coordinator;
+mod cross_shard;
 mod error;
 mod harness;
 mod loaded;

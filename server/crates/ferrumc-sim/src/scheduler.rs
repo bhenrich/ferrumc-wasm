@@ -3,11 +3,12 @@
 //!
 //! The scheduler is the simulation tick flow's "run active shards" seam. The
 //! current shard still drains its admitted bounded inbox inside
-//! [`SimShard::run_tick`], while storage completions, plugin tasks, cross-shard
-//! delivery, dirty batching, and metrics do not yet have scheduler-owned
-//! carriers. Those boundaries are deliberately not represented by fake no-op
-//! hooks here: later packets add the real bounded values around this execution
-//! seam.
+//! [`SimShard::run_tick`]. Cross-shard intents now return with worker results,
+//! enter one scheduler-owned bounded queue in canonical order, and become a
+//! separate destination prefix at exactly the next tick boundary. Storage
+//! completions, plugin tasks, dirty batching, and metrics do not yet have
+//! scheduler-owned carriers; later packets add those real values without fake
+//! no-op phases.
 //!
 //! The default mode calls the existing single-shard primitive directly. The
 //! non-default shadow mode builds a canonical worker-slot plan, transfers owned
@@ -15,7 +16,8 @@
 //! channels, then restores ownership and canonical output order before the next
 //! tick. Because a batch owns each shard value, plans reject duplicate ids, and
 //! the scheduler waits for every batch to return, the same shard can never be
-//! entered concurrently.
+//! entered concurrently. Workers never send directly to one another or borrow a
+//! destination shard.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
@@ -30,6 +32,10 @@ use std::sync::{Arc, Barrier, Condvar, Mutex};
 use ferrumc_core::Tick;
 
 use crate::coordinator::TickCoordinator;
+use crate::cross_shard::{
+    CrossShardEnvelope, CrossShardIntent, CrossShardPayload, CrossShardQueue, CrossShardRejection,
+    CrossShardRejectionReason, PreparedBoundary,
+};
 use crate::error::{SimError, SimResult};
 use crate::message::{GameInput, GameOutput};
 use crate::ownership::{ShardId, ShardLifecycle, ShardLifecycleState};
@@ -273,6 +279,82 @@ impl Drop for TestWorkerProbeGuard {
     }
 }
 
+/// Unforgeable scheduler-owned inputs for exactly one shard tick.
+///
+/// The type is visible to the shard implementation, but every constructor and
+/// field stays private to this module. Sibling modules therefore cannot invoke
+/// the cross-shard application path with an invented mid-tick payload.
+#[derive(Debug)]
+pub(crate) struct ScheduledTickInputs {
+    boundary_inputs: Vec<CrossShardPayload>,
+    #[cfg(test)]
+    staged_test_emissions: Vec<CrossShardIntent>,
+}
+
+impl ScheduledTickInputs {
+    /// Creates a scheduled tick with no cross-shard boundary prefix.
+    const fn empty() -> Self {
+        Self {
+            boundary_inputs: Vec::new(),
+            #[cfg(test)]
+            staged_test_emissions: Vec::new(),
+        }
+    }
+
+    /// Creates a scheduled tick carrying one validated boundary prefix.
+    fn with_boundary(boundary_inputs: Vec<CrossShardPayload>) -> Self {
+        Self {
+            boundary_inputs,
+            #[cfg(test)]
+            staged_test_emissions: Vec::new(),
+        }
+    }
+
+    /// Transfers the validated prefix to the shard's private tick body.
+    pub(crate) fn take_boundary_inputs(&mut self) -> Vec<CrossShardPayload> {
+        std::mem::take(&mut self.boundary_inputs)
+    }
+
+    /// Stages test instrumentation inside the same worker-owned tick call.
+    #[cfg(test)]
+    fn stage_test_emissions(&mut self, emissions: Vec<CrossShardIntent>) {
+        self.staged_test_emissions = emissions;
+    }
+
+    /// Transfers test emissions to the shard while its worker tick is active.
+    #[cfg(test)]
+    pub(crate) fn take_test_emissions(&mut self) -> Vec<CrossShardIntent> {
+        std::mem::take(&mut self.staged_test_emissions)
+    }
+}
+
+/// Unforgeable scheduler-owned rollback of already-drained source intents.
+///
+/// This is used only when the terminal tick cannot stamp a next-boundary
+/// envelope. It restores ownership without exposing an out-of-tick emission API
+/// to sibling modules.
+#[derive(Debug)]
+pub(crate) struct CrossShardOutboxRestore {
+    intents: Vec<CrossShardIntent>,
+}
+
+impl CrossShardOutboxRestore {
+    /// Wraps drained intents for an atomic scheduler rollback.
+    fn new(intents: Vec<CrossShardIntent>) -> Self {
+        Self { intents }
+    }
+
+    /// Returns the number of intents to restore.
+    pub(crate) const fn len(&self) -> usize {
+        self.intents.len()
+    }
+
+    /// Transfers the drained intents back to their source shard.
+    pub(crate) fn into_intents(self) -> Vec<CrossShardIntent> {
+        self.intents
+    }
+}
+
 /// One scheduler-owned shard and its eligibility lifecycle.
 #[derive(Debug)]
 struct ScheduledShard {
@@ -282,6 +364,8 @@ struct ScheduledShard {
     probe: Option<Arc<TestWorkerProbe>>,
     #[cfg(test)]
     panic_on_run: bool,
+    #[cfg(test)]
+    next_tick_cross_shard: Vec<CrossShardIntent>,
 }
 
 impl ScheduledShard {
@@ -294,27 +378,58 @@ impl ScheduledShard {
             probe: None,
             #[cfg(test)]
             panic_on_run: false,
+            #[cfg(test)]
+            next_tick_cross_shard: Vec::new(),
+        }
+    }
+
+    /// Returns whether this shard owns no admitted work for a future tick.
+    fn is_tick_quiescent(&self) -> bool {
+        self.shard.is_tick_quiescent() && {
+            #[cfg(test)]
+            {
+                self.next_tick_cross_shard.is_empty()
+            }
+            #[cfg(not(test))]
+            {
+                true
+            }
         }
     }
 
     /// Runs the shard once while activating the test-only overlap probe.
-    fn run_tick(&mut self) -> Vec<GameOutput> {
+    fn run_tick(&mut self, tick_inputs: ScheduledTickInputs) -> ScheduledShardTick {
         #[cfg(test)]
         assert!(!self.panic_on_run, "injected shard worker panic");
+
+        #[cfg(test)]
+        let mut tick_inputs = tick_inputs;
 
         #[cfg(test)]
         let probe = self.probe.clone();
         #[cfg(test)]
         let _guard = probe.as_ref().map(TestWorkerProbe::enter);
 
-        let outputs = self.shard.run_tick();
+        #[cfg(test)]
+        tick_inputs.stage_test_emissions(std::mem::take(&mut self.next_tick_cross_shard));
+        let (outputs, cross_shard) = self.shard.run_scheduled_tick(tick_inputs);
 
         #[cfg(test)]
         if let Some(probe) = probe {
             probe.after_run();
         }
-        outputs
+        ScheduledShardTick {
+            outputs,
+            cross_shard,
+        }
     }
+}
+
+/// Values one shard returns after its owned tick execution.
+#[derive(Debug)]
+struct ScheduledShardTick {
+    outputs: Vec<GameOutput>,
+    cross_shard: Vec<CrossShardIntent>,
 }
 
 /// One owned shard assigned to a persistent worker for a single tick.
@@ -322,16 +437,18 @@ impl ScheduledShard {
 struct ShardWork {
     visit: WorkerVisit,
     scheduled: ScheduledShard,
+    tick_inputs: ScheduledTickInputs,
 }
 
 impl ShardWork {
     /// Executes the one visit carried by this work item.
     fn run(mut self) -> CompletedShardWork {
-        let outputs = self.scheduled.run_tick();
+        let tick = self.scheduled.run_tick(self.tick_inputs);
         CompletedShardWork {
             visit: self.visit,
             scheduled: self.scheduled,
-            outputs,
+            outputs: tick.outputs,
+            cross_shard: tick.cross_shard,
         }
     }
 }
@@ -342,6 +459,7 @@ struct CompletedShardWork {
     visit: WorkerVisit,
     scheduled: ScheduledShard,
     outputs: Vec<GameOutput>,
+    cross_shard: Vec<CrossShardIntent>,
 }
 
 /// Outputs from one shard, kept grouped under its canonical identity.
@@ -351,12 +469,16 @@ struct ShardTickOutput {
     outputs: Vec<GameOutput>,
 }
 
+/// Cross-shard payload prefixes grouped by canonical destination.
+type CrossShardBoundaryInputs = BTreeMap<ShardId, Vec<CrossShardPayload>>;
+
 /// The result of one scheduler tick.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SchedulerTickOutcome {
     tick: Tick,
     visits: Vec<WorkerVisit>,
     shards: Vec<ShardTickOutput>,
+    cross_shard_rejections: Vec<CrossShardRejection>,
 }
 
 impl SchedulerTickOutcome {
@@ -376,6 +498,29 @@ impl SchedulerTickOutcome {
             .iter()
             .map(|shard| (shard.shard, shard.outputs.as_slice()))
     }
+
+    /// Returns cross-shard messages rejected after canonical bounded admission.
+    ///
+    /// Every rejection retains the complete owned envelope so the future
+    /// producing system can retry or apply its explicit failure policy without
+    /// silent loss.
+    pub(crate) fn cross_shard_rejections(&self) -> &[CrossShardRejection] {
+        &self.cross_shard_rejections
+    }
+
+    /// Consumes this outcome and transfers every rejected envelope to the
+    /// caller without cloning.
+    pub(crate) fn into_cross_shard_rejections(self) -> Vec<CrossShardRejection> {
+        self.cross_shard_rejections
+    }
+}
+
+/// Internal worker result before cross-shard envelopes are validated and
+/// admitted to the next-boundary queue.
+#[derive(Debug)]
+struct SchedulerExecution {
+    outcome: SchedulerTickOutcome,
+    cross_shard: Vec<(ShardId, Vec<CrossShardIntent>)>,
 }
 
 /// Returns whether a lifecycle still needs tick execution.
@@ -422,6 +567,22 @@ const WORKER_CHANNEL_CAPACITY: usize = 1;
 /// Capping it at 64 prevents a future caller from turning an unchecked integer
 /// into an unbounded OS-thread allocation.
 const MAX_SHARD_WORKERS: usize = 64;
+
+/// Default number of accepted cross-shard envelopes awaiting their exact next
+/// tick boundary.
+///
+/// This matches the ordinary shard inbox default. Full admission is
+/// nonblocking reject-newest after canonical sorting; the rejected owned
+/// envelope is returned in the completed tick outcome.
+const DEFAULT_CROSS_SHARD_QUEUE_CAPACITY: usize = 1024;
+
+/// Builds the fixed nonzero default without a production `unwrap`.
+const fn nonzero_cross_shard_capacity() -> NonZeroUsize {
+    match NonZeroUsize::new(DEFAULT_CROSS_SHARD_QUEUE_CAPACITY) {
+        Some(capacity) => capacity,
+        None => NonZeroUsize::MIN,
+    }
+}
 
 /// One persistent worker thread and its capacity-one command/result endpoints.
 #[derive(Debug)]
@@ -519,7 +680,11 @@ impl ShardWorkerPool {
                 Self::restore_work(shards, buckets);
                 return Err(SimError::InvalidSchedulerPlan { shard: visit.shard });
             };
-            bucket.push(ShardWork { visit, scheduled });
+            bucket.push(ShardWork {
+                visit,
+                scheduled,
+                tick_inputs: ScheduledTickInputs::empty(),
+            });
         }
         Ok(buckets)
     }
@@ -531,17 +696,38 @@ impl ShardWorkerPool {
         }
     }
 
+    /// Attaches each prepared next-boundary payload prefix to its exclusively
+    /// owned destination work item.
+    fn attach_boundary_inputs(
+        buckets: &mut [Vec<ShardWork>],
+        mut boundary_inputs: CrossShardBoundaryInputs,
+    ) -> SimResult<()> {
+        for work in buckets.iter_mut().flatten() {
+            if let Some(inputs) = boundary_inputs.remove(&work.visit.shard) {
+                work.tick_inputs = ScheduledTickInputs::with_boundary(inputs);
+            }
+        }
+        match boundary_inputs.into_keys().next() {
+            Some(shard) => Err(SimError::InvalidSchedulerPlan { shard }),
+            None => Ok(()),
+        }
+    }
+
     /// Restores completed shards and appends their grouped outputs.
     fn restore_completed(
         shards: &mut BTreeMap<ShardId, ScheduledShard>,
         completed: Vec<CompletedShardWork>,
         outputs: &mut Vec<ShardTickOutput>,
+        cross_shard: &mut Vec<(ShardId, Vec<CrossShardIntent>)>,
     ) {
         for work in completed {
             outputs.push(ShardTickOutput {
                 shard: work.visit.shard,
                 outputs: work.outputs,
             });
+            if !work.cross_shard.is_empty() {
+                cross_shard.push((work.visit.shard, work.cross_shard));
+            }
             shards.insert(work.visit.shard, work.scheduled);
         }
     }
@@ -570,17 +756,29 @@ impl ShardWorkerPool {
         coordinator: &mut TickCoordinator,
         shards: &mut BTreeMap<ShardId, ScheduledShard>,
         plan: ExecutionPlan,
-    ) -> SimResult<SchedulerTickOutcome> {
+        boundary_inputs: CrossShardBoundaryInputs,
+    ) -> SimResult<SchedulerExecution> {
         if plan.visits().is_empty() {
+            if let Some(shard) = boundary_inputs.into_keys().next() {
+                return Err(SimError::InvalidSchedulerPlan { shard });
+            }
             let tick = coordinator.advance()?;
-            return Ok(SchedulerTickOutcome {
-                tick,
-                visits: Vec::new(),
-                shards: Vec::new(),
+            return Ok(SchedulerExecution {
+                outcome: SchedulerTickOutcome {
+                    tick,
+                    visits: Vec::new(),
+                    shards: Vec::new(),
+                    cross_shard_rejections: Vec::new(),
+                },
+                cross_shard: Vec::new(),
             });
         }
 
-        let buckets = self.take_work(shards, &plan)?;
+        let mut buckets = self.take_work(shards, &plan)?;
+        if let Err(error) = Self::attach_boundary_inputs(&mut buckets, boundary_inputs) {
+            Self::restore_work(shards, buckets);
+            return Err(error);
+        }
         let tick = match coordinator.advance() {
             Ok(tick) => tick,
             Err(error) => {
@@ -611,6 +809,7 @@ impl ShardWorkerPool {
         }
 
         let mut outputs = Vec::with_capacity(plan.visits().len());
+        let mut cross_shard = Vec::with_capacity(plan.visits().len());
         for index in sent {
             if let Ok(result) = self.workers[index].result_rx.recv() {
                 if result.tick != tick && failure.is_none() {
@@ -620,7 +819,7 @@ impl ShardWorkerPool {
                         actual: result.tick,
                     });
                 }
-                Self::restore_completed(shards, result.work, &mut outputs);
+                Self::restore_completed(shards, result.work, &mut outputs, &mut cross_shard);
             } else {
                 let error = self.disconnected_error(index, tick);
                 if failure.is_none() {
@@ -633,10 +832,14 @@ impl ShardWorkerPool {
             return Err(error);
         }
         outputs.sort_unstable_by_key(|output| output.shard);
-        Ok(SchedulerTickOutcome {
-            tick,
-            visits: plan.visits,
-            shards: outputs,
+        Ok(SchedulerExecution {
+            outcome: SchedulerTickOutcome {
+                tick,
+                visits: plan.visits,
+                shards: outputs,
+                cross_shard_rejections: Vec::new(),
+            },
+            cross_shard,
         })
     }
 
@@ -698,6 +901,7 @@ pub(crate) struct ShardScheduler {
     mode: SchedulerMode,
     worker_pool: Option<ShardWorkerPool>,
     shards: BTreeMap<ShardId, ScheduledShard>,
+    cross_shard: CrossShardQueue,
     /// A worker failure after tick advance is fail-stop: retry could double-run
     /// peers whose state was already returned.
     poisoned_at: Option<Tick>,
@@ -712,6 +916,7 @@ impl ShardScheduler {
             mode: SchedulerMode::default(),
             worker_pool: None,
             shards: BTreeMap::new(),
+            cross_shard: CrossShardQueue::new(nonzero_cross_shard_capacity()),
             poisoned_at: None,
         };
         let shard_id = scheduler.register(shard)?;
@@ -724,11 +929,30 @@ impl ShardScheduler {
         coordinator: TickCoordinator,
         worker_slots: NonZeroUsize,
     ) -> SimResult<Self> {
+        Self::with_shadow_workers_and_cross_shard_capacity(
+            coordinator,
+            worker_slots,
+            nonzero_cross_shard_capacity(),
+        )
+    }
+
+    /// Creates an empty shadow scheduler with an explicit bounded cross-shard
+    /// queue capacity.
+    ///
+    /// This remains crate-private rollout plumbing. A tiny capacity is useful
+    /// for deterministic backpressure tests; production-neutral shadow
+    /// construction uses [`DEFAULT_CROSS_SHARD_QUEUE_CAPACITY`].
+    pub(crate) fn with_shadow_workers_and_cross_shard_capacity(
+        coordinator: TickCoordinator,
+        worker_slots: NonZeroUsize,
+        cross_shard_capacity: NonZeroUsize,
+    ) -> SimResult<Self> {
         Ok(Self {
             coordinator,
             mode: SchedulerMode::shadow(worker_slots),
             worker_pool: Some(ShardWorkerPool::new(worker_slots)?),
             shards: BTreeMap::new(),
+            cross_shard: CrossShardQueue::new(cross_shard_capacity),
             poisoned_at: None,
         })
     }
@@ -796,12 +1020,12 @@ impl ShardScheduler {
         }
         if current == ShardLifecycleState::Draining
             && next == ShardLifecycleState::Stopped
-            && !self
+            && (!self
                 .shards
                 .get(&shard)
                 .ok_or(SimError::UnknownScheduledShard { shard })?
-                .shard
                 .is_tick_quiescent()
+                || self.cross_shard.has_destination(shard))
         {
             return Err(SimError::ShardDrainIncomplete { shard });
         }
@@ -830,6 +1054,127 @@ impl ShardScheduler {
         scheduled.shard.enqueue(input)
     }
 
+    /// Validates a non-mutating queue snapshot and groups its payloads by
+    /// destination for attachment to owned worker batches.
+    fn prepare_cross_shard_boundary(
+        &self,
+        prepared: &PreparedBoundary,
+    ) -> SimResult<CrossShardBoundaryInputs> {
+        let mut boundary = BTreeMap::new();
+        for envelope in prepared.envelopes() {
+            let destination = envelope.destination();
+            let scheduled = self
+                .shards
+                .get(&destination)
+                .ok_or(SimError::UnknownScheduledShard { shard: destination })?;
+            let state = scheduled.lifecycle.state();
+            if !is_runnable(state) {
+                return Err(SimError::ShardInputNotAccepted {
+                    shard: destination,
+                    state,
+                });
+            }
+            boundary
+                .entry(destination)
+                .or_insert_with(Vec::new)
+                .push(envelope.payload().clone());
+        }
+        Ok(boundary)
+    }
+
+    /// Stamps worker-produced intents, rejects invalid destinations without
+    /// consuming queue capacity, then performs canonical bounded admission.
+    fn admit_cross_shard_emissions(
+        &mut self,
+        completed_tick: Tick,
+        mut emissions: Vec<(ShardId, Vec<CrossShardIntent>)>,
+    ) -> SimResult<Vec<CrossShardRejection>> {
+        emissions.sort_unstable_by_key(|(source, _)| *source);
+        if completed_tick.next().is_none() {
+            if let Some(first_source) = emissions.first().map(|(source, _)| *source) {
+                for (source, intents) in emissions {
+                    let scheduled = self
+                        .shards
+                        .get_mut(&source)
+                        .ok_or(SimError::UnknownScheduledShard { shard: source })?;
+                    let restore = CrossShardOutboxRestore::new(intents);
+                    if scheduled.shard.restore_cross_shard_outbox(restore).is_err() {
+                        return Err(SimError::CrossShardOutboxFull {
+                            shard: source,
+                            capacity: SimShard::cross_shard_outbox_capacity(),
+                        });
+                    }
+                }
+                return Err(SimError::CrossShardEnvelopeTickOverflow {
+                    shard: first_source,
+                    tick: completed_tick,
+                });
+            }
+        }
+
+        let mut candidates = Vec::new();
+        for (source, intents) in emissions {
+            for (source_sequence, intent) in intents.into_iter().enumerate() {
+                let envelope = match CrossShardEnvelope::from_intent(
+                    completed_tick,
+                    source,
+                    source_sequence,
+                    intent,
+                ) {
+                    Ok(envelope) => envelope,
+                    Err(intent) => {
+                        let scheduled = self
+                            .shards
+                            .get_mut(&source)
+                            .ok_or(SimError::UnknownScheduledShard { shard: source })?;
+                        let restore = CrossShardOutboxRestore::new(vec![intent]);
+                        if scheduled.shard.restore_cross_shard_outbox(restore).is_err() {
+                            return Err(SimError::CrossShardOutboxFull {
+                                shard: source,
+                                capacity: SimShard::cross_shard_outbox_capacity(),
+                            });
+                        }
+                        return Err(SimError::CrossShardEnvelopeTickOverflow {
+                            shard: source,
+                            tick: completed_tick,
+                        });
+                    }
+                };
+                candidates.push(envelope);
+            }
+        }
+        candidates.sort_unstable_by_key(CrossShardEnvelope::canonical_key);
+
+        let mut valid = Vec::with_capacity(candidates.len());
+        let mut rejections = Vec::new();
+        for envelope in candidates {
+            if envelope.source() == envelope.destination() {
+                valid.push(envelope);
+                continue;
+            }
+            let reason = match self.shards.get(&envelope.destination()) {
+                None => Some(CrossShardRejectionReason::UnknownDestination),
+                Some(destination)
+                    if destination.lifecycle.state() != ShardLifecycleState::Active =>
+                {
+                    Some(CrossShardRejectionReason::DestinationNotActive {
+                        state: destination.lifecycle.state(),
+                    })
+                }
+                Some(_) => None,
+            };
+            if let Some(reason) = reason {
+                rejections.push(CrossShardRejection::new(reason, envelope));
+            } else {
+                valid.push(envelope);
+            }
+        }
+
+        rejections.extend(self.cross_shard.admit_completed_tick(completed_tick, valid));
+        rejections.sort_unstable_by_key(|rejection| rejection.envelope().canonical_key());
+        Ok(rejections)
+    }
+
     /// Advances once and runs only active shards according to the validated
     /// plan.
     ///
@@ -839,6 +1184,11 @@ impl ShardScheduler {
     /// first shard is touched.
     pub(crate) fn tick(&mut self) -> SimResult<SchedulerTickOutcome> {
         self.ensure_healthy()?;
+        let boundary_tick = self
+            .coordinator
+            .current()
+            .next()
+            .ok_or(SimError::TickOverflow)?;
         let plan = ExecutionPlan::for_ids(
             self.mode,
             self.shards
@@ -846,27 +1196,57 @@ impl ShardScheduler {
                 .filter(|(_, scheduled)| is_runnable(scheduled.lifecycle.state()))
                 .map(|(shard, _)| *shard),
         )?;
-        match self.mode {
-            SchedulerMode::AuthoritativeInline => {
-                Self::execute_inline(&mut self.coordinator, &mut self.shards, plan)
-            }
+        let prepared = self.cross_shard.prepare_boundary(boundary_tick);
+        let boundary_inputs = self.prepare_cross_shard_boundary(&prepared)?;
+        let result = match self.mode {
+            SchedulerMode::AuthoritativeInline => Self::execute_inline(
+                &mut self.coordinator,
+                &mut self.shards,
+                plan,
+                boundary_inputs,
+            ),
             SchedulerMode::ShadowWorkers { .. } => {
                 let result = self
                     .worker_pool
                     .as_mut()
                     .ok_or(SimError::ShardWorkerPoolUnavailable)?
-                    .execute(&mut self.coordinator, &mut self.shards, plan);
-                if matches!(
-                    &result,
-                    Err(SimError::ShardWorkerPanicked { .. }
-                        | SimError::ShardWorkerStopped { .. }
-                        | SimError::ShardWorkerWrongTick { .. })
-                ) {
-                    self.poisoned_at = Some(self.coordinator.current());
-                }
+                    .execute(
+                        &mut self.coordinator,
+                        &mut self.shards,
+                        plan,
+                        boundary_inputs,
+                    );
                 result
             }
+        };
+        if matches!(
+            &result,
+            Err(SimError::ShardWorkerPanicked { .. }
+                | SimError::ShardWorkerStopped { .. }
+                | SimError::ShardWorkerWrongTick { .. })
+        ) {
+            self.poisoned_at = Some(self.coordinator.current());
         }
+        let mut execution = result?;
+        if execution.outcome.tick() != prepared.apply_at()
+            || !self.cross_shard.commit_boundary(&prepared)
+        {
+            self.poisoned_at = Some(self.coordinator.current());
+            return Err(SimError::CrossShardBoundaryCommitFailed {
+                tick: prepared.apply_at(),
+            });
+        }
+        let rejections = match self
+            .admit_cross_shard_emissions(execution.outcome.tick(), execution.cross_shard)
+        {
+            Ok(rejections) => rejections,
+            Err(error) => {
+                self.poisoned_at = Some(self.coordinator.current());
+                return Err(error);
+            }
+        };
+        execution.outcome.cross_shard_rejections = rejections;
+        Ok(execution.outcome)
     }
 
     /// Executes the exact legacy single-shard path without a worker dispatch.
@@ -874,7 +1254,8 @@ impl ShardScheduler {
         coordinator: &mut TickCoordinator,
         shards: &mut BTreeMap<ShardId, ScheduledShard>,
         plan: ExecutionPlan,
-    ) -> SimResult<SchedulerTickOutcome> {
+        mut boundary_inputs: CrossShardBoundaryInputs,
+    ) -> SimResult<SchedulerExecution> {
         let mut runnable = shards
             .iter_mut()
             .filter(|(_, scheduled)| is_runnable(scheduled.lifecycle.state()));
@@ -896,19 +1277,38 @@ impl ShardScheduler {
         if let Some((shard, _)) = runnable.next() {
             return Err(SimError::InvalidSchedulerPlan { shard: *shard });
         }
+        let scheduled_tick_inputs = scheduled
+            .as_ref()
+            .and_then(|(shard, _)| boundary_inputs.remove(shard))
+            .map_or_else(
+                ScheduledTickInputs::empty,
+                ScheduledTickInputs::with_boundary,
+            );
+        if let Some(shard) = boundary_inputs.into_keys().next() {
+            return Err(SimError::InvalidSchedulerPlan { shard });
+        }
 
         let tick = coordinator.advance()?;
         let mut outputs = Vec::with_capacity(usize::from(scheduled.is_some()));
+        let mut cross_shard = Vec::with_capacity(usize::from(scheduled.is_some()));
         if let Some((shard, scheduled)) = scheduled {
+            let completed = scheduled.run_tick(scheduled_tick_inputs);
             outputs.push(ShardTickOutput {
                 shard,
-                outputs: scheduled.run_tick(),
+                outputs: completed.outputs,
             });
+            if !completed.cross_shard.is_empty() {
+                cross_shard.push((shard, completed.cross_shard));
+            }
         }
-        Ok(SchedulerTickOutcome {
-            tick,
-            visits: plan.visits,
-            shards: outputs,
+        Ok(SchedulerExecution {
+            outcome: SchedulerTickOutcome {
+                tick,
+                visits: plan.visits,
+                shards: outputs,
+                cross_shard_rejections: Vec::new(),
+            },
+            cross_shard,
         })
     }
 
@@ -927,6 +1327,51 @@ impl ShardScheduler {
         self.shards
             .get(&shard)
             .map(|scheduled| scheduled.lifecycle.state())
+    }
+
+    /// Returns the number of accepted envelopes awaiting a boundary.
+    #[cfg(test)]
+    fn cross_shard_queue_len(&self) -> usize {
+        self.cross_shard.len()
+    }
+
+    /// Installs an intent that the named source emits from inside its next
+    /// actual worker execution.
+    ///
+    /// This is test instrumentation for the Packet 42 carrier until a gameplay
+    /// system produces transfers. It enters the same bounded shard outbox,
+    /// canonical merge, central queue, and destination boundary path as future
+    /// production intents.
+    #[cfg(test)]
+    fn emit_cross_shard_during_next_tick(
+        &mut self,
+        source: ShardId,
+        destination: ShardId,
+        payload: CrossShardPayload,
+    ) -> SimResult<()> {
+        self.ensure_healthy()?;
+        let scheduled = self
+            .shards
+            .get_mut(&source)
+            .ok_or(SimError::UnknownScheduledShard { shard: source })?;
+        let state = scheduled.lifecycle.state();
+        if state != ShardLifecycleState::Active {
+            return Err(SimError::ShardInputNotAccepted {
+                shard: source,
+                state,
+            });
+        }
+        let capacity = SimShard::cross_shard_outbox_capacity();
+        if scheduled.next_tick_cross_shard.len() >= capacity {
+            return Err(SimError::CrossShardOutboxFull {
+                shard: source,
+                capacity,
+            });
+        }
+        scheduled
+            .next_tick_cross_shard
+            .push(CrossShardIntent::new(destination, payload));
+        Ok(())
     }
 
     /// Installs deterministic overlap/completion instrumentation for a test.
@@ -967,6 +1412,7 @@ mod tests {
         MAX_SHARD_WORKERS,
     };
     use crate::{
+        cross_shard::{CrossShardPayload, CrossShardRejectionReason},
         GameInput, GameOutput, MutationCause, ShardId, ShardLifecycleState, SignFace, SimError,
         SimShard, TickCoordinator, TickRate,
     };
@@ -1618,5 +2064,498 @@ mod tests {
             assert_eq!(shard.inbox_len(), 1);
             assert_eq!(shard.player_count(), 0);
         }
+    }
+
+    #[test]
+    fn cross_shard_message_produced_in_tick_n_applies_only_at_n_plus_one() {
+        let mut scheduler = ShardScheduler::with_shadow_workers_and_cross_shard_capacity(
+            TickCoordinator::new(TickRate::VANILLA),
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(4).expect("nonzero queue"),
+        )
+        .expect("worker pool");
+        let source = scheduler
+            .register(SimShard::new(ShardPos::new(0, 0)))
+            .expect("source");
+        let destination = scheduler
+            .register(SimShard::with_inbox_capacity(
+                ShardPos::new(1, 0),
+                NonZeroUsize::MIN,
+            ))
+            .expect("destination");
+        scheduler.activate(source).expect("activate source");
+        scheduler
+            .activate(destination)
+            .expect("activate destination");
+
+        let player = PlayerId::offline("next-boundary");
+        let transfer = GameInput::PlayerJoin {
+            player,
+            position: Vec3::new(130.0, 70.0, 8.0),
+        };
+        scheduler
+            .emit_cross_shard_during_next_tick(
+                source,
+                destination,
+                CrossShardPayload::ApplyInput(transfer),
+            )
+            .expect("source outbox has room");
+
+        assert_eq!(scheduler.cross_shard_queue_len(), 0);
+        assert!(!scheduler
+            .shard(destination)
+            .expect("destination")
+            .contains_player(player));
+
+        let tick_n = scheduler.tick().expect("source production tick");
+        assert_eq!(tick_n.tick(), Tick::new(1));
+        assert!(tick_n
+            .shard_outputs()
+            .all(|(_, outputs)| outputs.is_empty()));
+        assert!(tick_n.cross_shard_rejections().is_empty());
+        assert!(!scheduler
+            .shard(destination)
+            .expect("destination")
+            .contains_player(player));
+        assert_eq!(scheduler.cross_shard_queue_len(), 1);
+
+        scheduler
+            .enqueue(destination, GameInput::PlayerLeave { player })
+            .expect("ordinary inbox has its one slot");
+        let tick_n_plus_one = scheduler.tick().expect("destination boundary tick");
+        assert_eq!(tick_n_plus_one.tick(), Tick::new(2));
+        let destination_outputs = tick_n_plus_one
+            .shard_outputs()
+            .find_map(|(shard, outputs)| (shard == destination).then_some(outputs))
+            .expect("destination outcome");
+        assert_eq!(
+            destination_outputs,
+            &[
+                GameOutput::PlayerSpawned {
+                    player,
+                    position: Vec3::new(130.0, 70.0, 8.0),
+                },
+                GameOutput::PlayerDespawned { player },
+            ]
+        );
+        assert!(!scheduler
+            .shard(destination)
+            .expect("destination")
+            .contains_player(player));
+        assert_eq!(scheduler.cross_shard_queue_len(), 0);
+
+        let tick_n_plus_two = scheduler.tick().expect("following tick");
+        assert!(tick_n_plus_two
+            .shard_outputs()
+            .all(|(_, outputs)| outputs.is_empty()));
+        assert_eq!(scheduler.cross_shard_queue_len(), 0);
+        assert!(
+            !scheduler
+                .shard(destination)
+                .expect("destination")
+                .contains_player(player),
+            "a duplicate N+2 application would visibly re-add the player"
+        );
+    }
+
+    #[test]
+    fn cross_shard_nan_payload_uses_metadata_commit_identity() {
+        let mut scheduler = ShardScheduler::with_shadow_workers_and_cross_shard_capacity(
+            TickCoordinator::new(TickRate::VANILLA),
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(2).expect("nonzero queue"),
+        )
+        .expect("worker pool");
+        let source = scheduler
+            .register(SimShard::new(ShardPos::new(0, 0)))
+            .expect("source");
+        let destination = scheduler
+            .register(SimShard::new(ShardPos::new(1, 0)))
+            .expect("destination");
+        scheduler.activate(source).expect("activate source");
+        scheduler
+            .activate(destination)
+            .expect("activate destination");
+
+        let player = PlayerId::offline("nan-commit-identity");
+        scheduler
+            .emit_cross_shard_during_next_tick(
+                source,
+                destination,
+                CrossShardPayload::ApplyInput(GameInput::PlayerMove {
+                    player,
+                    position: None,
+                    yaw: Some(f32::NAN),
+                    pitch: None,
+                }),
+            )
+            .expect("source outbox has room");
+
+        scheduler.tick().expect("production tick");
+        let boundary = scheduler
+            .tick()
+            .expect("NaN payload must not falsify boundary identity");
+        assert_eq!(scheduler.cross_shard_queue_len(), 0);
+        assert!(boundary
+            .shard_outputs()
+            .all(|(_, outputs)| outputs.is_empty()));
+        assert!(!scheduler
+            .shard(destination)
+            .expect("destination")
+            .contains_player(player));
+
+        let following = scheduler.tick().expect("scheduler remains healthy");
+        assert!(following
+            .shard_outputs()
+            .all(|(_, outputs)| outputs.is_empty()));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one adversarial scenario pins concurrency, capacity, ownership, and ordering"
+    )]
+    fn cross_shard_queue_rejects_full_and_applies_in_canonical_order() {
+        let capacity = NonZeroUsize::new(3).expect("nonzero queue");
+        let mut scheduler = ShardScheduler::with_shadow_workers_and_cross_shard_capacity(
+            TickCoordinator::new(TickRate::VANILLA),
+            NonZeroUsize::new(2).expect("nonzero workers"),
+            capacity,
+        )
+        .expect("worker pool");
+        let source_a = scheduler
+            .register(SimShard::new(ShardPos::new(0, 0)))
+            .expect("source a");
+        let source_b = scheduler
+            .register(SimShard::new(ShardPos::new(1, 0)))
+            .expect("source b");
+        let destination = scheduler
+            .register(SimShard::new(ShardPos::new(2, 0)))
+            .expect("destination");
+        for shard in [source_a, source_b, destination] {
+            scheduler.activate(shard).expect("activate");
+        }
+        let start = Arc::new(Barrier::new(2));
+        let global_active = Arc::new(AtomicUsize::new(0));
+        let global_max = Arc::new(AtomicUsize::new(0));
+        let completion = Arc::new(TestCompletionOrder::new(source_b));
+        let lower_source_probe = Arc::new(TestWorkerProbe::new(
+            source_a,
+            Arc::clone(&start),
+            Arc::clone(&global_active),
+            Arc::clone(&global_max),
+            Arc::clone(&completion),
+        ));
+        let higher_source_probe = Arc::new(TestWorkerProbe::new(
+            source_b,
+            start,
+            Arc::clone(&global_active),
+            Arc::clone(&global_max),
+            Arc::clone(&completion),
+        ));
+        scheduler
+            .set_probe(source_a, lower_source_probe)
+            .expect("source a probe");
+        scheduler
+            .set_probe(source_b, higher_source_probe)
+            .expect("source b probe");
+
+        let player_a_first = PlayerId::offline("source-a-first");
+        let player_a_second = PlayerId::offline("source-a-second");
+        let player_b = PlayerId::offline("source-b");
+        let rejected_player = PlayerId::offline("queue-rejected");
+        let from_b = GameInput::PlayerJoin {
+            player: player_b,
+            position: Vec3::new(260.0, 70.0, 8.0),
+        };
+        let from_a_first = GameInput::PlayerJoin {
+            player: player_a_first,
+            position: Vec3::new(261.0, 70.0, 8.0),
+        };
+        let from_a_second = GameInput::PlayerJoin {
+            player: player_a_second,
+            position: Vec3::new(262.0, 70.0, 8.0),
+        };
+        let rejected = GameInput::PlayerJoin {
+            player: rejected_player,
+            position: Vec3::new(263.0, 70.0, 8.0),
+        };
+
+        // Stage the higher source first. Boundary application must still sort by
+        // destination, source id, then source-local emission order.
+        scheduler
+            .emit_cross_shard_during_next_tick(
+                source_b,
+                destination,
+                CrossShardPayload::ApplyInput(from_b),
+            )
+            .expect("source b first");
+        scheduler
+            .emit_cross_shard_during_next_tick(
+                source_a,
+                destination,
+                CrossShardPayload::ApplyInput(from_a_first),
+            )
+            .expect("source a first");
+        scheduler
+            .emit_cross_shard_during_next_tick(
+                source_a,
+                destination,
+                CrossShardPayload::ApplyInput(from_a_second),
+            )
+            .expect("source a second");
+        scheduler
+            .emit_cross_shard_during_next_tick(
+                source_b,
+                destination,
+                CrossShardPayload::ApplyInput(rejected.clone()),
+            )
+            .expect("source b second");
+
+        let production = scheduler.tick().expect("production tick");
+        assert_eq!(completion.observed(), vec![source_b, source_a]);
+        assert_eq!(global_max.load(Ordering::SeqCst), 2);
+        assert!(production
+            .shard_outputs()
+            .all(|(_, outputs)| outputs.is_empty()));
+        let mut rejections = production.into_cross_shard_rejections();
+        assert_eq!(rejections.len(), 1);
+        let rejection = rejections.pop().expect("one owned rejection");
+        assert_eq!(
+            rejection.reason(),
+            CrossShardRejectionReason::QueueFull {
+                capacity: capacity.get(),
+            }
+        );
+        assert_eq!(rejection.envelope().source(), source_b);
+        assert_eq!(rejection.envelope().destination(), destination);
+        let rejected_envelope = rejection.into_envelope();
+        assert_eq!(
+            rejected_envelope.payload(),
+            &CrossShardPayload::ApplyInput(rejected)
+        );
+        assert_eq!(scheduler.cross_shard_queue_len(), capacity.get());
+
+        let boundary = scheduler.tick().expect("application tick");
+        let destination_outputs = boundary
+            .shard_outputs()
+            .find_map(|(shard, outputs)| (shard == destination).then_some(outputs))
+            .expect("destination outcome");
+        assert_eq!(
+            destination_outputs,
+            &[
+                GameOutput::PlayerSpawned {
+                    player: player_a_first,
+                    position: Vec3::new(261.0, 70.0, 8.0),
+                },
+                GameOutput::PlayerSpawned {
+                    player: player_a_second,
+                    position: Vec3::new(262.0, 70.0, 8.0),
+                },
+                GameOutput::PlayerSpawned {
+                    player: player_b,
+                    position: Vec3::new(260.0, 70.0, 8.0),
+                },
+            ]
+        );
+        assert!(!scheduler
+            .shard(destination)
+            .expect("destination")
+            .contains_player(rejected_player));
+        assert_eq!(scheduler.cross_shard_queue_len(), 0);
+    }
+
+    #[test]
+    fn admitted_cross_shard_work_drains_before_destination_stops() {
+        let mut scheduler = ShardScheduler::with_shadow_workers_and_cross_shard_capacity(
+            TickCoordinator::new(TickRate::VANILLA),
+            NonZeroUsize::new(2).expect("nonzero workers"),
+            NonZeroUsize::new(2).expect("nonzero queue"),
+        )
+        .expect("worker pool");
+        let source = scheduler
+            .register(SimShard::new(ShardPos::new(0, 0)))
+            .expect("source");
+        let destination = scheduler
+            .register(SimShard::new(ShardPos::new(1, 0)))
+            .expect("destination");
+        scheduler.activate(source).expect("activate source");
+        scheduler
+            .activate(destination)
+            .expect("activate destination");
+
+        let player = PlayerId::offline("draining-boundary");
+        scheduler
+            .emit_cross_shard_during_next_tick(
+                source,
+                destination,
+                CrossShardPayload::ApplyInput(GameInput::PlayerJoin {
+                    player,
+                    position: Vec3::new(132.0, 70.0, 8.0),
+                }),
+            )
+            .expect("source outbox");
+        scheduler.tick().expect("production tick");
+        assert_eq!(scheduler.cross_shard_queue_len(), 1);
+
+        scheduler
+            .transition(destination, ShardLifecycleState::Draining)
+            .expect("begin draining");
+        assert_eq!(
+            scheduler.transition(destination, ShardLifecycleState::Stopped),
+            Err(SimError::ShardDrainIncomplete { shard: destination })
+        );
+
+        let boundary = scheduler.tick().expect("draining boundary tick");
+        let destination_outputs = boundary
+            .shard_outputs()
+            .find_map(|(shard, outputs)| (shard == destination).then_some(outputs))
+            .expect("destination outcome");
+        assert_eq!(
+            destination_outputs,
+            &[GameOutput::PlayerSpawned {
+                player,
+                position: Vec3::new(132.0, 70.0, 8.0),
+            }]
+        );
+        assert_eq!(scheduler.cross_shard_queue_len(), 0);
+        scheduler
+            .transition(destination, ShardLifecycleState::Stopped)
+            .expect("admitted boundary work drained");
+    }
+
+    #[test]
+    fn invalid_cross_shard_destinations_reject_without_mutation() {
+        let mut scheduler = ShardScheduler::with_shadow_workers_and_cross_shard_capacity(
+            TickCoordinator::new(TickRate::VANILLA),
+            NonZeroUsize::new(2).expect("nonzero workers"),
+            NonZeroUsize::new(8).expect("nonzero queue"),
+        )
+        .expect("worker pool");
+        let source = scheduler
+            .register(SimShard::new(ShardPos::new(0, 0)))
+            .expect("source");
+        let created = scheduler
+            .register(SimShard::new(ShardPos::new(1, 0)))
+            .expect("created");
+        let draining = scheduler
+            .register(SimShard::new(ShardPos::new(2, 0)))
+            .expect("draining");
+        let stopped = scheduler
+            .register(SimShard::new(ShardPos::new(3, 0)))
+            .expect("stopped");
+        let unknown = logical_id(WorldId::new(0), DimensionId::new(0), ShardPos::new(4, 0));
+        scheduler.activate(source).expect("activate source");
+        scheduler.activate(draining).expect("activate draining");
+        scheduler
+            .transition(draining, ShardLifecycleState::Draining)
+            .expect("drain");
+        scheduler.activate(stopped).expect("activate stopped");
+        scheduler
+            .transition(stopped, ShardLifecycleState::Draining)
+            .expect("drain stopped");
+        scheduler
+            .transition(stopped, ShardLifecycleState::Stopped)
+            .expect("stop");
+
+        for (destination, name) in [
+            (source, "same"),
+            (created, "created"),
+            (draining, "draining"),
+            (stopped, "stopped"),
+            (unknown, "unknown"),
+        ] {
+            scheduler
+                .emit_cross_shard_during_next_tick(
+                    source,
+                    destination,
+                    CrossShardPayload::ApplyInput(GameInput::PlayerJoin {
+                        player: PlayerId::offline(name),
+                        position: Vec3::ZERO,
+                    }),
+                )
+                .expect("bounded source outbox");
+        }
+
+        let outcome = scheduler.tick().expect("production tick");
+        let reasons: Vec<_> = outcome
+            .cross_shard_rejections()
+            .iter()
+            .map(crate::cross_shard::CrossShardRejection::reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                CrossShardRejectionReason::SameShard,
+                CrossShardRejectionReason::DestinationNotActive {
+                    state: ShardLifecycleState::Created,
+                },
+                CrossShardRejectionReason::DestinationNotActive {
+                    state: ShardLifecycleState::Draining,
+                },
+                CrossShardRejectionReason::DestinationNotActive {
+                    state: ShardLifecycleState::Stopped,
+                },
+                CrossShardRejectionReason::UnknownDestination,
+            ]
+        );
+        assert_eq!(scheduler.cross_shard_queue_len(), 0);
+        for shard in [source, created, draining, stopped] {
+            assert_eq!(
+                scheduler.shard(shard).expect("registered").player_count(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn tick_overflow_preserves_a_ready_cross_shard_boundary() {
+        let mut scheduler = ShardScheduler::with_shadow_workers_and_cross_shard_capacity(
+            TickCoordinator::new(TickRate::VANILLA),
+            NonZeroUsize::MIN,
+            NonZeroUsize::MIN,
+        )
+        .expect("worker pool");
+        let source = scheduler
+            .register(SimShard::new(ShardPos::new(0, 0)))
+            .expect("source");
+        let destination = scheduler
+            .register(SimShard::new(ShardPos::new(1, 0)))
+            .expect("destination");
+        scheduler.activate(source).expect("activate source");
+        scheduler
+            .activate(destination)
+            .expect("activate destination");
+        let player = PlayerId::offline("overflow-boundary");
+        scheduler
+            .emit_cross_shard_during_next_tick(
+                source,
+                destination,
+                CrossShardPayload::ApplyInput(GameInput::PlayerJoin {
+                    player,
+                    position: Vec3::new(133.0, 70.0, 8.0),
+                }),
+            )
+            .expect("source outbox");
+        scheduler.tick().expect("production tick");
+        assert_eq!(scheduler.cross_shard_queue_len(), 1);
+
+        scheduler.coordinator =
+            TickCoordinator::resuming_at(TickRate::VANILLA, Tick::new(u64::MAX));
+        assert_eq!(scheduler.tick(), Err(SimError::TickOverflow));
+        assert_eq!(scheduler.cross_shard_queue_len(), 1);
+        assert!(!scheduler
+            .shard(destination)
+            .expect("destination")
+            .contains_player(player));
+
+        scheduler.coordinator = TickCoordinator::resuming_at(TickRate::VANILLA, Tick::new(1));
+        let boundary = scheduler.tick().expect("retry exact boundary");
+        assert_eq!(boundary.tick(), Tick::new(2));
+        assert!(scheduler
+            .shard(destination)
+            .expect("destination")
+            .contains_player(player));
+        assert_eq!(scheduler.cross_shard_queue_len(), 0);
     }
 }

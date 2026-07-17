@@ -188,6 +188,32 @@ pub enum SimError {
         /// Draining logical shard that still has tick work.
         shard: ShardId,
     },
+
+    /// One shard's bounded per-tick cross-shard outbox rejected a new intent.
+    #[error("logical shard {shard} cross-shard outbox is full (capacity {capacity})")]
+    CrossShardOutboxFull {
+        /// Source shard whose local outbox reached its fixed ceiling.
+        shard: ShardId,
+        /// Fixed per-shard outbox capacity.
+        capacity: usize,
+    },
+
+    /// A prepared cross-shard boundary changed before its successful tick could
+    /// commit it.
+    #[error("cross-shard boundary for tick {tick} changed before commit")]
+    CrossShardBoundaryCommitFailed {
+        /// Boundary whose unchanged snapshot could not be removed.
+        tick: Tick,
+    },
+
+    /// A shard emitted a cross-shard intent on the final representable tick.
+    #[error("logical shard {shard} emitted cross-shard work at terminal tick {tick}")]
+    CrossShardEnvelopeTickOverflow {
+        /// Source shard whose owned intent could not receive a next boundary.
+        shard: ShardId,
+        /// Completed terminal tick.
+        tick: Tick,
+    },
 }
 
 impl From<SimError> for ServerError {
@@ -261,6 +287,17 @@ impl From<SimError> for ServerError {
             SimError::ShardDrainIncomplete { shard } => ServerError::invalid_state(format!(
                 "logical shard {shard} cannot stop before its admitted tick work drains"
             )),
+            SimError::CrossShardOutboxFull { shard, capacity } => ServerError::capacity(format!(
+                "logical shard {shard} cross-shard outbox full (capacity {capacity})"
+            )),
+            SimError::CrossShardBoundaryCommitFailed { tick } => ServerError::internal(format!(
+                "cross-shard boundary for tick {tick} changed before commit"
+            )),
+            SimError::CrossShardEnvelopeTickOverflow { shard, tick } => {
+                ServerError::internal(format!(
+                    "logical shard {shard} emitted cross-shard work at terminal tick {tick}"
+                ))
+            }
         }
     }
 }
