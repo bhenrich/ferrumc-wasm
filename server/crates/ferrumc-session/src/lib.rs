@@ -30,6 +30,8 @@
 //!
 //! - [`SessionRouter`] / [`PlayerSessionHandle`] — the mapping and the
 //!   per-connection handle.
+//! - [`ShardDirectory`] / [`ShardLease`] — exact and world-covering endpoint
+//!   resolution with generation-checked registration mutation.
 //! - [`NetEvent`] — the network-side input vocabulary.
 //! - [`net_event_to_input`] / [`output_to_clientbound`] / [`shard_for_position`]
 //!   — the pure translation and routing-policy functions.
@@ -45,6 +47,7 @@
 
 mod block_entity;
 mod delivery;
+mod directory;
 mod error;
 mod event;
 mod outbound;
@@ -56,6 +59,10 @@ mod translate;
 
 pub use block_entity::{open_screen, open_sign_editor, sign_block_entity_data};
 pub use delivery::{DeliveryLane, DeliveryPolicy, InputDeliveryError, InputDeliveryPolicy};
+pub use directory::{
+    ResolvedShard, ShardCoverage, ShardDirectory, ShardDirectoryEntry, ShardDirectoryError,
+    ShardGeneration, ShardLease, ShardRegistrationId,
+};
 pub use error::SessionError;
 pub use event::NetEvent;
 pub use outbound::OutboundMessage;
@@ -68,8 +75,8 @@ pub use presentation::{
     SOUND_UI_BUTTON_CLICK,
 };
 pub use router::{
-    PlayerSessionHandle, SessionRouter, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_SHARD_CONTROL_RESERVE,
-    DEFAULT_SHARD_INPUT_CAPACITY, DEFAULT_VIEW_DISTANCE,
+    PlayerSessionHandle, SessionRouter, ShardRegistration, DEFAULT_OUTBOUND_CAPACITY,
+    DEFAULT_SHARD_CONTROL_RESERVE, DEFAULT_SHARD_INPUT_CAPACITY, DEFAULT_VIEW_DISTANCE,
 };
 pub use scoreboard::{
     boss_bar_add, boss_bar_remove, boss_bar_update_flags, boss_bar_update_health,

@@ -5,21 +5,22 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tokio::sync::mpsc::{self, error::TrySendError};
 
-use ferrumc_core::{PlayerId, TextComponent};
+use ferrumc_core::{DimensionId, PlayerId, TextComponent, WorldId};
 use ferrumc_math::{BlockPos, ChunkPos, ShardPos, Vec3};
 use ferrumc_net::{Criticality, OutboundPriority};
 use ferrumc_proto::generated::play::ClientboundPlayPacket;
-use ferrumc_sim::{BlockStateId, GameInput, GameOutput, MutationCause};
+use ferrumc_sim::{BlockStateId, GameInput, GameOutput, MutationCause, ShardId, ShardPartitioner};
 
 use crate::delivery::{DeliveryLane, InputDeliveryError, InputDeliveryPolicy};
+use crate::directory::{ShardCoverage, ShardDirectory, ShardLease, ShardRegistrationId};
 use crate::error::SessionError;
 use crate::event::NetEvent;
 use crate::outbound::OutboundMessage;
 use crate::translate::{
     ack_shell, block_update_shell, chunk_for_position, entity_spawn_shell, entity_teleport_shell,
     move_shell, play_packet_to_input, player_info_add, player_info_remove, remove_entities_shell,
-    set_equipment_shell, set_head_rotation_shell, shard_for_position,
-    update_entity_position_and_rotation_shell, update_entity_rotation_shell,
+    set_equipment_shell, set_head_rotation_shell, update_entity_position_and_rotation_shell,
+    update_entity_rotation_shell,
 };
 
 /// Default capacity of each shard's input channel.
@@ -61,6 +62,35 @@ pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
 /// a viewer's own.
 const FIRST_ENTITY_ID: i32 = 2;
 
+/// The current single-world app's typed routing scope.
+const DEFAULT_WORLD: WorldId = WorldId::new(0);
+
+/// The current single-dimension app's typed routing scope.
+const DEFAULT_DIMENSION: DimensionId = DimensionId::new(0);
+
+/// One current runtime endpoint registered in the shard directory.
+///
+/// `home` identifies the simulation owner for compatibility and diagnostics;
+/// it is not the set of logical targets the endpoint covers.
+#[derive(Debug, Clone)]
+struct ShardEndpoint {
+    home: ShardId,
+    sender: mpsc::Sender<GameInput>,
+}
+
+/// A stable data-plane binding to one directory coverage slot.
+///
+/// Generations authorize control-plane replacement/removal. Player bindings
+/// intentionally retain the stable slot and home instead, so an authorized
+/// sender rotation keeps existing sessions routable without silently moving
+/// them to newly introduced, more-specific coverage.
+#[derive(Debug, Clone, Copy)]
+struct ShardBinding {
+    coverage: ShardCoverage,
+    registration_id: ShardRegistrationId,
+    home: ShardId,
+}
+
 /// The router's private per-player record.
 ///
 /// Holds the routing target (`shard` + `outbound` channel) plus the lightweight
@@ -73,7 +103,7 @@ const FIRST_ENTITY_ID: i32 = 2;
 /// state — the simulation still owns the real positions.
 #[derive(Debug)]
 struct SessionEntry {
-    shard: ShardPos,
+    shard: ShardBinding,
     outbound: mpsc::Sender<OutboundMessage>,
     name: String,
     entity_id: i32,
@@ -120,6 +150,40 @@ struct PeerSnapshot {
     equipment: Vec<u8>,
 }
 
+/// A newly installed shard endpoint and its bounded input receiver.
+///
+/// The caller gives the receiver to the shard worker and retains
+/// [`lease`](Self::lease) for an authorized future sender rotation or removal.
+/// Dropping this value without extracting the receiver closes the endpoint.
+#[derive(Debug)]
+pub struct ShardRegistration {
+    home: ShardId,
+    lease: ShardLease,
+    receiver: mpsc::Receiver<GameInput>,
+}
+
+impl ShardRegistration {
+    /// Returns the canonical home shard used for compatibility and diagnostics.
+    pub const fn shard_id(&self) -> ShardId {
+        self.home
+    }
+
+    /// Returns the coverage and generation authorizing this registration.
+    pub fn lease(&self) -> ShardLease {
+        self.lease.clone()
+    }
+
+    /// Consumes the registration and returns its bounded input receiver.
+    pub fn into_receiver(self) -> mpsc::Receiver<GameInput> {
+        self.receiver
+    }
+
+    /// Consumes the registration into its home, lease, and bounded receiver.
+    pub fn into_parts(self) -> (ShardId, ShardLease, mpsc::Receiver<GameInput>) {
+        (self.home, self.lease, self.receiver)
+    }
+}
+
 /// A handle to one player's session, returned by
 /// [`SessionRouter::join_player`].
 ///
@@ -134,7 +198,7 @@ struct PeerSnapshot {
 #[derive(Debug)]
 pub struct PlayerSessionHandle {
     player: PlayerId,
-    shard: ShardPos,
+    shard: ShardId,
     outbound: mpsc::Receiver<OutboundMessage>,
 }
 
@@ -146,6 +210,15 @@ impl PlayerSessionHandle {
 
     /// The shard the player was routed to on join.
     pub fn shard(&self) -> ShardPos {
+        self.shard.position()
+    }
+
+    /// The canonical home shard of the endpoint selected on join.
+    ///
+    /// This is the registered runtime endpoint's home, not necessarily the
+    /// logical 8x8 target containing the player's position when world coverage
+    /// selected one endpoint for the whole scope.
+    pub fn shard_id(&self) -> ShardId {
         self.shard
     }
 
@@ -237,7 +310,7 @@ impl PlayerSessionHandle {
 /// simulation outputs — never authored here.
 #[derive(Debug)]
 pub struct SessionRouter {
-    shards: BTreeMap<ShardPos, mpsc::Sender<GameInput>>,
+    shards: ShardDirectory<ShardEndpoint>,
     players: BTreeMap<PlayerId, SessionEntry>,
     pending_disconnects: BTreeSet<PlayerId>,
     shard_input_capacity: usize,
@@ -283,7 +356,7 @@ impl SessionRouter {
     ) -> Self {
         let shard_input_capacity = shard_input_capacity.max(1);
         Self {
-            shards: BTreeMap::new(),
+            shards: ShardDirectory::new(),
             players: BTreeMap::new(),
             pending_disconnects: BTreeSet::new(),
             shard_input_capacity,
@@ -330,9 +403,13 @@ impl SessionRouter {
         self.shards.len()
     }
 
-    /// `true` if a shard is registered at `shard`.
+    /// `true` if the default world/dimension can route logical `shard`.
+    ///
+    /// Exact coverage or a world-covering fallback may satisfy the lookup.
     pub fn is_shard_registered(&self, shard: ShardPos) -> bool {
-        self.shards.contains_key(&shard)
+        ShardPartitioner::for_shard(DEFAULT_WORLD, DEFAULT_DIMENSION, shard)
+            .ok()
+            .is_some_and(|target| self.shards.resolve(target).is_some())
     }
 
     /// The number of players with an active session.
@@ -357,20 +434,135 @@ impl SessionRouter {
 
     /// The shard `player` is bound to, or `None` if they have no session.
     pub fn player_shard(&self, player: PlayerId) -> Option<ShardPos> {
-        self.players.get(&player).map(|entry| entry.shard)
+        self.player_shard_id(player).map(ShardId::position)
     }
 
-    /// Registers a shard at `shard`, returning the receiving half of its bounded
-    /// input channel.
+    /// The canonical home shard of `player`'s registered runtime endpoint.
     ///
-    /// The caller (the shard worker) drains the returned receiver into the
-    /// shard's inbox each tick. Registering an already-registered shard replaces
-    /// its sender, closing the previous channel — so the previous receiver, if
-    /// still held, observes the channel as closed.
+    /// A world-covering endpoint can own a player whose position belongs to a
+    /// different logical target, so this returns the endpoint home selected at
+    /// join rather than recomputing from the player's position.
+    pub fn player_shard_id(&self, player: PlayerId) -> Option<ShardId> {
+        self.players.get(&player).map(|entry| entry.shard.home)
+    }
+
+    /// Registers exact default-world coverage at `shard`, returning its bounded
+    /// input receiver.
+    ///
+    /// This source-compatible adapter preserves the current app's exact spatial
+    /// registration until its explicit world-covering adoption. New supervisors
+    /// should use [`register_exact_shard`](Self::register_exact_shard) or
+    /// [`register_world_shard`](Self::register_world_shard), which return the
+    /// validation result and lease.
+    ///
+    /// Duplicate registration is refused without replacing the active endpoint;
+    /// the returned receiver is already closed because this legacy signature
+    /// cannot carry a typed error. An invalid out-of-domain position or exhausted
+    /// generation fails closed in the same way. The fallible typed APIs expose
+    /// those failures directly, and sender rotation always requires
+    /// [`replace_shard_registration`](Self::replace_shard_registration) with the
+    /// current lease.
     pub fn register_shard(&mut self, shard: ShardPos) -> mpsc::Receiver<GameInput> {
-        let (tx, rx) = mpsc::channel(self.shard_input_capacity);
-        self.shards.insert(shard, tx);
-        rx
+        let Ok(home) = ShardPartitioner::for_shard(DEFAULT_WORLD, DEFAULT_DIMENSION, shard) else {
+            return self.closed_shard_receiver();
+        };
+        match self.register_exact_shard(home) {
+            Ok(registration) => registration.into_receiver(),
+            Err(_) => self.closed_shard_receiver(),
+        }
+    }
+
+    /// Registers one exact logical shard endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::ShardDirectory`] if exact coverage is occupied
+    /// or a fresh generation cannot be allocated. The existing endpoint remains
+    /// unchanged.
+    pub fn register_exact_shard(
+        &mut self,
+        home: ShardId,
+    ) -> Result<ShardRegistration, SessionError> {
+        self.register_shard_coverage(ShardCoverage::exact(home), home)
+    }
+
+    /// Registers `home` as the endpoint covering its entire world/dimension.
+    ///
+    /// Resolution keeps the target logical [`ShardId`] distinct from this
+    /// endpoint home. Exact registrations in the same scope take precedence for
+    /// new resolutions; otherwise positions arbitrarily far from `home` route
+    /// through this one bounded endpoint without enumerating regions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::ShardDirectory`] if world coverage is occupied
+    /// or a fresh generation cannot be allocated.
+    pub fn register_world_shard(
+        &mut self,
+        home: ShardId,
+    ) -> Result<ShardRegistration, SessionError> {
+        self.register_shard_coverage(ShardCoverage::world(home.world(), home.dimension()), home)
+    }
+
+    /// Rotates the sender for the registration authorized by `lease`.
+    ///
+    /// Coverage and endpoint home remain unchanged. Existing player bindings to
+    /// that stable coverage slot immediately use the new bounded sender, while
+    /// the old receiver closes after draining.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::ShardDirectory`] when `lease` belongs to another
+    /// directory, is stale, or the generation space is exhausted. A failure
+    /// leaves the active endpoint unchanged.
+    pub fn replace_shard_registration(
+        &mut self,
+        lease: &ShardLease,
+    ) -> Result<ShardRegistration, SessionError> {
+        let home = self.shards.get(lease)?.endpoint().home;
+        let (sender, receiver) = mpsc::channel(self.shard_input_capacity);
+        let next = self.shards.replace(lease, ShardEndpoint { home, sender })?;
+        Ok(ShardRegistration {
+            home,
+            lease: next,
+            receiver,
+        })
+    }
+
+    /// Removes the endpoint authorized by `lease` and closes its sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::ShardDirectory`] if `lease` belongs to another
+    /// directory, is absent, or is stale; the current registration then remains
+    /// unchanged.
+    pub fn unregister_shard_registration(
+        &mut self,
+        lease: &ShardLease,
+    ) -> Result<ShardId, SessionError> {
+        Ok(self.shards.remove(lease)?.home)
+    }
+
+    fn register_shard_coverage(
+        &mut self,
+        coverage: ShardCoverage,
+        home: ShardId,
+    ) -> Result<ShardRegistration, SessionError> {
+        let (sender, receiver) = mpsc::channel(self.shard_input_capacity);
+        let lease = self
+            .shards
+            .register(coverage, ShardEndpoint { home, sender })?;
+        Ok(ShardRegistration {
+            home,
+            lease,
+            receiver,
+        })
+    }
+
+    fn closed_shard_receiver(&self) -> mpsc::Receiver<GameInput> {
+        let (sender, receiver) = mpsc::channel(self.shard_input_capacity);
+        drop(sender);
+        receiver
     }
 
     /// The network entity id a `player` is broadcast to other clients as, or
@@ -448,10 +640,22 @@ impl SessionRouter {
         position: Vec3,
         equipment: Vec<u8>,
     ) -> Result<PlayerSessionHandle, SessionError> {
-        let shard = shard_for_position(position);
-        if !self.shards.contains_key(&shard) {
-            return Err(SessionError::UnknownShard { shard });
-        }
+        let target = ShardPartitioner::for_chunk(
+            DEFAULT_WORLD,
+            DEFAULT_DIMENSION,
+            chunk_for_position(position),
+        );
+        let shard = self
+            .shards
+            .resolve(target)
+            .map(|resolved| ShardBinding {
+                coverage: resolved.coverage(),
+                registration_id: resolved.registration_id(),
+                home: resolved.endpoint().home,
+            })
+            .ok_or(SessionError::UnknownShard {
+                shard: target.position(),
+            })?;
         if self.players.contains_key(&player) {
             return Err(SessionError::DuplicatePlayer { player });
         }
@@ -539,7 +743,7 @@ impl SessionRouter {
         let _retained_failure = self.drain_disconnect_worklist(to_disconnect);
         Ok(PlayerSessionHandle {
             player,
-            shard,
+            shard: shard.home,
             outbound: rx,
         })
     }
@@ -689,6 +893,8 @@ impl SessionRouter {
     ///   session.
     /// - [`SessionError::ShardInboxFull`] / [`SessionError::ShardClosed`] if the
     ///   input could not be delivered to the shard.
+    /// - [`SessionError::StaleShardBinding`] if the player's endpoint was removed
+    ///   and re-registered without an explicit session handoff.
     pub fn route_event(&mut self, event: &NetEvent) -> Result<(), SessionError> {
         self.route_event_owned(event)
             .map_err(InputDeliveryError::into_error)
@@ -729,6 +935,8 @@ impl SessionRouter {
     /// - [`SessionError::UnknownPlayer`] if `player` has no session.
     /// - [`SessionError::ShardInboxFull`] / [`SessionError::ShardClosed`] if the
     ///   input could not be delivered to the shard.
+    /// - [`SessionError::StaleShardBinding`] if the player's endpoint lineage is
+    ///   no longer current.
     pub fn route_game_input(&self, player: PlayerId, input: GameInput) -> Result<(), SessionError> {
         self.route_game_input_owned(player, input)
             .map_err(InputDeliveryError::into_error)
@@ -1268,6 +1476,8 @@ impl SessionRouter {
     ///   required leave could not be delivered. That player's mapping remains so
     ///   the caller can retry or terminate explicitly rather than orphaning a sim
     ///   entity.
+    /// - [`SessionError::StaleShardBinding`] if a required player's endpoint
+    ///   lineage was removed or replaced by a new registration.
     pub fn disconnect_player(&mut self, player: PlayerId) -> Result<ShardPos, SessionError> {
         self.disconnect_player_owned(player)
             .map_err(InputDeliveryError::into_error)
@@ -1313,7 +1523,8 @@ impl SessionRouter {
     /// # Errors
     ///
     /// Returns an [`InputDeliveryError`] if at least one retained leave is still
-    /// rejected. The corresponding player mapping remains registered.
+    /// rejected by capacity, closure, or a stale endpoint lineage. The
+    /// corresponding player mapping remains registered.
     pub fn retry_pending_disconnects(&mut self) -> Result<(), InputDeliveryError> {
         let worklist = self.pending_disconnects.iter().copied().collect();
         if let Some(err) = self.drain_disconnect_worklist(worklist) {
@@ -1385,7 +1596,7 @@ impl SessionRouter {
             ));
         };
         self.broadcast_leave_visibility(player, entry.entity_id, also_disconnect);
-        Ok(shard)
+        Ok(shard.home.position())
     }
 
     /// Tells every remaining player that *had `departed` in view* to drop it
@@ -1552,6 +1763,8 @@ impl SessionRouter {
     /// - [`SessionError::UnknownPlayer`] if `player` has no session.
     /// - [`SessionError::ShardInboxFull`] / [`SessionError::ShardClosed`] if the
     ///   authoritative move could not be delivered to the shard.
+    /// - [`SessionError::StaleShardBinding`] if the player's endpoint lineage is
+    ///   no longer current.
     pub fn teleport_player(
         &mut self,
         player: PlayerId,
@@ -1611,7 +1824,7 @@ impl SessionRouter {
     /// Routes an already-translated input to the shard that should apply it.
     ///
     /// A block edit is routed by the *block's* chunk (see
-    /// [`shard_for_block`](Self::shard_for_block)); every other input routes to
+    /// [`binding_for_block`](Self::binding_for_block)); every other input routes to
     /// the player's bound shard.
     fn route_input_owned(
         &self,
@@ -1641,7 +1854,7 @@ impl SessionRouter {
             | GameInput::BlockPlace { position, .. }
             | GameInput::SetBlockExact { position, .. }
             | GameInput::RejectBlockEdit { position, .. } => {
-                self.shard_for_block(*position, entry.shard)
+                self.binding_for_block(*position, entry.shard)
             }
             _ => entry.shard,
         };
@@ -1657,17 +1870,31 @@ impl SessionRouter {
     /// otherwise the edit falls back to the player's bound shard (`fallback`). In
     /// this single-shard milestone both resolve to the same shard, so routing is
     /// unchanged — the seam only positions the router for real multi-shard later.
-    fn shard_for_block(&self, position: BlockPos, fallback: ShardPos) -> ShardPos {
-        let owner = position.to_chunk_pos().to_shard_pos();
-        if self.shards.contains_key(&owner) {
-            owner
-        } else {
-            fallback
+    fn binding_for_block(&self, position: BlockPos, fallback: ShardBinding) -> ShardBinding {
+        let Some(current_fallback) = self.shards.current(fallback.coverage) else {
+            return fallback;
+        };
+        if current_fallback.registration_id() != fallback.registration_id
+            || current_fallback.endpoint().home != fallback.home
+        {
+            return fallback;
         }
+        let target = ShardPartitioner::for_block(DEFAULT_WORLD, DEFAULT_DIMENSION, position);
+        self.shards.resolve(target).map_or(fallback, |resolved| {
+            if resolved.coverage() == fallback.coverage {
+                fallback
+            } else {
+                ShardBinding {
+                    coverage: resolved.coverage(),
+                    registration_id: resolved.registration_id(),
+                    home: resolved.endpoint().home,
+                }
+            }
+        })
     }
 
     /// Non-blocking send of `input` to `shard`'s input channel.
-    fn send_to_shard(&self, shard: ShardPos, input: GameInput) -> Result<(), SessionError> {
+    fn send_to_shard(&self, shard: ShardBinding, input: GameInput) -> Result<(), SessionError> {
         let policy = InputDeliveryPolicy::for_input(&input);
         self.send_to_shard_owned(shard, input, policy)
             .map_err(InputDeliveryError::into_error)
@@ -1676,17 +1903,38 @@ impl SessionRouter {
     /// Non-blocking shard send that returns the exact input on rejection.
     fn send_to_shard_owned(
         &self,
-        shard: ShardPos,
+        binding: ShardBinding,
         input: GameInput,
         policy: InputDeliveryPolicy,
     ) -> Result<(), InputDeliveryError> {
-        let Some(sender) = self.shards.get(&shard) else {
+        let current = self.shards.current(binding.coverage);
+        let Some(current) = current else {
             return Err(InputDeliveryError::new(
                 input,
                 policy,
-                SessionError::UnknownShard { shard },
+                SessionError::StaleShardBinding {
+                    home: binding.home,
+                    registration_id: binding.registration_id,
+                    current_registration_id: None,
+                },
             ));
         };
+        if current.registration_id() != binding.registration_id
+            || current.endpoint().home != binding.home
+        {
+            return Err(InputDeliveryError::new(
+                input,
+                policy,
+                SessionError::StaleShardBinding {
+                    home: binding.home,
+                    registration_id: binding.registration_id,
+                    current_registration_id: Some(current.registration_id()),
+                },
+            ));
+        }
+        let endpoint = current.endpoint();
+        let sender = &endpoint.sender;
+        let shard = endpoint.home.position();
 
         // The router is the sole sender. Refusing ordinary data once only the
         // reserved tail remains cannot race another producer; the receiver may

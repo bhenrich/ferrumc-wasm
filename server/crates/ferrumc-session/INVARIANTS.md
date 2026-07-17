@@ -25,5 +25,17 @@
   `disconnect_player` must enqueue `PlayerLeave` before removing the mapping; if
   the control lane rejects the leave, the mapping remains available for retry or
   explicit overload termination.
+- Logical `ShardId` targets and runtime endpoints are distinct. Directory
+  resolution is scoped by `WorldId` + `DimensionId`, prefers exact coverage over
+  a world-covering fallback, and never falls through after a selected endpoint
+  reports full or closed.
+- Directory registration is atomic and lease-validated. Duplicate insertion
+  cannot overwrite an endpoint; replace/remove requires the current generation;
+  generations and registration-lineage ids are never reused after removal
+  within a directory instance.
+- A player binding retains one coverage slot, endpoint home, and registration
+  lineage. An authorized sender rotation preserves that lineage and immediately
+  serves existing sessions. Unregister/re-register creates a new lineage and
+  cannot silently retarget them.
 - Translation (`net_event_to_input`, `output_to_clientbound`,
   `shard_for_position`) is pure: no channels, maps, or I/O.

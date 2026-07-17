@@ -2,6 +2,9 @@
 
 use ferrumc_core::{PlayerId, ServerError};
 use ferrumc_math::ShardPos;
+use ferrumc_sim::ShardId;
+
+use crate::directory::{ShardDirectoryError, ShardRegistrationId};
 
 /// A classifying error returned by [`SessionRouter`](crate::SessionRouter)
 /// operations.
@@ -63,6 +66,27 @@ pub enum SessionError {
         shard: ShardPos,
     },
 
+    /// A shard-directory registration mutation failed validation.
+    #[error("shard directory rejected the operation: {0}")]
+    ShardDirectory(#[from] ShardDirectoryError),
+
+    /// A player binding refers to a removed registration lineage.
+    ///
+    /// Checked sender rotation preserves the registration id, so this occurs
+    /// only after unregister/re-register (or removal), which requires an
+    /// explicit session handoff rather than silent retargeting.
+    #[error(
+        "stale shard binding for {home}: registration {registration_id}, current registration {current_registration_id:?}"
+    )]
+    StaleShardBinding {
+        /// The endpoint home selected when the session was joined.
+        home: ShardId,
+        /// The registration lineage retained by the player binding.
+        registration_id: ShardRegistrationId,
+        /// The current lineage for that coverage, or `None` after removal.
+        current_registration_id: Option<ShardRegistrationId>,
+    },
+
     /// A player's bounded outbound channel was at capacity and rejected the
     /// packet.
     ///
@@ -112,6 +136,16 @@ impl From<SessionError> for ServerError {
                 "shard ({}, {}) input channel closed",
                 shard.x(),
                 shard.z()
+            )),
+            SessionError::ShardDirectory(err) => {
+                ServerError::invalid_state(format!("shard directory operation failed: {err}"))
+            }
+            SessionError::StaleShardBinding {
+                home,
+                registration_id,
+                current_registration_id,
+            } => ServerError::invalid_state(format!(
+                "stale binding for {home}: registration {registration_id}, current {current_registration_id:?}"
             )),
             SessionError::OutboundClosed { player } => {
                 ServerError::invalid_state(format!("player {player} outbound channel closed"))
