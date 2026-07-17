@@ -46,3 +46,15 @@
 - A logical region may have at most one ownership claim.
 - Shard lifecycle is strictly `Created -> Active -> Draining -> Stopped`.
   Rejected transitions leave the prior state unchanged.
+- The scheduler defaults to the existing one-shard inline path. Its multi-shard
+  worker mode is crate-internal, explicitly selected, and not wired into the
+  application.
+- A shadow tick visits each runnable shard exactly once in canonical `ShardId`
+  order. Persistent workers receive owned, disjoint shard batches through
+  capacity-one command/result channels; every shard is returned before the next
+  tick, and worker completion order never changes output publication order.
+- Only `Active` shards accept new scheduler input. `Draining` shards continue
+  ticking admitted work, reject new input, and cannot become `Stopped` until
+  their tick work is quiescent.
+- A worker failure after dispatch permanently poisons that scheduler. A partial
+  tick is fail-stop and must never be retried.

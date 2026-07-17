@@ -6,8 +6,11 @@
 //!
 //! This milestone delivers the deterministic *skeleton* of the simulation
 //! layer: the messages crossing the sim boundary, the tick counter that drives
-//! it, and one shard that applies inputs at tick boundaries. There is no
-//! networking, no storage handle, and no plugin dispatch here yet.
+//! it, and shards that apply inputs at tick boundaries. The application still
+//! drives one authoritative shard; a crate-internal, non-default shadow
+//! scheduler prepares deterministic multi-shard worker ownership without
+//! changing that runtime. There is no networking, no storage handle, and no
+//! plugin dispatch here yet.
 //!
 //! The pieces fit together as a one-way pipeline driven entirely by explicit
 //! `tick` calls (never a wall clock):
@@ -27,8 +30,8 @@
 //!   chunks, applying inputs only at tick boundaries.
 //! - [`ShardPartitioner`] / [`ShardOwnershipMap`] — deterministic typed 8x8
 //!   region partitioning and overlap-free runtime ownership claims.
-//! - [`ShardLifecycle`] — the explicit lifecycle of a future scheduled shard,
-//!   without introducing a worker pool.
+//! - [`ShardLifecycle`] — the explicit eligibility lifecycle used by the
+//!   crate-internal shadow scheduler's logical worker plan.
 //! - [`SimHarness`] / [`TickOutcome`] — a deterministic, wall-clock-free driver
 //!   tying a coordinator to one shard, used by tests and replay.
 //!
@@ -54,6 +57,11 @@ mod message;
 mod mutation;
 mod ownership;
 mod region;
+#[allow(
+    dead_code,
+    reason = "the owner-gated shadow scheduler intentionally has no app wiring yet"
+)]
+pub(crate) mod scheduler;
 mod shard;
 mod spawn;
 mod ticket;

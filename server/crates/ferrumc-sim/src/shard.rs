@@ -381,6 +381,21 @@ impl SimShard {
         self.inbox.len()
     }
 
+    /// Returns whether no admitted input or incremental region operation still
+    /// needs a future tick.
+    ///
+    /// Used by the crate-internal scheduler before completing a draining
+    /// lifecycle. Buffered mutation records and dirty chunks are completed
+    /// outputs for later persistence phases, not tick work, so they do not make
+    /// the shard non-quiescent.
+    #[allow(
+        dead_code,
+        reason = "the owner-gated shadow scheduler intentionally has no app wiring yet"
+    )]
+    pub(crate) fn is_tick_quiescent(&self) -> bool {
+        self.inbox.is_empty() && self.pending_region_work.is_empty()
+    }
+
     /// Returns `true` if the inbox is at capacity and will reject new inputs.
     pub fn is_inbox_full(&self) -> bool {
         self.inbox.len() >= self.inbox_capacity
