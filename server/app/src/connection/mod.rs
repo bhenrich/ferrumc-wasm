@@ -23,9 +23,10 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use ferrumc_codec::BoundedString;
+use ferrumc_core::PlayerId;
 use ferrumc_math::Vec3;
 use ferrumc_net::{
-    offline_uuid, CompressionState, ConnectionState, DecodeError, FrameDecodeError, InboundDecoder,
+    CompressionState, ConnectionState, DecodeError, FrameDecodeError, InboundDecoder,
     InboundPacket, OutboundEncoder, OutboundPacket,
 };
 use ferrumc_observability::SessionDebug;
@@ -121,6 +122,28 @@ enum LoginProgress {
     Play,
 }
 
+/// The canonical identity established once from Login Start and carried into
+/// every later app-owned identity surface.
+struct LoginIdentity {
+    /// The exact, case-sensitive username supplied by the client.
+    name: BoundedString<16>,
+    /// The canonical offline-mode player identity derived from `name`.
+    player: PlayerId,
+}
+
+impl LoginIdentity {
+    /// Derives the canonical offline identity once for a wire-bounded name.
+    fn offline(name: BoundedString<16>) -> Self {
+        let player = PlayerId::offline(name.as_str());
+        Self { name, player }
+    }
+
+    /// Returns the UUID exposed in Login Success and player-facing packets.
+    fn uuid(&self) -> uuid::Uuid {
+        self.player.as_uuid()
+    }
+}
+
 /// One connection's mutable framing state during the login handshake.
 struct Connection<'a> {
     /// The accepted socket.
@@ -169,8 +192,8 @@ impl<'a> Connection<'a> {
         write_all(&mut self.stream, &buf, self.ctx.io_timeout).await
     }
 
-    /// Sends the (optional) Set Compression and the Login Success for `name`.
-    async fn send_login_success(&mut self, name: &BoundedString<16>) -> anyhow::Result<()> {
+    /// Sends the optional Set Compression and Login Success for `identity`.
+    async fn send_login_success(&mut self, identity: &LoginIdentity) -> anyhow::Result<()> {
         if let Some(threshold) = self.ctx.enabled_threshold() {
             self.send(&OutboundPacket::Login(
                 ClientboundLoginPacket::SetCompression(SetCompression::new(threshold)),
@@ -180,9 +203,12 @@ impl<'a> Connection<'a> {
             // framed with the negotiated zlib threshold.
             self.compression = CompressionState::enabled(threshold as usize);
         }
-        let uuid = offline_uuid(name.as_str());
         self.send(&OutboundPacket::Login(
-            ClientboundLoginPacket::LoginSuccess(LoginSuccess::new(uuid, name.clone(), Vec::new())),
+            ClientboundLoginPacket::LoginSuccess(LoginSuccess::new(
+                identity.uuid(),
+                identity.name.clone(),
+                Vec::new(),
+            )),
         ))
         .await
     }
@@ -233,19 +259,19 @@ pub(crate) async fn handle_connection(
 ) -> anyhow::Result<()> {
     let mut conn = Connection::new(stream, ctx);
     match run_login(&mut conn, &mut shutdown).await? {
-        Some(name) => enter_play(conn, name, &mut shutdown).await,
+        Some(identity) => enter_play(conn, identity.name, identity.player, &mut shutdown).await,
         None => Ok(()),
     }
 }
 
-/// Runs the login handshake, returning the player name once play is reached, or
-/// `None` if the connection closed cleanly first.
+/// Runs the login handshake, returning the canonical identity once play is
+/// reached, or `None` if the connection closed cleanly first.
 async fn run_login(
     conn: &mut Connection<'_>,
     shutdown: &mut watch::Receiver<bool>,
-) -> anyhow::Result<Option<BoundedString<16>>> {
+) -> anyhow::Result<Option<LoginIdentity>> {
     let mut phase = LoginPhase::Handshaking;
-    let mut name: Option<BoundedString<16>> = None;
+    let mut identity: Option<LoginIdentity> = None;
     let mut read_buf = [0u8; READ_CHUNK];
 
     loop {
@@ -263,14 +289,13 @@ async fn run_login(
                 let trace =
                     observe::trace_inbound_login(&packet, &conn.compression, &conn.ctx.clock);
                 conn.debug.record_inbound(trace);
-                match advance(conn, &mut phase, &mut name, &packet).await? {
+                match advance(conn, &mut phase, &mut identity, &packet).await? {
                     LoginProgress::Continue => continue,
                     LoginProgress::Close => return Ok(None),
                     LoginProgress::Play => {
-                        return name
-                            .take()
-                            .map(Some)
-                            .ok_or_else(|| anyhow::anyhow!("reached play without a login name"));
+                        return identity.take().map(Some).ok_or_else(|| {
+                            anyhow::anyhow!("reached play without a login identity")
+                        });
                     }
                 }
             }
@@ -342,7 +367,7 @@ fn is_ignorable_unknown_packet(state: ConnectionState, err: &FrameDecodeError) -
 async fn advance(
     conn: &mut Connection<'_>,
     phase: &mut LoginPhase,
-    name: &mut Option<BoundedString<16>>,
+    identity: &mut Option<LoginIdentity>,
     packet: &InboundPacket,
 ) -> anyhow::Result<LoginProgress> {
     match (*phase, packet) {
@@ -379,15 +404,18 @@ async fn advance(
             Ok(LoginProgress::Close)
         }
         (LoginPhase::Login, InboundPacket::Login(ServerboundLoginPacket::LoginStart(start))) => {
-            let player_name = start.name().clone();
+            let player_identity = LoginIdentity::offline(start.name().clone());
             // Beta-gate: reject banned / non-whitelisted players before login
             // completes (single additive access check; see ConnContext::login_denial).
-            if let Some(disconnect) = conn.ctx.login_denial(player_name.as_str())? {
+            if let Some(disconnect) = conn
+                .ctx
+                .login_denial(player_identity.name.as_str(), player_identity.player)?
+            {
                 conn.send(&disconnect).await?;
                 return Ok(LoginProgress::Close);
             }
-            conn.send_login_success(&player_name).await?;
-            *name = Some(player_name);
+            conn.send_login_success(&player_identity).await?;
+            *identity = Some(player_identity);
             *phase = LoginPhase::AwaitingLoginAck;
             Ok(LoginProgress::Continue)
         }
@@ -480,4 +508,20 @@ async fn write_all(
         .await
         .map_err(|_| anyhow::anyhow!("socket flush timed out"))??;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_identity_is_derived_once() {
+        let name = BoundedString::<16>::new("IdentityProbe".to_string())
+            .expect("test username is within the protocol bound");
+        let identity = LoginIdentity::offline(name);
+
+        assert_eq!(identity.player, PlayerId::offline("IdentityProbe"));
+        assert_eq!(identity.uuid(), identity.player.as_uuid());
+        assert_eq!(identity.name.as_str(), "IdentityProbe");
+    }
 }

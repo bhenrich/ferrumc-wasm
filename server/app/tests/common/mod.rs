@@ -21,6 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use ferrumc_codec::{write_var_int, BoundedReader, BoundedString, CodecError, FrameLengthReader};
 use ferrumc_proto::generated::configuration::{
@@ -52,6 +53,8 @@ pub struct TestClient {
     writer: OwnedWriteHalf,
     /// Complete clientbound frame bodies, fed by the background drainer.
     frames: mpsc::Receiver<Vec<u8>>,
+    /// Canonical UUID observed in Login Success once login has completed.
+    login_uuid: Option<Uuid>,
 }
 
 impl TestClient {
@@ -61,7 +64,11 @@ impl TestClient {
         let (reader, writer) = stream.into_split();
         let (tx, frames) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
         tokio::spawn(drain_frames(reader, tx));
-        Ok(Self { writer, frames })
+        Ok(Self {
+            writer,
+            frames,
+            login_uuid: None,
+        })
     }
 
     /// Writes one frame: a `VarInt` length prefix followed by `body` (id + fields).
@@ -87,6 +94,12 @@ impl TestClient {
         let mut reader = BoundedReader::new(&body);
         let id = reader.read_var_int()?;
         Ok(ClientboundPlayPacket::decode(id, &mut reader)?)
+    }
+
+    /// Returns the UUID carried by Login Success after [`login_to_play`].
+    #[allow(dead_code)] // This shared module is compiled into tests that do not inspect login identity.
+    pub fn login_uuid(&self) -> Option<Uuid> {
+        self.login_uuid
     }
 }
 
@@ -178,10 +191,10 @@ pub async fn login_to_play(addr: SocketAddr, name: &str) -> anyhow::Result<TestC
         let frame = client.next_frame().await?;
         let mut reader = BoundedReader::new(&frame);
         let id = reader.read_var_int()?;
-        if matches!(
-            ClientboundLoginPacket::decode(id, &mut reader)?,
-            ClientboundLoginPacket::LoginSuccess(_)
-        ) {
+        if let ClientboundLoginPacket::LoginSuccess(success) =
+            ClientboundLoginPacket::decode(id, &mut reader)?
+        {
+            client.login_uuid = Some(success.uuid());
             break;
         }
     }

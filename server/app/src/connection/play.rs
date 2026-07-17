@@ -43,6 +43,7 @@ use super::{Connection, GAME_EVENT_CHANGE_GAMEMODE, READ_CHUNK};
 pub(super) async fn enter_play(
     conn: Connection<'_>,
     name: BoundedString<16>,
+    player: PlayerId,
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let Connection {
@@ -56,7 +57,6 @@ pub(super) async fn enter_play(
     // Upgrade the session label from the peer address to the player name now that
     // login has completed.
     debug.set_session(name.as_str());
-    let player = PlayerId::offline(name.as_str());
 
     // Restore this player's persisted state if they have a saved record; a fresh
     // player — or one whose record is corrupt, written under an incompatible schema,

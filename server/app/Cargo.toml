@@ -27,8 +27,8 @@ ferrumc-registry = { workspace = true }
 # The item-stack model + trusted/untrusted slot codecs: builds the join-kit
 # container body and validates hostile creative-slot bytes.
 ferrumc-items = { workspace = true }
-# Framing, per-state limits, compression, the offline UUID, and the play-phase
-# reader / writer this binary wires onto a real socket.
+# Framing, per-state limits, compression, and the play-phase reader / writer
+# this binary wires onto a real socket.
 ferrumc-net = { workspace = true }
 # The net <-> sim bridge: the player <-> shard router and its event vocabulary.
 ferrumc-session = { workspace = true }

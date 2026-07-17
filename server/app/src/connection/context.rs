@@ -7,7 +7,8 @@ use tokio::sync::mpsc;
 
 use ferrumc_codec::BoundedString;
 use ferrumc_config::{LoginDecision, PacketBudgetConfig, ResolvedAccess};
-use ferrumc_net::{offline_uuid, ConnectionLimits, OutboundPacket, StatusInfo};
+use ferrumc_core::PlayerId;
+use ferrumc_net::{ConnectionLimits, OutboundPacket, StatusInfo};
 use ferrumc_observability::{CounterRegistry, NetTelemetryHub, ServerClock};
 use ferrumc_proto::generated::login::{ClientboundLoginPacket, LoginDisconnect};
 use ferrumc_proto::generated::status::{ClientboundStatusPacket, StatusResponse};
@@ -116,16 +117,20 @@ impl ConnContext {
     ///
     /// `Ok(None)` means the login is allowed; `Ok(Some(packet))` means it is
     /// rejected (banned or not whitelisted) and the caller should send `packet`
-    /// and close. The offline-mode UUID is derived from the name, so a UUID-based
-    /// ban or whitelist entry matches even though the client only sends a name.
+    /// and close. `player` is the canonical identity established by the login
+    /// state machine, so UUID rules inspect the same UUID exposed to the client
+    /// and carried into Play.
     ///
     /// # Errors
     ///
     /// Returns an error only if the (controlled, short) kick reason cannot be
     /// encoded into the wire string bound — effectively impossible in practice.
-    pub(super) fn login_denial(&self, name: &str) -> anyhow::Result<Option<OutboundPacket>> {
-        let uuid = offline_uuid(name);
-        match self.access.login_decision(name, uuid) {
+    pub(super) fn login_denial(
+        &self,
+        name: &str,
+        player: PlayerId,
+    ) -> anyhow::Result<Option<OutboundPacket>> {
+        match self.access.login_decision(name, player.as_uuid()) {
             LoginDecision::Allow => Ok(None),
             LoginDecision::Deny(reason) => Ok(Some(login_disconnect(reason.message())?)),
         }
