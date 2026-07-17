@@ -55,6 +55,9 @@ pub enum DisconnectReason {
     OutboundOverflow,
     /// The client missed the keep-alive deadline.
     KeepAliveTimeout,
+    /// The peer made no complete valid state or frame progress before an
+    /// absolute connection deadline.
+    ProgressTimeout,
     /// The server is shutting down and is closing connections cooperatively.
     ServerShutdown,
     /// An operator, plugin, or game-logic action kicked the player.
@@ -77,7 +80,8 @@ impl DisconnectReason {
             | Self::MalformedPacket
             | Self::FrameTooLarge
             | Self::BudgetExceeded
-            | Self::OutboundOverflow => DisconnectPolicy::Immediate,
+            | Self::OutboundOverflow
+            | Self::ProgressTimeout => DisconnectPolicy::Immediate,
         }
     }
 
@@ -90,6 +94,7 @@ impl DisconnectReason {
                 | Self::MalformedPacket
                 | Self::FrameTooLarge
                 | Self::BudgetExceeded
+                | Self::ProgressTimeout
         )
     }
 
@@ -136,6 +141,7 @@ mod tests {
             DisconnectReason::FrameTooLarge,
             DisconnectReason::BudgetExceeded,
             DisconnectReason::OutboundOverflow,
+            DisconnectReason::ProgressTimeout,
         ] {
             assert_eq!(reason.policy(), DisconnectPolicy::Immediate);
         }
@@ -147,6 +153,7 @@ mod tests {
         assert!(DisconnectReason::ProtocolViolation.is_peer_fault());
         assert!(!DisconnectReason::ServerShutdown.is_peer_fault());
         assert!(!DisconnectReason::Kicked.is_peer_fault());
+        assert!(DisconnectReason::ProgressTimeout.is_peer_fault());
         // OutboundOverflow is a delivery failure, not classed as a peer fault.
         assert!(!DisconnectReason::OutboundOverflow.is_peer_fault());
     }

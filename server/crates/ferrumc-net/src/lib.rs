@@ -35,7 +35,9 @@
 //! top of the framing: [`PlayReader`] (budgeted serverbound decode), [`PlayWriter`]
 //! (bounded per-[`OutboundPriority`] queues drained into batches), the
 //! [`MovementCoalescer`] hook, the [`DisconnectReason`] policy, and placeholder
-//! [`PlayMetrics`]. It is pure logic — no gameplay mutation and no socket.
+//! [`PlayMetrics`]. [`ConnectionLiveness`] adds absolute state/frame deadlines
+//! and one-outstanding-Keep-Alive validation. It is pure logic — no gameplay
+//! mutation and no socket.
 
 mod accept;
 mod compression;
@@ -65,12 +67,14 @@ pub use login::{LoginFlowError, LoginServer, LoginServerConfig, DEFAULT_KEEP_ALI
 pub use offline::offline_uuid;
 pub use outbound::{OutboundEncoder, OutboundPacket};
 pub use play::{
-    is_movement, BatchLimits, BudgetStatus, Criticality, DisconnectPolicy, DisconnectReason,
-    EnqueueOutcome, InboundPlayPacket, MovementCoalescer, OfferOutcome, OutboundPriority,
-    PacketBudget, PlayBatch, PlayMetrics, PlayReader, PlayWriter, DEFAULT_BATCH_MAX_BYTES,
-    DEFAULT_BATCH_MAX_FRAMES, DEFAULT_COSMETIC_CAPACITY, DEFAULT_CRITICAL_CAPACITY,
+    is_movement, BatchLimits, BudgetStatus, ConnectionLiveness, Criticality, DisconnectPolicy,
+    DisconnectReason, EnqueueOutcome, InboundPlayPacket, KeepAliveError, LivenessActivityError,
+    LivenessConfig, LivenessDeadline, LivenessTimeout, MovementCoalescer, OfferOutcome,
+    OutboundPriority, PacketBudget, PlayBatch, PlayMetrics, PlayReader, PlayWriter,
+    DEFAULT_BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_FRAMES, DEFAULT_COSMETIC_CAPACITY,
+    DEFAULT_CRITICAL_CAPACITY, DEFAULT_FRAME_COMPLETION_TIMEOUT, DEFAULT_KEEP_ALIVE_TIMEOUT,
     DEFAULT_PLAY_FRAME_BURST, DEFAULT_PLAY_FRAME_RATE, DEFAULT_STATE_CAPACITY,
-    DEFAULT_WORLD_CAPACITY, PRIORITY_COUNT,
+    DEFAULT_STATE_PROGRESS_TIMEOUT, DEFAULT_WORLD_CAPACITY, PRIORITY_COUNT,
 };
 pub use server::{
     StatusInfo, StatusServer, StatusServerConfig, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_CONNECTIONS,

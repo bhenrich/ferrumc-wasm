@@ -29,6 +29,7 @@
 mod budget;
 mod coalesce;
 mod disconnect;
+mod liveness;
 mod metrics;
 mod priority;
 mod reader;
@@ -37,6 +38,11 @@ mod writer;
 pub use budget::{BudgetStatus, PacketBudget, DEFAULT_PLAY_FRAME_BURST, DEFAULT_PLAY_FRAME_RATE};
 pub use coalesce::{is_movement, MovementCoalescer, OfferOutcome};
 pub use disconnect::{DisconnectPolicy, DisconnectReason};
+pub use liveness::{
+    ConnectionLiveness, KeepAliveError, LivenessActivityError, LivenessConfig, LivenessDeadline,
+    LivenessTimeout, DEFAULT_FRAME_COMPLETION_TIMEOUT, DEFAULT_KEEP_ALIVE_TIMEOUT,
+    DEFAULT_STATE_PROGRESS_TIMEOUT,
+};
 pub use metrics::PlayMetrics;
 pub use priority::{
     Criticality, OutboundPriority, DEFAULT_COSMETIC_CAPACITY, DEFAULT_CRITICAL_CAPACITY,

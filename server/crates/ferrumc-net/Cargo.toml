@@ -29,6 +29,9 @@ flate2 = { workspace = true }
 # used (no extra crate feature beyond the workspace default is required).
 uuid = { workspace = true }
 [dev-dependencies]
+# Paused-time liveness regressions advance Tokio's deterministic clock without
+# wall-clock sleeps.
+tokio = { workspace = true, features = ["test-util"] }
 # Build wire buffers and decode readers in the round-trip / malformed tests.
 bytes = { workspace = true }
 ferrumc-codec = { workspace = true }
