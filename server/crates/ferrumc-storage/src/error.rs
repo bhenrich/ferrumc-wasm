@@ -2,6 +2,8 @@
 
 use ferrumc_core::ServerError;
 
+use crate::JournalBatchId;
+
 /// A classified storage failure.
 ///
 /// Every variant names *why* an operation failed so callers can react
@@ -79,6 +81,49 @@ pub enum StorageError {
         id: u64,
     },
 
+    /// An idempotency token was reused with a different normalized mutation
+    /// payload than the batch it already identifies.
+    #[error("mutation journal batch id {batch_id} was reused with a different payload")]
+    JournalBatchConflict {
+        /// Reused idempotency token.
+        batch_id: JournalBatchId,
+    },
+
+    /// A persisted journal receipt did not have the required fixed-width encoding.
+    #[error(
+        "malformed mutation journal receipt for batch {batch_id}: {len} bytes (expected {expected})"
+    )]
+    MalformedJournalReceipt {
+        /// Batch whose receipt was malformed.
+        batch_id: JournalBatchId,
+        /// Length of the persisted receipt.
+        len: usize,
+        /// Required fixed-width receipt length.
+        expected: usize,
+    },
+
+    /// A persisted journal receipt described an impossible or over-limit range.
+    #[error(
+        "invalid mutation journal receipt range for batch {batch_id}: first={first_id}, count={count}"
+    )]
+    InvalidJournalReceiptRange {
+        /// Batch whose receipt was inconsistent.
+        batch_id: JournalBatchId,
+        /// First durable ID encoded by the receipt.
+        first_id: u64,
+        /// Number of records encoded by the receipt.
+        count: u64,
+    },
+
+    /// A receipt referenced a journal record that was not present.
+    #[error("mutation journal receipt for batch {batch_id} references missing record {id}")]
+    JournalReceiptMissingRecord {
+        /// Batch whose committed range was incomplete.
+        batch_id: JournalBatchId,
+        /// Missing durable journal sequence ID.
+        id: u64,
+    },
+
     /// A persisted mutation-journal key did not have the required eight-byte
     /// big-endian representation.
     #[error("malformed mutation journal key: {len} bytes (expected 8)")]
@@ -115,8 +160,12 @@ impl From<StorageError> for ServerError {
             | StorageError::JournalSequenceExhausted { .. } => Self::capacity(message),
             // A backend failure is an internal invariant violation.
             StorageError::JournalIdCollision { .. }
+            | StorageError::MalformedJournalReceipt { .. }
+            | StorageError::InvalidJournalReceiptRange { .. }
+            | StorageError::JournalReceiptMissingRecord { .. }
             | StorageError::MalformedJournalKey { .. }
             | StorageError::Backend(_) => Self::internal(message),
+            StorageError::JournalBatchConflict { .. } => Self::invalid_state(message),
         }
     }
 }
@@ -155,6 +204,15 @@ mod tests {
         let err = StorageError::JournalIdCollision { id: 7 };
         let converted: ServerError = err.into();
         assert!(matches!(converted, ServerError::Internal { .. }));
+    }
+
+    #[test]
+    fn journal_batch_conflict_maps_to_invalid_state() {
+        let err = StorageError::JournalBatchConflict {
+            batch_id: JournalBatchId::from_bytes([7; 16]),
+        };
+        let converted: ServerError = err.into();
+        assert!(matches!(converted, ServerError::InvalidState(_)));
     }
 
     #[test]

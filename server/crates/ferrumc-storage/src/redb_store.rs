@@ -26,6 +26,7 @@
 //! is a single atomic commit.
 
 use std::fmt;
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -42,6 +43,7 @@ use crate::record::{
 use crate::store::{
     journal_id_range, PlayerStore, PluginStore, WorldStore, MAX_PLUGIN_VALUE_LEN, MAX_SAVE_BATCH,
 };
+use crate::{JournalAppendReceipt, JournalBatchId};
 
 /// On-disk layout version recorded in the metadata table.
 ///
@@ -84,6 +86,14 @@ const CHUNK_OVERLAY_TABLE: TableDefinition<'_, &[u8], &[u8]> =
 const MUTATION_LOG_TABLE: TableDefinition<'_, &[u8], &[u8]> =
     TableDefinition::new("ferrumc:mutation_log");
 
+/// Mutation-batch receipt table: 16-byte [`JournalBatchId`] to a fixed-width
+/// durable sequence range. Receipt insertion is atomic with its journal rows.
+const MUTATION_BATCH_TABLE: TableDefinition<'_, &[u8], &[u8]> =
+    TableDefinition::new("ferrumc:mutation_batch");
+
+/// `first_id(u64) ++ record_count(u64)`.
+const JOURNAL_RECEIPT_ENCODED_LEN: usize = 16;
+
 /// Wraps any redb error as a classified [`ServerError`].
 fn backend_err<E: fmt::Display>(err: E) -> ServerError {
     StorageError::backend(err.to_string()).into()
@@ -104,6 +114,84 @@ fn mutation_id_from_key(key: &[u8]) -> std::result::Result<u64, StorageError> {
         .try_into()
         .map_err(|_| StorageError::MalformedJournalKey { len: key.len() })?;
     Ok(u64::from_be_bytes(bytes))
+}
+
+/// Encodes a journal receipt into its fixed-width persisted representation.
+fn encode_journal_receipt(
+    receipt: JournalAppendReceipt,
+) -> std::result::Result<[u8; JOURNAL_RECEIPT_ENCODED_LEN], StorageError> {
+    let count = u64::try_from(receipt.len()).map_err(|_| StorageError::BatchTooLarge {
+        len: receipt.len(),
+        max: MAX_SAVE_BATCH,
+    })?;
+    let first_id = receipt.first_id().unwrap_or(0);
+    let mut encoded = [0; JOURNAL_RECEIPT_ENCODED_LEN];
+    let (first_out, count_out) = encoded.split_at_mut(size_of::<u64>());
+    first_out.copy_from_slice(&first_id.to_be_bytes());
+    count_out.copy_from_slice(&count.to_be_bytes());
+    Ok(encoded)
+}
+
+/// Decodes and validates one fixed-width persisted journal receipt.
+fn decode_journal_receipt(
+    batch_id: JournalBatchId,
+    encoded: &[u8],
+) -> std::result::Result<JournalAppendReceipt, StorageError> {
+    if encoded.len() != JOURNAL_RECEIPT_ENCODED_LEN {
+        return Err(StorageError::MalformedJournalReceipt {
+            batch_id,
+            len: encoded.len(),
+            expected: JOURNAL_RECEIPT_ENCODED_LEN,
+        });
+    }
+    let (first_bytes, count_bytes) = encoded.split_at(size_of::<u64>());
+    let first_bytes: [u8; 8] =
+        first_bytes
+            .try_into()
+            .map_err(|_| StorageError::MalformedJournalReceipt {
+                batch_id,
+                len: encoded.len(),
+                expected: JOURNAL_RECEIPT_ENCODED_LEN,
+            })?;
+    let count_bytes: [u8; 8] =
+        count_bytes
+            .try_into()
+            .map_err(|_| StorageError::MalformedJournalReceipt {
+                batch_id,
+                len: encoded.len(),
+                expected: JOURNAL_RECEIPT_ENCODED_LEN,
+            })?;
+    let first_id = u64::from_be_bytes(first_bytes);
+    let count = u64::from_be_bytes(count_bytes);
+    let max_count = u64::try_from(MAX_SAVE_BATCH).map_err(|_| {
+        StorageError::backend("MAX_SAVE_BATCH does not fit the persisted receipt count")
+    })?;
+    let len = usize::try_from(count).map_err(|_| StorageError::InvalidJournalReceiptRange {
+        batch_id,
+        first_id,
+        count,
+    })?;
+    if count > max_count || (count == 0 && first_id != 0) {
+        return Err(StorageError::InvalidJournalReceiptRange {
+            batch_id,
+            first_id,
+            count,
+        });
+    }
+    let range = if count == 0 {
+        None
+    } else {
+        let last_id =
+            first_id
+                .checked_add(count - 1)
+                .ok_or(StorageError::InvalidJournalReceiptRange {
+                    batch_id,
+                    first_id,
+                    count,
+                })?;
+        Some((first_id, last_id))
+    };
+    Ok(JournalAppendReceipt::from_range(batch_id, range, len))
 }
 
 /// A durable, redb-backed store implementing [`WorldStore`], [`PlayerStore`],
@@ -152,11 +240,12 @@ impl RedbStore {
         txn.open_table(ENTITY_TABLE).map_err(backend_err)?;
         txn.open_table(PLAYER_TABLE).map_err(backend_err)?;
         txn.open_table(PLUGIN_TABLE).map_err(backend_err)?;
-        // Overlay + journal tables are created lazily here too. They are purely
+        // Overlay, journal, and receipt tables are created lazily here too. They are purely
         // additive to the v1 layout (no existing table changes shape), so opening
-        // a pre-existing v1 database simply gains two empty tables rather than
+        // a pre-existing v1 database simply gains empty tables rather than
         // tripping a format-version mismatch — see docs/adr/0007 for the rationale.
         txn.open_table(CHUNK_OVERLAY_TABLE).map_err(backend_err)?;
+        txn.open_table(MUTATION_BATCH_TABLE).map_err(backend_err)?;
         let journal_last_id = {
             let journal = txn.open_table(MUTATION_LOG_TABLE).map_err(backend_err)?;
             let last_id = journal
@@ -401,6 +490,114 @@ impl WorldStore for RedbStore {
         join.await.map_err(join_err)?
     }
 
+    async fn append_block_mutation_batch(
+        &self,
+        batch_id: JournalBatchId,
+        mutations: Vec<BlockMutationLogRecord>,
+    ) -> Result<JournalAppendReceipt> {
+        if mutations.len() > MAX_SAVE_BATCH {
+            return Err(StorageError::BatchTooLarge {
+                len: mutations.len(),
+                max: MAX_SAVE_BATCH,
+            }
+            .into());
+        }
+        let db = Arc::clone(&self.db);
+        let join = tokio::task::spawn_blocking(move || -> Result<JournalAppendReceipt> {
+            // A write transaction serializes same-token races and makes the
+            // receipt, sequence metadata, and journal records one durable fact.
+            let txn = db.begin_write().map_err(backend_err)?;
+            let existing_receipt = {
+                let receipts = txn.open_table(MUTATION_BATCH_TABLE).map_err(backend_err)?;
+                let persisted = receipts
+                    .get(batch_id.as_bytes().as_slice())
+                    .map_err(backend_err)?;
+                persisted
+                    .map(|guard| decode_journal_receipt(batch_id, guard.value()))
+                    .transpose()?
+            };
+
+            if let Some(receipt) = existing_receipt {
+                if receipt.len() != mutations.len() {
+                    return Err(StorageError::JournalBatchConflict { batch_id }.into());
+                }
+                if let Some(ids) = receipt.id_range() {
+                    let journal = txn.open_table(MUTATION_LOG_TABLE).map_err(backend_err)?;
+                    for (record, id) in mutations.iter().zip(ids) {
+                        let expected =
+                            codec::encode_mutation_log_record(&record.with_storage_id(id));
+                        let key_bytes = id.to_be_bytes();
+                        let stored = journal
+                            .get(key_bytes.as_slice())
+                            .map_err(backend_err)?
+                            .ok_or(StorageError::JournalReceiptMissingRecord { batch_id, id })?;
+                        if stored.value() != expected.as_slice() {
+                            return Err(StorageError::JournalBatchConflict { batch_id }.into());
+                        }
+                    }
+                }
+                return Ok(receipt);
+            }
+
+            let previous_last_id = {
+                let meta = txn.open_table(META_TABLE).map_err(backend_err)?;
+                let last_id = meta
+                    .get(META_LAST_MUTATION_ID_KEY)
+                    .map_err(backend_err)?
+                    .map(|guard| guard.value());
+                last_id
+            };
+            let range = journal_id_range(previous_last_id, mutations.len())?;
+            let receipt = JournalAppendReceipt::from_range(batch_id, range, mutations.len());
+
+            if let Some(ids) = receipt.id_range() {
+                let mut journal = txn.open_table(MUTATION_LOG_TABLE).map_err(backend_err)?;
+                for id in ids.clone() {
+                    let key_bytes = id.to_be_bytes();
+                    if journal
+                        .get(key_bytes.as_slice())
+                        .map_err(backend_err)?
+                        .is_some()
+                    {
+                        return Err(StorageError::JournalIdCollision { id }.into());
+                    }
+                }
+                for (record, id) in mutations.iter().zip(ids) {
+                    let record = record.with_storage_id(id);
+                    let key_bytes = id.to_be_bytes();
+                    let value = codec::encode_mutation_log_record(&record);
+                    let replaced = journal
+                        .insert(key_bytes.as_slice(), value.as_slice())
+                        .map_err(backend_err)?;
+                    if replaced.is_some() {
+                        return Err(StorageError::JournalIdCollision { id }.into());
+                    }
+                }
+            }
+            if let Some(final_id) = receipt.last_id() {
+                let mut meta = txn.open_table(META_TABLE).map_err(backend_err)?;
+                meta.insert(META_LAST_MUTATION_ID_KEY, final_id)
+                    .map_err(backend_err)?;
+            }
+            {
+                let mut receipts = txn.open_table(MUTATION_BATCH_TABLE).map_err(backend_err)?;
+                let encoded_receipt = encode_journal_receipt(receipt)?;
+                let replaced = receipts
+                    .insert(batch_id.as_bytes().as_slice(), encoded_receipt.as_slice())
+                    .map_err(backend_err)?;
+                if replaced.is_some() {
+                    return Err(StorageError::backend(format!(
+                        "journal receipt {batch_id} appeared inside one write transaction"
+                    ))
+                    .into());
+                }
+            }
+            txn.commit().map_err(backend_err)?;
+            Ok(receipt)
+        });
+        join.await.map_err(join_err)?
+    }
+
     async fn load_entity(&self, key: EntityKey) -> Result<Option<EntityRecord>> {
         let db = Arc::clone(&self.db);
         let join = tokio::task::spawn_blocking(move || -> Result<Option<EntityRecord>> {
@@ -618,7 +815,7 @@ mod tests {
     use tokio::sync::Barrier;
 
     use super::*;
-    use crate::{MutationActor, MutationLogCause, SchemaVersion};
+    use crate::{JournalBatchId, MutationActor, MutationLogCause, SchemaVersion};
 
     fn mutation(local_id: u64, tick: u64) -> BlockMutationLogRecord {
         let coordinate = i32::try_from(tick).expect("test tick fits i32");
@@ -682,6 +879,284 @@ mod tests {
             .expect("read sequence")
             .map(|guard| guard.value());
         last_id
+    }
+
+    fn receipt_count(store: &RedbStore) -> usize {
+        let txn = store.db.begin_read().expect("read transaction");
+        let table = txn.open_table(MUTATION_BATCH_TABLE).expect("receipt table");
+        table.iter().expect("receipt iterator").count()
+    }
+
+    fn receipt_bytes(first_id: u64, count: u64) -> [u8; JOURNAL_RECEIPT_ENCODED_LEN] {
+        let mut encoded = [0; JOURNAL_RECEIPT_ENCODED_LEN];
+        let (first_out, count_out) = encoded.split_at_mut(size_of::<u64>());
+        first_out.copy_from_slice(&first_id.to_be_bytes());
+        count_out.copy_from_slice(&count.to_be_bytes());
+        encoded
+    }
+
+    fn seed_receipt(store: &RedbStore, batch_id: JournalBatchId, encoded: &[u8]) {
+        let txn = store.db.begin_write().expect("write transaction");
+        {
+            let mut table = txn.open_table(MUTATION_BATCH_TABLE).expect("receipt table");
+            table
+                .insert(batch_id.as_bytes().as_slice(), encoded)
+                .expect("seed receipt");
+        }
+        txn.commit().expect("commit receipt");
+    }
+
+    fn batch_id(byte: u8) -> JournalBatchId {
+        JournalBatchId::from_bytes([byte; 16])
+    }
+
+    #[tokio::test]
+    async fn journal_receipt_replay_returns_original_range_without_append() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("journal.redb");
+        let id = batch_id(7);
+        let batch = vec![mutation(90, 10), mutation(91, 11)];
+
+        let (original_receipt, original_snapshot) = {
+            let store = RedbStore::open(&path).expect("open store");
+            let receipt = store
+                .append_block_mutation_batch(id, batch.clone())
+                .await
+                .expect("first append");
+            (receipt, journal_snapshot(&store))
+        };
+
+        let reopened = RedbStore::open(&path).expect("reopen store");
+        let replayed_receipt = reopened
+            .append_block_mutation_batch(id, batch)
+            .await
+            .expect("idempotent replay");
+        assert_eq!(replayed_receipt, original_receipt);
+        assert_eq!(replayed_receipt.first_id(), Some(0));
+        assert_eq!(replayed_receipt.last_id(), Some(1));
+        assert_eq!(replayed_receipt.len(), 2);
+        assert_eq!(journal_snapshot(&reopened), original_snapshot);
+        assert_eq!(stored_last_id(&reopened), Some(1));
+    }
+
+    #[tokio::test]
+    async fn journal_receipt_payload_mismatch_is_typed_error() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = RedbStore::open(dir.path().join("journal.redb")).expect("open store");
+        let id = batch_id(8);
+        let original_receipt = store
+            .append_block_mutation_batch(id, vec![mutation(0, 10)])
+            .await
+            .expect("first append");
+        let before = journal_snapshot(&store);
+
+        let error = store
+            .append_block_mutation_batch(id, vec![mutation(0, 11)])
+            .await
+            .expect_err("same token with a different payload must fail");
+        assert!(matches!(error, ServerError::InvalidState(_)));
+        assert_eq!(journal_snapshot(&store), before);
+        assert_eq!(stored_last_id(&store), Some(0));
+
+        assert_eq!(
+            store
+                .append_block_mutation_batch(id, vec![mutation(99, 10)])
+                .await
+                .expect("the original normalized payload remains replayable"),
+            original_receipt
+        );
+        let next = store
+            .append_block_mutation_batch(batch_id(10), vec![mutation(0, 12)])
+            .await
+            .expect("a fresh token still receives the next id");
+        assert_eq!(next.first_id(), Some(1));
+        assert_eq!(next.last_id(), Some(1));
+        assert_eq!(journal_snapshot(&store).len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_same_journal_token_appends_exactly_once() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = Arc::new(RedbStore::open(dir.path().join("journal.redb")).expect("open store"));
+        let barrier = Arc::new(Barrier::new(2));
+        let id = batch_id(9);
+        let batch = vec![mutation(0, 20), mutation(1, 21), mutation(2, 22)];
+        let mut handles = Vec::with_capacity(2);
+
+        for _ in 0..2 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let batch = batch.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                store.append_block_mutation_batch(id, batch).await
+            }));
+        }
+
+        let first = handles
+            .remove(0)
+            .await
+            .expect("first task did not panic")
+            .expect("first append succeeds");
+        let second = handles
+            .remove(0)
+            .await
+            .expect("second task did not panic")
+            .expect("second append succeeds");
+        assert_eq!(first, second);
+        assert_eq!(first.first_id(), Some(0));
+        assert_eq!(first.last_id(), Some(2));
+        assert_eq!(journal_snapshot(&store).len(), batch.len());
+        assert_eq!(stored_last_id(&store), Some(2));
+        assert_eq!(receipt_count(&store), 1);
+    }
+
+    #[tokio::test]
+    async fn idempotent_journal_overflow_does_not_consume_token_or_sequence() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = RedbStore::open(dir.path().join("journal.redb")).expect("open store");
+        seed_journal(&store, Some(u64::MAX - 1), &[mutation(u64::MAX - 1, 1)]);
+        let id = batch_id(11);
+        let before = journal_snapshot(&store);
+
+        let error = store
+            .append_block_mutation_batch(id, vec![mutation(0, 2), mutation(1, 3)])
+            .await
+            .expect_err("two records cannot fit");
+        assert!(matches!(error, ServerError::Capacity(_)));
+        assert_eq!(journal_snapshot(&store), before);
+        assert_eq!(stored_last_id(&store), Some(u64::MAX - 1));
+        assert_eq!(receipt_count(&store), 0);
+
+        let at_max = store
+            .append_block_mutation_batch(id, vec![mutation(0, 2)])
+            .await
+            .expect("the failed token can be retried with a fitting batch");
+        assert_eq!(at_max.first_id(), Some(u64::MAX));
+        assert_eq!(at_max.last_id(), Some(u64::MAX));
+        assert_eq!(
+            store
+                .append_block_mutation_batch(id, vec![mutation(9, 2)])
+                .await
+                .expect("max-id receipt replays after exhaustion"),
+            at_max
+        );
+        assert_eq!(journal_snapshot(&store).len(), 2);
+        assert_eq!(receipt_count(&store), 1);
+
+        let error = store
+            .append_block_mutation_batch(batch_id(12), vec![mutation(0, 4)])
+            .await
+            .expect_err("a fresh token is exhausted after u64::MAX");
+        assert!(matches!(error, ServerError::Capacity(_)));
+        assert_eq!(journal_snapshot(&store).len(), 2);
+        assert_eq!(receipt_count(&store), 1);
+    }
+
+    #[test]
+    fn journal_receipt_codec_rejects_malformed_values() {
+        let id = batch_id(13);
+        for malformed in [&[][..], &[0; 15], &[0; 17]] {
+            let error = decode_journal_receipt(id, malformed).expect_err("malformed length");
+            assert!(matches!(
+                error,
+                StorageError::MalformedJournalReceipt { len, .. } if len == malformed.len()
+            ));
+        }
+
+        let invalid_empty = receipt_bytes(1, 0);
+        assert!(matches!(
+            decode_journal_receipt(id, &invalid_empty),
+            Err(StorageError::InvalidJournalReceiptRange { .. })
+        ));
+        let over_limit = receipt_bytes(
+            0,
+            u64::try_from(MAX_SAVE_BATCH + 1).expect("save bound fits u64"),
+        );
+        assert!(matches!(
+            decode_journal_receipt(id, &over_limit),
+            Err(StorageError::InvalidJournalReceiptRange { .. })
+        ));
+        let overflowing = receipt_bytes(u64::MAX, 2);
+        assert!(matches!(
+            decode_journal_receipt(id, &overflowing),
+            Err(StorageError::InvalidJournalReceiptRange { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn journal_receipt_missing_record_fails_without_appending() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = RedbStore::open(dir.path().join("journal.redb")).expect("open store");
+        let id = batch_id(14);
+        seed_receipt(&store, id, &receipt_bytes(0, 1));
+
+        let error = store
+            .append_block_mutation_batch(id, vec![mutation(0, 1)])
+            .await
+            .expect_err("receipt cannot acknowledge a missing row");
+        assert!(matches!(error, ServerError::Internal { .. }));
+        assert!(journal_snapshot(&store).is_empty());
+        assert_eq!(stored_last_id(&store), None);
+        assert_eq!(receipt_count(&store), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_journal_receipt_is_durable_without_advancing_sequence() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("journal.redb");
+        let id = batch_id(15);
+        let original = {
+            let store = RedbStore::open(&path).expect("open store");
+            let receipt = store
+                .append_block_mutation_batch(id, Vec::new())
+                .await
+                .expect("empty receipt");
+            assert!(receipt.is_empty());
+            assert!(journal_snapshot(&store).is_empty());
+            assert_eq!(stored_last_id(&store), None);
+            assert_eq!(receipt_count(&store), 1);
+            receipt
+        };
+
+        let reopened = RedbStore::open(&path).expect("reopen store");
+        assert_eq!(
+            reopened
+                .append_block_mutation_batch(id, Vec::new())
+                .await
+                .expect("empty replay"),
+            original
+        );
+        let conflict = reopened
+            .append_block_mutation_batch(id, vec![mutation(0, 1)])
+            .await
+            .expect_err("empty token cannot be reused for data");
+        assert!(matches!(conflict, ServerError::InvalidState(_)));
+        let first_nonempty = reopened
+            .append_block_mutation_batch(batch_id(16), vec![mutation(0, 1)])
+            .await
+            .expect("empty receipt did not consume a sequence");
+        assert_eq!(first_nonempty.first_id(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn oversized_idempotent_batch_is_rejected_before_receipt() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = RedbStore::open(dir.path().join("journal.redb")).expect("open store");
+        let oversized = (0..=MAX_SAVE_BATCH)
+            .map(|index| {
+                let id = u64::try_from(index).expect("test id fits u64");
+                mutation(id, id)
+            })
+            .collect();
+        let error = store
+            .append_block_mutation_batch(batch_id(17), oversized)
+            .await
+            .expect_err("oversized batch must fail");
+        assert!(matches!(error, ServerError::Capacity(_)));
+        assert!(journal_snapshot(&store).is_empty());
+        assert_eq!(stored_last_id(&store), None);
+        assert_eq!(receipt_count(&store), 0);
     }
 
     #[tokio::test]

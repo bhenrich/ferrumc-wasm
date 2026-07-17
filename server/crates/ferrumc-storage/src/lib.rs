@@ -4,6 +4,7 @@
 
 mod codec;
 mod error;
+mod journal;
 mod key;
 mod memory;
 mod record;
@@ -12,6 +13,7 @@ mod schema;
 mod store;
 
 pub use error::StorageError;
+pub use journal::{JournalAppendReceipt, JournalBatchId};
 pub use key::{ChunkKey, EntityKey, StorageKey, MAX_PLUGIN_KEY_LEN};
 pub use memory::InMemoryStore;
 pub use record::{

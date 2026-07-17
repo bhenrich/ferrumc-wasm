@@ -21,12 +21,13 @@
 //! [`MAX_PLUGIN_VALUE_LEN`].
 
 use async_trait::async_trait;
-use ferrumc_core::{PlayerId, PluginId, Result};
+use ferrumc_core::{PlayerId, PluginId, Result, ServerError};
 
 use crate::key::{ChunkKey, EntityKey, StorageKey};
 use crate::record::{
     BlockMutationLogRecord, ChunkOverlayRecord, ChunkRecord, EntityRecord, PlayerRecord,
 };
+use crate::{JournalAppendReceipt, JournalBatchId};
 
 /// Maximum number of items accepted in a single batched save call.
 ///
@@ -90,6 +91,30 @@ pub trait WorldStore: Send + Sync {
     /// [`crate::StorageError::BatchTooLarge`] and sequence exhaustion with
     /// [`crate::StorageError::JournalSequenceExhausted`] before storing anything.
     async fn append_block_mutations(&self, mutations: Vec<BlockMutationLogRecord>) -> Result<()>;
+
+    /// Idempotently appends one logical mutation batch and returns its durable receipt.
+    ///
+    /// The first successful call for `batch_id` assigns storage-owned sequence
+    /// IDs and atomically commits the normalized records, sequence metadata, and
+    /// receipt. A retry with the same normalized payload returns the original
+    /// receipt without appending. Since storage replaces provisional record IDs,
+    /// those IDs are excluded from payload identity; every other encoded field
+    /// must match. Reusing an ID for a different payload returns
+    /// [`ServerError::InvalidState`].
+    ///
+    /// Implementations that have not adopted durable receipts return
+    /// [`ServerError::Unsupported`] without appending. The shipping
+    /// [`crate::RedbStore`] and [`crate::InMemoryStore`] implement the full
+    /// contract.
+    async fn append_block_mutation_batch(
+        &self,
+        _batch_id: JournalBatchId,
+        _mutations: Vec<BlockMutationLogRecord>,
+    ) -> Result<JournalAppendReceipt> {
+        Err(ServerError::unsupported(
+            "idempotent mutation-journal receipts",
+        ))
+    }
 
     /// Loads the entity at `key`, or `Ok(None)` if no entity is stored there.
     async fn load_entity(&self, key: EntityKey) -> Result<Option<EntityRecord>>;

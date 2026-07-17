@@ -21,12 +21,21 @@ use crate::record::{
 use crate::store::{
     journal_id_range, PlayerStore, PluginStore, WorldStore, MAX_PLUGIN_VALUE_LEN, MAX_SAVE_BATCH,
 };
+use crate::{JournalAppendReceipt, JournalBatchId};
+
+/// One committed idempotent batch, retained for exact normalized-payload replay.
+#[derive(Debug)]
+struct CommittedJournalBatch {
+    receipt: JournalAppendReceipt,
+    records: Vec<BlockMutationLogRecord>,
+}
 
 /// In-memory journal state protected by one lock so allocation and append are atomic.
 #[derive(Debug, Default)]
 struct MutationJournalState {
     last_id: Option<u64>,
     records: Vec<BlockMutationLogRecord>,
+    receipts: HashMap<JournalBatchId, CommittedJournalBatch>,
 }
 
 /// An in-memory store implementing [`WorldStore`], [`PlayerStore`], and
@@ -146,6 +155,64 @@ impl WorldStore for InMemoryStore {
         );
         log.last_id = Some(final_id);
         Ok(())
+    }
+
+    async fn append_block_mutation_batch(
+        &self,
+        batch_id: JournalBatchId,
+        mutations: Vec<BlockMutationLogRecord>,
+    ) -> Result<JournalAppendReceipt> {
+        if mutations.len() > MAX_SAVE_BATCH {
+            return Err(StorageError::BatchTooLarge {
+                len: mutations.len(),
+                max: MAX_SAVE_BATCH,
+            }
+            .into());
+        }
+        let mut log = self
+            .mutation_log
+            .write()
+            .map_err(|_| poisoned("mutation log"))?;
+
+        if let Some(committed) = log.receipts.get(&batch_id) {
+            if committed.receipt.len() != mutations.len() {
+                return Err(StorageError::JournalBatchConflict { batch_id }.into());
+            }
+            let normalized: Vec<_> = committed
+                .receipt
+                .id_range()
+                .into_iter()
+                .flatten()
+                .zip(mutations.iter())
+                .map(|(id, record)| record.with_storage_id(id))
+                .collect();
+            if normalized != committed.records {
+                return Err(StorageError::JournalBatchConflict { batch_id }.into());
+            }
+            return Ok(committed.receipt);
+        }
+
+        let range = journal_id_range(log.last_id, mutations.len())?;
+        let receipt = JournalAppendReceipt::from_range(batch_id, range, mutations.len());
+        let normalized: Vec<_> = receipt
+            .id_range()
+            .into_iter()
+            .flatten()
+            .zip(mutations.iter())
+            .map(|(id, record)| record.with_storage_id(id))
+            .collect();
+        log.records.extend(normalized.iter().copied());
+        if let Some(final_id) = receipt.last_id() {
+            log.last_id = Some(final_id);
+        }
+        log.receipts.insert(
+            batch_id,
+            CommittedJournalBatch {
+                receipt,
+                records: normalized,
+            },
+        );
+        Ok(receipt)
     }
 
     async fn load_entity(&self, key: EntityKey) -> Result<Option<EntityRecord>> {
@@ -303,5 +370,52 @@ mod tests {
         assert_eq!(journal.last_id, Some(u64::MAX));
         assert_eq!(journal.records.len(), 1);
         assert_eq!(journal.records[0].id(), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn in_memory_journal_receipts_are_idempotent() {
+        let store = InMemoryStore::new();
+        let id = JournalBatchId::from_bytes([4; 16]);
+        let original = store
+            .append_block_mutation_batch(id, vec![mutation(90, 10), mutation(91, 11)])
+            .await
+            .expect("first append");
+        let replay = store
+            .append_block_mutation_batch(id, vec![mutation(0, 10), mutation(1, 11)])
+            .await
+            .expect("provisional ids are normalized");
+        assert_eq!(replay, original);
+
+        let error = store
+            .append_block_mutation_batch(id, vec![mutation(0, 12), mutation(1, 13)])
+            .await
+            .expect_err("different normalized payload conflicts");
+        assert!(matches!(error, ferrumc_core::ServerError::InvalidState(_)));
+        let journal = store.mutation_log.read().expect("journal lock");
+        assert_eq!(journal.records.len(), 2);
+        assert_eq!(journal.receipts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn in_memory_empty_journal_receipt_reserves_its_token() {
+        let store = InMemoryStore::new();
+        let id = JournalBatchId::from_bytes([5; 16]);
+        let receipt = store
+            .append_block_mutation_batch(id, Vec::new())
+            .await
+            .expect("empty receipt");
+        assert!(receipt.is_empty());
+        assert_eq!(
+            store
+                .append_block_mutation_batch(id, Vec::new())
+                .await
+                .expect("empty replay"),
+            receipt
+        );
+        let error = store
+            .append_block_mutation_batch(id, vec![mutation(0, 1)])
+            .await
+            .expect_err("empty token cannot identify a nonempty batch");
+        assert!(matches!(error, ferrumc_core::ServerError::InvalidState(_)));
     }
 }
