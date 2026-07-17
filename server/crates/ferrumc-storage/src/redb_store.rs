@@ -361,7 +361,7 @@ impl RedbStore {
         txn.open_table(PLUGIN_TABLE).map_err(schema_table_err)?;
         // Keep every current table under the same initialization transaction.
         // If validation of current-format data fails, dropping this transaction
-        // rolls back table creation and metadata reconciliation.
+        // abandons initialization without modifying existing data.
         txn.open_table(CHUNK_OVERLAY_TABLE)
             .map_err(schema_table_err)?;
         txn.open_table(MUTATION_BATCH_TABLE)
@@ -370,33 +370,38 @@ impl RedbStore {
             let journal = txn
                 .open_table(MUTATION_LOG_TABLE)
                 .map_err(schema_table_err)?;
-            let last_id = journal
-                .last()
-                .map_err(backend_err)?
-                .map(|(key, _value)| mutation_id_from_key(key.value()))
-                .transpose()?;
+            // Current append transactions create a gap-free sequence from zero
+            // and update its marker atomically. Validate every key once at
+            // startup so old or corrupt rows cannot hide behind a valid final
+            // key; appends still use only the metadata hot path.
+            let mut last_id: Option<u64> = None;
+            for entry in journal.iter().map_err(backend_err)? {
+                let (key, _value) = entry.map_err(backend_err)?;
+                let id = mutation_id_from_key(key.value()).map_err(|_| incompatible_data_err())?;
+                let expected = match last_id {
+                    Some(previous) => previous.checked_add(1).ok_or_else(incompatible_data_err)?,
+                    None => 0,
+                };
+                if id != expected {
+                    return Err(incompatible_data_err());
+                }
+                last_id = Some(id);
+            }
             last_id
         };
         {
-            let mut meta = txn.open_table(META_TABLE).map_err(schema_table_err)?;
-            // Older databases have journal rows but no durable sequence key.
-            // Reconcile once on open from the B-tree's greatest key; appends
-            // thereafter read only this metadata entry inside their write
-            // transaction, so allocation never scans the journal hot path.
+            let meta = txn.open_table(META_TABLE).map_err(schema_table_err)?;
             let stored_last_id = meta
                 .get(META_LAST_MUTATION_ID_KEY)
                 .map_err(backend_err)?
                 .map(|guard| guard.value());
-            let reconciled_last_id = match (stored_last_id, journal_last_id) {
-                (Some(stored), Some(journal)) => Some(stored.max(journal)),
-                (stored @ Some(_), None) => stored,
-                (None, journal) => journal,
+            let is_current_sequence_state = match (stored_last_id, journal_last_id) {
+                (None, None) => true,
+                (Some(stored), Some(journal)) => stored == journal,
+                _ => false,
             };
-            if reconciled_last_id != stored_last_id {
-                if let Some(last_id) = reconciled_last_id {
-                    meta.insert(META_LAST_MUTATION_ID_KEY, last_id)
-                        .map_err(backend_err)?;
-                }
+            if !is_current_sequence_state {
+                return Err(incompatible_data_err());
             }
         }
         txn.commit().map_err(backend_err)?;
@@ -1748,48 +1753,127 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_journal_without_sequence_resumes_after_greatest_key() {
+    async fn legacy_journal_without_sequence_is_refused_without_repair() {
         let dir = TempDir::new().expect("temp dir");
         let path = dir.path().join("journal.redb");
         let legacy_snapshot = {
             let store = RedbStore::open(&path).expect("open store");
-            seed_journal(&store, None, &[mutation(4, 4), mutation(9, 9)]);
+            seed_journal(&store, None, &[mutation(0, 4), mutation(1, 9)]);
             journal_snapshot(&store)
         };
 
-        let store = RedbStore::open(&path).expect("reopen legacy store");
-        assert_eq!(stored_last_id(&store), Some(9));
-        store
-            .append_block_mutations(vec![mutation(0, 10)])
-            .await
-            .expect("append after legacy journal");
-        let snapshot = journal_snapshot(&store);
-        assert_eq!(
-            &snapshot[..legacy_snapshot.len()],
-            legacy_snapshot.as_slice()
-        );
-        assert_eq!(snapshot.last().map(|(id, _bytes)| *id), Some(10));
+        assert_incompatible_open(&path);
+
+        let db = Database::open(&path).expect("inspect refused legacy store");
+        let txn = db.begin_read().expect("read refused legacy store");
+        let meta = txn.open_table(META_TABLE).expect("metadata table");
+        assert!(meta
+            .get(META_LAST_MUTATION_ID_KEY)
+            .expect("read sequence")
+            .is_none());
+        let journal = txn.open_table(MUTATION_LOG_TABLE).expect("journal table");
+        let snapshot: Vec<_> = journal
+            .iter()
+            .expect("journal iterator")
+            .map(|entry| {
+                let (key, value) = entry.expect("journal entry");
+                let key: [u8; 8] = key.value().try_into().expect("u64 journal key");
+                (u64::from_be_bytes(key), value.value().to_vec())
+            })
+            .collect();
+        assert_eq!(snapshot, legacy_snapshot);
     }
 
     #[tokio::test]
-    async fn stale_sequence_metadata_reconciles_to_greatest_journal_key() {
+    async fn stale_sequence_metadata_is_refused_without_repair() {
         let dir = TempDir::new().expect("temp dir");
         let path = dir.path().join("journal.redb");
         let prior_snapshot = {
             let store = RedbStore::open(&path).expect("open store");
-            seed_journal(&store, Some(2), &[mutation(2, 2), mutation(9, 9)]);
+            seed_journal(&store, Some(0), &[mutation(0, 2), mutation(1, 9)]);
             journal_snapshot(&store)
         };
 
-        let store = RedbStore::open(&path).expect("reopen store");
-        assert_eq!(stored_last_id(&store), Some(9));
-        store
-            .append_block_mutations(vec![mutation(0, 10)])
-            .await
-            .expect("append after reconciliation");
-        let snapshot = journal_snapshot(&store);
-        assert_eq!(&snapshot[..prior_snapshot.len()], prior_snapshot.as_slice());
-        assert_eq!(snapshot.last().map(|(id, _bytes)| *id), Some(10));
+        assert_incompatible_open(&path);
+
+        let db = Database::open(&path).expect("inspect refused stale-sequence store");
+        let txn = db.begin_read().expect("read refused stale-sequence store");
+        let meta = txn.open_table(META_TABLE).expect("metadata table");
+        assert_eq!(
+            meta.get(META_LAST_MUTATION_ID_KEY)
+                .expect("read sequence")
+                .map(|guard| guard.value()),
+            Some(0)
+        );
+        let journal = txn.open_table(MUTATION_LOG_TABLE).expect("journal table");
+        let snapshot: Vec<_> = journal
+            .iter()
+            .expect("journal iterator")
+            .map(|entry| {
+                let (key, value) = entry.expect("journal entry");
+                let key: [u8; 8] = key.value().try_into().expect("u64 journal key");
+                (u64::from_be_bytes(key), value.value().to_vec())
+            })
+            .collect();
+        assert_eq!(snapshot, prior_snapshot);
+    }
+
+    #[test]
+    fn impossible_journal_sequence_states_are_refused() {
+        let dir = TempDir::new().expect("temp dir");
+
+        let orphaned_sequence_path = dir.path().join("orphaned-sequence.redb");
+        {
+            let store =
+                RedbStore::open(&orphaned_sequence_path).expect("create orphaned-sequence store");
+            seed_journal(&store, Some(3), &[]);
+        }
+        assert_incompatible_open(&orphaned_sequence_path);
+        {
+            let db = Database::open(&orphaned_sequence_path)
+                .expect("inspect refused orphaned-sequence store");
+            let txn = db.begin_read().expect("read orphaned-sequence store");
+            let meta = txn.open_table(META_TABLE).expect("metadata table");
+            assert_eq!(
+                meta.get(META_LAST_MUTATION_ID_KEY)
+                    .expect("read sequence")
+                    .map(|guard| guard.value()),
+                Some(3)
+            );
+            let journal = txn.open_table(MUTATION_LOG_TABLE).expect("journal table");
+            assert_eq!(journal.iter().expect("journal iterator").count(), 0);
+        }
+
+        let ahead_sequence_path = dir.path().join("ahead-sequence.redb");
+        let ahead_snapshot = {
+            let store = RedbStore::open(&ahead_sequence_path).expect("create ahead-sequence store");
+            seed_journal(&store, Some(10), &[mutation(0, 2), mutation(1, 9)]);
+            journal_snapshot(&store)
+        };
+        assert_incompatible_open(&ahead_sequence_path);
+        {
+            let db =
+                Database::open(&ahead_sequence_path).expect("inspect refused ahead-sequence store");
+            let txn = db.begin_read().expect("read ahead-sequence store");
+            let meta = txn.open_table(META_TABLE).expect("metadata table");
+            assert_eq!(
+                meta.get(META_LAST_MUTATION_ID_KEY)
+                    .expect("read sequence")
+                    .map(|guard| guard.value()),
+                Some(10)
+            );
+            let journal = txn.open_table(MUTATION_LOG_TABLE).expect("journal table");
+            let snapshot: Vec<_> = journal
+                .iter()
+                .expect("journal iterator")
+                .map(|entry| {
+                    let (key, value) = entry.expect("journal entry");
+                    let key: [u8; 8] = key.value().try_into().expect("u64 journal key");
+                    (u64::from_be_bytes(key), value.value().to_vec())
+                })
+                .collect();
+            assert_eq!(snapshot, ahead_snapshot);
+        }
     }
 
     #[tokio::test]
@@ -1854,8 +1938,71 @@ mod tests {
             txn.commit().expect("commit malformed key");
         }
 
-        let error = RedbStore::open(&path).expect_err("malformed key must reject open");
-        assert!(matches!(error, ServerError::Internal { .. }));
+        assert_incompatible_open(&path);
+
+        let db = Database::open(&path).expect("inspect refused malformed-key store");
+        let txn = db.begin_read().expect("read refused malformed-key store");
+        let journal = txn.open_table(MUTATION_LOG_TABLE).expect("journal table");
+        assert!(journal
+            .get(&[0xff; 9][..])
+            .expect("read malformed journal key")
+            .is_some());
+    }
+
+    #[test]
+    fn opening_store_rejects_a_malformed_interior_journal_key() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("journal.redb");
+        {
+            let store = RedbStore::open(&path).expect("open store");
+            seed_journal(&store, Some(1), &[mutation(0, 0), mutation(1, 1)]);
+            let txn = store.db.begin_write().expect("write transaction");
+            {
+                let mut table = txn.open_table(MUTATION_LOG_TABLE).expect("journal table");
+                table
+                    .insert(&[0_u8; 9][..], &[0][..])
+                    .expect("seed malformed interior key");
+            }
+            txn.commit().expect("commit malformed interior key");
+        }
+
+        assert_incompatible_open(&path);
+
+        let db = Database::open(&path).expect("inspect refused malformed-key store");
+        let txn = db.begin_read().expect("read refused malformed-key store");
+        let journal = txn.open_table(MUTATION_LOG_TABLE).expect("journal table");
+        assert!(journal
+            .get(&[0_u8; 9][..])
+            .expect("read malformed journal key")
+            .is_some());
+        assert_eq!(journal.iter().expect("journal iterator").count(), 3);
+    }
+
+    #[test]
+    fn opening_store_rejects_a_gapped_journal_sequence() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("journal.redb");
+        let prior_snapshot = {
+            let store = RedbStore::open(&path).expect("open store");
+            seed_journal(&store, Some(2), &[mutation(0, 0), mutation(2, 2)]);
+            journal_snapshot(&store)
+        };
+
+        assert_incompatible_open(&path);
+
+        let db = Database::open(&path).expect("inspect refused gapped store");
+        let txn = db.begin_read().expect("read refused gapped store");
+        let journal = txn.open_table(MUTATION_LOG_TABLE).expect("journal table");
+        let snapshot: Vec<_> = journal
+            .iter()
+            .expect("journal iterator")
+            .map(|entry| {
+                let (key, value) = entry.expect("journal entry");
+                let key: [u8; 8] = key.value().try_into().expect("u64 journal key");
+                (u64::from_be_bytes(key), value.value().to_vec())
+            })
+            .collect();
+        assert_eq!(snapshot, prior_snapshot);
     }
 
     #[test]
