@@ -1937,11 +1937,8 @@ mod tests {
         commands: mpsc::Sender<SimCommand>,
         move_calls: Arc<AtomicUsize>,
     ) -> ConnContext {
-        let config = AppConfig {
-            spawn_chunk_radius: 0,
-            view_distance: 0,
-            ..AppConfig::default()
-        };
+        let config = AppConfig::from_toml_str("spawn_chunk_radius = 0\nview_distance = 0\n")
+            .expect("movement-handler test config is valid");
         let setup = build_world(&config, ShardPos::new(0, 0))
             .await
             .expect("build one-column handler world");
@@ -1959,23 +1956,23 @@ mod tests {
             .expect("resolve default access policy");
         ConnContext {
             limits: ConnectionLimits::default(),
-            io_timeout: config.io_timeout,
-            compression_threshold: config.compression_threshold,
+            io_timeout: config.io_timeout(),
+            compression_threshold: config.compression_threshold(),
             join_kit: setup.join_kit,
             config: Arc::new(ConfigRegistries::build().expect("build registries")),
-            keep_alive_interval: config.keep_alive_interval,
-            chunk_stream_interval: config.chunk_stream_interval,
+            keep_alive_interval: config.keep_alive_interval(),
+            chunk_stream_interval: config.chunk_stream_interval(),
             commands,
             player_store: setup.player_store,
             policy: Arc::new(policy),
             block_events: Arc::new(BlockEventDispatcher::new(host)),
             status_response: Arc::new(build_status_response(1).expect("build status response")),
-            view_distance: config.view_distance,
+            view_distance: config.view_distance(),
             metrics: Arc::new(CounterRegistry::new()),
             clock: ServerClock::new(),
             net_telemetry: Arc::new(NetTelemetryHub::new()),
             access: Arc::new(access),
-            budget: config.budget,
+            budget: config.budget(),
         }
     }
 

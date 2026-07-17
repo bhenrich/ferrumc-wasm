@@ -105,7 +105,7 @@ pub fn load_or_init_config(
     port: Option<u16>,
     bind: Option<SocketAddr>,
 ) -> anyhow::Result<AppConfig> {
-    let mut config = if path.exists() {
+    let config = if path.exists() {
         let text = std::fs::read_to_string(path)
             .map_err(|err| anyhow::anyhow!("reading config {}: {err}", path.display()))?;
         AppConfig::from_toml_str(&text)
@@ -121,20 +121,8 @@ pub fn load_or_init_config(
         AppConfig::default()
     };
 
-    // CLI overrides sit on top of the loaded (or default) config: the full bind
-    // address first, then --port refines just the port so it wins over both.
-    if let Some(addr) = bind {
-        config.bind = addr;
-    }
-    if let Some(port) = port {
-        config.bind.set_port(port);
-    }
-
-    // Make the durable redb store the runtime default unless the operator named a
-    // world directory explicitly.
-    if config.world_dir.is_none() {
-        config.world_dir = Some(PathBuf::from(DEFAULT_WORLD_DIR));
-    }
-
-    Ok(config)
+    // The config module owns mutation so CLI overrides cannot bypass the same
+    // validation used for TOML. The full address is applied before the port, and
+    // the shipping binary fills its durable world directory last.
+    config.with_runtime_overrides(bind, port, PathBuf::from(DEFAULT_WORLD_DIR))
 }

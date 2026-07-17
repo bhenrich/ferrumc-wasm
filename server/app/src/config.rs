@@ -6,8 +6,7 @@
 //! the optional-field TOML shape that merges over the documented defaults.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ferrumc_config::{AccessConfig, PacketBudgetConfig, WorldConfig};
@@ -15,7 +14,7 @@ use ferrumc_math::Vec3;
 use serde::Deserialize;
 
 /// Default address the server binds to when the config omits one.
-const DEFAULT_BIND: &str = "127.0.0.1:25565";
+const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 25_565);
 
 /// Default address the read-only observability dashboard binds to. Loopback by
 /// design: the dashboard is never exposed off-host unless the operator opts in.
@@ -86,62 +85,150 @@ const DEFAULT_CHUNK_STREAM_INTERVAL_MS: u64 = 50;
 /// the operator gate meaningful instead of granting every connection level 4.
 const DEFAULT_PERMISSION_LEVEL: u8 = 0;
 
+/// Largest supported concurrent-connection ceiling. This matches the bounded
+/// observability roster and prevents a config typo from allocating an enormous
+/// semaphore.
+const MAX_CONNECTIONS: usize = 1_024;
+
+/// Longest per-operation socket timeout accepted at startup.
+#[allow(clippy::duration_suboptimal_units)] // `from_mins` is newer than the Rust 1.80 MSRV.
+const MAX_IO_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Largest compression threshold accepted by the largest configured frame cap.
+const MAX_COMPRESSION_THRESHOLD: i32 = 2_097_152;
+
+/// Largest advertised view or simulation distance supported by the streamer.
+const MAX_PLAY_DISTANCE: i32 = 32;
+
+/// Horizontal world-coordinate boundary used by movement and routing.
+const MAX_HORIZONTAL_COORDINATE: f64 = 30_000_000.0;
+
+/// Lowest valid overworld spawn Y.
+const MIN_SPAWN_Y: f64 = -64.0;
+
+/// Highest valid overworld spawn Y.
+const MAX_SPAWN_Y: f64 = 319.0;
+
+/// Largest resident spawn radius: at most a 17x17 (289 chunk) startup square.
+const MAX_SPAWN_CHUNK_RADIUS: u8 = 8;
+
+/// Fastest supported simulation rate, retaining a non-zero 1 ms tick period.
+const MAX_TICKS_PER_SECOND: u32 = 1_000;
+
+/// Largest meaningful Chebyshev spawn-protection radius.
+const MAX_SPAWN_PROTECT_RADIUS: i32 = 30_000_000;
+
+/// Largest single region edit an operator may retain for undo.
+const MAX_REGION_FILL_VOLUME: u64 = 1_000_000;
+
+/// Largest number of region undo entries retained per player.
+const MAX_REGION_UNDO_HISTORY: usize = 64;
+
+/// Combined prior-state ceiling retained by region undo history per player.
+const MAX_RETAINED_REGION_CELLS: u64 = 1_048_576;
+
+/// Accepted keep-alive cadence range.
+const MIN_KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Accepted chunk-stream pump cadence range.
+const MIN_CHUNK_STREAM_INTERVAL: Duration = Duration::from_millis(10);
+#[allow(clippy::duration_suboptimal_units)] // `from_mins` is newer than the Rust 1.80 MSRV.
+const MAX_CHUNK_STREAM_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Highest vanilla permission tier.
+const MAX_PERMISSION_LEVEL: u8 = 4;
+
+/// Packet-budget bounds that still admit at least one complete frame.
+const MIN_PACKET_BUDGET: f64 = 1.0;
+const MAX_PACKET_RATE: f64 = 10_000.0;
+const MAX_PACKET_BURST: f64 = 20_000.0;
+
+/// Server-wide sustained and immediate packet-work ceilings.
+const MAX_GLOBAL_PACKET_RATE: f64 = 100_000.0;
+const MAX_GLOBAL_PACKET_BURST: f64 = 200_000.0;
+
+/// Maximum potential per-player view slots across the configured connection cap.
+const MAX_TOTAL_VIEW_SLOTS: u64 = 1_100_000;
+
+/// Maximum full-view scans the stream pump may request each second.
+const MAX_VIEW_SCAN_UNITS_PER_SECOND: u64 = 3_000_000;
+
 /// Validated, runtime-ready server configuration.
 ///
 /// Construct one with [`AppConfig::default`] for the documented defaults, or
 /// parse and validate user input with [`AppConfig::from_toml_str`]. Every field
 /// is already checked, so the rest of the application can consume it directly.
+///
+/// Fields cannot be assembled or changed directly, so invalid values cannot
+/// bypass the same validation used by TOML and command-line overrides.
+///
+/// ```compile_fail
+/// use ferrumc_app::AppConfig;
+///
+/// let _ = AppConfig {
+///     max_connections: 0,
+///     ..AppConfig::default()
+/// };
+/// ```
+///
+/// ```compile_fail
+/// use ferrumc_app::AppConfig;
+///
+/// let mut config = AppConfig::default();
+/// config.max_connections = 0;
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppConfig {
     /// The socket address the TCP listener binds to.
-    pub bind: SocketAddr,
+    bind: SocketAddr,
     /// The ceiling on simultaneously accepted connections.
-    pub max_connections: usize,
+    max_connections: usize,
     /// The deadline applied to each socket read and write.
-    pub io_timeout: Duration,
+    io_timeout: Duration,
     /// The packet-compression threshold in bytes, or `None` to leave compression
     /// disabled (the slice default — frames travel uncompressed).
-    pub compression_threshold: Option<i32>,
+    compression_threshold: Option<i32>,
     /// The play view distance advertised to clients, in chunks.
-    pub view_distance: i32,
+    view_distance: i32,
     /// The play simulation distance advertised to clients, in chunks.
-    pub simulation_distance: i32,
+    simulation_distance: i32,
     /// The world-spawn position players join at.
-    pub spawn: Vec3,
+    spawn: Vec3,
     /// The radius, in chunks, of the spawn area kept resident.
-    pub spawn_chunk_radius: u8,
+    spawn_chunk_radius: u8,
     /// The simulation tick rate, in ticks per second.
-    pub ticks_per_second: NonZeroU32,
+    ticks_per_second: u32,
     /// Directory scanned for dynamic (`cdylib`) plugins at startup, or `None` to
     /// skip dynamic plugin loading.
-    pub plugins_dir: Option<PathBuf>,
+    plugins_dir: Option<PathBuf>,
     /// Spawn-protection radius, in blocks (Chebyshev) around the spawn column.
     /// Zero disables spawn protection.
-    pub spawn_protect_radius: i32,
+    spawn_protect_radius: i32,
     /// Names of players granted the spawn-protection bypass permission.
-    pub spawn_protect_bypass: Vec<String>,
+    spawn_protect_bypass: Vec<String>,
     /// Maximum number of blocks a single `/fill` or `/replace` command may affect.
     /// A larger region is rejected with a command error, bounding the per-tick work
     /// (and undo memory) one operator command can demand.
-    pub max_region_fill_volume: u64,
+    max_region_fill_volume: u64,
     /// Number of undoable region edits retained per player before the oldest is
     /// evicted (the `/undo` history depth).
-    pub region_undo_history: usize,
+    region_undo_history: usize,
     /// Interval between clientbound play-phase Keep Alive pings.
-    pub keep_alive_interval: Duration,
+    keep_alive_interval: Duration,
     /// How often a player's view is pumped toward the full advertised view
     /// distance. Movement only replaces the pending target; this fixed cadence
     /// consumes the latest target and advances a non-moving joiner's initial
     /// backlog. Each pump is bounded by the per-update load and unload caps, so a
     /// short interval drains work promptly without flooding the socket.
-    pub chunk_stream_interval: Duration,
+    chunk_stream_interval: Duration,
     /// Names of players granted operator status (permission level 4), letting
     /// them run operator-gated commands such as `/gamemode`. Everyone else acts
     /// at [`default_permission_level`](Self::default_permission_level).
-    pub ops: Vec<String>,
+    ops: Vec<String>,
     /// Permission level granted to a player who is not an operator. Defaults to
     /// `0` (ordinary player), so the operator gate is meaningful.
-    pub default_permission_level: u8,
+    default_permission_level: u8,
     /// Where the persistent world database lives.
     ///
     /// `Some(path)` selects the durable redb-backed [`WorldStore`] at that path
@@ -150,20 +237,20 @@ pub struct AppConfig {
     /// deterministic and file-free. The redb file is created under this directory.
     ///
     /// [`WorldStore`]: ferrumc_storage::WorldStore
-    pub world_dir: Option<PathBuf>,
+    world_dir: Option<PathBuf>,
     /// Whether the read-only observability dashboard starts alongside the server.
-    pub dashboard_enabled: bool,
+    dashboard_enabled: bool,
     /// The socket address the read-only dashboard binds to. Defaults to a loopback
     /// address so the dashboard is not reachable off-host unless reconfigured.
-    pub dashboard_bind: SocketAddr,
+    dashboard_bind: SocketAddr,
     /// Access control for a public-facing server: the per-IP connection limit, the
     /// ban list, and the optional whitelist. Resolved (files read, entries
     /// classified) at startup; see [`ferrumc_config::AccessConfig::resolve`].
-    pub access: AccessConfig,
+    access: AccessConfig,
     /// Per-connection serverbound packet budget (token-bucket sustained rate and
     /// burst) that throttles a flooding client: a sustained over-budget peer is
     /// dropped with `BudgetExceeded`. Validated at startup.
-    pub budget: PacketBudgetConfig,
+    budget: PacketBudgetConfig,
     /// World-content configuration: the source of the world's initial terrain.
     ///
     /// Defaults to the built-in flat world. When
@@ -171,38 +258,454 @@ pub struct AppConfig {
     /// `region/` directory is imported into the world store at startup. This is
     /// separate from [`world_dir`](Self::world_dir), which is the *persistence*
     /// location; `[world]` selects the *initial content*.
-    pub world: WorldConfig,
+    world: WorldConfig,
 }
 
 impl AppConfig {
     /// Parses and validates an [`AppConfig`] from a TOML document.
     ///
-    /// Any field the document omits keeps its documented default. The bind
-    /// address is parsed and the tick rate is checked to be non-zero; a malformed
-    /// document, an unparseable address, or a zero tick rate is an error.
+    /// Any field the document omits keeps its documented default. Socket
+    /// addresses, numeric ranges, checked durations, and combined resource
+    /// ceilings are all validated before the configuration is returned.
     ///
     /// # Errors
     ///
     /// Returns an error if the TOML cannot be parsed, contains an unknown field,
-    /// carries an invalid bind address, or sets a tick rate of zero.
+    /// carries an invalid socket address, or violates a numeric or cross-field
+    /// resource ceiling.
     pub fn from_toml_str(toml: &str) -> anyhow::Result<Self> {
         let raw: RawConfig = toml::from_str(toml)?;
         raw.into_config()
     }
 
+    /// Returns the socket address the TCP listener binds to.
+    #[must_use]
+    pub const fn bind(&self) -> SocketAddr {
+        self.bind
+    }
+
+    /// Returns the ceiling on simultaneously accepted connections.
+    #[must_use]
+    pub const fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// Returns the deadline applied to each socket read and write.
+    #[must_use]
+    pub const fn io_timeout(&self) -> Duration {
+        self.io_timeout
+    }
+
+    /// Returns the compression threshold, or `None` when compression is disabled.
+    #[must_use]
+    pub const fn compression_threshold(&self) -> Option<i32> {
+        self.compression_threshold
+    }
+
+    /// Returns the play view distance advertised to clients.
+    #[must_use]
+    pub const fn view_distance(&self) -> i32 {
+        self.view_distance
+    }
+
+    /// Returns the play simulation distance advertised to clients.
+    #[must_use]
+    pub const fn simulation_distance(&self) -> i32 {
+        self.simulation_distance
+    }
+
+    /// Returns the validated world-spawn position.
+    #[must_use]
+    pub const fn spawn(&self) -> Vec3 {
+        self.spawn
+    }
+
+    /// Returns the resident spawn-area radius in chunks.
+    #[must_use]
+    pub const fn spawn_chunk_radius(&self) -> u8 {
+        self.spawn_chunk_radius
+    }
+
+    /// Returns the simulation rate in ticks per second.
+    #[must_use]
+    pub const fn ticks_per_second(&self) -> u32 {
+        self.ticks_per_second
+    }
+
+    /// Returns the configured dynamic-plugin directory, if any.
+    #[must_use]
+    pub fn plugins_dir(&self) -> Option<&Path> {
+        self.plugins_dir.as_deref()
+    }
+
+    /// Returns the spawn-protection radius in blocks.
+    #[must_use]
+    pub const fn spawn_protect_radius(&self) -> i32 {
+        self.spawn_protect_radius
+    }
+
+    /// Returns the names granted the spawn-protection bypass.
+    #[must_use]
+    pub fn spawn_protect_bypass(&self) -> &[String] {
+        &self.spawn_protect_bypass
+    }
+
+    /// Returns the maximum block volume of one region-edit command.
+    #[must_use]
+    pub const fn max_region_fill_volume(&self) -> u64 {
+        self.max_region_fill_volume
+    }
+
+    /// Returns the number of region undo entries retained per player.
+    #[must_use]
+    pub const fn region_undo_history(&self) -> usize {
+        self.region_undo_history
+    }
+
+    /// Returns the clientbound keep-alive interval.
+    #[must_use]
+    pub const fn keep_alive_interval(&self) -> Duration {
+        self.keep_alive_interval
+    }
+
+    /// Returns the chunk-stream pump interval.
+    #[must_use]
+    pub const fn chunk_stream_interval(&self) -> Duration {
+        self.chunk_stream_interval
+    }
+
+    /// Returns the configured operator names.
+    #[must_use]
+    pub fn ops(&self) -> &[String] {
+        &self.ops
+    }
+
+    /// Returns the default permission level for a non-operator player.
+    #[must_use]
+    pub const fn default_permission_level(&self) -> u8 {
+        self.default_permission_level
+    }
+
+    /// Returns the persistent world directory, if one is configured.
+    #[must_use]
+    pub fn world_dir(&self) -> Option<&Path> {
+        self.world_dir.as_deref()
+    }
+
+    /// Returns whether the read-only dashboard is enabled.
+    #[must_use]
+    pub const fn dashboard_enabled(&self) -> bool {
+        self.dashboard_enabled
+    }
+
+    /// Returns the socket address used by the read-only dashboard.
+    #[must_use]
+    pub const fn dashboard_bind(&self) -> SocketAddr {
+        self.dashboard_bind
+    }
+
+    /// Returns the validated access-control configuration.
+    #[must_use]
+    pub const fn access(&self) -> &AccessConfig {
+        &self.access
+    }
+
+    /// Returns the validated per-connection packet budget.
+    #[must_use]
+    pub const fn budget(&self) -> PacketBudgetConfig {
+        self.budget
+    }
+
+    /// Returns the initial-world-content configuration.
+    #[must_use]
+    pub const fn world(&self) -> &WorldConfig {
+        &self.world
+    }
+
     /// The nominal duration of one simulation tick.
     #[must_use]
     pub fn tick_period(&self) -> Duration {
-        Duration::from_nanos(1_000_000_000 / u64::from(self.ticks_per_second.get()))
+        match self.checked_tick_period() {
+            Ok(period) => period,
+            // Public construction is sealed and `run` validates again. Retaining
+            // a non-zero fallback makes this accessor panic-free even if future
+            // crate-internal code temporarily assembles an invalid candidate.
+            Err(_) => Duration::from_nanos(1),
+        }
+    }
+
+    /// Returns a revalidated copy that uses `world_dir` for persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this configuration no longer satisfies a numeric or
+    /// cross-field resource ceiling.
+    pub fn with_world_dir(mut self, world_dir: Option<PathBuf>) -> anyhow::Result<Self> {
+        self.world_dir = world_dir;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Returns a revalidated copy that scans `plugins_dir` at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this configuration no longer satisfies a numeric or
+    /// cross-field resource ceiling.
+    pub fn with_plugins_dir(mut self, plugins_dir: Option<PathBuf>) -> anyhow::Result<Self> {
+        self.plugins_dir = plugins_dir;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Returns a revalidated copy carrying the supplied access-control policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the per-IP connection limit exceeds the global
+    /// connection ceiling, or if another config invariant is invalid.
+    pub fn with_access(mut self, access: AccessConfig) -> anyhow::Result<Self> {
+        self.access = access;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Applies command-line and shipping-runtime defaults, then revalidates.
+    pub(crate) fn with_runtime_overrides(
+        mut self,
+        bind: Option<SocketAddr>,
+        port: Option<u16>,
+        default_world_dir: PathBuf,
+    ) -> anyhow::Result<Self> {
+        if let Some(bind) = bind {
+            self.bind = bind;
+        }
+        if let Some(port) = port {
+            self.bind.set_port(port);
+        }
+        if self.world_dir.is_none() {
+            self.world_dir = Some(default_world_dir);
+        }
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Validates every runtime-facing numeric and cross-field invariant.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=MAX_CONNECTIONS).contains(&self.max_connections),
+            "max_connections must be in 1..={MAX_CONNECTIONS}, got {}",
+            self.max_connections,
+        );
+        anyhow::ensure!(
+            (Duration::from_secs(1)..=MAX_IO_TIMEOUT).contains(&self.io_timeout),
+            "io_timeout_secs must be in 1..={} seconds, got {:?}",
+            MAX_IO_TIMEOUT.as_secs(),
+            self.io_timeout,
+        );
+        if let Some(threshold) = self.compression_threshold {
+            anyhow::ensure!(
+                (0..=MAX_COMPRESSION_THRESHOLD).contains(&threshold),
+                "compression_threshold must disable compression or be in \
+                 0..={MAX_COMPRESSION_THRESHOLD} bytes, got {threshold}",
+            );
+        }
+        anyhow::ensure!(
+            (0..=MAX_PLAY_DISTANCE).contains(&self.view_distance),
+            "view_distance must be in 0..={MAX_PLAY_DISTANCE} chunks, got {}",
+            self.view_distance,
+        );
+        anyhow::ensure!(
+            (0..=MAX_PLAY_DISTANCE).contains(&self.simulation_distance),
+            "simulation_distance must be in 0..={MAX_PLAY_DISTANCE} chunks, got {}",
+            self.simulation_distance,
+        );
+        validate_spawn_axis(
+            "x",
+            self.spawn.x,
+            -MAX_HORIZONTAL_COORDINATE,
+            MAX_HORIZONTAL_COORDINATE,
+        )?;
+        validate_spawn_axis("y", self.spawn.y, MIN_SPAWN_Y, MAX_SPAWN_Y)?;
+        validate_spawn_axis(
+            "z",
+            self.spawn.z,
+            -MAX_HORIZONTAL_COORDINATE,
+            MAX_HORIZONTAL_COORDINATE,
+        )?;
+
+        anyhow::ensure!(
+            self.spawn_chunk_radius <= MAX_SPAWN_CHUNK_RADIUS,
+            "spawn_chunk_radius must be in 0..={MAX_SPAWN_CHUNK_RADIUS} chunks, got {}",
+            self.spawn_chunk_radius,
+        );
+        let spawn_side = u64::from(self.spawn_chunk_radius)
+            .checked_mul(2)
+            .and_then(|diameter| diameter.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("spawn_chunk_radius square overflow"))?;
+        let spawn_chunks = spawn_side
+            .checked_mul(spawn_side)
+            .ok_or_else(|| anyhow::anyhow!("spawn_chunk_radius square overflow"))?;
+        anyhow::ensure!(
+            spawn_chunks <= 289,
+            "spawn_chunk_radius requests {spawn_chunks} chunks; startup ceiling is 289",
+        );
+
+        anyhow::ensure!(
+            (1..=MAX_TICKS_PER_SECOND).contains(&self.ticks_per_second),
+            "ticks_per_second must be in 1..={MAX_TICKS_PER_SECOND}, got {}",
+            self.ticks_per_second,
+        );
+        let _ = self.checked_tick_period()?;
+        anyhow::ensure!(
+            (0..=MAX_SPAWN_PROTECT_RADIUS).contains(&self.spawn_protect_radius),
+            "spawn_protect_radius must be in 0..={MAX_SPAWN_PROTECT_RADIUS} blocks, got {}",
+            self.spawn_protect_radius,
+        );
+        anyhow::ensure!(
+            self.max_region_fill_volume <= MAX_REGION_FILL_VOLUME,
+            "max_region_fill_volume must be in 0..={MAX_REGION_FILL_VOLUME} blocks, got {}",
+            self.max_region_fill_volume,
+        );
+        anyhow::ensure!(
+            self.region_undo_history <= MAX_REGION_UNDO_HISTORY,
+            "region_undo_history must be in 0..={MAX_REGION_UNDO_HISTORY}, got {}",
+            self.region_undo_history,
+        );
+        let undo_history = u64::try_from(self.region_undo_history)
+            .map_err(|_| anyhow::anyhow!("region_undo_history does not fit in u64"))?;
+        let retained_cells = self
+            .max_region_fill_volume
+            .checked_mul(undo_history)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "max_region_fill_volume * region_undo_history overflows the retained-cell count"
+                )
+            })?;
+        anyhow::ensure!(
+            retained_cells <= MAX_RETAINED_REGION_CELLS,
+            "max_region_fill_volume * region_undo_history retains up to \
+             {retained_cells} cells; ceiling is {MAX_RETAINED_REGION_CELLS}",
+        );
+        anyhow::ensure!(
+            (MIN_KEEP_ALIVE_INTERVAL..=MAX_KEEP_ALIVE_INTERVAL).contains(&self.keep_alive_interval),
+            "keep_alive_interval_ms must be in {}..={} milliseconds, got {:?}",
+            MIN_KEEP_ALIVE_INTERVAL.as_millis(),
+            MAX_KEEP_ALIVE_INTERVAL.as_millis(),
+            self.keep_alive_interval,
+        );
+        anyhow::ensure!(
+            (MIN_CHUNK_STREAM_INTERVAL..=MAX_CHUNK_STREAM_INTERVAL)
+                .contains(&self.chunk_stream_interval),
+            "chunk_stream_interval_ms must be in {}..={} milliseconds, got {:?}",
+            MIN_CHUNK_STREAM_INTERVAL.as_millis(),
+            MAX_CHUNK_STREAM_INTERVAL.as_millis(),
+            self.chunk_stream_interval,
+        );
+        anyhow::ensure!(
+            self.default_permission_level <= MAX_PERMISSION_LEVEL,
+            "default_permission_level must be in 0..={MAX_PERMISSION_LEVEL}, got {}",
+            self.default_permission_level,
+        );
+        anyhow::ensure!(
+            self.access.per_ip_connection_limit == 0
+                || self.access.per_ip_connection_limit <= self.max_connections,
+            "access.per_ip_connection_limit must be 0 or no greater than max_connections \
+             ({}), got {}",
+            self.max_connections,
+            self.access.per_ip_connection_limit,
+        );
+
+        self.budget.validate()?;
+        anyhow::ensure!(
+            (MIN_PACKET_BUDGET..=MAX_PACKET_RATE).contains(&self.budget.sustained_rate),
+            "budget.sustained_rate must be in {MIN_PACKET_BUDGET}..={MAX_PACKET_RATE} \
+             frames/second, got {}",
+            self.budget.sustained_rate,
+        );
+        anyhow::ensure!(
+            (MIN_PACKET_BUDGET..=MAX_PACKET_BURST).contains(&self.budget.burst),
+            "budget.burst must be in {MIN_PACKET_BUDGET}..={MAX_PACKET_BURST} frames, got {}",
+            self.budget.burst,
+        );
+        let connection_count = u32::try_from(self.max_connections)
+            .map_err(|_| anyhow::anyhow!("max_connections does not fit in u32"))?;
+        let global_packet_rate = f64::from(connection_count) * self.budget.sustained_rate;
+        anyhow::ensure!(
+            global_packet_rate <= MAX_GLOBAL_PACKET_RATE,
+            "max_connections * budget.sustained_rate permits {global_packet_rate} \
+             serverbound frames/second; ceiling is {MAX_GLOBAL_PACKET_RATE}",
+        );
+        let global_packet_burst = f64::from(connection_count) * self.budget.burst;
+        anyhow::ensure!(
+            global_packet_burst <= MAX_GLOBAL_PACKET_BURST,
+            "max_connections * budget.burst permits {global_packet_burst} immediate \
+             serverbound frames; ceiling is {MAX_GLOBAL_PACKET_BURST}",
+        );
+
+        let view_distance = u64::try_from(self.view_distance)
+            .map_err(|_| anyhow::anyhow!("view_distance cannot be represented as u64"))?;
+        let view_side = view_distance
+            .checked_mul(2)
+            .and_then(|diameter| diameter.checked_add(1))
+            .ok_or_else(|| anyhow::anyhow!("view_distance square overflow"))?;
+        let view_area = view_side
+            .checked_mul(view_side)
+            .ok_or_else(|| anyhow::anyhow!("view_distance square overflow"))?;
+        let connections = u64::try_from(self.max_connections)
+            .map_err(|_| anyhow::anyhow!("max_connections cannot be represented as u64"))?;
+        let view_slots = connections
+            .checked_mul(view_area)
+            .ok_or_else(|| anyhow::anyhow!("max_connections * view_distance square overflow"))?;
+        anyhow::ensure!(
+            view_slots <= MAX_TOTAL_VIEW_SLOTS,
+            "max_connections ({}) * view_distance square ({view_area}) requests \
+             {view_slots} view slots; ceiling is {MAX_TOTAL_VIEW_SLOTS}",
+            self.max_connections,
+        );
+
+        let interval_ms = u64::try_from(self.chunk_stream_interval.as_millis())
+            .map_err(|_| anyhow::anyhow!("chunk_stream_interval_ms does not fit in u64"))?;
+        let scan_numerator = view_slots
+            .checked_mul(1_000)
+            .ok_or_else(|| anyhow::anyhow!("view scan rate overflow"))?;
+        let scans_per_second = scan_numerator
+            .checked_add(interval_ms - 1)
+            .ok_or_else(|| anyhow::anyhow!("view scan rate overflow"))?
+            / interval_ms;
+        anyhow::ensure!(
+            scans_per_second <= MAX_VIEW_SCAN_UNITS_PER_SECOND,
+            "max_connections, view_distance, and chunk_stream_interval_ms request \
+             {scans_per_second} view-scan units/second; ceiling is \
+             {MAX_VIEW_SCAN_UNITS_PER_SECOND}",
+        );
+        Ok(())
+    }
+
+    /// Computes the tick period without division truncating to zero.
+    fn checked_tick_period(&self) -> anyhow::Result<Duration> {
+        let period = Duration::from_secs(1)
+            .checked_div(self.ticks_per_second)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ticks_per_second must produce a representable duration, got {}",
+                    self.ticks_per_second,
+                )
+            })?;
+        anyhow::ensure!(
+            !period.is_zero(),
+            "ticks_per_second {} produces a zero-duration tick",
+            self.ticks_per_second,
+        );
+        Ok(period)
     }
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        // `expect` is confined to building the compile-time defaults, the
-        // documented startup-config exception: these literals are known good.
-        Self {
-            bind: DEFAULT_BIND.parse().expect("default bind address is valid"),
+        let config = Self {
+            bind: DEFAULT_BIND,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             io_timeout: Duration::from_secs(DEFAULT_IO_TIMEOUT_SECS),
             compression_threshold: None,
@@ -210,8 +713,7 @@ impl Default for AppConfig {
             simulation_distance: DEFAULT_SIMULATION_DISTANCE,
             spawn: DEFAULT_SPAWN,
             spawn_chunk_radius: DEFAULT_SPAWN_CHUNK_RADIUS,
-            ticks_per_second: NonZeroU32::new(DEFAULT_TICKS_PER_SECOND)
-                .expect("default tick rate is non-zero"),
+            ticks_per_second: DEFAULT_TICKS_PER_SECOND,
             plugins_dir: None,
             spawn_protect_radius: DEFAULT_SPAWN_PROTECT_RADIUS,
             spawn_protect_bypass: Vec::new(),
@@ -231,8 +733,22 @@ impl Default for AppConfig {
             budget: PacketBudgetConfig::default(),
             // No Anvil import by default: the server generates its flat world.
             world: WorldConfig::default(),
-        }
+        };
+        debug_assert!(
+            config.validate().is_ok(),
+            "compile-time AppConfig defaults must satisfy validation",
+        );
+        config
     }
+}
+
+/// Validates one spawn component against its finite inclusive range.
+fn validate_spawn_axis(axis: &str, value: f64, min: f64, max: f64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.is_finite() && (min..=max).contains(&value),
+        "spawn.{axis} must be finite and in {min}..={max}, got {value}",
+    );
+    Ok(())
 }
 
 /// The optional-field TOML shape that merges over [`AppConfig::default`].
@@ -308,11 +824,7 @@ impl RawConfig {
             None => defaults.bind,
         };
 
-        let ticks_per_second = match self.ticks_per_second {
-            Some(value) => NonZeroU32::new(value)
-                .ok_or_else(|| anyhow::anyhow!("ticks_per_second must be greater than zero"))?,
-            None => defaults.ticks_per_second,
-        };
+        let ticks_per_second = self.ticks_per_second.unwrap_or(defaults.ticks_per_second);
 
         let spawn = self
             .spawn
@@ -325,19 +837,29 @@ impl RawConfig {
             None => defaults.dashboard_bind,
         };
 
-        // Reject a degenerate packet budget at startup: a non-positive rate would
-        // silently disconnect every client rather than surface as a config error.
-        self.budget.validate()?;
+        // Every negative threshold already meant "compression disabled" at the
+        // connection boundary. Normalize that spelling to the sealed `None`
+        // representation while preserving the public key's established meaning.
+        let compression_threshold = match self.compression_threshold {
+            Some(threshold) if threshold < 0 => None,
+            Some(threshold) => Some(threshold),
+            None => defaults.compression_threshold,
+        };
+        // The spawn-protection plugin has always defined every non-positive
+        // radius as disabled. Keep that public key meaning while sealing the
+        // runtime representation to the validator's non-negative range.
+        let spawn_protect_radius = self
+            .spawn_protect_radius
+            .unwrap_or(defaults.spawn_protect_radius)
+            .max(0);
 
-        Ok(AppConfig {
+        let candidate = AppConfig {
             bind,
             max_connections: self.max_connections.unwrap_or(defaults.max_connections),
             io_timeout: self
                 .io_timeout_secs
                 .map_or(defaults.io_timeout, Duration::from_secs),
-            compression_threshold: self
-                .compression_threshold
-                .or(defaults.compression_threshold),
+            compression_threshold,
             view_distance: self.view_distance.unwrap_or(defaults.view_distance),
             simulation_distance: self
                 .simulation_distance
@@ -348,9 +870,7 @@ impl RawConfig {
                 .unwrap_or(defaults.spawn_chunk_radius),
             ticks_per_second,
             plugins_dir: self.plugins_dir.map(PathBuf::from).or(defaults.plugins_dir),
-            spawn_protect_radius: self
-                .spawn_protect_radius
-                .unwrap_or(defaults.spawn_protect_radius),
+            spawn_protect_radius,
             spawn_protect_bypass: self
                 .spawn_protect_bypass
                 .unwrap_or(defaults.spawn_protect_bypass),
@@ -376,7 +896,9 @@ impl RawConfig {
             access: self.access,
             budget: self.budget,
             world: self.world,
-        })
+        };
+        candidate.validate()?;
+        Ok(candidate)
     }
 }
 
@@ -428,7 +950,7 @@ mod tests {
         assert_eq!(parsed.simulation_distance, 7);
         assert_eq!(parsed.spawn, Vec3::new(1.0, 65.0, 2.0));
         assert_eq!(parsed.spawn_chunk_radius, 1);
-        assert_eq!(parsed.ticks_per_second, NonZeroU32::new(10).unwrap());
+        assert_eq!(parsed.ticks_per_second, 10);
         assert_eq!(parsed.plugins_dir, Some(PathBuf::from("/srv/plugins")));
         assert_eq!(parsed.spawn_protect_radius, 12);
         assert_eq!(parsed.spawn_protect_bypass, vec!["Admin", "Mod"]);
@@ -597,9 +1119,226 @@ mod tests {
     #[test]
     fn tick_period_tracks_rate() {
         let config = AppConfig {
-            ticks_per_second: NonZeroU32::new(20).unwrap(),
+            ticks_per_second: 20,
             ..AppConfig::default()
         };
         assert_eq!(config.tick_period(), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn every_numeric_config_field_rejects_unsafe_values_with_its_name() {
+        let cases = [
+            ("max_connections = 0", "max_connections"),
+            ("max_connections = 1025", "max_connections"),
+            ("io_timeout_secs = 0", "io_timeout"),
+            ("io_timeout_secs = 301", "io_timeout"),
+            ("compression_threshold = 2097153", "compression_threshold"),
+            ("view_distance = -1", "view_distance"),
+            ("view_distance = 33", "view_distance"),
+            ("simulation_distance = -1", "simulation_distance"),
+            ("simulation_distance = 33", "simulation_distance"),
+            ("spawn = [nan, 64.0, 8.0]", "spawn"),
+            ("spawn = [8.0, inf, 8.0]", "spawn"),
+            ("spawn = [8.0, 64.0, -inf]", "spawn"),
+            ("spawn = [30000001.0, 64.0, 8.0]", "spawn"),
+            ("spawn = [-30000001.0, 64.0, 8.0]", "spawn"),
+            ("spawn = [8.0, -65.0, 8.0]", "spawn"),
+            ("spawn = [8.0, 320.0, 8.0]", "spawn"),
+            ("spawn = [8.0, 64.0, 30000001.0]", "spawn"),
+            ("spawn = [8.0, 64.0, -30000001.0]", "spawn"),
+            ("spawn_chunk_radius = 9", "spawn_chunk_radius"),
+            ("ticks_per_second = 0", "ticks_per_second"),
+            ("ticks_per_second = 1001", "ticks_per_second"),
+            ("spawn_protect_radius = 30000001", "spawn_protect_radius"),
+            ("max_region_fill_volume = 1000001", "max_region_fill_volume"),
+            ("region_undo_history = 65", "region_undo_history"),
+            (
+                "max_region_fill_volume = 32769\nregion_undo_history = 32",
+                "max_region_fill_volume",
+            ),
+            ("keep_alive_interval_ms = 99", "keep_alive_interval"),
+            ("keep_alive_interval_ms = 15001", "keep_alive_interval"),
+            ("chunk_stream_interval_ms = 9", "chunk_stream_interval"),
+            ("chunk_stream_interval_ms = 60001", "chunk_stream_interval"),
+            ("default_permission_level = 5", "default_permission_level"),
+            (
+                "max_connections = 1\n[access]\nper_ip_connection_limit = 2",
+                "per_ip_connection_limit",
+            ),
+            (
+                "max_connections = 1024\nview_distance = 32\n\
+                 [budget]\nsustained_rate = 1.0\nburst = 1.0",
+                "max_connections",
+            ),
+            (
+                "view_distance = 32\nchunk_stream_interval_ms = 10",
+                "chunk_stream_interval_ms",
+            ),
+            (
+                "[budget]\nsustained_rate = 0.5\nburst = 1.0",
+                "sustained_rate",
+            ),
+            (
+                "[budget]\nsustained_rate = nan\nburst = 1.0",
+                "sustained_rate",
+            ),
+            ("[budget]\nsustained_rate = 1.0\nburst = 0.5", "burst"),
+            ("[budget]\nsustained_rate = 1.0\nburst = inf", "burst"),
+            ("[budget]\nsustained_rate = 2.0\nburst = 1.0", "burst"),
+            (
+                "[budget]\nsustained_rate = 10001.0\nburst = 10001.0",
+                "sustained_rate",
+            ),
+            (
+                "[budget]\nsustained_rate = 10000.0\nburst = 20001.0",
+                "burst",
+            ),
+        ];
+
+        for (toml, field) in cases {
+            let Err(error) = AppConfig::from_toml_str(toml) else {
+                panic!("{field} case unexpectedly parsed: {toml:?}");
+            };
+            assert!(
+                error.to_string().contains(field),
+                "{field} rejection was not actionable: {error:#}",
+            );
+        }
+    }
+
+    #[test]
+    fn declared_minimum_and_maximum_resource_boundaries_are_accepted() {
+        let cases = [
+            "max_connections = 1\n[access]\nper_ip_connection_limit = 0",
+            "max_connections = 1024\nview_distance = 0\n\
+             [budget]\nsustained_rate = 1.0\nburst = 1.0",
+            "io_timeout_secs = 1",
+            "io_timeout_secs = 300",
+            "compression_threshold = 0",
+            "compression_threshold = 2097152",
+            "view_distance = 0",
+            "max_connections = 1\nview_distance = 32\n\
+             [access]\nper_ip_connection_limit = 0",
+            "simulation_distance = 0",
+            "simulation_distance = 32",
+            "spawn = [-30000000.0, -64.0, -30000000.0]",
+            "spawn = [30000000.0, 319.0, 30000000.0]",
+            "spawn_chunk_radius = 0",
+            "spawn_chunk_radius = 8",
+            "ticks_per_second = 1",
+            "ticks_per_second = 1000",
+            "spawn_protect_radius = 0",
+            "spawn_protect_radius = 30000000",
+            "max_region_fill_volume = 0\nregion_undo_history = 64",
+            "max_region_fill_volume = 1000000\nregion_undo_history = 1",
+            "max_region_fill_volume = 16384\nregion_undo_history = 64",
+            "keep_alive_interval_ms = 100",
+            "keep_alive_interval_ms = 15000",
+            "view_distance = 0\nchunk_stream_interval_ms = 10",
+            "chunk_stream_interval_ms = 60000",
+            "default_permission_level = 0",
+            "default_permission_level = 4",
+            "[access]\nper_ip_connection_limit = 0",
+            "[access]\nper_ip_connection_limit = 256",
+            "[budget]\nsustained_rate = 1.0\nburst = 1.0",
+            "max_connections = 10\n\
+             [budget]\nsustained_rate = 10000.0\nburst = 20000.0",
+        ];
+
+        for toml in cases {
+            let config = AppConfig::from_toml_str(toml)
+                .unwrap_or_else(|error| panic!("declared boundary failed: {toml:?}: {error:#}"));
+            assert!(!config.tick_period().is_zero());
+        }
+
+        let maximum_spawn = AppConfig::from_toml_str("spawn_chunk_radius = 8")
+            .expect("maximum spawn radius is valid");
+        assert_eq!(
+            (2 * usize::from(maximum_spawn.spawn_chunk_radius) + 1).pow(2),
+            289,
+            "accepted spawn configuration has a declared startup ceiling",
+        );
+        let maximum_view = AppConfig::from_toml_str(
+            "max_connections = 1\nview_distance = 32\n\
+             [access]\nper_ip_connection_limit = 0",
+        )
+        .expect("maximum view is valid");
+        assert_eq!(
+            (2 * usize::try_from(maximum_view.view_distance).unwrap() + 1).pow(2),
+            4_225,
+            "accepted per-player view has a declared residency ceiling",
+        );
+    }
+
+    #[test]
+    fn negative_compression_threshold_preserves_disabled_meaning() {
+        let config =
+            AppConfig::from_toml_str("compression_threshold = -7").expect("negative disables");
+        assert_eq!(config.compression_threshold, None);
+    }
+
+    #[test]
+    fn negative_spawn_protection_preserves_disabled_meaning() {
+        let config = AppConfig::from_toml_str("spawn_protect_radius = -7")
+            .expect("negative spawn protection disables");
+        assert_eq!(config.spawn_protect_radius, 0);
+    }
+
+    #[test]
+    fn accepted_discrete_ranges_keep_derived_work_nonzero_and_bounded() {
+        for ticks_per_second in 1..=MAX_TICKS_PER_SECOND {
+            let config = AppConfig {
+                ticks_per_second,
+                ..AppConfig::default()
+            };
+            config.validate().expect("accepted tick rate validates");
+            assert!(!config.tick_period().is_zero());
+        }
+
+        for radius in 0..=MAX_SPAWN_CHUNK_RADIUS {
+            let side = 2 * u64::from(radius) + 1;
+            assert!(side * side <= 289);
+        }
+        for distance in 0..=MAX_PLAY_DISTANCE {
+            let side = 2 * u64::try_from(distance).unwrap() + 1;
+            assert!(side * side <= 4_225);
+        }
+    }
+
+    #[test]
+    fn multiplicative_resource_maxima_are_rejected_actionably() {
+        let cases = [
+            (
+                "max_connections = 1024\nview_distance = 32\n\
+                 [budget]\nsustained_rate = 1.0\nburst = 1.0",
+                "view slots",
+            ),
+            (
+                "view_distance = 32\nchunk_stream_interval_ms = 10",
+                "view-scan units/second",
+            ),
+            (
+                "max_region_fill_volume = 1000000\nregion_undo_history = 64",
+                "retains up to",
+            ),
+            (
+                "max_connections = 11\n\
+                 [budget]\nsustained_rate = 10000.0\nburst = 20000.0",
+                "serverbound frames/second",
+            ),
+            (
+                "max_connections = 11\n\
+                 [budget]\nsustained_rate = 1.0\nburst = 20000.0",
+                "immediate serverbound frames",
+            ),
+        ];
+        for (toml, diagnostic) in cases {
+            let error = AppConfig::from_toml_str(toml)
+                .expect_err("combined resource maxima must be rejected");
+            assert!(
+                error.to_string().contains(diagnostic),
+                "missing {diagnostic:?} in {error:#}",
+            );
+        }
     }
 }

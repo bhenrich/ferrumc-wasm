@@ -220,7 +220,9 @@ fn register_world_owner(
 /// built, or the listener cannot bind the configured address.
 #[allow(clippy::too_many_lines)] // one cohesive bring-up: build world+stores, wire channels, spawn tasks, bind
 pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
-    let shard_pos = shard_for_position(config.spawn);
+    config.validate()?;
+
+    let shard_pos = shard_for_position(config.spawn());
     let setup = build_world(config, shard_pos).await?;
 
     // The configuration-phase registry payloads are identical for every
@@ -237,7 +239,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
 
     // Prove the dynamic loader: scan the configured plugins directory across the
     // C ABI. Failures are logged and never fatal to startup.
-    if let Some(dir) = &config.plugins_dir {
+    if let Some(dir) = config.plugins_dir() {
         match load_plugins(dir) {
             Ok(count) => {
                 tracing::info!(plugins = count, dir = %dir.display(), "loaded dynamic plugins");
@@ -250,7 +252,7 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
 
     let mut router = SessionRouter::new();
     // Scope multiplayer visibility to the configured play view distance.
-    router.set_view_distance(config.view_distance);
+    router.set_view_distance(config.view_distance());
     // The current runtime has one authoritative simulation owner for the entire
     // overworld, even though its canonical home is the 8x8 region containing
     // spawn. Register that existing owner as world-covering so a restored player
@@ -314,26 +316,27 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
 
     // A port clash is the common operator mistake, so name the port and the fix
     // instead of surfacing a bare "Address already in use (os error 48)".
-    let listener = match TcpListener::bind(config.bind).await {
+    let listener = match TcpListener::bind(config.bind()).await {
         Ok(listener) => listener,
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
             return Err(anyhow::anyhow!(
                 "port {} is already in use (bind {}). Another server may be running — \
                  pick a different port with --port <PORT> (or set `bind` in config.toml), \
                  or find what holds it with `lsof -i :{}`.",
-                config.bind.port(),
-                config.bind,
-                config.bind.port(),
+                config.bind().port(),
+                config.bind(),
+                config.bind().port(),
             ));
         }
-        Err(err) => return Err(anyhow::anyhow!("binding to {}: {err}", config.bind)),
+        Err(err) => return Err(anyhow::anyhow!("binding to {}: {err}", config.bind())),
     };
     let local_addr = listener.local_addr()?;
 
     // Render the server-list status response once; it advertises the connection
     // ceiling as the player max and never changes for the server's lifetime. A
     // ceiling above `u32::MAX` saturates rather than wrapping to a tiny max.
-    let max_players = u32::try_from(config.max_connections).unwrap_or(u32::MAX);
+    let max_players = u32::try_from(config.max_connections())
+        .map_err(|_| anyhow::anyhow!("validated max_connections does not fit in u32"))?;
     let status_response = Arc::new(build_status_response(max_players)?);
 
     // Resolve access control once at startup and build the per-IP limiter from it.
@@ -341,29 +344,29 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
 
     let ctx = ConnContext {
         limits: ConnectionLimits::default(),
-        io_timeout: config.io_timeout,
-        compression_threshold: config.compression_threshold,
+        io_timeout: config.io_timeout(),
+        compression_threshold: config.compression_threshold(),
         join_kit: setup.join_kit,
         config: config_registries,
-        keep_alive_interval: config.keep_alive_interval,
-        chunk_stream_interval: config.chunk_stream_interval,
+        keep_alive_interval: config.keep_alive_interval(),
+        chunk_stream_interval: config.chunk_stream_interval(),
         commands: commands_tx,
         player_store,
         policy,
         block_events,
         status_response,
-        view_distance: config.view_distance,
+        view_distance: config.view_distance(),
         metrics: Arc::clone(&metrics),
         clock,
         net_telemetry,
         access,
-        budget: config.budget,
+        budget: config.budget(),
     };
 
     let accept_task = tokio::spawn(accept_loop(
         listener,
         ctx,
-        config.max_connections,
+        config.max_connections(),
         per_ip,
         shutdown_rx,
     ));
@@ -390,7 +393,7 @@ fn build_access(
     let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let access = Arc::new(
         config
-            .access
+            .access()
             .resolve(&base_dir)
             .map_err(|err| anyhow::anyhow!("resolving access control: {err}"))?,
     );

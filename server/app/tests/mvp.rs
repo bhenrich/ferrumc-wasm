@@ -491,16 +491,16 @@ async fn mvp_end_to_end() {
 
     // A radius-1 spawn keeps the resident area small; spawn protection is on with
     // the admin granted bypass.
-    let config = AppConfig {
-        bind: "127.0.0.1:0".parse().expect("valid bind"),
-        spawn_chunk_radius: 1,
-        spawn_protect_radius: PROTECT_RADIUS,
-        spawn_protect_bypass: vec!["Admin".to_string()],
-        // The admin is an operator so `/gamemode` (operator-gated) actually runs.
-        ops: vec!["Admin".to_string()],
-        plugins_dir: Some(plugins.path().to_path_buf()),
-        ..AppConfig::default()
-    };
+    let config = AppConfig::from_toml_str(&format!(
+        "bind = \"127.0.0.1:0\"\n\
+         spawn_chunk_radius = 1\n\
+         spawn_protect_radius = {PROTECT_RADIUS}\n\
+         spawn_protect_bypass = [\"Admin\"]\n\
+         ops = [\"Admin\"]\n",
+    ))
+    .expect("MVP config parses")
+    .with_plugins_dir(Some(plugins.path().to_path_buf()))
+    .expect("plugins directory preserves a valid config");
     let server = ferrumc_app::run(&config).await.expect("server starts");
     let addr = server.local_addr();
 

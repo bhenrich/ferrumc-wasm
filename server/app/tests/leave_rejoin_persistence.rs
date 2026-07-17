@@ -60,13 +60,12 @@ const STONE_STATE: u32 = 1;
 /// an explicit spawn radius and view distance, so the resident vs. streamed split
 /// is exact.
 fn persistent_config(world_dir: &Path, spawn_chunk_radius: u8, view_distance: i32) -> AppConfig {
-    AppConfig {
-        bind: "127.0.0.1:0".parse().expect("loopback addr"),
-        spawn_chunk_radius,
-        view_distance,
-        world_dir: Some(world_dir.to_path_buf()),
-        ..AppConfig::default()
-    }
+    AppConfig::from_toml_str(&format!(
+        "bind = \"127.0.0.1:0\"\nspawn_chunk_radius = {spawn_chunk_radius}\nview_distance = {view_distance}"
+    ))
+    .expect("config parses")
+    .with_world_dir(Some(world_dir.to_path_buf()))
+    .expect("world directory preserves valid config")
 }
 
 /// Sends a `UseItemOn` clicking the top face of the block at `pos` (placing on the

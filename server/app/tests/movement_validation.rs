@@ -79,14 +79,15 @@ fn test_runtime() -> Runtime {
 
 /// Builds a durable radius-two stream on an ephemeral port.
 fn persistent_config(world_dir: &Path) -> AppConfig {
-    AppConfig {
-        bind: "127.0.0.1:0".parse().expect("loopback address"),
-        spawn_chunk_radius: 2,
-        view_distance: 2,
-        world_dir: Some(world_dir.to_path_buf()),
-        ops: vec!["MovementGuard".to_string(), "MovementObserver".to_string()],
-        ..AppConfig::default()
-    }
+    AppConfig::from_toml_str(
+        "bind = \"127.0.0.1:0\"\n\
+         spawn_chunk_radius = 2\n\
+         view_distance = 2\n\
+         ops = [\"MovementGuard\", \"MovementObserver\"]\n",
+    )
+    .expect("movement-validation config parses")
+    .with_world_dir(Some(world_dir.to_path_buf()))
+    .expect("world directory preserves a valid config")
 }
 
 /// Runs `future` under the suite's diagnostic timeout guard.

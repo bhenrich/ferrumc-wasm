@@ -159,10 +159,11 @@ pub(crate) struct WorldSetup {
 
 /// Returns the chunk position the spawn point falls in.
 fn spawn_center_chunk(config: &AppConfig) -> ChunkPos {
+    let spawn = config.spawn();
     BlockPos::new(
-        config.spawn.x.floor() as i32,
-        config.spawn.y.floor() as i32,
-        config.spawn.z.floor() as i32,
+        spawn.x.floor() as i32,
+        spawn.y.floor() as i32,
+        spawn.z.floor() as i32,
     )
     .to_chunk_pos()
 }
@@ -184,14 +185,14 @@ pub(crate) async fn build_world(
         player_store,
     } = open_store(config)?;
     let generator = FlatWorldGenerator::new();
-    let spawn = SpawnChunkTickets::new(spawn_center_chunk(config), config.spawn_chunk_radius);
+    let spawn = SpawnChunkTickets::new(spawn_center_chunk(config), config.spawn_chunk_radius());
 
     let mut shard = SimShard::new(shard_pos);
     // Bound the region build commands (/fill, /replace, /undo) with the operator's
     // configured caps; the shard re-checks these defensively on every region edit.
     shard.set_region_limits(RegionLimits {
-        max_volume: config.max_region_fill_volume,
-        max_undo_entries: config.region_undo_history,
+        max_volume: config.max_region_fill_volume(),
+        max_undo_entries: config.region_undo_history(),
         // The per-tick application budget keeps its built-in default; only the
         // operator-facing volume + undo caps are configurable.
         ..RegionLimits::default()
@@ -204,7 +205,7 @@ pub(crate) async fn build_world(
     // its chunk schema version, so the load-or-generate flow finds them. A
     // missing/empty/malformed map aborts startup here (before connections), rather
     // than silently serving flat terrain.
-    if let Some(region_dir) = config.world.anvil_import_dir() {
+    if let Some(region_dir) = config.world().anvil_import_dir() {
         let loaded = shard.loaded_chunks();
         let imported = import_anvil_world(
             &*store,
@@ -262,7 +263,7 @@ struct OpenedStore {
 /// Returns an error if the world directory cannot be created or the redb file
 /// cannot be opened.
 fn open_store(config: &AppConfig) -> anyhow::Result<OpenedStore> {
-    if let Some(dir) = &config.world_dir {
+    if let Some(dir) = config.world_dir() {
         std::fs::create_dir_all(dir)
             .map_err(|err| anyhow::anyhow!("creating world directory {}: {err}", dir.display()))?;
         let path = dir.join("world.redb");
@@ -399,14 +400,15 @@ fn collect_region_paths(region_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
 /// live blob from the resident shard chunks at join time, so the kit never holds a
 /// stale snapshot of a spawn chunk.
 fn build_join_kit(config: &AppConfig, spawn: &SpawnChunkTickets) -> anyhow::Result<JoinKit> {
+    let spawn_position = config.spawn();
     let spawn_block = BlockPosition::new(
-        config.spawn.x.floor() as i32,
-        config.spawn.y.floor() as i32,
-        config.spawn.z.floor() as i32,
+        spawn_position.x.floor() as i32,
+        spawn_position.y.floor() as i32,
+        spawn_position.z.floor() as i32,
     );
     Ok(JoinKit {
         join_game: build_join_game(config)?,
-        spawn_position: config.spawn,
+        spawn_position,
         spawn_chunk: spawn_center_chunk(config),
         spawn_block,
         spawn_positions: spawn.positions().collect(),
@@ -434,8 +436,8 @@ fn build_join_game(config: &AppConfig) -> anyhow::Result<JoinGame> {
         false,
         vec![overworld],
         MAX_PLAYERS,
-        config.view_distance,
-        config.simulation_distance,
+        config.view_distance(),
+        config.simulation_distance(),
         false,
         true,
         false,
@@ -496,7 +498,6 @@ pub(crate) fn chunk_packet(pos: ChunkPos, chunk: &Chunk) -> anyhow::Result<Chunk
 
 #[cfg(test)]
 mod tests {
-    use ferrumc_config::WorldConfig;
     use ferrumc_math::ShardPos;
     use ferrumc_world::BlockStateId;
 
@@ -598,18 +599,17 @@ mod tests {
 
     #[tokio::test]
     async fn build_world_imports_configured_anvil_map() {
-        let config = AppConfig {
-            world: WorldConfig {
-                anvil_import_dir: Some(anvil_fixtures_dir()),
-            },
-            ..AppConfig::default()
-        };
+        let config = AppConfig::from_toml_str(&format!(
+            "[world]\nanvil_import_dir = {:?}\n",
+            anvil_fixtures_dir().to_string_lossy()
+        ))
+        .expect("fixture import config is valid");
         let setup = build_world(&config, ShardPos::new(0, 0))
             .await
             .expect("world builds with anvil import");
 
         // Spawn radius 2 -> a 5x5 resident square around chunk (0, 0).
-        let expected_resident = (2 * usize::from(config.spawn_chunk_radius) + 1).pow(2);
+        let expected_resident = (2 * usize::from(config.spawn_chunk_radius()) + 1).pow(2);
         assert_eq!(
             setup.shard.loaded_chunks().loaded_count(),
             expected_resident
@@ -647,13 +647,13 @@ mod tests {
 
         // Radius 2 -> a 5x5 spawn square, all resident, all covered by the kit's
         // position list.
-        let expected = (2 * usize::from(config.spawn_chunk_radius) + 1).pow(2);
+        let expected = (2 * usize::from(config.spawn_chunk_radius()) + 1).pow(2);
         assert_eq!(setup.shard.loaded_chunks().loaded_count(), expected);
         assert_eq!(setup.join_kit.chunk_positions().count(), expected);
-        assert_eq!(setup.join_kit.spawn_position(), config.spawn);
+        assert_eq!(setup.join_kit.spawn_position(), config.spawn());
         assert_eq!(
             setup.join_kit.join_game().view_distance(),
-            config.view_distance
+            config.view_distance()
         );
         // The spawn point (8, 64, 8) falls in chunk (0, 0) and block (8, 64, 8).
         assert_eq!(

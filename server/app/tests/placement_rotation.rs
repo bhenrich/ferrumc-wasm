@@ -348,13 +348,12 @@ async fn side_face_log_is_rotated_and_seen_by_second_client() {
 #[tokio::test(flavor = "multi_thread")]
 async fn placed_rotated_log_survives_rejoin() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let config = AppConfig {
-        bind: "127.0.0.1:0".parse().expect("loopback addr"),
-        spawn_chunk_radius: 1,
-        view_distance: 1,
-        world_dir: Some(temp.path().to_path_buf()),
-        ..AppConfig::default()
-    };
+    let config = AppConfig::from_toml_str(
+        "bind = \"127.0.0.1:0\"\nspawn_chunk_radius = 1\nview_distance = 1",
+    )
+    .expect("config parses")
+    .with_world_dir(Some(temp.path().to_path_buf()))
+    .expect("world directory preserves valid config");
 
     let server = ferrumc_app::run(&config).await.expect("server starts");
     let addr = server.local_addr();

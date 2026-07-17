@@ -42,8 +42,8 @@ fn log_startup_banner(config: &AppConfig, server: &RunningServer) {
         ferrumc_registry::MINECRAFT_VERSION,
     );
     tracing::info!(addr = %server.local_addr(), "listening for Minecraft clients");
-    if config.dashboard_enabled {
-        tracing::info!(addr = %config.dashboard_bind, "observability dashboard available");
+    if config.dashboard_enabled() {
+        tracing::info!(addr = %config.dashboard_bind(), "observability dashboard available");
     }
     tracing::info!("set RUST_LOG=debug for verbose logs (e.g. RUST_LOG=debug ferrumc)");
 }
@@ -64,9 +64,9 @@ async fn main() -> anyhow::Result<()> {
     // Start the read-only observability dashboard on its own task so it never
     // blocks or stalls the simulation tick. It reads the snapshot the driver
     // publishes through `server.snapshot_handle()` and binds loopback by default.
-    if config.dashboard_enabled {
+    if config.dashboard_enabled() {
         let snapshots = server.snapshot_handle();
-        let dashboard_bind = config.dashboard_bind;
+        let dashboard_bind = config.dashboard_bind();
         tokio::spawn(async move {
             if let Err(err) = ferrumc_dashboard::run(dashboard_bind, snapshots).await {
                 tracing::warn!(%err, "dashboard server exited");

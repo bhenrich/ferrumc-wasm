@@ -582,9 +582,10 @@ impl PlayPolicy {
 pub(crate) fn build_play_policy(
     config: &AppConfig,
 ) -> anyhow::Result<(PlayPolicy, BlockEventDispatcher)> {
-    let center_x = config.spawn.x.floor() as i32;
-    let center_z = config.spawn.z.floor() as i32;
-    let seed = SpawnProtect::new(center_x, center_z, config.spawn_protect_radius);
+    let spawn = config.spawn();
+    let center_x = spawn.x.floor() as i32;
+    let center_z = spawn.z.floor() as i32;
+    let seed = SpawnProtect::new(center_x, center_z, config.spawn_protect_radius());
 
     // The long-lived host: register + enable the in-process plugins that vote on
     // block edits at the intent boundary. The shared storage clone lets us read
@@ -607,9 +608,9 @@ pub(crate) fn build_play_policy(
     let greeter_id = host.register(Box::new(GreeterPlugin::new()))?;
     host.enable(&greeter_id)?;
 
-    let permissions = PermissionRegistry::from_bypass_names(&config.spawn_protect_bypass)?;
+    let permissions = PermissionRegistry::from_bypass_names(config.spawn_protect_bypass())?;
     let ops = config
-        .ops
+        .ops()
         .iter()
         .map(|name| PlayerId::offline(name))
         .collect();
@@ -617,10 +618,10 @@ pub(crate) fn build_play_policy(
     let policy = PlayPolicy {
         guard,
         permissions,
-        command_tree: build_command_tree_with_limits(config.max_region_fill_volume),
-        spawn: config.spawn,
+        command_tree: build_command_tree_with_limits(config.max_region_fill_volume()),
+        spawn,
         ops,
-        default_permission_level: config.default_permission_level,
+        default_permission_level: config.default_permission_level(),
     };
     tracing::debug!(
         center = ?policy.guard().center(),
@@ -655,11 +656,15 @@ mod tests {
     use super::*;
 
     fn config_with(radius: i32, bypass: &[&str]) -> AppConfig {
-        AppConfig {
-            spawn_protect_radius: radius,
-            spawn_protect_bypass: bypass.iter().map(|s| (*s).to_string()).collect(),
-            ..AppConfig::default()
-        }
+        let bypass = bypass
+            .iter()
+            .map(|name| format!("{name:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        AppConfig::from_toml_str(&format!(
+            "spawn_protect_radius = {radius}\nspawn_protect_bypass = [{bypass}]\n"
+        ))
+        .expect("spawn-protection test config is valid")
     }
 
     #[test]
@@ -695,11 +700,8 @@ mod tests {
 
     #[test]
     fn operators_act_at_operator_level_others_at_the_default() {
-        let config = AppConfig {
-            ops: vec!["Admin".to_string()],
-            default_permission_level: 0,
-            ..AppConfig::default()
-        };
+        let config = AppConfig::from_toml_str("ops = [\"Admin\"]\ndefault_permission_level = 0\n")
+            .expect("operator test config is valid");
         let (policy, _dispatcher) = build_play_policy(&config).expect("policy builds");
         assert_eq!(
             policy.permission_level(PlayerId::offline("Admin")),

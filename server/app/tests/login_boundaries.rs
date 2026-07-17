@@ -255,9 +255,13 @@ fn database_path(world_dir: &Path) -> PathBuf {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn login_protocol_table_rejects_mismatch_before_login_start() {
-    let mut config = AppConfig::from_toml_str("bind = \"127.0.0.1:0\"\nspawn_chunk_radius = 1")
+    let config = AppConfig::from_toml_str("bind = \"127.0.0.1:0\"\nspawn_chunk_radius = 1")
         .expect("config parses");
-    config.access.per_ip_connection_limit = 32;
+    let mut access = config.access().clone();
+    access.per_ip_connection_limit = 32;
+    let config = config
+        .with_access(access)
+        .expect("connection limit preserves a valid config");
     let server = ferrumc_app::run(&config).await.expect("server starts");
     let addr = server.local_addr();
 
@@ -333,9 +337,13 @@ async fn login_protocol_table_rejects_mismatch_before_login_start() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn valid_username_boundary_table_reaches_play() {
-    let mut config = AppConfig::from_toml_str("bind = \"127.0.0.1:0\"\nspawn_chunk_radius = 1")
+    let config = AppConfig::from_toml_str("bind = \"127.0.0.1:0\"\nspawn_chunk_radius = 1")
         .expect("config parses");
-    config.access.per_ip_connection_limit = 32;
+    let mut access = config.access().clone();
+    access.per_ip_connection_limit = 32;
+    let config = config
+        .with_access(access)
+        .expect("connection limit preserves a valid config");
     let server = ferrumc_app::run(&config).await.expect("server starts");
     let addr = server.local_addr();
 
@@ -403,27 +411,29 @@ fn invalid_username_table_has_no_identity_or_downstream_side_effects() {
         },
     ];
 
-    let mut config = AppConfig {
-        bind: "127.0.0.1:0".parse().expect("loopback address"),
-        spawn_chunk_radius: 1,
-        world_dir: Some(world.path().to_path_buf()),
-        access: AccessConfig {
-            per_ip_connection_limit: 32,
-            whitelist_enabled: true,
-            whitelist: std::iter::once(OBSERVER.to_string())
-                .chain(invalid.iter().map(|case| case.name.to_string()))
-                .collect(),
-            ..AccessConfig::default()
-        },
-        ..AppConfig::default()
+    let mut access = AccessConfig {
+        per_ip_connection_limit: 32,
+        whitelist_enabled: true,
+        whitelist: std::iter::once(OBSERVER.to_string())
+            .chain(invalid.iter().map(|case| case.name.to_string()))
+            .collect(),
+        ..AccessConfig::default()
     };
     // A UUID-only ban for this invalid name proves grammar rejection precedes
     // both UUID derivation and ACL policy: the visible reason must be the static
     // grammar reason, never the ban reason.
-    config
-        .access
+    access
         .bans
         .push(PlayerId::offline("Bad Name").as_uuid().to_string());
+    let config = AppConfig::from_toml_str(
+        "bind = \"127.0.0.1:0\"\n\
+         spawn_chunk_radius = 1\n",
+    )
+    .expect("invalid-name test config parses")
+    .with_world_dir(Some(world.path().to_path_buf()))
+    .expect("world directory preserves a valid config")
+    .with_access(access)
+    .expect("dynamic access list preserves a valid config");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

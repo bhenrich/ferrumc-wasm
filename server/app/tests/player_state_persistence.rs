@@ -54,13 +54,10 @@ const EPS: f64 = 1e-6;
 /// Builds a redb-persistent server config on an ephemeral port, with the spawn
 /// area and view distance the rejoin needs to stream the player's chunk back in.
 fn persistent_config(world_dir: &Path) -> AppConfig {
-    AppConfig {
-        bind: "127.0.0.1:0".parse().expect("loopback addr"),
-        spawn_chunk_radius: 1,
-        view_distance: 1,
-        world_dir: Some(world_dir.to_path_buf()),
-        ..AppConfig::default()
-    }
+    AppConfig::from_toml_str("bind = \"127.0.0.1:0\"\nspawn_chunk_radius = 1\nview_distance = 1")
+        .expect("config parses")
+        .with_world_dir(Some(world_dir.to_path_buf()))
+        .expect("world directory preserves valid config")
 }
 
 /// Reads play packets until the first `SynchronizePlayerPosition`, returning its

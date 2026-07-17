@@ -84,10 +84,9 @@ fn first_run_writes_template_and_uses_defaults() {
     );
 
     // Defaults, plus the runtime world-dir fill.
-    let expected = AppConfig {
-        world_dir: Some(PathBuf::from("world")),
-        ..AppConfig::default()
-    };
+    let expected = AppConfig::default()
+        .with_world_dir(Some(PathBuf::from("world")))
+        .expect("runtime world directory preserves valid defaults");
     assert_eq!(config, expected);
 }
 
@@ -126,7 +125,7 @@ fn port_override_replaces_only_the_port() {
 
     let config = load_or_init_config(&path, Some(40000), None).expect("valid config");
     assert_eq!(
-        config.bind,
+        config.bind(),
         "127.0.0.1:40000".parse::<SocketAddr>().unwrap()
     );
 }
@@ -140,7 +139,7 @@ fn bind_override_replaces_the_full_address() {
 
     let bind: SocketAddr = "0.0.0.0:1".parse().unwrap();
     let config = load_or_init_config(&path, None, Some(bind)).expect("valid config");
-    assert_eq!(config.bind, bind);
+    assert_eq!(config.bind(), bind);
 }
 
 /// When both are supplied, `--bind` applies first and `--port` wins the port.
@@ -152,7 +151,7 @@ fn port_wins_over_bind_port() {
 
     let bind: SocketAddr = "0.0.0.0:1".parse().unwrap();
     let config = load_or_init_config(&path, Some(7), Some(bind)).expect("valid config");
-    assert_eq!(config.bind, "0.0.0.0:7".parse::<SocketAddr>().unwrap());
+    assert_eq!(config.bind(), "0.0.0.0:7".parse::<SocketAddr>().unwrap());
 }
 
 /// A malformed existing config is the one allowed startup-config error path: it is

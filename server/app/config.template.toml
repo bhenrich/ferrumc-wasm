@@ -17,56 +17,65 @@
 # connections from other machines on your network; 127.0.0.1 is loopback only.
 # bind = "127.0.0.1:25565"
 
-# Ceiling on simultaneously accepted connections. Also advertised as the player max
-# in the server-list ping.
+# Ceiling on simultaneously accepted connections (1..=1024). Also advertised as
+# the player max in the server-list ping.
 # max_connections = 256
 
-# Deadline applied to each individual socket read and write, in whole seconds.
+# Deadline applied to each individual socket read and write, in whole seconds
+# (1..=300).
 # io_timeout_secs = 30
 
-# Packet-compression threshold in bytes: frames larger than this are zlib-compressed.
-# Omitted (commented) means compression is DISABLED — frames travel uncompressed.
+# Packet-compression threshold in bytes (0..=2097152): frames larger than this are
+# zlib-compressed. Omitted or negative means compression is DISABLED.
 # compression_threshold = 256
 
 # --- World view ---
 
-# Play view distance advertised to clients, in chunks.
+# Play view distance advertised to clients, in chunks (0..=32). Together with
+# max_connections and chunk_stream_interval_ms it may request at most 1100000
+# view slots and 3000000 full-view scan units per second.
 # view_distance = 10
 
-# Play simulation distance advertised to clients, in chunks.
+# Play simulation distance advertised to clients, in chunks (0..=32).
 # simulation_distance = 10
 
-# World-spawn position players join at, as [x, y, z]. The default sits one block
-# above the flat grass surface at the centre of the spawn chunk.
+# World-spawn position players join at, as finite [x, y, z]. X/Z must be within
+# +/-30000000 and overworld Y within -64..=319. The default sits one block above
+# the flat grass surface at the centre of the spawn chunk.
 # spawn = [8.0, 64.0, 8.0]
 
 # Radius, in chunks, of the spawn area kept permanently resident around spawn
-# (a (2 * r + 1) square). Larger keeps more chunks loaded and costs more memory.
+# (0..=8, a (2 * r + 1) square). The maximum keeps 289 chunks resident.
 # spawn_chunk_radius = 2
 
 # --- Simulation ---
 
-# Simulation tick rate, in ticks per second. Must be greater than zero. The vanilla
-# rate is 20; lowering it slows the whole simulation.
+# Simulation tick rate, in ticks per second (1..=1000). The vanilla rate is 20;
+# lowering it slows the whole simulation.
 # ticks_per_second = 20
 
-# Interval between clientbound keep-alive pings, in milliseconds. A vanilla client
-# disconnects after 20 s of silence, so keep this comfortably below 20000.
+# Interval between clientbound keep-alive pings, in milliseconds (100..=15000).
 # keep_alive_interval_ms = 10000
 
 # How often a standing player's view is pumped toward the full view distance, in
-# milliseconds. One tick (50 ms at 20 TPS) drains the chunk backlog promptly.
+# milliseconds (10..=60000). One tick (50 ms at 20 TPS) drains the backlog.
 # chunk_stream_interval_ms = 50
 
 # --- Spawn protection ---
 
-# Spawn-protection radius in blocks (Chebyshev) around the spawn column. 0 DISABLES
-# spawn protection entirely, which is the default.
+# Spawn-protection radius in blocks (positive values up to 30000000, Chebyshev)
+# around spawn. 0 or any negative value DISABLES protection.
 # spawn_protect_radius = 0
 
 # Player names allowed to bypass spawn protection. Only meaningful when
 # spawn_protect_radius is greater than zero.
 # spawn_protect_bypass = []
+
+# Maximum blocks affected by one /fill or /replace (0..=1000000), and undo entries
+# retained per player (0..=64). Their product may not exceed 1048576 prior cells
+# per player.
+# max_region_fill_volume = 32768
+# region_undo_history = 16
 
 # --- Permissions ---
 
@@ -74,8 +83,8 @@
 # operator-gated commands such as /gamemode.
 # ops = []
 
-# Permission level granted to a player who is NOT an operator. 0 is the ordinary
-# "player" tier, which is what makes the operator gate meaningful.
+# Permission level granted to a player who is NOT an operator (0..=4). 0 is the
+# ordinary "player" tier, which is what makes the operator gate meaningful.
 # default_permission_level = 0
 
 # --- Storage & plugins ---
@@ -122,8 +131,8 @@
 # directory; a configured-but-missing file is a startup error (fail fast).
 [access]
 
-# Maximum concurrent connections allowed from a single source IP. Stops one host
-# from exhausting the global connection budget. 0 disables the per-IP limit.
+# Maximum concurrent connections allowed from a single source IP. It must not
+# exceed max_connections; 0 disables the per-IP limit.
 # per_ip_connection_limit = 3
 
 # When true, only whitelisted players may complete login; everyone else is kicked
@@ -148,3 +157,14 @@
 # Optional path to a newline-delimited deny-list file (one name, UUID, or IP per
 # line; blank lines and # comments ignored). Merged with the inline bans list.
 # ban_file = "bans.txt"
+
+# --- Serverbound packet budget ---
+#
+# Every play connection gets a token bucket. The sustained rate must be
+# 1..=10000 frames/second, burst 1..=20000 frames, and burst must be at least the
+# rate. Multiplied by max_connections, the server-wide ceilings are 100000
+# frames/second and 200000 immediate frames.
+[budget]
+
+# sustained_rate = 300.0
+# burst = 600.0

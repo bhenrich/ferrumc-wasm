@@ -35,7 +35,7 @@ const VIEWER_NAME: &str = "IdentityViewer";
 /// Builds the first-boot configuration with a UUID-only whitelist and durable
 /// player storage.
 fn whitelisted_config(world_dir: &Path, target: Uuid, viewer: Uuid) -> AppConfig {
-    let mut config = AppConfig::from_toml_str(&format!(
+    AppConfig::from_toml_str(&format!(
         "bind = \"127.0.0.1:0\"\n\
          spawn_chunk_radius = 1\n\
          view_distance = 1\n\
@@ -43,9 +43,9 @@ fn whitelisted_config(world_dir: &Path, target: Uuid, viewer: Uuid) -> AppConfig
          whitelist_enabled = true\n\
          whitelist = [\"{target}\", \"{viewer}\"]\n",
     ))
-    .expect("UUID-only whitelist config parses");
-    config.world_dir = Some(world_dir.to_path_buf());
-    config
+    .expect("UUID-only whitelist config parses")
+    .with_world_dir(Some(world_dir.to_path_buf()))
+    .expect("world directory preserves a valid config")
 }
 
 /// Builds the second-boot configuration with a UUID-only ban for the target.

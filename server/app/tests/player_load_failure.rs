@@ -33,13 +33,14 @@ const PLAYER_TABLE: TableDefinition<'_, &[u8], &[u8]> = TableDefinition::new("fe
 
 /// Builds a durable server on an ephemeral port with one spawn chunk.
 fn persistent_config(world_dir: &Path) -> AppConfig {
-    AppConfig {
-        bind: "127.0.0.1:0".parse().expect("loopback address"),
-        spawn_chunk_radius: 0,
-        view_distance: 0,
-        world_dir: Some(world_dir.to_path_buf()),
-        ..AppConfig::default()
-    }
+    AppConfig::from_toml_str(
+        "bind = \"127.0.0.1:0\"\n\
+         spawn_chunk_radius = 0\n\
+         view_distance = 0\n",
+    )
+    .expect("player-load-failure config parses")
+    .with_world_dir(Some(world_dir.to_path_buf()))
+    .expect("world directory preserves a valid config")
 }
 
 /// Returns the database path selected by the app for `world_dir`.

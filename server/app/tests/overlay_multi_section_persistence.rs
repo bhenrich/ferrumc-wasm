@@ -72,12 +72,10 @@ const PLACED: BlockPos = BlockPos::new(9, 64, 8);
 /// Builds a server config that persists to `world_dir` on an ephemeral port with a
 /// small resident spawn area.
 fn persistent_config(world_dir: &Path) -> AppConfig {
-    AppConfig {
-        bind: "127.0.0.1:0".parse().expect("loopback addr"),
-        spawn_chunk_radius: 1,
-        world_dir: Some(world_dir.to_path_buf()),
-        ..AppConfig::default()
-    }
+    AppConfig::from_toml_str("bind = \"127.0.0.1:0\"\nspawn_chunk_radius = 1")
+        .expect("config parses")
+        .with_world_dir(Some(world_dir.to_path_buf()))
+        .expect("world directory preserves valid config")
 }
 
 /// Sends a dig-start `PlayerAction` breaking the block at `pos`, stamped with
