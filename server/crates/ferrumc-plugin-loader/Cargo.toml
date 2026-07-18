@@ -1,0 +1,24 @@
+[package]
+name = "ferrumc-plugin-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+# Stable ABI values and compatibility assignments used during validation.
+ferrumc-plugin-abi = { workspace = true }
+# Audited native boundary that supplies validated, host-owned plugin factories.
+ferrumc-plugin-abi-sys = { workspace = true }
+# Parses plugin and server API semantic versions and requirements.
+semver = { workspace = true }
+# Derives the strict schema used to deserialize plugin manifests.
+serde = { workspace = true, features = ["derive"] }
+# Defines classified discovery, manifest, and validation errors.
+thiserror = { workspace = true }
+# Parses bounded plugin.toml files into the strict manifest schema.
+toml = { workspace = true }
+
+[lints]
+workspace = true

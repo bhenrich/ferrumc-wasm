@@ -22,6 +22,7 @@ members = [
     "crates/ferrumc-plugin-api",
     "crates/ferrumc-plugin-abi",
     "crates/ferrumc-plugin-abi-sys",
+    "crates/ferrumc-plugin-loader",
     "crates/ferrumc-plugin-host",
     "crates/ferrumc-anvil",
     "crates/ferrumc-placement",
@@ -134,6 +135,7 @@ ferrumc-permission = { path = "crates/ferrumc-permission" }
 ferrumc-plugin-api = { path = "crates/ferrumc-plugin-api" }
 ferrumc-plugin-abi = { path = "crates/ferrumc-plugin-abi" }
 ferrumc-plugin-abi-sys = { path = "crates/ferrumc-plugin-abi-sys" }
+ferrumc-plugin-loader = { path = "crates/ferrumc-plugin-loader" }
 ferrumc-plugin-host = { path = "crates/ferrumc-plugin-host" }
 ferrumc-anvil = { path = "crates/ferrumc-anvil" }
 ferrumc-placement = { path = "crates/ferrumc-placement" }
