@@ -33,7 +33,9 @@ Use C ABI (`extern "C"`) with opaque handles for the plugin ↔ host boundary.
 
 ## Trade-offs
 
-**Pro:** Works across Rust versions, stable ABI, proven pattern (most plugin systems work this way)
+**Pro:** A versioned C ABI decouples the plugin boundary from Rust's compiler
+ABI, subject to ADR-0008's ABI-version and target-platform constraints; this is
+a common native-plugin pattern.
 **Con:** FFI boundary is ugly to write, must be careful with ownership across the boundary, no generics at the boundary
 
 ## Consequences
