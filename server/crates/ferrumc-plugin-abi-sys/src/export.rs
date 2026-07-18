@@ -43,12 +43,13 @@ impl<'call> PluginEvent<'call> {
         self.kind
     }
 
-    /// Returns the deterministic simulation tick.
+    /// Returns the exact simulation tick, or `0` when unavailable off-tick.
     pub const fn tick(&self) -> u64 {
         self.tick
     }
 
-    /// Returns the call-scoped shard handle.
+    /// Returns the call-scoped live shard handle, or
+    /// [`FcResourceHandle::INVALID`] when unavailable off-tick.
     pub const fn shard(&self) -> FcResourceHandle {
         self.shard
     }
@@ -639,7 +640,7 @@ unsafe fn event_from_raw<'call>(event: *const FcEventV1) -> Option<PluginEvent<'
     // remaining fields are fixed-width scalars, opaque integers, and a raw view
     // whose bit patterns are inert until validated below.
     let event = unsafe { event.read() };
-    if event.flags() != FC_EVENT_FLAGS_NONE || !event.shard().is_valid() {
+    if event.flags() != FC_EVENT_FLAGS_NONE || (!event.shard().is_valid() && event.tick() != 0) {
         return None;
     }
 
@@ -719,7 +720,7 @@ mod tests {
     use core::ptr;
 
     use ferrumc_plugin_abi::{
-        FcAbiHeader, FcCallHandle, FcCommandKind, FcCommandV1, FcEventKind, FcEventV1,
+        FcAbiHeader, FcBytesView, FcCallHandle, FcCommandKind, FcCommandV1, FcEventKind, FcEventV1,
         FcHostFunctionsV1, FcHostHandle, FcHostRequestKind, FcHostRequestV1, FcOutputBufferV1,
         FcPluginDescriptorV1, FcPluginFunctionsV1, FcPluginHandle, FcResourceHandle,
         FcSemanticVersion, FcStatus, FcStrView, ABI_MAJOR, ABI_MINOR, FC_DIAGNOSTIC_INFO, FC_ERROR,
@@ -727,8 +728,9 @@ mod tests {
     };
 
     use super::{
-        plugin_descriptor_v1, plugin_functions_v1, plugin_init, plugin_on_event, plugin_shutdown,
-        producer_header_is_compatible, valid_byte_extent, PluginBridge, PluginCall, PluginEvent,
+        event_from_raw, plugin_descriptor_v1, plugin_functions_v1, plugin_init, plugin_on_event,
+        plugin_shutdown, producer_header_is_compatible, valid_byte_extent, PluginBridge,
+        PluginCall, PluginEvent,
     };
 
     struct Bridge;
@@ -914,6 +916,36 @@ mod tests {
             1,
             0,
         ));
+    }
+
+    #[test]
+    fn event_decoder_preserves_the_unavailable_shard_sentinel() {
+        let event = FcEventV1::new(
+            FcEventKind::BLOCK_PLACE_ATTEMPT,
+            FC_EVENT_FLAGS_NONE,
+            0,
+            FcResourceHandle::INVALID,
+            FcBytesView::empty(),
+        );
+
+        // SAFETY: `event` is an aligned, complete ABI v1 record that remains
+        // live for the returned call-scoped view; its empty payload is inert.
+        let decoded = unsafe { event_from_raw(ptr::from_ref(&event)) }
+            .expect("connection-side event sentinel is a valid envelope");
+        assert_eq!(decoded.tick(), 0);
+        assert_eq!(decoded.shard(), FcResourceHandle::INVALID);
+        assert!(decoded.payload().is_empty());
+
+        let mismatched = FcEventV1::new(
+            FcEventKind::BLOCK_PLACE_ATTEMPT,
+            FC_EVENT_FLAGS_NONE,
+            1,
+            FcResourceHandle::INVALID,
+            FcBytesView::empty(),
+        );
+        // SAFETY: `mismatched` is a complete, live record; the deliberately
+        // inconsistent sentinel pair must be rejected before a view is exposed.
+        assert!(unsafe { event_from_raw(ptr::from_ref(&mismatched)) }.is_none());
     }
 
     #[test]

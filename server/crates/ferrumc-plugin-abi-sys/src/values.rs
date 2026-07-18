@@ -136,12 +136,13 @@ impl OwnedEvent {
         self.flags
     }
 
-    /// Returns the deterministic simulation tick.
+    /// Returns the exact simulation tick, or `0` when unavailable off-tick.
     pub const fn tick(&self) -> u64 {
         self.tick
     }
 
-    /// Returns the shard resource handle.
+    /// Returns the live shard resource handle, or
+    /// [`FcResourceHandle::INVALID`] when unavailable off-tick.
     pub const fn shard(&self) -> FcResourceHandle {
         self.shard
     }
