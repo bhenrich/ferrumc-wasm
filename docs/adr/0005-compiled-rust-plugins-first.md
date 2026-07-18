@@ -11,7 +11,8 @@ Plugin system needed. Options: compiled Rust, dynamic libraries, WASM, scripting
 
 Phase A (dev): compiled-in Rust plugins for API iteration.
 Phase A (ship): dynamic libraries (.so/.dll) loaded from /plugins/ folder via C ABI.
-Phase B (later): WASM for language-agnostic sandboxed plugins.
+WASM is rejected by ADR-0008. Reconsideration requires a superseding ADR and an
+explicitly changed trust model.
 
 ## Rationale
 
