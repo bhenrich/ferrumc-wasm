@@ -67,11 +67,16 @@ getter runs. No borrowed plugin pointer leaves the call.
 
 Validated loaded callbacks remain private. `LoadedAbiPlugin` and
 `PluginInstance` expose owned metadata, owned envelopes, typed statuses, and
-safe lifecycle methods.
+safe lifecycle methods. `LoadedAbiPlugin` is a reusable factory: initialization
+copies its host-owned metadata and private validated callback set into a fresh
+instance. A failed initialization leaves the factory available, and a later
+initialization does not reopen the permanently resident library.
 
 Each initialized instance receives a process-resident, nonzero host identity
 and a checked `u64` call sequence. The sequence never wraps: reaching
-`u64::MAX` produces a permanent typed exhaustion error.
+`u64::MAX` produces a permanent typed exhaustion error. Separate instances
+receive separate identities, including instances initialized sequentially from
+one factory.
 
 During one callback, a bounded thread-local slot records the internally
 created frame pointer plus the expected host/call tokens. A host callback first

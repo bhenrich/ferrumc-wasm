@@ -24,6 +24,9 @@
   used; foreign-thread, stale, and nested calls are rejected.
 - Each initialized plugin receives a process-resident nonzero host identity and
   a non-reusing checked call sequence; exhaustion is permanent and typed.
+- A validated loaded plugin is a reusable safe factory. Each initialization
+  receives an independent plugin handle and host identity, and a failed
+  initialization does not consume the factory.
 - Every successfully opened library remains resident until process exit,
   including a library rejected after its initializers ran.
 - There is no unload or hot-reload API.

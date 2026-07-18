@@ -231,23 +231,33 @@ impl fmt::Debug for PluginInstance {
 }
 
 impl LoadedAbiPlugin {
-    /// Initializes this validated plugin using conservative callback limits.
+    /// Initializes a new plugin instance using conservative callback limits.
+    ///
+    /// The validated loaded plugin is a reusable factory. Each successful call
+    /// creates an independent plugin handle and host identity; callers remain
+    /// responsible for preventing concurrent callbacks on the returned
+    /// [`PluginInstance`].
     pub fn initialize(
-        self,
+        &self,
         granted_capabilities: u64,
         services: &mut dyn HostServices,
     ) -> Result<PluginInstance, CallbackError> {
         self.initialize_with_limits(granted_capabilities, InvocationLimits::DEFAULT, services)
     }
 
-    /// Initializes this validated plugin using explicit bounded callback limits.
+    /// Initializes a new plugin instance using explicit bounded callback limits.
+    ///
+    /// A failed initialization does not consume this factory, so lifecycle
+    /// policy may report the error and attempt a later enable without reopening
+    /// the permanently resident library.
     pub fn initialize_with_limits(
-        self,
+        &self,
         granted_capabilities: u64,
         limits: InvocationLimits,
         services: &mut dyn HostServices,
     ) -> Result<PluginInstance, CallbackError> {
-        let (metadata, callbacks) = self.into_parts();
+        let metadata = self.metadata().clone();
+        let callbacks = self.callbacks();
         let identity = Box::leak(Box::new(HostIdentity {
             next_call: AtomicU64::new(1),
             _private: 0,
@@ -714,12 +724,14 @@ mod tests {
         HostServices, InvocationLimits, DEFAULT_OUTPUT_CAPACITY, DEFAULT_PAYLOAD_LIMIT,
         MAX_OUTPUT_CAPACITY, MAX_PAYLOAD_LIMIT,
     };
-    use crate::{OwnedCommand, OwnedHostRequest};
+    use crate::values::{OwnedPluginMetadata, PluginSemanticVersion, ValidatedCallbacks};
+    use crate::{LoadedAbiPlugin, OwnedCommand, OwnedHostRequest};
     use ferrumc_plugin_abi::{
-        FcBytesView, FcCallHandle, FcCommandKind, FcCommandV1, FcHostHandle, FcHostRequestKind,
-        FcHostRequestV1, FcResourceHandle, FcStatus, FcStrView, FC_BUFFER_TOO_SMALL,
-        FC_COMMAND_FLAGS_NONE, FC_DIAGNOSTIC_INFO, FC_HOST_REQUEST_FLAGS_NONE, FC_INVALID_ARGUMENT,
-        FC_OK,
+        FcBytesView, FcCallHandle, FcCommandKind, FcCommandV1, FcEventV1, FcHostFunctionsV1,
+        FcHostHandle, FcHostRequestKind, FcHostRequestV1, FcOutputBufferV1, FcPluginHandle,
+        FcResourceHandle, FcStatus, FcStrView, CURRENT_ABI, FC_BUFFER_TOO_SMALL,
+        FC_COMMAND_FLAGS_NONE, FC_DIAGNOSTIC_INFO, FC_ERROR, FC_HOST_REQUEST_FLAGS_NONE,
+        FC_INVALID_ARGUMENT, FC_OK,
     };
 
     #[derive(Default)]
@@ -728,6 +740,7 @@ mod tests {
         commands: Vec<OwnedCommand>,
         diagnostics: Vec<(u32, String)>,
         response: Vec<u8>,
+        diagnostic_status: Option<FcStatus>,
     }
 
     impl HostServices for RecordingHost {
@@ -743,8 +756,88 @@ mod tests {
 
         fn diagnostic(&mut self, level: u32, message: String) -> FcStatus {
             self.diagnostics.push((level, message));
-            FC_OK
+            self.diagnostic_status.unwrap_or(FC_OK)
         }
+    }
+
+    unsafe extern "C" fn lifecycle_init(
+        host: FcHostHandle,
+        call: FcCallHandle,
+        host_functions: *const FcHostFunctionsV1,
+        _granted_capabilities: u64,
+        _output: *mut FcOutputBufferV1,
+        plugin_out: *mut FcPluginHandle,
+    ) -> FcStatus {
+        // SAFETY: this synthetic callback is invoked only through the boundary
+        // with its live, raw-validated host table.
+        let functions = unsafe { host_functions.read() };
+        let message = "init";
+        // SAFETY: the host/call pair and table are live for this callback, and
+        // the UTF-8 message remains readable until the call returns.
+        let status = unsafe {
+            (functions.diagnostic())(
+                host,
+                call,
+                FC_DIAGNOSTIC_INFO,
+                FcStrView::new(message.as_ptr(), 4),
+            )
+        };
+        if !status.is_ok() {
+            return status;
+        }
+
+        // SAFETY: the boundary supplies a non-null aligned output pointer. The
+        // process-resident host identity is nonzero and unique to this instance.
+        unsafe { plugin_out.write(FcPluginHandle::from_raw(host.raw())) };
+        FC_OK
+    }
+
+    unsafe extern "C" fn lifecycle_event(
+        _host: FcHostHandle,
+        _plugin: FcPluginHandle,
+        _call: FcCallHandle,
+        _host_functions: *const FcHostFunctionsV1,
+        _event: *const FcEventV1,
+        _output: *mut FcOutputBufferV1,
+    ) -> FcStatus {
+        FC_OK
+    }
+
+    unsafe extern "C" fn lifecycle_shutdown(
+        host: FcHostHandle,
+        _plugin: FcPluginHandle,
+        call: FcCallHandle,
+        host_functions: *const FcHostFunctionsV1,
+        _output: *mut FcOutputBufferV1,
+    ) -> FcStatus {
+        // SAFETY: this synthetic callback is invoked only through the boundary
+        // with its live, raw-validated host table.
+        let functions = unsafe { host_functions.read() };
+        let message = "shutdown";
+        // SAFETY: the host/call pair and table are live for this callback, and
+        // the UTF-8 message remains readable until the call returns.
+        unsafe {
+            (functions.diagnostic())(
+                host,
+                call,
+                FC_DIAGNOSTIC_INFO,
+                FcStrView::new(message.as_ptr(), 8),
+            )
+        }
+    }
+
+    fn lifecycle_factory() -> LoadedAbiPlugin {
+        LoadedAbiPlugin::from_validated(
+            OwnedPluginMetadata::new(
+                CURRENT_ABI,
+                PluginSemanticVersion::new(1, 2, 3),
+                0,
+                "lifecycle".to_owned(),
+                "Lifecycle".to_owned(),
+                "test-target".to_owned(),
+            ),
+            ValidatedCallbacks::new(lifecycle_init, lifecycle_event, lifecycle_shutdown),
+        )
     }
 
     #[test]
@@ -760,6 +853,54 @@ mod tests {
         assert!(InvocationLimits::new(MAX_PAYLOAD_LIMIT, MAX_OUTPUT_CAPACITY).is_ok());
         assert!(InvocationLimits::new(MAX_PAYLOAD_LIMIT + 1, 0).is_err());
         assert!(InvocationLimits::new(0, MAX_OUTPUT_CAPACITY + 1).is_err());
+    }
+
+    #[test]
+    fn loaded_factory_survives_shutdown_for_a_fresh_instance() {
+        let factory = lifecycle_factory();
+        let mut services = RecordingHost::default();
+
+        let first = factory
+            .initialize(0, &mut services)
+            .expect("first instance initializes");
+        let first_handle = first.plugin_handle();
+        assert_eq!(factory.metadata().id(), "lifecycle");
+        assert_eq!(first.shutdown(&mut services), Ok(FC_OK));
+
+        let second = factory
+            .initialize(0, &mut services)
+            .expect("second instance initializes");
+        let second_handle = second.plugin_handle();
+        assert_ne!(first_handle, second_handle);
+        assert_eq!(second.shutdown(&mut services), Ok(FC_OK));
+        assert_eq!(
+            services
+                .diagnostics
+                .iter()
+                .map(|(_, message)| message.as_str())
+                .collect::<Vec<_>>(),
+            ["init", "shutdown", "init", "shutdown"]
+        );
+    }
+
+    #[test]
+    fn failed_initialization_does_not_consume_loaded_factory() {
+        let factory = lifecycle_factory();
+        let mut services = RecordingHost {
+            diagnostic_status: Some(FC_ERROR),
+            ..RecordingHost::default()
+        };
+
+        assert!(matches!(
+            factory.initialize(0, &mut services),
+            Err(CallbackError::Status(status)) if status == FC_ERROR
+        ));
+        services.diagnostic_status = None;
+
+        let instance = factory
+            .initialize(0, &mut services)
+            .expect("retry initializes from the same factory");
+        assert_eq!(instance.shutdown(&mut services), Ok(FC_OK));
     }
 
     #[test]

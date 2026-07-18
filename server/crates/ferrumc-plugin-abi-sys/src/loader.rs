@@ -13,19 +13,28 @@ use crate::values::{OwnedPluginMetadata, PluginSemanticVersion, ValidatedCallbac
 /// process exit. This type exposes neither the library handle nor callback
 /// pointers.
 pub struct LoadedAbiPlugin {
-    _resident_library: &'static Library,
     metadata: OwnedPluginMetadata,
     callbacks: ValidatedCallbacks,
 }
 
 impl LoadedAbiPlugin {
+    pub(crate) fn from_validated(
+        metadata: OwnedPluginMetadata,
+        callbacks: ValidatedCallbacks,
+    ) -> Self {
+        Self {
+            metadata,
+            callbacks,
+        }
+    }
+
     /// Returns the validated host-owned metadata.
     pub const fn metadata(&self) -> &OwnedPluginMetadata {
         &self.metadata
     }
 
-    pub(crate) fn into_parts(self) -> (OwnedPluginMetadata, ValidatedCallbacks) {
-        (self.metadata, self.callbacks)
+    pub(crate) const fn callbacks(&self) -> ValidatedCallbacks {
+        self.callbacks
     }
 }
 
@@ -86,9 +95,5 @@ pub fn load(path: &Path) -> Result<LoadedAbiPlugin, LoadError> {
     let callbacks =
         ValidatedCallbacks::new(functions.init(), functions.on_event(), functions.shutdown());
 
-    Ok(LoadedAbiPlugin {
-        _resident_library: library,
-        metadata,
-        callbacks,
-    })
+    Ok(LoadedAbiPlugin::from_validated(metadata, callbacks))
 }

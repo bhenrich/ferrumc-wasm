@@ -8,6 +8,10 @@ call-scoped plugin data into host-owned values, and invokes validated
 callbacks. Its host-facing loader exposes no plugin-supplied raw pointer,
 callback pointer, or unload-capable library handle.
 
+A validated loaded plugin remains a reusable safe factory, allowing a host to
+initialize, shut down, and later initialize a fresh instance without reopening
+the permanently resident library.
+
 The opposite, plugin-authored direction has one deliberate bridge for the safe
 dynamic SDK: doc-hidden builders publish this crate's own generic trampoline
 table, and `export_plugin_v1!` generates the required raw C bootstrap return.
