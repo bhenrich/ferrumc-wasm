@@ -22,9 +22,10 @@ error.
 ## Records and versioning
 
 Every record carries a [`SchemaVersion`], preserved verbatim across save/load,
-so a future backend can detect and migrate data written by an older build. A
-`ChunkRecord` holds a structured `Chunk`; `EntityRecord` and `PlayerRecord`
-carry a length-bounded opaque payload owned by the simulation layer (a
+so its owning layer can detect and refuse data written by an incompatible
+build. No automatic pre-alpha migration is attempted. A `ChunkRecord` holds a
+structured `Chunk`; `EntityRecord` and `PlayerRecord` carry a length-bounded
+opaque payload owned by the simulation layer (a
 `PlayerRecord` also keeps the typed `GameMode`).
 
 ## Async strategy
