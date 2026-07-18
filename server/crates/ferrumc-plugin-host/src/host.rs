@@ -1,4 +1,4 @@
-//! The plugin registry: registration, lifecycle, and panic-contained dispatch.
+//! The plugin registry: registration, lifecycle, and catch-and-disable dispatch.
 
 use std::collections::BTreeSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -468,7 +468,7 @@ impl ResolvedEventOutcome {
 }
 
 /// An in-process plugin host: a registry that owns plugins and drives their
-/// lifecycle with panic containment and a per-call time budget.
+/// lifecycle with catch-and-disable panic handling and a per-call time budget.
 ///
 /// The host owns compiled-in [`Plugin`] trait objects and validated trusted
 /// native factories. Compiled-in calls use `catch_unwind`; trusted native
@@ -1001,7 +1001,8 @@ impl PluginHost {
     /// [`ResolvedBlockDecision`].
     ///
     /// See [`PluginHost::dispatch_block_break_decision`] for the shared semantics
-    /// (precedence, containment, fail-safe); this is the placement-side entry point.
+    /// (precedence, catch-and-disable handling, fail-safe); this is the
+    /// placement-side entry point.
     pub fn dispatch_block_place_decision(
         &mut self,
         attempt: &BlockPlaceAttempt,
@@ -1030,15 +1031,15 @@ impl PluginHost {
     ///    vectors concatenate (capped at [`MAX_EMITTED_INTENTS`]).
     /// 3. If nobody objects, the result is [`Allow`](ResolvedDecision::Allow).
     ///
-    /// # Containment and fail-safe
+    /// # Catch-and-disable and fail-safe
     ///
     /// Each hook is wrapped in [`catch_unwind`], exactly like
     /// [`dispatch_event`](Self::dispatch_event). A plugin that *panics* is disabled
     /// ([`DisableReason::Panicked`]), counted in [`PluginStats`], logged, and — the
     /// fail-safe — treated as a [`Deny`](ResolvedDecision::Deny) so a broken plugin
-    /// can never silently let a destructive edit through. Per-call budgets apply as
-    /// for event dispatch. None of this runs inside the simulation tick, so the
-    /// server and tick are unaffected.
+    /// cannot silently let a destructive edit through. Per-call budgets apply as
+    /// for event dispatch. The returned decision is `Deny`; callers must reject
+    /// the attempted edit.
     pub fn dispatch_block_break_decision(
         &mut self,
         attempt: &BlockBreakAttempt,
@@ -1054,8 +1055,8 @@ impl PluginHost {
     /// The shared fold driving both `before_block_*` decision paths.
     ///
     /// `call` invokes the appropriate hook on one plugin; everything else (the
-    /// capability gate, panic containment, budgeting, and the precedence fold) is
-    /// identical for placement and break.
+    /// capability gate, catch-and-disable handling, budgeting, and the precedence
+    /// fold) is identical for placement and break.
     fn fold_before<F>(
         &mut self,
         world: &dyn WorldView,
@@ -1184,8 +1185,9 @@ impl PluginHost {
     /// [`ResolvedEventOutcome`].
     ///
     /// See [`PluginHost::dispatch_interact_decision`] for the shared semantics
-    /// (precedence, containment, fail-safe); this is the chat-side entry point. Any
-    /// intents a plugin submits during the hook are pushed to `sink`.
+    /// (precedence, catch-and-disable handling, fail-safe); this is the chat-side
+    /// entry point. Any intents a plugin submits during the hook are pushed to
+    /// `sink`.
     pub fn dispatch_chat_decision(
         &mut self,
         attempt: &ChatAttempt,
@@ -1209,7 +1211,7 @@ impl PluginHost {
     /// plugins are skipped, and its message (the first non-`None`) is carried. If
     /// nobody objects the result is [`Allow`](PluginEventDecision::Allow).
     ///
-    /// # Containment and fail-safe
+    /// # Catch-and-disable and fail-safe
     ///
     /// Each hook is wrapped in [`catch_unwind`], exactly like
     /// [`dispatch_event`](Self::dispatch_event). A plugin that *panics* is disabled,
@@ -1232,8 +1234,9 @@ impl PluginHost {
     /// paths.
     ///
     /// `call` invokes the appropriate hook on one plugin; everything else (the
-    /// [`VetoEvents`](Capability::VetoEvents) gate, panic containment, budgeting, and
-    /// the absorbing-`Deny` precedence) is identical for chat and interact.
+    /// [`VetoEvents`](Capability::VetoEvents) gate, catch-and-disable handling,
+    /// budgeting, and the absorbing-`Deny` precedence) is identical for chat and
+    /// interact.
     fn fold_event_decision<F>(
         &mut self,
         world: &dyn WorldView,
@@ -2359,7 +2362,7 @@ mod tests {
     }
 
     #[test]
-    fn panicking_plugin_is_contained_and_fails_safe_to_deny() {
+    fn panicking_plugin_is_disabled_and_fails_safe_to_deny() {
         let mut host = PluginHost::in_memory();
         let id = host
             .register(Box::new(PanicDecisionPlugin { id: "boom" }))
@@ -2681,7 +2684,7 @@ mod tests {
     }
 
     #[test]
-    fn event_decision_panic_is_contained_and_fails_safe_to_deny() {
+    fn event_decision_panic_disables_plugin_and_fails_safe_to_deny() {
         // A plugin that panics in before_chat must be disabled and treated as Deny.
         struct PanicChat {
             id: &'static str,

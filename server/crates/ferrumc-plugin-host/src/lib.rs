@@ -5,14 +5,14 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-//! In-process plugin host: registry, lifecycle, event dispatch, and containment.
+//! In-process plugin host: registry, lifecycle, event dispatch, and failure handling.
 //!
 //! The host owns compiled-in [`Plugin`](ferrumc_plugin_api::Plugin) trait
 //! objects plus validated trusted native factories and drives both through
 //! their lifecycle. It enforces three properties the rest of the server relies
 //! on:
 //!
-//! - **Compiled-in panic containment.** Calls through the Rust
+//! - **Compiled-in catch-and-disable handling.** Calls through the Rust
 //!   [`Plugin`](ferrumc_plugin_api::Plugin) trait are wrapped in
 //!   [`std::panic::catch_unwind`]; an unwinding compiled-in plugin is disabled
 //!   and not called again. See [`PluginHost::dispatch_event`].
@@ -35,9 +35,10 @@
 //! wrapped in an adapter that implements [`Plugin`](ferrumc_plugin_api::Plugin)
 //! for legacy app compatibility. Calls that return enter the host's ordinary
 //! budget accounting; a process-aborting library failure cannot be recovered by
-//! that adapter. Scan failures are reported as classified [`LoadError`]s and do
-//! not stop later directory entries. All compatibility FFI lives in one audited
-//! `#[allow(unsafe_code)]` module; see
+//! that adapter. Per-entry read, load, and registration failures that return are
+//! reported as classified [`LoadError`]s, and later entries are attempted; an
+//! unreadable directory is returned as the outer error. All compatibility FFI
+//! lives in one audited `#[allow(unsafe_code)]` module; see
 //! `docs/safety/ferrumc-plugin-host.md`.
 //!
 //! The current trusted-native path accepts
@@ -70,9 +71,9 @@
 //! `unsafe` — because a compiled-in plugin that unwinds is immediately moved to
 //! the disabled state and never called again. Its internal state may be left
 //! inconsistent by the unwind, but since nothing ever observes that state afterward, the
-//! "assertion" of unwind safety holds. Panic containment depends on the standard
-//! unwinding panic strategy; under `panic = "abort"` a panic aborts the process
-//! before it can be caught.
+//! "assertion" of unwind safety holds. Catch-and-disable handling depends on
+//! the standard unwinding panic strategy; under `panic = "abort"` a panic
+//! aborts the process before it can be caught.
 
 mod budget;
 mod dynamic;

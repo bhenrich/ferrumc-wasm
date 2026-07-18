@@ -83,9 +83,8 @@ impl PluginLoader {
     ///
     /// Only files whose extension matches the platform's dynamic-library
     /// extension (`.so`, `.dylib`, `.dll`) are attempted; everything else is
-    /// ignored. A failure loading one library is recorded in the returned
-    /// [`DirLoadReport`] and the scan continues, so one broken plugin never
-    /// blocks the others.
+    /// ignored. Each load or registration failure that returns is recorded in
+    /// the [`DirLoadReport`], and later directory entries are still attempted.
     ///
     /// The outer [`Result`] fails only if the directory itself cannot be read.
     pub fn load_dir(&self, dir: &Path, host: &mut PluginHost) -> Result<DirLoadReport, LoadError> {
