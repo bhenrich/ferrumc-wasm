@@ -597,6 +597,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrumc-plugin-sdk"
+version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-core",
+ "ferrumc-math",
+ "ferrumc-permission",
+ "ferrumc-plugin-api",
+ "thiserror",
+]
+
+[[package]]
 name = "ferrumc-plugin-spawn-protect"
 version = "0.2.0-dev"
 dependencies = [

@@ -1,0 +1,22 @@
+[package]
+name = "ferrumc-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Packaging-independent author API for FerrumC plugins"
+
+[dependencies]
+# Stable identifiers and deterministic tick values exposed to plugin authors.
+ferrumc-core = { workspace = true }
+# Typed positions and vectors used by world-query and intent facades.
+ferrumc-math = { workspace = true }
+# Reuses the established capability bit assignments and classified capability error.
+ferrumc-plugin-api = { workspace = true }
+# Reuses validated permission nodes and tri-state permission outcomes.
+ferrumc-permission = { workspace = true }
+# Classifying errors on the author-facing facade surface.
+thiserror = { workspace = true }
+
+[lints]
+workspace = true
