@@ -21,6 +21,10 @@ serde_json = { workspace = true }
 serde_json = { workspace = true }
 # Captures the `dump()` tracing events to assert the end-to-end emission path.
 tracing-subscriber = { workspace = true }
+# Paused virtual time drives the watchdog's manual test clock without sleeps.
+tokio = { workspace = true, features = ["test-util"] }
+# Parses the approved nested watchdog TOML surface in contract tests.
+toml = { workspace = true }
 
 [lints]
 workspace = true

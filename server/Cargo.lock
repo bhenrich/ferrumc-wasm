@@ -478,6 +478,8 @@ dependencies = [
  "ferrumc-core",
  "serde",
  "serde_json",
+ "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

@@ -21,12 +21,16 @@
 //! - A read-only [`ServerSnapshot`] (folded from the registry plus app-supplied
 //!   [`ServerSnapshotParts`]) published lock-light through a [`SnapshotPublisher`]
 //!   for the localhost dashboard to render.
+//! - A dedicated-thread [`PluginWatchdog`] that detects slow or non-returning
+//!   plugin callbacks and publishes bounded diagnostics. Detection is not
+//!   preemption: the watchdog never cancels a callback or unloads native code.
 
 mod metrics;
 mod net_telemetry;
 mod ring;
 mod snapshot;
 mod trace;
+mod watchdog;
 
 pub use metrics::{
     BlockMutationResults, BlockMutationTotals, CounterRegistry, DecodeErrorEntry,
@@ -44,3 +48,11 @@ pub use snapshot::{
     ServerSnapshot, ServerSnapshotParts, SnapshotPublisher, Vec3Snapshot,
 };
 pub use trace::{Direction, PacketState, PacketTrace, SessionDebug, SessionDebugSnapshot};
+pub use watchdog::{
+    PluginWatchdog, PluginWatchdogConfig, PluginWatchdogHandle, TracingWatchdogReporter,
+    WatchdogActiveCall, WatchdogBeginError, WatchdogCallGuard, WatchdogCallId, WatchdogCallback,
+    WatchdogConfigError, WatchdogCrashReport, WatchdogDiagnostic, WatchdogHardAction,
+    WatchdogHealth, WatchdogLabelError, WatchdogReporter, WatchdogSnapshot, WatchdogStartError,
+    WatchdogThreadDisposition, WatchdogThreshold, ACTIVE_CALLBACK_CAPACITY,
+    DIAGNOSTIC_HISTORY_CAPACITY, RETIRED_THREAD_CAPACITY,
+};
