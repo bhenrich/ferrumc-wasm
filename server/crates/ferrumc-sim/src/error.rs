@@ -1,7 +1,10 @@
 //! Error types for the simulation layer.
 
-use ferrumc_core::ServerError;
+use std::io::ErrorKind;
+
+use ferrumc_core::{ServerError, Tick};
 use ferrumc_math::{ChunkPos, ShardPos};
+use ferrumc_storage::ChunkKey;
 
 use crate::ownership::{ShardId, ShardLifecycleState, ShardRegion};
 
@@ -83,6 +86,149 @@ pub enum SimError {
         /// The rejected target state.
         to: ShardLifecycleState,
     },
+
+    /// A scheduler operation named a shard that is not registered.
+    #[error("logical shard {shard} is not registered with the scheduler")]
+    UnknownScheduledShard {
+        /// The unregistered logical shard.
+        shard: ShardId,
+    },
+
+    /// More than one runnable shard was requested while the multi-shard switch
+    /// was off.
+    #[error("multi-shard scheduling is disabled, but {scheduled} runnable shards were requested")]
+    MultipleScheduledShardsDisabled {
+        /// Number of runnable shards the rejected operation would create.
+        scheduled: usize,
+    },
+
+    /// The same shard appeared more than once in one scheduler execution plan.
+    #[error("logical shard {shard} was dispatched more than once in one tick")]
+    DuplicateShardDispatch {
+        /// The duplicate logical shard.
+        shard: ShardId,
+    },
+
+    /// An internally generated scheduler plan did not match owned shard state.
+    #[error("internal scheduler plan did not match logical shard {shard}")]
+    InvalidSchedulerPlan {
+        /// The first shard whose plan entry was missing, extra, or misplaced.
+        shard: ShardId,
+    },
+
+    /// A persistent shard worker thread could not be created.
+    #[error("failed to spawn simulation shard worker slot {slot}: {kind}")]
+    ShardWorkerSpawnFailed {
+        /// Zero-based worker slot that could not be created.
+        slot: usize,
+        /// Operating-system error classification returned by thread creation.
+        kind: ErrorKind,
+    },
+
+    /// A worker-pool request exceeded the defensive OS-thread ceiling.
+    #[error("requested {requested} simulation shard workers, maximum is {maximum}")]
+    TooManyShardWorkers {
+        /// Requested persistent worker count.
+        requested: usize,
+        /// Fixed maximum persistent worker count.
+        maximum: usize,
+    },
+
+    /// A persistent shard worker panicked after a tick was dispatched.
+    #[error("simulation shard worker slot {slot} panicked during tick {tick}")]
+    ShardWorkerPanicked {
+        /// Zero-based worker slot whose thread panicked.
+        slot: usize,
+        /// Tick that may have been partially applied and makes retry unsafe.
+        tick: Tick,
+    },
+
+    /// A persistent worker exited without returning its dispatched shard batch.
+    #[error("simulation shard worker slot {slot} stopped during tick {tick}")]
+    ShardWorkerStopped {
+        /// Zero-based worker slot that stopped.
+        slot: usize,
+        /// Tick whose owned shard batch was not returned.
+        tick: Tick,
+    },
+
+    /// A worker returned a result stamped with the wrong global tick.
+    #[error("simulation shard worker slot {slot} returned tick {actual}, expected {expected}")]
+    ShardWorkerWrongTick {
+        /// Zero-based worker slot that returned the invalid result.
+        slot: usize,
+        /// Global tick dispatched by the scheduler.
+        expected: Tick,
+        /// Tick returned by the worker.
+        actual: Tick,
+    },
+
+    /// Shadow mode was constructed without its required worker pool.
+    #[error("shadow shard scheduler has no worker pool")]
+    ShardWorkerPoolUnavailable,
+
+    /// A prior worker failure made the scheduler unsafe to retry.
+    #[error("simulation shard scheduler is fail-stop after partial tick {tick}")]
+    ShardSchedulerPoisoned {
+        /// Potentially partial tick that permanently poisoned the scheduler.
+        tick: Tick,
+    },
+
+    /// A scheduler input targeted a shard whose lifecycle rejects new work.
+    #[error("logical shard {shard} does not accept input while {state}")]
+    ShardInputNotAccepted {
+        /// Logical shard that rejected the input.
+        shard: ShardId,
+        /// Lifecycle state that disallows admission.
+        state: ShardLifecycleState,
+    },
+
+    /// A draining shard still owns admitted work and cannot stop yet.
+    #[error("logical shard {shard} cannot stop before its admitted tick work drains")]
+    ShardDrainIncomplete {
+        /// Draining logical shard that still has tick work.
+        shard: ShardId,
+    },
+
+    /// Two registered shard containers held the same storage chunk key.
+    ///
+    /// This is rejected before tick advancement so two owners can never publish
+    /// competing persist records for one world/dimension/chunk identity.
+    #[error("persist chunk {key:?} is resident in both logical shards {first} and {second}")]
+    PersistChunkAliased {
+        /// Full world/dimension/chunk key claimed by both containers.
+        key: ChunkKey,
+        /// Canonically first registered container holding the key.
+        first: ShardId,
+        /// Later conflicting registered container.
+        second: ShardId,
+    },
+
+    /// One shard's bounded per-tick cross-shard outbox rejected a new intent.
+    #[error("logical shard {shard} cross-shard outbox is full (capacity {capacity})")]
+    CrossShardOutboxFull {
+        /// Source shard whose local outbox reached its fixed ceiling.
+        shard: ShardId,
+        /// Fixed per-shard outbox capacity.
+        capacity: usize,
+    },
+
+    /// A prepared cross-shard boundary changed before its successful tick could
+    /// commit it.
+    #[error("cross-shard boundary for tick {tick} changed before commit")]
+    CrossShardBoundaryCommitFailed {
+        /// Boundary whose unchanged snapshot could not be removed.
+        tick: Tick,
+    },
+
+    /// A shard emitted a cross-shard intent on the final representable tick.
+    #[error("logical shard {shard} emitted cross-shard work at terminal tick {tick}")]
+    CrossShardEnvelopeTickOverflow {
+        /// Source shard whose owned intent could not receive a next boundary.
+        shard: ShardId,
+        /// Completed terminal tick.
+        tick: Tick,
+    },
 }
 
 impl From<SimError> for ServerError {
@@ -107,6 +253,69 @@ impl From<SimError> for ServerError {
             SimError::InvalidShardLifecycleTransition { shard, from, to } => {
                 ServerError::invalid_state(format!(
                     "shard {shard} cannot transition from {from} to {to}",
+                ))
+            }
+            SimError::UnknownScheduledShard { shard } => ServerError::invalid_state(format!(
+                "logical shard {shard} is not registered with the scheduler"
+            )),
+            SimError::MultipleScheduledShardsDisabled { scheduled } => {
+                ServerError::invalid_state(format!(
+                    "multi-shard scheduling is disabled, but {scheduled} runnable shards were requested"
+                ))
+            }
+            SimError::DuplicateShardDispatch { shard } => ServerError::internal(format!(
+                "logical shard {shard} was dispatched more than once in one tick"
+            )),
+            SimError::InvalidSchedulerPlan { shard } => ServerError::internal(format!(
+                "internal scheduler plan did not match logical shard {shard}"
+            )),
+            SimError::ShardWorkerSpawnFailed { slot, kind } => ServerError::internal(format!(
+                "failed to spawn simulation shard worker slot {slot}: {kind}"
+            )),
+            SimError::TooManyShardWorkers { requested, maximum } => {
+                ServerError::capacity(format!(
+                    "requested {requested} simulation shard workers, maximum is {maximum}"
+                ))
+            }
+            SimError::ShardWorkerPanicked { slot, tick } => ServerError::internal(format!(
+                "simulation shard worker slot {slot} panicked during tick {tick}"
+            )),
+            SimError::ShardWorkerStopped { slot, tick } => ServerError::internal(format!(
+                "simulation shard worker slot {slot} stopped during tick {tick}"
+            )),
+            SimError::ShardWorkerWrongTick {
+                slot,
+                expected,
+                actual,
+            } => ServerError::internal(format!(
+                "simulation shard worker slot {slot} returned tick {actual}, expected {expected}"
+            )),
+            SimError::ShardWorkerPoolUnavailable => {
+                ServerError::internal("shadow shard scheduler has no worker pool")
+            }
+            SimError::ShardSchedulerPoisoned { tick } => ServerError::internal(format!(
+                "simulation shard scheduler is fail-stop after partial tick {tick}"
+            )),
+            SimError::ShardInputNotAccepted { shard, state } => ServerError::invalid_state(
+                format!("logical shard {shard} does not accept input while {state}"),
+            ),
+            SimError::ShardDrainIncomplete { shard } => ServerError::invalid_state(format!(
+                "logical shard {shard} cannot stop before its admitted tick work drains"
+            )),
+            SimError::PersistChunkAliased { key, first, second } => {
+                ServerError::invalid_state(format!(
+                    "persist chunk {key:?} is resident in both logical shards {first} and {second}"
+                ))
+            }
+            SimError::CrossShardOutboxFull { shard, capacity } => ServerError::capacity(format!(
+                "logical shard {shard} cross-shard outbox full (capacity {capacity})"
+            )),
+            SimError::CrossShardBoundaryCommitFailed { tick } => ServerError::internal(format!(
+                "cross-shard boundary for tick {tick} changed before commit"
+            )),
+            SimError::CrossShardEnvelopeTickOverflow { shard, tick } => {
+                ServerError::internal(format!(
+                    "logical shard {shard} emitted cross-shard work at terminal tick {tick}"
                 ))
             }
         }

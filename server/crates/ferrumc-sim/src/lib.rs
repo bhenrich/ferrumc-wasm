@@ -6,8 +6,13 @@
 //!
 //! This milestone delivers the deterministic *skeleton* of the simulation
 //! layer: the messages crossing the sim boundary, the tick counter that drives
-//! it, and one shard that applies inputs at tick boundaries. There is no
-//! networking, no storage handle, and no plugin dispatch here yet.
+//! it, and shards that apply inputs at tick boundaries. The application still
+//! drives one authoritative shard; a crate-internal, non-default shadow
+//! scheduler prepares deterministic multi-shard worker ownership without
+//! changing that runtime. The same internal seam owns a bounded typed
+//! cross-shard queue whose messages apply only at the next tick boundary; this
+//! is transport preparation, not an enabled entity-transfer feature. There is
+//! no networking, no storage handle, and no plugin dispatch here yet.
 //!
 //! The pieces fit together as a one-way pipeline driven entirely by explicit
 //! `tick` calls (never a wall clock):
@@ -27,8 +32,13 @@
 //!   chunks, applying inputs only at tick boundaries.
 //! - [`ShardPartitioner`] / [`ShardOwnershipMap`] — deterministic typed 8x8
 //!   region partitioning and overlap-free runtime ownership claims.
-//! - [`ShardLifecycle`] — the explicit lifecycle of a future scheduled shard,
-//!   without introducing a worker pool.
+//! - [`ShardLifecycle`] — the explicit eligibility lifecycle used by the
+//!   crate-internal shadow scheduler's logical worker plan.
+//! - The crate-internal cross-shard envelope queue — canonical reject-newest
+//!   admission after tick N and application as a separate prefix in tick N+1.
+//! - Crate-internal per-shard persist batches — move-owned overlay prefixes
+//!   bounded to the storage trait ceiling and emitted only after a successful
+//!   scheduler tick.
 //! - [`SimHarness`] / [`TickOutcome`] — a deterministic, wall-clock-free driver
 //!   tying a coordinator to one shard, used by tests and replay.
 //!
@@ -40,13 +50,16 @@
 //! ([`load_or_generate`]: try the [`WorldStore`](ferrumc_storage::WorldStore),
 //! else generate with [`FlatWorldGenerator`](ferrumc_world::FlatWorldGenerator)),
 //! [`LoadedChunkMap::release`] drops tickets and unloads, and
-//! [`LoadedChunkMap::take_dirty`] hands changed chunks off as save records. The
-//! [`SpawnChunkTickets`] set keeps the world spawn resident. The map collects
-//! dirty chunks but never persists them — flush *policy* is the caller's.
+//! [`LoadedChunkMap::take_dirty`] hands changed chunks off as full save records,
+//! while persist-dirty gameplay edits become overlay records. The
+//! [`SpawnChunkTickets`] set keeps the world spawn resident. The map and
+//! scheduler collect records but never persist them — flush *policy* is the
+//! caller's.
 //!
 //! [`Tick`]: ferrumc_core::Tick
 
 mod coordinator;
+mod cross_shard;
 mod error;
 mod harness;
 mod loaded;
@@ -54,6 +67,11 @@ mod message;
 mod mutation;
 mod ownership;
 mod region;
+#[allow(
+    dead_code,
+    reason = "the owner-gated shadow scheduler intentionally has no app wiring yet"
+)]
+pub(crate) mod scheduler;
 mod shard;
 mod spawn;
 mod ticket;

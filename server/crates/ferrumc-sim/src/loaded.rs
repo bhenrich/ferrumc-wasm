@@ -16,10 +16,14 @@
 //! [`ChunkOverlayRecord`] only for chunks a *gameplay* edit marked persist-dirty
 //! — so untouched generated terrain produces zero overlay records. This module
 //! collects but never persists; choosing *when* to flush is the caller's policy,
-//! deliberately out of scope here.
+//! deliberately out of scope here. The crate-internal multi-shard scheduler uses
+//! a bounded canonical-order variant with a deterministic continuation cursor,
+//! leaving overflow dirty without allowing low-key re-dirties to starve it.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
+use std::ops::Bound::{Excluded, Unbounded};
 
 use ferrumc_core::{DimensionId, WorldId};
 use ferrumc_math::ChunkPos;
@@ -30,6 +34,8 @@ use ferrumc_world::{Chunk, FlatWorldGenerator};
 
 use crate::error::{SimError, SimResult};
 use crate::spawn::SpawnChunkTickets;
+#[cfg(test)]
+use crate::ticket::TicketReason;
 use crate::ticket::{ChunkTicket, TicketLevel};
 
 /// The schema version the simulation stamps on chunks it hands off to be saved.
@@ -304,6 +310,7 @@ pub struct LoadedChunkMap {
     dimension: DimensionId,
     schema_version: SchemaVersion,
     resident: BTreeMap<ChunkPos, ResidentChunk>,
+    persist_scan_after: Option<ChunkPos>,
 }
 
 impl LoadedChunkMap {
@@ -327,6 +334,7 @@ impl LoadedChunkMap {
             dimension,
             schema_version,
             resident: BTreeMap::new(),
+            persist_scan_after: None,
         }
     }
 
@@ -391,6 +399,42 @@ impl LoadedChunkMap {
         self.resident
             .get(&pos)
             .map_or(0, |r| r.tickets.values().sum())
+    }
+
+    /// Returns one canonical complete ticket-state record for a resident chunk.
+    ///
+    /// The test-only record carries world, dimension, chunk position, and every
+    /// distinct `(reason, level, holder count)` entry. Ticket entries inherit
+    /// the resident map's deterministic [`ChunkTicket`] ordering. `None` means
+    /// `pos` is not resident.
+    #[cfg(test)]
+    pub(crate) fn canonical_ticket_state_record(&self, pos: ChunkPos) -> Option<Vec<u8>> {
+        let resident = self.resident.get(&pos)?;
+        let mut record = Vec::new();
+        record.extend_from_slice(&self.world.get().to_be_bytes());
+        record.extend_from_slice(&self.dimension.get().to_be_bytes());
+        record.extend_from_slice(&pos.x().to_be_bytes());
+        record.extend_from_slice(&pos.z().to_be_bytes());
+        record.extend_from_slice(
+            &u64::try_from(resident.tickets.len())
+                .expect("test ticket entry count fits u64")
+                .to_be_bytes(),
+        );
+        for (ticket, holders) in &resident.tickets {
+            let reason = match ticket.reason() {
+                TicketReason::Spawn => 0,
+                TicketReason::Player => 1,
+                TicketReason::Forced => 2,
+            };
+            record.push(reason);
+            record.extend_from_slice(&ticket.level().get().to_be_bytes());
+            record.extend_from_slice(
+                &u64::try_from(*holders)
+                    .expect("test ticket holder count fits u64")
+                    .to_be_bytes(),
+            );
+        }
+        Some(record)
     }
 
     /// Returns the chunk's *effective* (strongest, i.e. lowest) ticket level, or
@@ -555,25 +599,118 @@ impl LoadedChunkMap {
     /// Each overlay is stamped with `tick` as its capture time and
     /// [`OVERLAY_SCHEMA_VERSION`]. The batch is ordered by [`ChunkPos`] for
     /// determinism. As with `take_dirty`, this captures and clears but does not
-    /// itself persist — flush *policy* is the caller's.
+    /// itself persist — flush *policy* is the caller's. This legacy public path
+    /// retains its complete-drain behavior; the scheduler uses the separately
+    /// bounded internal variant.
     #[must_use]
     pub fn take_persist_dirty(&mut self, tick: u64) -> Vec<(ChunkKey, ChunkOverlayRecord)> {
+        let batch = self.take_persist_dirty_up_to(tick, usize::MAX);
+        self.persist_scan_after = None;
+        batch
+    }
+
+    /// Collects at most `capacity` persist-dirty overlays in deterministic
+    /// chunk order.
+    ///
+    /// Only records transferred into the returned vector have their per-flush
+    /// dirty masks cleared. A deterministic continuation cursor visits the
+    /// deferred tail before wrapping to lower keys, so repeatedly re-dirtying a
+    /// low chunk cannot starve older work. Returned records remain sorted by
+    /// chunk position even when selection wraps.
+    pub(crate) fn take_persist_dirty_bounded(
+        &mut self,
+        tick: u64,
+        capacity: NonZeroUsize,
+    ) -> Vec<(ChunkKey, ChunkOverlayRecord)> {
+        let capacity = capacity.get();
         let world = self.world;
         let dimension = self.dimension;
-        let mut batch = Vec::new();
+        let mut batch = Vec::with_capacity(capacity.min(self.resident.len()));
+        let mut last_selected = None;
+
+        if let Some(after) = self.persist_scan_after {
+            for (&pos, resident) in self.resident.range_mut((Excluded(after), Unbounded)) {
+                if batch.len() >= capacity {
+                    break;
+                }
+                if let Some(record) =
+                    Self::take_persist_record(world, dimension, tick, pos, resident)
+                {
+                    batch.push(record);
+                    last_selected = Some(pos);
+                }
+            }
+            if batch.len() < capacity {
+                for (&pos, resident) in self.resident.range_mut(..=after) {
+                    if batch.len() >= capacity {
+                        break;
+                    }
+                    if let Some(record) =
+                        Self::take_persist_record(world, dimension, tick, pos, resident)
+                    {
+                        batch.push(record);
+                        last_selected = Some(pos);
+                    }
+                }
+            }
+        } else {
+            for (&pos, resident) in &mut self.resident {
+                if batch.len() >= capacity {
+                    break;
+                }
+                if let Some(record) =
+                    Self::take_persist_record(world, dimension, tick, pos, resident)
+                {
+                    batch.push(record);
+                    last_selected = Some(pos);
+                }
+            }
+        }
+
+        self.persist_scan_after = if self.has_persist_dirty() {
+            last_selected
+        } else {
+            None
+        };
+        batch.sort_unstable_by_key(|(key, _)| key.pos());
+        batch
+    }
+
+    /// Shared deterministic persist capture with an explicit record ceiling.
+    fn take_persist_dirty_up_to(
+        &mut self,
+        tick: u64,
+        capacity: usize,
+    ) -> Vec<(ChunkKey, ChunkOverlayRecord)> {
+        let world = self.world;
+        let dimension = self.dimension;
+        let mut batch = Vec::with_capacity(capacity.min(self.resident.len()));
         for (&pos, resident) in &mut self.resident {
-            if resident.chunk.persist_dirty_sections().any() {
-                let record = ChunkOverlayRecord::from_chunk(
-                    OVERLAY_SCHEMA_VERSION,
-                    pos,
-                    &resident.chunk,
-                    tick,
-                );
-                resident.chunk.clear_persist_dirty();
-                batch.push((ChunkKey::new(world, dimension, pos), record));
+            if batch.len() >= capacity {
+                break;
+            }
+            if let Some(record) = Self::take_persist_record(world, dimension, tick, pos, resident) {
+                batch.push(record);
             }
         }
         batch
+    }
+
+    /// Captures one dirty resident and clears only the transferred flush mask.
+    fn take_persist_record(
+        world: WorldId,
+        dimension: DimensionId,
+        tick: u64,
+        pos: ChunkPos,
+        resident: &mut ResidentChunk,
+    ) -> Option<(ChunkKey, ChunkOverlayRecord)> {
+        if !resident.chunk.persist_dirty_sections().any() {
+            return None;
+        }
+        let record =
+            ChunkOverlayRecord::from_chunk(OVERLAY_SCHEMA_VERSION, pos, &resident.chunk, tick);
+        resident.chunk.clear_persist_dirty();
+        Some((ChunkKey::new(world, dimension, pos), record))
     }
 }
 

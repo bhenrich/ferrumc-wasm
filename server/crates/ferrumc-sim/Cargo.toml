@@ -40,9 +40,10 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 # The load-or-generate flow is `async` because `WorldStore` is. Tests drive it
-# with `#[tokio::test]`; tokio is dev-only here (the library pulls in no runtime)
-# and is already the workspace's async runtime.
-tokio = { workspace = true }
+# with `#[tokio::test]`; `test-util` lets deterministic replay tests pause the
+# clock rather than observe wall time. Tokio remains dev-only here (the library
+# pulls in no runtime) and is already the workspace's async runtime.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

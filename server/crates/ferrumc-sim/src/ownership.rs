@@ -1,10 +1,10 @@
 //! Typed logical-shard identity, ownership, and lifecycle values.
 //!
-//! This module defines the deterministic spatial seam used by future shard
-//! scheduling without introducing a worker pool or changing the current
-//! single-shard runtime. A [`ShardId`] canonically names one world/dimension
-//! scoped 8x8 chunk cell. Workers and directory registrations are separate
-//! runtime concepts and may process or route many logical shards.
+//! This module defines the deterministic spatial seam used by the crate's
+//! non-default shadow scheduler without changing the current single-shard
+//! runtime. A [`ShardId`] canonically names one world/dimension scoped 8x8
+//! chunk cell. Logical worker assignments and directory registrations remain
+//! separate concepts and may process or route many logical shards.
 
 use core::fmt;
 use std::collections::btree_map::Entry;

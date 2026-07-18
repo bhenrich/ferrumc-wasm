@@ -18,11 +18,13 @@ use ferrumc_world::{
     SIGN_LINES,
 };
 
+use crate::cross_shard::{CrossShardIntent, CrossShardPayload};
 use crate::error::SimError;
 use crate::loaded::LoadedChunkMap;
 use crate::message::{GameInput, GameOutput};
 use crate::mutation::{MutationCause, MutationResult, PendingMutation, RejectionReason};
 use crate::region::{RegionLimits, RegionOp};
+use crate::scheduler::{CrossShardOutboxRestore, ScheduledTickInputs};
 
 /// Maximum absolute value allowed for any player position coordinate.
 ///
@@ -91,6 +93,15 @@ const fn non_zero_usize(value: usize) -> NonZeroUsize {
 /// reaching it signals upstream misbehaviour or a stall — exactly when reject
 /// backpressure should kick in.
 const DEFAULT_INBOX_CAPACITY: NonZeroUsize = non_zero_usize(1024);
+
+/// Maximum number of cross-shard intents one shard may emit in one tick.
+///
+/// This matches the default input bound: the current seam permits at most one
+/// intent per admitted input, and the scheduler drains the outbox after every
+/// completed tick. A future system that can fan one input out further must
+/// handle reject-newest ownership from [`SimShard::emit_cross_shard`] instead of
+/// growing this buffer.
+const CROSS_SHARD_OUTBOX_CAPACITY: usize = 1024;
 
 /// Default world a shard owns chunks for when none is specified.
 ///
@@ -296,6 +307,10 @@ pub struct SimShard {
     /// spreads across ticks instead of stalling one. Bounded by
     /// [`MAX_PENDING_REGION_WORK`].
     pending_region_work: VecDeque<PendingRegionWork>,
+    /// Typed intents produced by this shard during its current tick. The
+    /// scheduler drains them only after every worker returns, then stamps source
+    /// identity and the completed tick before bounded canonical admission.
+    cross_shard_outbox: Vec<CrossShardIntent>,
 }
 
 impl SimShard {
@@ -344,6 +359,7 @@ impl SimShard {
             undo_history: BTreeMap::new(),
             region_limits: RegionLimits::default(),
             pending_region_work: VecDeque::new(),
+            cross_shard_outbox: Vec::new(),
         }
     }
 
@@ -381,6 +397,23 @@ impl SimShard {
         self.inbox.len()
     }
 
+    /// Returns whether no admitted input or incremental region operation still
+    /// needs a future tick.
+    ///
+    /// Used by the crate-internal scheduler before completing a draining
+    /// lifecycle. Buffered mutation records and dirty chunks are completed
+    /// outputs for later persistence phases, not tick work, so they do not make
+    /// the shard non-quiescent.
+    #[allow(
+        dead_code,
+        reason = "the owner-gated shadow scheduler intentionally has no app wiring yet"
+    )]
+    pub(crate) fn is_tick_quiescent(&self) -> bool {
+        self.inbox.is_empty()
+            && self.pending_region_work.is_empty()
+            && self.cross_shard_outbox.is_empty()
+    }
+
     /// Returns `true` if the inbox is at capacity and will reject new inputs.
     pub fn is_inbox_full(&self) -> bool {
         self.inbox.len() >= self.inbox_capacity
@@ -395,6 +428,50 @@ impl SimShard {
     /// storage journal.
     pub fn has_pending_mutations(&self) -> bool {
         !self.mutation_log.is_empty()
+    }
+
+    /// Iterates canonical complete pending-mutation records for determinism tests.
+    ///
+    /// Each item pairs its typed position (for coordinate-derived logical-owner
+    /// grouping) with a record carrying world and dimension scope, the complete
+    /// mutation cause (including the player UUID when present), block position,
+    /// and exact old/new block-state ids. Iteration preserves the journal
+    /// buffer's deterministic insertion order.
+    #[cfg(test)]
+    pub(crate) fn canonical_pending_mutation_records(
+        &self,
+    ) -> impl Iterator<Item = (BlockPos, Vec<u8>)> + '_ {
+        let world = self.chunks.world();
+        let dimension = self.chunks.dimension();
+        self.mutation_log.iter().map(move |mutation| {
+            let mut record = Vec::with_capacity(45);
+            record.extend_from_slice(&world.get().to_be_bytes());
+            record.extend_from_slice(&dimension.get().to_be_bytes());
+            match mutation.cause() {
+                MutationCause::PlayerCreative { player } => {
+                    record.push(0);
+                    record.extend_from_slice(player.as_uuid().as_bytes());
+                }
+                MutationCause::Command => record.push(1),
+                MutationCause::Plugin => record.push(2),
+                MutationCause::Test => record.push(3),
+            }
+            let position = mutation.position();
+            record.extend_from_slice(&position.x().to_be_bytes());
+            record.extend_from_slice(&position.y().to_be_bytes());
+            record.extend_from_slice(&position.z().to_be_bytes());
+            record.extend_from_slice(&mutation.old_state().as_u32().to_be_bytes());
+            record.extend_from_slice(&mutation.new_state().as_u32().to_be_bytes());
+            (position, record)
+        })
+    }
+
+    /// Returns whether any player owns at least one undo-history entry.
+    #[cfg(test)]
+    pub(crate) fn has_undo_history(&self) -> bool {
+        self.undo_history
+            .values()
+            .any(|history| !history.is_empty())
     }
 
     /// Drains and returns the buffered gameplay mutations for the storage
@@ -423,6 +500,32 @@ impl SimShard {
         self.players.get(&player).map(|state| state.game_mode)
     }
 
+    /// Iterates canonical complete-player records for determinism tests.
+    ///
+    /// This remains test-only so the shadow harness can digest every currently
+    /// modelled player field without expanding the production simulation API.
+    /// World and dimension are semantic identity; physical shard position is
+    /// deliberately absent because the compared topologies partition owners
+    /// differently.
+    #[cfg(test)]
+    pub(crate) fn canonical_player_state_records(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
+        let world = self.chunks.world();
+        let dimension = self.chunks.dimension();
+        self.players.iter().map(move |(&player, state)| {
+            let mut record = Vec::with_capacity(57);
+            record.extend_from_slice(&world.get().to_be_bytes());
+            record.extend_from_slice(&dimension.get().to_be_bytes());
+            record.extend_from_slice(player.as_uuid().as_bytes());
+            record.extend_from_slice(&state.position.x.to_bits().to_be_bytes());
+            record.extend_from_slice(&state.position.y.to_bits().to_be_bytes());
+            record.extend_from_slice(&state.position.z.to_bits().to_be_bytes());
+            record.extend_from_slice(&state.yaw.to_bits().to_be_bytes());
+            record.extend_from_slice(&state.pitch.to_bits().to_be_bytes());
+            record.push(state.game_mode.as_id());
+            record
+        })
+    }
+
     /// Enqueues `input` for application at the next tick boundary.
     ///
     /// Returns [`SimError::InboxFull`] without modifying the inbox if it is
@@ -437,10 +540,57 @@ impl SimShard {
         Ok(())
     }
 
+    /// Adds one owned cross-shard intent to this tick's bounded outbox.
+    ///
+    /// Reject-newest backpressure returns the intact intent when the fixed
+    /// outbox is full. The source shard never blocks and never mutates a
+    /// destination directly; the scheduler alone stamps and routes accepted
+    /// intents after this shard's tick completes.
+    #[allow(
+        dead_code,
+        reason = "Packet 42 adds the internal carrier before a gameplay system emits transfers"
+    )]
+    fn emit_cross_shard(&mut self, intent: CrossShardIntent) -> Result<(), CrossShardIntent> {
+        if self.cross_shard_outbox.len() >= CROSS_SHARD_OUTBOX_CAPACITY {
+            return Err(intent);
+        }
+        self.cross_shard_outbox.push(intent);
+        Ok(())
+    }
+
+    /// Drains this completed tick's cross-shard intents in source-local FIFO
+    /// order.
+    fn take_cross_shard_outbox(&mut self) -> Vec<CrossShardIntent> {
+        std::mem::take(&mut self.cross_shard_outbox)
+    }
+
+    /// Atomically restores scheduler-drained intents after terminal-tick
+    /// stamping fails.
+    ///
+    /// The restore carrier has no public constructor, so sibling modules cannot
+    /// use this rollback seam to manufacture out-of-tick emissions.
+    pub(crate) fn restore_cross_shard_outbox(
+        &mut self,
+        restore: CrossShardOutboxRestore,
+    ) -> Result<(), CrossShardOutboxRestore> {
+        if restore.len() > CROSS_SHARD_OUTBOX_CAPACITY.saturating_sub(self.cross_shard_outbox.len())
+        {
+            return Err(restore);
+        }
+        self.cross_shard_outbox.extend(restore.into_intents());
+        Ok(())
+    }
+
+    /// Returns the fixed per-shard cross-shard outbox capacity.
+    pub(crate) const fn cross_shard_outbox_capacity() -> usize {
+        CROSS_SHARD_OUTBOX_CAPACITY
+    }
+
     /// Applies every queued input at this tick boundary and returns the outputs.
     ///
-    /// This is the only method that mutates player state, so all queued inputs
-    /// take effect exactly at this boundary. The inbox is empty on return.
+    /// This public path and the capability-gated scheduler path share one
+    /// private tick body, so queued inputs mutate player state only at those
+    /// boundaries. The inbox is empty on return.
     ///
     /// Joins and leaves apply in FIFO order; movement is coalesced (latest valid
     /// position per player) and validated, then applied after the drain — see the
@@ -449,6 +599,45 @@ impl SimShard {
     /// fully deterministic for a given inbox.
     #[allow(clippy::too_many_lines)] // one tick drain: join/leave/move + every block-edit input arm
     pub fn run_tick(&mut self) -> Vec<GameOutput> {
+        self.run_tick_with_boundary_inputs(Vec::new())
+    }
+
+    /// Runs one scheduler-authorized tick and returns its bounded source
+    /// emissions with the ordinary outputs.
+    ///
+    /// [`ScheduledTickInputs`] is an unforgeable capability: only the scheduler
+    /// module can construct it. Consequently, no sibling module can invoke this
+    /// path to apply a cross-shard prefix between tick boundaries.
+    pub(crate) fn run_scheduled_tick(
+        &mut self,
+        mut tick_inputs: ScheduledTickInputs,
+    ) -> (Vec<GameOutput>, Vec<CrossShardIntent>) {
+        let boundary_inputs = tick_inputs.take_boundary_inputs();
+        let outputs = self.run_tick_with_boundary_inputs(boundary_inputs);
+
+        #[cfg(test)]
+        for intent in tick_inputs.take_test_emissions() {
+            self.emit_cross_shard(intent)
+                .expect("bounded test hook was preflighted");
+        }
+
+        (outputs, self.take_cross_shard_outbox())
+    }
+
+    /// Applies a scheduler-owned cross-shard prefix, then this shard's ordinary
+    /// inbox, in one tick-boundary execution.
+    ///
+    /// The prefix is already bounded by the central cross-shard queue. Keeping
+    /// it separate from the ordinary inbox prevents accepted cross-shard work
+    /// from competing with session-input capacity or being delayed to a later
+    /// tick. This private method is reachable from outside the shard module only
+    /// through [`SimShard::run_scheduled_tick`], whose input capability can be
+    /// constructed only by the scheduler.
+    #[allow(clippy::too_many_lines)] // same explicit tick drain as `run_tick`
+    fn run_tick_with_boundary_inputs(
+        &mut self,
+        boundary_inputs: Vec<CrossShardPayload>,
+    ) -> Vec<GameOutput> {
         let mut outputs = Vec::new();
         // Coalesce movement: keep only the latest *valid* position and rotation
         // per player (each component merged independently).
@@ -456,8 +645,15 @@ impl SimShard {
         // Players whose move was rejected this tick and still need a snap-back
         // correction (a later valid move removes them again).
         let mut corrections: BTreeSet<PlayerId> = BTreeSet::new();
+        let mut boundary_inputs = boundary_inputs
+            .into_iter()
+            .map(CrossShardPayload::into_input);
 
-        while let Some(input) = self.inbox.pop_front() {
+        loop {
+            let input = boundary_inputs.next().or_else(|| self.inbox.pop_front());
+            let Some(input) = input else {
+                break;
+            };
             match input {
                 GameInput::PlayerJoin { player, position } => {
                     // A duplicate join for an already-present player is ignored:
@@ -1543,6 +1739,7 @@ mod tests {
     use ferrumc_world::FlatWorldGenerator;
 
     use super::*;
+    use crate::ownership::ShardId;
     use crate::ticket::{ChunkTicket, TicketReason};
 
     fn player(name: &str) -> PlayerId {
@@ -1596,6 +1793,36 @@ mod tests {
         assert_eq!(s.inbox_len(), 0);
         assert_eq!(s.player_count(), 0);
         assert!(!s.is_inbox_full());
+    }
+
+    #[test]
+    fn cross_shard_outbox_rejects_newest_and_returns_it_intact() {
+        let mut source = shard();
+        let destination =
+            ShardId::try_new(WorldId::new(0), DimensionId::new(0), ShardPos::new(1, 0))
+                .expect("valid destination");
+        for index in 0..CROSS_SHARD_OUTBOX_CAPACITY {
+            let intent = CrossShardIntent::new(
+                destination,
+                CrossShardPayload::ApplyInput(GameInput::PlayerLeave {
+                    player: player(&format!("accepted-{index}")),
+                }),
+            );
+            source.emit_cross_shard(intent).expect("bounded slot");
+        }
+
+        let rejected = CrossShardIntent::new(
+            destination,
+            CrossShardPayload::ApplyInput(GameInput::PlayerLeave {
+                player: player("rejected-newest"),
+            }),
+        );
+        assert_eq!(source.emit_cross_shard(rejected.clone()), Err(rejected));
+        assert_eq!(
+            source.take_cross_shard_outbox().len(),
+            CROSS_SHARD_OUTBOX_CAPACITY
+        );
+        assert!(source.take_cross_shard_outbox().is_empty());
     }
 
     #[test]
