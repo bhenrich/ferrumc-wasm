@@ -15,7 +15,8 @@
 //! - **Compiled-in catch-and-disable handling.** Calls through the Rust
 //!   [`Plugin`](ferrumc_plugin_api::Plugin) trait are wrapped in
 //!   [`std::panic::catch_unwind`]; an unwinding compiled-in plugin is disabled
-//!   and not called again. See [`PluginHost::dispatch_event`].
+//!   and no later plugin hook is called on that retained instance. See
+//!   [`PluginHost::dispatch_event`].
 //! - **Capability gating.** Each plugin is granted a
 //!   [`CapabilityManifest`](ferrumc_plugin_api::CapabilityManifest); the
 //!   contexts handed to its hooks deny any facade it was not granted.
@@ -81,13 +82,15 @@
 //! Catching panics is the one place this crate must reason about unwinding. The
 //! compiled-in plugin call closures capture `&mut` plugin state, which is not
 //! [`std::panic::UnwindSafe`], so they are wrapped in
-//! [`std::panic::AssertUnwindSafe`]. This is sound here — and requires no
-//! `unsafe` — because a compiled-in plugin that unwinds is immediately moved to
-//! the disabled state and never called again. Its internal state may be left
-//! inconsistent by the unwind, but since nothing ever observes that state afterward, the
-//! "assertion" of unwind safety holds. Catch-and-disable handling depends on
-//! the standard unwinding panic strategy; under `panic = "abort"` a panic
-//! aborts the process before it can be caught.
+//! [`std::panic::AssertUnwindSafe`]. The assertion is limited to letting the
+//! host catch the unwind and terminally prevent later
+//! [`Plugin`](ferrumc_plugin_api::Plugin) hooks on that retained instance; it
+//! requires no `unsafe`. It is not transactional: storage writes, submitted
+//! intents, registered command handlers, or shared-state mutations completed
+//! before the unwind can remain observable. The boxed value is also dropped
+//! normally with the host. Catch-and-disable handling depends on the standard
+//! unwinding panic strategy; under `panic = "abort"` a panic aborts the process
+//! before it can be caught.
 
 mod budget;
 mod dynamic;

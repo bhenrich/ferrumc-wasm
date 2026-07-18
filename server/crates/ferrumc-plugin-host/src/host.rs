@@ -697,12 +697,13 @@ impl PluginHost {
     /// commands are merged into the host's command tree. If the hook returns an
     /// error the plugin is left disabled and [`HostError::PluginFailed`] is
     /// returned. If a compiled-in hook unwinds, that plugin is disabled and
-    /// [`HostError::Panicked`] is returned. A trusted native initialization
-    /// failure reported through the ABI returns [`HostError::NativeLifecycle`];
-    /// process-aborting native failures cannot be recovered here. A native
-    /// registration previously disabled by `FC_PLUGIN_PANIC` returns
-    /// [`HostError::NativePanicDisabled`] instead of allocating another
-    /// instance.
+    /// [`HostError::Panicked`] is returned; a later enable attempt returns
+    /// [`HostError::PanicDisabled`] without invoking that retained instance
+    /// again. A trusted native initialization failure reported through the ABI
+    /// returns [`HostError::NativeLifecycle`]; process-aborting native failures
+    /// cannot be recovered here. A native registration previously disabled by
+    /// `FC_PLUGIN_PANIC` returns [`HostError::NativePanicDisabled`] instead of
+    /// allocating another instance.
     pub fn enable(&mut self, id: &PluginId) -> Result<(), HostError> {
         if self.native_plugins.iter().any(|slot| &slot.id == id) {
             return self.enable_trusted_native(id);
@@ -723,6 +724,9 @@ impl PluginHost {
 
         if slot.state.is_enabled() {
             return Err(HostError::AlreadyEnabled(id.clone()));
+        }
+        if slot.state == PluginState::Disabled(DisableReason::Panicked) {
+            return Err(HostError::PanicDisabled(id.clone()));
         }
 
         let mut events = EventRegistrar::new();
@@ -770,11 +774,11 @@ impl PluginHost {
     /// Disables the enabled plugin with id `id`, running its
     /// [`on_disable`](Plugin::on_disable) hook.
     ///
-    /// An unwind from a compiled-in hook is caught and ignored because the
-    /// plugin is being disabled regardless. Returns [`HostError::NotEnabled`]
-    /// if the plugin is not currently enabled. A trusted native shutdown
-    /// failure reported through the ABI leaves the plugin disabled and returns
-    /// [`HostError::NativeLifecycle`].
+    /// An unwind from a compiled-in hook leaves the registration terminally
+    /// disabled and returns [`HostError::Panicked`]. Returns
+    /// [`HostError::NotEnabled`] if the plugin is not currently enabled. A
+    /// trusted native shutdown failure reported through the ABI leaves the
+    /// plugin disabled and returns [`HostError::NativeLifecycle`].
     pub fn disable(&mut self, id: &PluginId) -> Result<(), HostError> {
         if self.native_plugins.iter().any(|slot| &slot.id == id) {
             return self.disable_trusted_native(id);
@@ -795,12 +799,15 @@ impl PluginHost {
 
         let namespaced = NamespacedStorage::new(storage.as_ref(), slot.id.clone());
         let mut ctx = TeardownContext::new(slot.capabilities, &namespaced);
-        if catch_unwind(AssertUnwindSafe(|| slot.plugin.on_disable(&mut ctx))).is_err() {
+        if catch_unwind(AssertUnwindSafe(|| slot.plugin.on_disable(&mut ctx))).is_ok() {
+            slot.state = PluginState::Disabled(DisableReason::Manual);
+            Ok(())
+        } else {
             slot.stats.panics += 1;
-            tracing::warn!(plugin = %slot.id, "plugin panicked during on_disable; ignored");
+            slot.state = PluginState::Disabled(DisableReason::Panicked);
+            tracing::warn!(plugin = %slot.id, "plugin panicked during on_disable; disabled");
+            Err(HostError::Panicked { id: id.clone() })
         }
-        slot.state = PluginState::Disabled(DisableReason::Manual);
-        Ok(())
     }
 
     fn enable_trusted_native(&mut self, id: &PluginId) -> Result<(), HostError> {

@@ -121,6 +121,7 @@ impl Plugin for CounterPlugin {
 /// Panics on every event it receives.
 struct PanicPlugin {
     id: &'static str,
+    enable_calls: Arc<AtomicUsize>,
 }
 
 impl Plugin for PanicPlugin {
@@ -134,12 +135,53 @@ impl Plugin for PanicPlugin {
     }
 
     fn on_enable(&mut self, ctx: &mut SetupContext<'_>) -> Result<(), PluginError> {
+        self.enable_calls.fetch_add(1, Ordering::SeqCst);
         ctx.events()?.subscribe(EventKind::PlayerJoin);
         Ok(())
     }
 
     fn on_event(&mut self, _event: &PluginEvent, _ctx: &mut EventContext<'_>) {
         panic!("fixture plugin panic");
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LifecyclePanic {
+    Enable,
+    Disable,
+}
+
+/// Tracks lifecycle entry and panics at exactly one configured hook.
+struct LifecyclePanicPlugin {
+    id: &'static str,
+    panic_at: LifecyclePanic,
+    enable_calls: Arc<AtomicUsize>,
+    disable_calls: Arc<AtomicUsize>,
+}
+
+impl Plugin for LifecyclePanicPlugin {
+    fn metadata(&self) -> PluginMetadata {
+        PluginMetadata::new(
+            PluginId::new(self.id),
+            "Lifecycle panic",
+            Version::new(0, 1, 0),
+            CapabilityManifest::empty(),
+        )
+    }
+
+    fn on_enable(&mut self, _ctx: &mut SetupContext<'_>) -> Result<(), PluginError> {
+        self.enable_calls.fetch_add(1, Ordering::SeqCst);
+        if matches!(self.panic_at, LifecyclePanic::Enable) {
+            panic!("fixture enable panic");
+        }
+        Ok(())
+    }
+
+    fn on_disable(&mut self, _ctx: &mut ferrumc_plugin_api::TeardownContext<'_>) {
+        self.disable_calls.fetch_add(1, Ordering::SeqCst);
+        if matches!(self.panic_at, LifecyclePanic::Disable) {
+            panic!("fixture disable panic");
+        }
     }
 }
 
@@ -251,10 +293,14 @@ fn command_registration_feeds_the_host_tree() {
 #[test]
 fn panicking_plugin_is_caught_and_disabled_host_survives() {
     let joins = Arc::new(AtomicUsize::new(0));
+    let panic_enable_calls = Arc::new(AtomicUsize::new(0));
     let mut host = PluginHost::in_memory();
 
     let panic_id = host
-        .register(Box::new(PanicPlugin { id: "panic" }))
+        .register(Box::new(PanicPlugin {
+            id: "panic",
+            enable_calls: Arc::clone(&panic_enable_calls),
+        }))
         .expect("registers panic plugin");
     let counter_id = host
         .register(Box::new(CounterPlugin {
@@ -279,12 +325,81 @@ fn panicking_plugin_is_caught_and_disabled_host_survives() {
     );
     assert!(!host.is_enabled(&panic_id));
     assert_eq!(host.stats(&panic_id).map(PluginStats::panics), Some(1));
+    assert_eq!(
+        host.enable(&panic_id),
+        Err(HostError::PanicDisabled(panic_id.clone()))
+    );
+    assert_eq!(panic_enable_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        host.state(&panic_id),
+        Some(PluginState::Disabled(DisableReason::Panicked))
+    );
+    assert_eq!(host.stats(&panic_id).map(PluginStats::panics), Some(1));
 
-    // Second dispatch: the disabled plugin is skipped entirely; the host is fine.
+    // Second dispatch: the terminally disabled plugin is skipped; the host is fine.
     let report = dispatch_join(&mut host);
     assert!(report.panicked().is_empty());
     assert_eq!(report.delivered(), 1);
     assert_eq!(joins.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn panic_during_enable_is_terminal_for_the_retained_instance() {
+    let enable_calls = Arc::new(AtomicUsize::new(0));
+    let disable_calls = Arc::new(AtomicUsize::new(0));
+    let mut host = PluginHost::in_memory();
+    let id = host
+        .register(Box::new(LifecyclePanicPlugin {
+            id: "panic-enable",
+            panic_at: LifecyclePanic::Enable,
+            enable_calls: Arc::clone(&enable_calls),
+            disable_calls,
+        }))
+        .expect("registers");
+
+    assert_eq!(
+        host.enable(&id),
+        Err(HostError::Panicked { id: id.clone() })
+    );
+    assert_eq!(enable_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        host.state(&id),
+        Some(PluginState::Disabled(DisableReason::Panicked))
+    );
+    assert_eq!(host.enable(&id), Err(HostError::PanicDisabled(id.clone())));
+    assert_eq!(enable_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(host.stats(&id).map(PluginStats::panics), Some(1));
+}
+
+#[test]
+fn panic_during_disable_is_terminal_for_the_retained_instance() {
+    let enable_calls = Arc::new(AtomicUsize::new(0));
+    let disable_calls = Arc::new(AtomicUsize::new(0));
+    let mut host = PluginHost::in_memory();
+    let id = host
+        .register(Box::new(LifecyclePanicPlugin {
+            id: "panic-disable",
+            panic_at: LifecyclePanic::Disable,
+            enable_calls: Arc::clone(&enable_calls),
+            disable_calls: Arc::clone(&disable_calls),
+        }))
+        .expect("registers");
+    host.enable(&id).expect("initial enable succeeds");
+
+    assert_eq!(
+        host.disable(&id),
+        Err(HostError::Panicked { id: id.clone() })
+    );
+    assert_eq!(enable_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(disable_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        host.state(&id),
+        Some(PluginState::Disabled(DisableReason::Panicked))
+    );
+    assert_eq!(host.enable(&id), Err(HostError::PanicDisabled(id.clone())));
+    assert_eq!(enable_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(disable_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(host.stats(&id).map(PluginStats::panics), Some(1));
 }
 
 #[test]

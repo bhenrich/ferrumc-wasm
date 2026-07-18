@@ -15,13 +15,21 @@
 
 ## Crate-Specific
 
-- **Panic isolation is absolute.** Every call into plugin code
-  (`metadata`, `on_enable`, `on_event`, `on_disable`) is wrapped in
-  `std::panic::catch_unwind`. A panicking plugin is disabled and never called
-  again; it must never crash the host. This is the one place the crate reasons
-  about unwinding: closures capture `&mut` plugin state and use
-  `AssertUnwindSafe`, which is sound because a panicked plugin's state is never
-  observed again. No `unsafe` is used.
+- **Compiled-in plugin panic containment is terminal.** Every call through the
+  Rust `Plugin` trait (`metadata`, `on_enable`, `on_event`, `on_disable`) is
+  wrapped in `std::panic::catch_unwind`. A metadata unwind rejects registration
+  before the instance is retained. An unwind after registration moves that
+  registration to `Disabled(Panicked)`; a later enable returns
+  `HostError::PanicDisabled` without invoking another plugin hook on the retained
+  value. Closures capture `&mut` plugin state and use `AssertUnwindSafe`; this is
+  limited to allowing catch-and-disable despite the mutable borrow. Completed
+  storage writes, submitted intents, registered command handlers, and
+  shared-state mutations are not rolled back, and the boxed value is still
+  dropped normally with the host. This guarantee does **not** catch a panic that
+  crosses an `extern "C"` boundary; trusted native plugins must contain
+  unwinding panics before returning a status, while aborts, faults, hangs, and
+  undefined behavior remain process-wide failures. No `unsafe` is used by the
+  compiled-in containment path.
 - **Capability gating is enforced by the host, not trusted from plugins.** The
   host grants each plugin a `CapabilityManifest` (from metadata or an explicit
   override) and builds every context from it.

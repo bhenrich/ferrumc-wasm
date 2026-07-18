@@ -27,8 +27,9 @@ impl core::fmt::Display for NativeLifecycleHook {
 /// Variants classify *why* an operation failed so callers can react without
 /// parsing strings. An unwinding compiled-in plugin is reported as
 /// [`HostError::Panicked`] (for explicit operations) or recorded in the
-/// dispatch report. Trusted native lifecycle failures cross the audited
-/// boundary as [`HostError::NativeLifecycle`].
+/// dispatch report; a later enable attempt returns
+/// [`HostError::PanicDisabled`]. Trusted native lifecycle failures cross the
+/// audited boundary as [`HostError::NativeLifecycle`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum HostError {
@@ -47,6 +48,13 @@ pub enum HostError {
     /// The plugin is already enabled.
     #[error("plugin '{0}' is already enabled")]
     AlreadyEnabled(PluginId),
+
+    /// A compiled-in plugin previously unwound; its retained instance cannot
+    /// be re-enabled for this host registration.
+    #[error(
+        "compiled-in plugin '{0}' previously panicked and cannot be re-enabled for this host registration"
+    )]
+    PanicDisabled(PluginId),
 
     /// A trusted native plugin reported `FC_PLUGIN_PANIC`; its retired instance
     /// cannot be re-enabled for this host registration.

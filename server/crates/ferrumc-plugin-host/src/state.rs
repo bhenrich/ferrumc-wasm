@@ -21,9 +21,8 @@ pub enum PluginState {
     Registered,
     /// Enabled and receiving events.
     Enabled,
-    /// Disabled for the given reason; it will not be called again unless
-    /// re-enabled. A trusted native plugin disabled for
-    /// [`DisableReason::Panicked`] cannot be re-enabled for that
+    /// Disabled for the given reason. Non-panicked registrations may be
+    /// re-enabled; [`DisableReason::Panicked`] is terminal for that
     /// [`PluginHost`](crate::PluginHost) registration.
     Disabled(DisableReason),
 }
