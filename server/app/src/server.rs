@@ -26,7 +26,7 @@ use ferrumc_sim::{GameInput, ShardPartitioner, SimShard};
 use crate::config::AppConfig;
 use crate::connection::{build_status_response, handle_connection, ConnContext};
 use crate::driver;
-use crate::plugins::{build_play_policy, load_plugins};
+use crate::plugins::build_play_policy;
 use crate::registries::ConfigRegistries;
 use crate::storage_worker::{run_storage_worker, StorageFlushRequest};
 use crate::world::build_world;
@@ -233,22 +233,17 @@ pub async fn run(config: &AppConfig) -> anyhow::Result<RunningServer> {
     // long-lived block-event dispatcher that owns the plugin host. The dispatcher
     // is shared by every connection task so the plugins' `before_block_*` decision
     // hooks run at the intent boundary, off the simulation tick.
-    let (policy, block_events) = build_play_policy(config)?;
+    //
+    // Bundle discovery, hashing, dynamic-library loading, and initialization are
+    // synchronous filesystem/native work, so keep them off Tokio's async workers.
+    let plugin_config = config.clone();
+    let (policy, block_events) =
+        tokio::task::spawn_blocking(move || build_play_policy(&plugin_config))
+            .await
+            .context("plugin policy build task failed")?
+            .context("building the plugin play policy")?;
     let policy = Arc::new(policy);
     let block_events = Arc::new(block_events);
-
-    // Prove the dynamic loader: scan the configured plugins directory across the
-    // C ABI. Failures are logged and never fatal to startup.
-    if let Some(dir) = config.plugins_dir() {
-        match load_plugins(dir) {
-            Ok(count) => {
-                tracing::info!(plugins = count, dir = %dir.display(), "loaded dynamic plugins");
-            }
-            Err(err) => {
-                tracing::warn!(%err, dir = %dir.display(), "failed to scan plugins directory");
-            }
-        }
-    }
 
     let mut router = SessionRouter::new();
     // Scope multiplayer visibility to the configured play view distance.

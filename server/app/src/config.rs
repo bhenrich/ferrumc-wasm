@@ -48,6 +48,9 @@ const DEFAULT_SPAWN_CHUNK_RADIUS: u8 = 2;
 /// Default simulation tick rate, in ticks per second.
 const DEFAULT_TICKS_PER_SECOND: u32 = 20;
 
+/// Whether the built-in plugin set is registered by default.
+const DEFAULT_BUILTIN_PLUGINS: bool = true;
+
 /// Default spawn-protection radius, in blocks. Zero disables spawn protection
 /// entirely, which is the default so an unconfigured server protects nothing.
 const DEFAULT_SPAWN_PROTECT_RADIUS: i32 = 0;
@@ -199,9 +202,11 @@ pub struct AppConfig {
     spawn_chunk_radius: u8,
     /// The simulation tick rate, in ticks per second.
     ticks_per_second: u32,
-    /// Directory scanned for dynamic (`cdylib`) plugins at startup, or `None` to
-    /// skip dynamic plugin loading.
+    /// Directory containing strict trusted-native plugin bundles, or `None` to
+    /// skip native plugin loading.
     plugins_dir: Option<PathBuf>,
+    /// Whether the application registers its built-in plugin set.
+    builtin_plugins: bool,
     /// Spawn-protection radius, in blocks (Chebyshev) around the spawn column.
     /// Zero disables spawn protection.
     spawn_protect_radius: i32,
@@ -336,6 +341,12 @@ impl AppConfig {
     #[must_use]
     pub fn plugins_dir(&self) -> Option<&Path> {
         self.plugins_dir.as_deref()
+    }
+
+    /// Returns whether the built-in plugin set is enabled.
+    #[must_use]
+    pub const fn builtin_plugins(&self) -> bool {
+        self.builtin_plugins
     }
 
     /// Returns the spawn-protection radius in blocks.
@@ -715,6 +726,7 @@ impl Default for AppConfig {
             spawn_chunk_radius: DEFAULT_SPAWN_CHUNK_RADIUS,
             ticks_per_second: DEFAULT_TICKS_PER_SECOND,
             plugins_dir: None,
+            builtin_plugins: DEFAULT_BUILTIN_PLUGINS,
             spawn_protect_radius: DEFAULT_SPAWN_PROTECT_RADIUS,
             spawn_protect_bypass: Vec::new(),
             max_region_fill_volume: DEFAULT_MAX_REGION_FILL_VOLUME,
@@ -778,6 +790,8 @@ struct RawConfig {
     ticks_per_second: Option<u32>,
     /// Override for [`AppConfig::plugins_dir`], as a filesystem path.
     plugins_dir: Option<String>,
+    /// Override for [`AppConfig::builtin_plugins`].
+    builtin_plugins: Option<bool>,
     /// Override for [`AppConfig::spawn_protect_radius`].
     spawn_protect_radius: Option<i32>,
     /// Override for [`AppConfig::spawn_protect_bypass`].
@@ -870,6 +884,7 @@ impl RawConfig {
                 .unwrap_or(defaults.spawn_chunk_radius),
             ticks_per_second,
             plugins_dir: self.plugins_dir.map(PathBuf::from).or(defaults.plugins_dir),
+            builtin_plugins: self.builtin_plugins.unwrap_or(defaults.builtin_plugins),
             spawn_protect_radius,
             spawn_protect_bypass: self
                 .spawn_protect_bypass
@@ -929,6 +944,7 @@ mod tests {
             spawn_chunk_radius = 1
             ticks_per_second = 10
             plugins_dir = "/srv/plugins"
+            builtin_plugins = false
             spawn_protect_radius = 12
             spawn_protect_bypass = ["Admin", "Mod"]
             max_region_fill_volume = 4096
@@ -952,6 +968,7 @@ mod tests {
         assert_eq!(parsed.spawn_chunk_radius, 1);
         assert_eq!(parsed.ticks_per_second, 10);
         assert_eq!(parsed.plugins_dir, Some(PathBuf::from("/srv/plugins")));
+        assert!(!parsed.builtin_plugins);
         assert_eq!(parsed.spawn_protect_radius, 12);
         assert_eq!(parsed.spawn_protect_bypass, vec!["Admin", "Mod"]);
         assert_eq!(parsed.max_region_fill_volume, 4096);
@@ -992,6 +1009,14 @@ mod tests {
         assert_eq!(parsed.spawn_protect_radius, 0);
         assert!(parsed.spawn_protect_bypass.is_empty());
         assert_eq!(parsed.plugins_dir, None);
+    }
+
+    #[test]
+    fn builtin_plugins_default_on_and_can_be_disabled() {
+        assert!(AppConfig::default().builtin_plugins());
+        let parsed =
+            AppConfig::from_toml_str("builtin_plugins = false").expect("valid plugin toggle");
+        assert!(!parsed.builtin_plugins());
     }
 
     #[test]

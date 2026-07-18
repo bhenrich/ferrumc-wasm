@@ -1,6 +1,6 @@
 //! The MVP acceptance suite: the ten-point vertical slice driven end to end by a
-//! hand-rolled 1.21.8 fake client over a real socket, plus the spawn-protection
-//! plugin loaded dynamically and enforced in-process.
+//! hand-rolled 1.21.8 fake client over a real socket, plus the built-in
+//! spawn-protection plugin enforced through the shared plugin host.
 //!
 //! Each of the ten MVP points is asserted against the closest observable the fake
 //! client (or the server's public API) can reach:
@@ -23,9 +23,6 @@
 //!    broadcast) while a bypassing player's edits go through.
 //! 10. **clean shutdown** — the server winds down within the guard.
 //!
-//! Plus: the application loads the spawn-protection `cdylib` from a `/plugins`
-//! directory across the C ABI ([`ferrumc_app::load_plugins`]).
-//!
 //! Determinism without wall-clock sleeps: every step awaits the next frame, uses
 //! same-shard FIFO ordering as a fence (a vetoed edit is pipelined ahead of an
 //! observable move), and the whole flow is wrapped in a timeout guard.
@@ -35,15 +32,12 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::time::timeout;
 use uuid::Uuid;
 
-use ferrumc_app::{build_command_tree, load_plugins, AppConfig};
+use ferrumc_app::{build_command_tree, AppConfig};
 use ferrumc_codec::{BoundedReader, BoundedString};
 use ferrumc_command::CommandSource;
 use ferrumc_core::PlayerId;
@@ -75,76 +69,6 @@ const STONE_STATE: i32 = 1;
 
 /// Spawn-protection radius, in blocks, the MVP server runs with.
 const PROTECT_RADIUS: i32 = 16;
-
-// --------------------------------------------------------------------------
-// Building and staging the spawn-protection cdylib.
-// --------------------------------------------------------------------------
-
-/// The spawn-protect package name (its `cdylib` artifact backs the loader test).
-const PLUGIN_PACKAGE: &str = "ferrumc-plugin-spawn-protect";
-
-/// Builds the spawn-protect `cdylib` once per test process and returns its path.
-fn plugin_dylib() -> &'static Path {
-    static DYLIB: OnceLock<PathBuf> = OnceLock::new();
-    DYLIB.get_or_init(build_plugin).as_path()
-}
-
-/// Runs `cargo build -p <plugin>` and extracts the dynamic-library artifact path.
-fn build_plugin() -> PathBuf {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let output = Command::new(&cargo)
-        .current_dir(workspace_root())
-        .args([
-            "build",
-            "-p",
-            PLUGIN_PACKAGE,
-            "--message-format=json-render-diagnostics",
-        ])
-        .output()
-        .expect("failed to spawn cargo to build the spawn-protect plugin");
-    assert!(
-        output.status.success(),
-        "building the spawn-protect plugin failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let dll_suffix = std::env::consts::DLL_SUFFIX;
-    let stdout = String::from_utf8(output.stdout).expect("cargo json output is utf-8");
-    let needle = PLUGIN_PACKAGE.replace('-', "_");
-    for line in stdout.lines() {
-        if !line.contains("\"compiler-artifact\"") || !line.contains(PLUGIN_PACKAGE) {
-            continue;
-        }
-        for candidate in line.split('"') {
-            if candidate.contains(&needle) && candidate.ends_with(dll_suffix) {
-                return PathBuf::from(candidate);
-            }
-        }
-    }
-    panic!("could not find the {dll_suffix} artifact in cargo output:\n{stdout}");
-}
-
-/// Returns the Cargo workspace root (the `server/` directory).
-fn workspace_root() -> PathBuf {
-    // CARGO_MANIFEST_DIR = .../server/app
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("app manifest dir has a workspace-root parent")
-        .to_path_buf()
-}
-
-/// Copies the built plugin into a fresh, isolated `/plugins` directory.
-fn stage_plugins_dir() -> tempfile::TempDir {
-    let dylib = plugin_dylib();
-    let dir = tempfile::tempdir().expect("create plugins dir");
-    let dest = dir
-        .path()
-        .join(dylib.file_name().expect("dylib has a name"));
-    std::fs::copy(dylib, &dest).expect("copy plugin into plugins dir");
-    // A non-library file the scan must ignore.
-    std::fs::write(dir.path().join("README.txt"), b"not a plugin").expect("write decoy");
-    dir
-}
 
 // --------------------------------------------------------------------------
 // Fake-client read helpers.
@@ -468,13 +392,6 @@ async fn run_flow(addr: SocketAddr) -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn mvp_end_to_end() {
-    // The plugins directory holds the freshly-built spawn-protect cdylib.
-    let plugins = stage_plugins_dir();
-
-    // Point (dynamic loading): the application loads the cdylib across the C ABI.
-    let loaded = load_plugins(plugins.path()).expect("plugins dir scans");
-    assert_eq!(loaded, 1, "the spawn-protect cdylib must load");
-
     // Point 8 (direct, server-side): /gamemode dispatches as a server command.
     let tree = build_command_tree();
     let op = CommandSource::for_player(PlayerId::offline("Admin"), "Admin", 4);
@@ -498,9 +415,7 @@ async fn mvp_end_to_end() {
          spawn_protect_bypass = [\"Admin\"]\n\
          ops = [\"Admin\"]\n",
     ))
-    .expect("MVP config parses")
-    .with_plugins_dir(Some(plugins.path().to_path_buf()))
-    .expect("plugins directory preserves a valid config");
+    .expect("MVP config parses");
     let server = ferrumc_app::run(&config).await.expect("server starts");
     let addr = server.local_addr();
 

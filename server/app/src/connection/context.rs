@@ -67,9 +67,12 @@ pub(crate) struct ConnContext {
     /// The shared block-event dispatcher: the long-lived plugin host the
     /// connection consults at the intent boundary for every block break/place.
     ///
-    /// The plugins' `before_block_*` decision hooks run here (synchronously,
-    /// panic-isolated, under a mutex with no lock held across an `.await`) — never
-    /// inside the deterministic, plugin-free simulation tick.
+    /// The plugins' `before_block_*` decision hooks run here synchronously under
+    /// a mutex with no lock held across an `.await` — never inside the
+    /// deterministic, plugin-free simulation tick. Built-in unwinds are caught,
+    /// disable that plugin, and fail the edit closed; trusted-native callbacks
+    /// receive the host's documented connection-side sentinel context and retain
+    /// their process-level failure limits.
     pub(crate) block_events: Arc<BlockEventDispatcher>,
     /// The prebuilt server-list status response, rendered once at startup and
     /// replayed for every status (`next_state == 1`) handshake. Behind an [`Arc`]

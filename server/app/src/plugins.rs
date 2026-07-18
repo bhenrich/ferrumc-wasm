@@ -1,15 +1,11 @@
 //! Plugin bring-up and the per-connection play policy.
 //!
-//! At startup the application:
-//!
-//! 1. scans the configured `/plugins` directory and loads every dynamic
-//!    (`cdylib`) plugin across the C ABI ([`load_plugins`]), proving the dynamic
-//!    loader end to end; and
-//! 2. builds one long-lived [`PluginHost`] ([`build_play_policy`]) and enables the
-//!    in-process plugins that vote on block edits at the intent boundary:
-//!    [`SpawnProtectPlugin`] (which also seeds and reads back its configuration
-//!    from private, namespaced storage) and the [`BlockRulesPlugin`] sample. The
-//!    host is wrapped in a [`BlockEventDispatcher`] every connection shares.
+//! At startup the application builds one long-lived [`PluginHost`]
+//! ([`build_play_policy`]). Depending on configuration, that host registers the
+//! built-in [`SpawnProtectPlugin`], [`BlockRulesPlugin`], and [`GreeterPlugin`],
+//! then loads, registers, and enables every strict trusted-native bundle from
+//! the configured plugins directory. The host is wrapped in a
+//! [`BlockEventDispatcher`] every connection shares.
 //!
 //! The resulting [`PlayPolicy`] bundles the rest of what a connection consults
 //! during play: the per-player bypass permissions, the command tree, and the
@@ -23,34 +19,35 @@
 //! [`BlockEventDispatcher`] at the *intent boundary* on the connection task —
 //! before the edit reaches the simulation, and never inside the deterministic,
 //! plugin-free tick. The hooks run under a [`std::sync::Mutex`] with no lock held
-//! across an `.await`, and a panicking plugin is contained and fails safe to a
-//! deny.
+//! across an `.await`. An unwinding built-in hook is caught, disabled, and fails
+//! the block decision closed. Trusted-native code is not panic-contained:
+//! cooperative SDK panic statuses are handled fail-stop, but an abort, hang, or
+//! memory-safety failure can still terminate or compromise the process.
 //!
-//! The C ABI carries no event hook, so a dynamically-loaded `cdylib` cannot
-//! receive a block decision across the boundary (the block-decision surface is
-//! in-process only). The dynamic load therefore proves the loader; the in-process
-//! plugins provide the real decisions and exercise the full SDK the deliverable
-//! names: the veto-block-edits decision hooks, namespaced storage, and the
-//! permission API for the bypass node.
+//! Trusted-native callbacks receive connection-side metadata explicitly marked
+//! as sentinel context: it identifies this off-tick boundary without pretending
+//! to be an authoritative simulation tick or logical shard.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 use std::sync::Mutex;
 
+use anyhow::Context;
 use ferrumc_core::{DimensionId, PlayerId};
 use ferrumc_math::{BlockPos, ChunkPos, Vec3, WorldIntent};
 use ferrumc_observability::{PluginDecisionSnapshot, PluginDecisions};
 use ferrumc_permission::{Grant, PermissionNode, Resolution, Subject};
 use ferrumc_plugin_api::{
-    BlockBreakAttempt, BlockPlaceAttempt, ChatAttempt, CommandSink, IntentError, InteractAttempt,
-    PermissionApi, PluginEvent, PluginEventDecision, WorldView, MAX_EMITTED_INTENTS,
+    BlockBreakAttempt, BlockPlaceAttempt, ChatAttempt, CommandSink, EventKind, IntentError,
+    InteractAttempt, PermissionApi, PluginEvent, PluginEventDecision, WorldView,
+    MAX_EMITTED_INTENTS,
 };
 use ferrumc_plugin_block_rules::BlockRulesPlugin;
 use ferrumc_plugin_greeter::GreeterPlugin;
 use ferrumc_plugin_host::{
-    InMemoryPluginStorage, PluginHost, PluginLoader, PluginStorageBackend, ResolvedDecision,
-    ResolvedEventOutcome,
+    DispatchReport, InMemoryPluginStorage, NativeCapabilityDenial, NativeEventContext, PluginHost,
+    PluginStorageBackend, ResolvedDecision, ResolvedEventOutcome,
 };
+use ferrumc_plugin_loader::{PluginCapabilities, PluginCapability, PluginLoader};
 use ferrumc_plugin_spawn_protect::{bypass_node, SpawnProtect, SpawnProtectPlugin, CONFIG_KEY};
 
 use crate::command::build_command_tree_with_limits;
@@ -64,6 +61,16 @@ use crate::config::AppConfig;
 /// the configured [`AppConfig::default_permission_level`] (0 by default), so the
 /// gate is meaningful instead of granting every connection operator rights.
 pub(crate) const OPERATOR_PERMISSION_LEVEL: u8 = 4;
+
+/// Trusted-native capabilities the production connection boundary implements.
+///
+/// This is deliberately narrower than the ABI vocabulary. In particular, the
+/// app does not advertise authoritative world reads, permission reads, storage,
+/// command registration, or non-block vetoes until those facades are wired.
+const NATIVE_PLUGIN_CAPABILITIES: PluginCapabilities = PluginCapabilities::empty()
+    .with(PluginCapability::ReceiveEvents)
+    .with(PluginCapability::SubmitIntents)
+    .with(PluginCapability::VetoBlockEdits);
 
 /// A read-only registry mapping players to their permission [`Subject`].
 ///
@@ -244,20 +251,28 @@ impl CommandSink for CollectingSink {
 /// Despite the name (kept for the block-edit path it grew from) this is the
 /// connection's single entry point to the plugin host for *every* off-tick event:
 /// the `before_block_*` decisions, the `after_block_*` notifications, and the chat
-/// / interact / move events this milestone adds. All run the same way — synchronous,
-/// panic-isolated, under the mutex, with no lock held across an `.await`.
+/// / interact / move events this milestone adds. All run synchronously under the
+/// mutex, with no lock held across an `.await`.
 ///
 /// Shared behind an [`Arc`](std::sync::Arc) by every connection task (it lives on
 /// [`ConnContext`](crate::connection::ConnContext)). Connection tasks run
 /// concurrently, but [`PluginHost`] is `Send` and not `Sync` (plugins are called
 /// one at a time), so it is guarded by a [`std::sync::Mutex`]. The plugin calls
-/// are synchronous and panic-isolated — the lock is acquired, the decision is
-/// folded, and the lock is released *before* any async I/O (acks, resyncs,
-/// system-chat, intent routing) happens, so the guard is never held across an
-/// `.await`. This is a per-edit serialization point, not a broad lock over world
-/// state: it guards only the plugin registry, which owns no world.
+/// are synchronous: the lock is acquired, the decision is folded, and the lock
+/// is released *before* any async I/O (acks, resyncs, system-chat, intent
+/// routing) happens, so the guard is never held across an `.await`. Built-in
+/// plugin unwinds are caught and disable that plugin; trusted native callbacks
+/// retain the process-level failure limits documented by [`PluginHost`]. This is
+/// a per-edit serialization point, not a broad lock over world state: it guards
+/// only the plugin registry, which owns no world.
 pub(crate) struct BlockEventDispatcher {
     host: Mutex<PluginHost>,
+    /// Native failure warnings already emitted, keyed by stable plugin and hook.
+    ///
+    /// The set is bounded by the host's plugin limit multiplied by the finite
+    /// [`EventKind`] vocabulary. It prevents a client-triggerable failing
+    /// callback from amplifying the same warning on every event.
+    native_failure_warnings: Mutex<BTreeSet<(ferrumc_core::PluginId, EventKind)>>,
 }
 
 impl BlockEventDispatcher {
@@ -265,6 +280,7 @@ impl BlockEventDispatcher {
     pub(crate) fn new(host: PluginHost) -> Self {
         Self {
             host: Mutex::new(host),
+            native_failure_warnings: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -295,9 +311,10 @@ impl BlockEventDispatcher {
 
     /// Locks the host, recovering the guard even if a previous holder panicked.
     ///
-    /// Plugin panics are caught inside the host ([`std::panic::catch_unwind`]), so
-    /// the mutex is not poisoned in practice; recovering on the off chance keeps a
-    /// stray poison from wedging every future block edit (and avoids an `unwrap`).
+    /// Built-in plugin unwinds are caught inside the host
+    /// ([`std::panic::catch_unwind`]), so those callbacks do not poison this
+    /// mutex. Recovering from any other Rust-side poison keeps a stray panic from
+    /// wedging later dispatch; it does not contain native process failures.
     fn lock(&self) -> std::sync::MutexGuard<'_, PluginHost> {
         self.host
             .lock()
@@ -307,9 +324,11 @@ impl BlockEventDispatcher {
     /// Consults the loaded plugins about a pending block *placement*, returning the
     /// combined [`ResolvedDecision`] and any world-mutation intents to route.
     ///
-    /// Runs the synchronous, panic-isolated host dispatch under the lock and
-    /// returns owned data, so the caller does its async routing after the lock is
-    /// released.
+    /// Runs the synchronous host dispatch under the lock and returns owned data,
+    /// so the caller does its async routing after the lock is released. An
+    /// unwinding built-in voter is caught, disabled, and fails the decision
+    /// closed; trusted-native callbacks retain their documented process-level
+    /// failure limits.
     pub(crate) fn before_block_place(
         &self,
         attempt: &BlockPlaceAttempt,
@@ -317,9 +336,16 @@ impl BlockEventDispatcher {
     ) -> (ResolvedDecision, Vec<WorldIntent>) {
         let world = ConnectionWorldView::new(attempt.player(), None);
         let mut sink = CollectingSink::new();
-        let resolved =
-            self.lock()
-                .dispatch_block_place_decision(attempt, &world, &mut sink, permissions);
+        let resolved = self
+            .lock()
+            .dispatch_block_place_decision_with_native_context(
+                attempt,
+                NativeEventContext::connection_side(),
+                &world,
+                &mut sink,
+                permissions,
+            );
+        self.record_native_dispatch_failures(resolved.report());
         let (decision, mut emitted) = resolved.into_parts();
         // A Deny prevents the edit, so intents conditioned on it proceeding must not
         // run: the host already drops the folded `EmitIntents` on a Deny, and the
@@ -340,9 +366,16 @@ impl BlockEventDispatcher {
     ) -> (ResolvedDecision, Vec<WorldIntent>) {
         let world = ConnectionWorldView::new(attempt.player(), None);
         let mut sink = CollectingSink::new();
-        let resolved =
-            self.lock()
-                .dispatch_block_break_decision(attempt, &world, &mut sink, permissions);
+        let resolved = self
+            .lock()
+            .dispatch_block_break_decision_with_native_context(
+                attempt,
+                NativeEventContext::connection_side(),
+                &world,
+                &mut sink,
+                permissions,
+            );
+        self.record_native_dispatch_failures(resolved.report());
         let (decision, mut emitted) = resolved.into_parts();
         // A Deny prevents the edit; drop both intent channels (see
         // [`before_block_place`](Self::before_block_place)).
@@ -398,8 +431,8 @@ impl BlockEventDispatcher {
     /// subscribers emitted to route.
     ///
     /// `position` is the sender's last known position (the connection mirrors it),
-    /// surfaced to plugins through [`ConnectionWorldView`]. Runs the synchronous,
-    /// panic-isolated host dispatch under the lock and returns owned data, so the
+    /// surfaced to plugins through [`ConnectionWorldView`]. Runs the synchronous
+    /// built-in decision dispatch under the lock and returns owned data, so the
     /// caller does its async routing after the lock is released. On a `Deny` the
     /// intents are dropped (the dropped message must not still trigger side effects).
     pub(crate) fn before_chat(
@@ -494,18 +527,56 @@ impl BlockEventDispatcher {
     ) -> Vec<WorldIntent> {
         let world = ConnectionWorldView::new(player, position);
         let mut sink = CollectingSink::new();
-        self.lock()
-            .dispatch_event(event, &world, &mut sink, permissions);
+        let report = self.lock().dispatch_event_with_native_context(
+            event,
+            NativeEventContext::connection_side(),
+            &world,
+            &mut sink,
+            permissions,
+        );
+        self.record_native_dispatch_failures(&report);
         sink.into_intents()
+    }
+
+    /// Emits one operational diagnostic per trusted-native plugin and hook.
+    ///
+    /// The host makes failures observable through [`DispatchReport`] instead of
+    /// logging policy at the library boundary. The application must consume that
+    /// report: otherwise a malformed or capability-denied callback could keep
+    /// failing block edits closed with no clue in the server log.
+    fn record_native_dispatch_failures(&self, report: &DispatchReport) {
+        let mut warned = self
+            .native_failure_warnings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for failure in report.native_failures() {
+            let key = (failure.plugin_id().clone(), failure.hook());
+            if !warned.insert(key) {
+                continue;
+            }
+            let denied_capability = report
+                .native_capability_denials()
+                .iter()
+                .find(|denial| denial.plugin_id() == failure.plugin_id())
+                .map(NativeCapabilityDenial::capability);
+            tracing::warn!(
+                plugin = %failure.plugin_id(),
+                hook = ?failure.hook(),
+                failure = ?failure.failure(),
+                ?denied_capability,
+                "trusted-native plugin callback failed during connection-side dispatch"
+            );
+        }
     }
 }
 
 /// Everything a connection consults during the play phase.
 ///
 /// Shared behind an [`Arc`](std::sync::Arc) by every connection: the
-/// spawn-protection [`SpawnProtect`] veto, the [`PermissionRegistry`], the
-/// command tree, the spawn position teleports return to, and the permission
-/// level players act at.
+/// configured [`SpawnProtect`] value, the [`PermissionRegistry`], the command
+/// tree, the spawn position teleports return to, and the permission level
+/// players act at. The spawn-protection value is informational; only an active
+/// plugin enforces it.
 pub(crate) struct PlayPolicy {
     guard: SpawnProtect,
     permissions: PermissionRegistry,
@@ -518,13 +589,13 @@ pub(crate) struct PlayPolicy {
 }
 
 impl PlayPolicy {
-    /// Returns the effective spawn-protection policy seeded into the plugin.
+    /// Returns the configured spawn-protection policy.
     ///
-    /// Informational only: enforcement now lives in the spawn-protect plugin's
-    /// `before_block_*` decision hooks (run through the
-    /// [`BlockEventDispatcher`]), not in a bespoke connection-side veto. This
-    /// accessor exposes the configuration that was read back from the plugin's
-    /// namespaced storage, for diagnostics and tests.
+    /// Informational only: when built-ins are active, this is the value read back
+    /// from the spawn-protect plugin's namespaced storage. When built-ins are
+    /// disabled, it is the unapplied configuration seed. Enforcement lives only
+    /// in active plugins' `before_block_*` decision hooks, not in a bespoke
+    /// connection-side veto.
     pub(crate) fn guard(&self) -> SpawnProtect {
         self.guard
     }
@@ -558,8 +629,8 @@ impl PlayPolicy {
 /// Builds the [`PlayPolicy`] and the long-lived [`BlockEventDispatcher`] for a
 /// configured server.
 ///
-/// Builds a persistent [`PluginHost`] and registers + enables the in-process
-/// plugins that participate at the intent boundary:
+/// Builds a persistent [`PluginHost`] and optionally registers + enables the
+/// built-in plugins that participate at the intent boundary:
 ///
 /// - [`SpawnProtectPlugin`], which seeds the spawn-protection configuration
 ///   (centre = spawn column, radius = [`AppConfig::spawn_protect_radius`]) into
@@ -572,13 +643,22 @@ impl PlayPolicy {
 /// - [`BlockRulesPlugin`], the second sample, which denies placing a configured
 ///   block and rewrites another (proving `Deny` and `Replace`).
 ///
+/// If [`AppConfig::plugins_dir`] is configured, each immediate-child directory
+/// containing `plugin.toml` is treated as a strict bundle candidate; other
+/// child directories are ignored. Candidates are validated, registered, and
+/// enabled in deterministic plugin-id order on that same host. Any load,
+/// duplicate-id, initialization, or enable failure aborts server startup before
+/// it accepts connections. A library mapped before a later failure remains
+/// process-resident, as required by the trusted-native lifetime contract.
+///
 /// The host is moved into the returned [`BlockEventDispatcher`], which every
 /// connection shares to run the decision hooks off the simulation tick.
 ///
 /// # Errors
 ///
-/// Returns an error if a plugin cannot be registered or enabled, if reading the
-/// seeded configuration back fails, or if the bypass permission node is invalid.
+/// Returns an error if a plugin bundle cannot be loaded, registered, or enabled,
+/// if reading the built-in spawn-protection configuration back fails, or if the
+/// bypass permission node is invalid.
 pub(crate) fn build_play_policy(
     config: &AppConfig,
 ) -> anyhow::Result<(PlayPolicy, BlockEventDispatcher)> {
@@ -593,20 +673,29 @@ pub(crate) fn build_play_policy(
     let storage = InMemoryPluginStorage::new();
     let mut host = PluginHost::new(Box::new(storage.clone()));
 
-    let spawn_protect_id = host.register(Box::new(SpawnProtectPlugin::new(seed)))?;
-    host.enable(&spawn_protect_id)?;
-    let guard = storage
-        .get(&spawn_protect_id, CONFIG_KEY)?
-        .and_then(|bytes| SpawnProtect::from_bytes(&bytes))
-        .unwrap_or(seed);
+    let guard = if config.builtin_plugins() {
+        let spawn_protect_id = host.register(Box::new(SpawnProtectPlugin::new(seed)))?;
+        host.enable(&spawn_protect_id)?;
+        let guard = storage
+            .get(&spawn_protect_id, CONFIG_KEY)?
+            .and_then(|bytes| SpawnProtect::from_bytes(&bytes))
+            .unwrap_or(seed);
 
-    let block_rules_id = host.register(Box::new(BlockRulesPlugin::new()))?;
-    host.enable(&block_rules_id)?;
+        let block_rules_id = host.register(Box::new(BlockRulesPlugin::new()))?;
+        host.enable(&block_rules_id)?;
 
-    // The greeter sample exercises the event surface: greet on join, filter a
-    // banned chat word (Deny), and observe move/interact.
-    let greeter_id = host.register(Box::new(GreeterPlugin::new()))?;
-    host.enable(&greeter_id)?;
+        // The greeter sample exercises the event surface: greet on join, filter a
+        // banned chat word (Deny), and observe move/interact.
+        let greeter_id = host.register(Box::new(GreeterPlugin::new()))?;
+        host.enable(&greeter_id)?;
+        guard
+    } else {
+        seed
+    };
+
+    if let Some(dir) = config.plugins_dir() {
+        load_trusted_native_plugins(&mut host, dir)?;
+    }
 
     let permissions = PermissionRegistry::from_bypass_names(config.spawn_protect_bypass())?;
     let ops = config
@@ -626,29 +715,32 @@ pub(crate) fn build_play_policy(
     tracing::debug!(
         center = ?policy.guard().center(),
         radius = policy.guard().radius(),
-        "spawn-protection policy loaded from plugin storage"
+        builtin_plugins = config.builtin_plugins(),
+        "spawn-protection configuration prepared"
     );
     Ok((policy, BlockEventDispatcher::new(host)))
 }
 
-/// Scans `dir` for dynamic (`cdylib`) plugins and loads each across the C ABI,
-/// returning the number that loaded successfully.
-///
-/// This proves the M28 dynamic loader runs from the application: every library is
-/// attempted, failures are logged and skipped, and the loaded plugins are
-/// registered with a throwaway host (they carry no event hook across the ABI, so
-/// nothing else drives them — see the module docs).
-///
-/// # Errors
-///
-/// Returns an error only if `dir` itself cannot be scanned.
-pub fn load_plugins(dir: &Path) -> anyhow::Result<usize> {
-    let mut host = PluginHost::in_memory();
-    let report = PluginLoader::new().load_dir(dir, &mut host)?;
-    for (path, err) in report.failed() {
-        tracing::warn!(path = %path.display(), %err, "plugin failed to load");
+/// Loads and enables every configured trusted-native bundle on the live host.
+fn load_trusted_native_plugins(host: &mut PluginHost, dir: &std::path::Path) -> anyhow::Result<()> {
+    let loader = PluginLoader::current(NATIVE_PLUGIN_CAPABILITIES)
+        .context("constructing the trusted-native plugin loader policy")?;
+    let plugins = loader
+        .load_directory(dir)
+        .with_context(|| format!("loading plugin bundles from {}", dir.display()))?;
+    let count = plugins.len();
+
+    for plugin in plugins.into_plugins() {
+        let manifest_id = plugin.manifest().id().to_owned();
+        let id = host
+            .register_trusted_native(plugin)
+            .with_context(|| format!("registering trusted-native plugin {manifest_id}"))?;
+        host.enable(&id)
+            .with_context(|| format!("enabling trusted-native plugin {manifest_id}"))?;
     }
-    Ok(report.loaded_count())
+
+    tracing::info!(plugins = count, dir = %dir.display(), "enabled trusted-native plugins");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -710,13 +802,26 @@ mod tests {
         assert_eq!(policy.permission_level(PlayerId::offline("Random")), 0);
     }
 
-    #[test]
-    fn load_plugins_errors_on_missing_directory() {
-        let err = load_plugins(Path::new("/definitely/not/here/ferrumc")).expect_err("missing dir");
-        assert!(err.to_string().contains("plugin directory") || err.to_string().contains("scan"));
-    }
-
     // --- BlockEventDispatcher: the wired intent boundary ----------------------
+    #[test]
+    fn disabling_builtins_registers_no_plugins_and_applies_no_block_rule() {
+        let config = AppConfig::from_toml_str("builtin_plugins = false")
+            .expect("built-in plugin toggle is valid");
+        let (policy, dispatcher) = build_play_policy(&config).expect("policy builds");
+        let permissions = PermissionFacade::new(policy.permissions());
+        let (decision, emitted) = dispatcher.before_block_place(
+            &BlockPlaceAttempt::new(
+                PlayerId::offline("Steve"),
+                BlockPos::new(100, 64, 100),
+                ferrumc_plugin_block_rules::GLASS_BLOCK_STATE_ID,
+            ),
+            &permissions,
+        );
+
+        assert!(dispatcher.decision_snapshots().is_empty());
+        assert_eq!(decision, ResolvedDecision::Allow);
+        assert!(emitted.is_empty());
+    }
 
     #[test]
     fn dispatcher_denies_a_protected_break() {

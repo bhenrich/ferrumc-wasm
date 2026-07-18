@@ -52,8 +52,11 @@ ferrumc-plugin-api = { workspace = true }
 # The plugin host: dynamic loader plus the in-process registry that drives the
 # spawn-protect and block-rules plugins' block-decision hooks.
 ferrumc-plugin-host = { workspace = true }
-# The spawn-protection plugin: loaded dynamically (cdylib) and driven in-process
-# (rlib) for its veto policy, config, and bypass permission node.
+# Strict manifest/hash/target validation and lifecycle factories for trusted
+# native bundles registered into the same long-lived host.
+ferrumc-plugin-loader = { workspace = true }
+# The built-in spawn-protection plugin: driven in-process for its veto policy,
+# config, and bypass permission node.
 ferrumc-plugin-spawn-protect = { workspace = true }
 # The block-rules sample plugin (deny bedrock, glass -> tinted glass), driven
 # in-process to prove the Deny + Replace decision outcomes.
@@ -105,8 +108,8 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 # Build the player UUID carried by the client's Login Start packet.
 uuid = { workspace = true }
-# Stages the built spawn-protect cdylib in an isolated /plugins directory, and
-# backs the world-persistence integration test with a throwaway redb directory.
+# Backs persistence and configuration integration tests with throwaway
+# directories.
 tempfile = { workspace = true }
 # Reopen the persisted redb world store directly and reconstruct chunks to assert
 # the persistence integration test's saved-block / zero-overlay properties.
@@ -120,6 +123,9 @@ ferrumc-testkit = { workspace = true }
 # Opens the test-local player table directly to preserve and inspect a malformed
 # backend record that the typed storage API correctly refuses to decode.
 redb = { workspace = true }
+# Hash the exact dynamic-library bytes copied into the strict plugin bundle used
+# by the production-socket trusted-native regression.
+sha2 = "0.10"
 
 [lints]
 workspace = true

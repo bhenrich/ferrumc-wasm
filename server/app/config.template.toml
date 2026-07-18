@@ -94,8 +94,15 @@
 # build a custom binary that wants the in-memory store.
 # world_dir = "world"
 
-# Directory scanned for dynamic (cdylib) plugins at startup. Omitted means no
-# dynamic plugins are loaded.
+# Whether the built-in spawn-protect, block-rules, and greeter plugins are
+# registered. Set this to false when replacing them with dynamic bundles that
+# use the same stable plugin ids.
+# builtin_plugins = true
+
+# Directory containing strict trusted-native plugin bundles. Each immediate child
+# with a plugin.toml is treated as a candidate; other child directories are
+# ignored. Every candidate must name its hash-pinned dynamic library. Omitted
+# means no dynamic plugins are loaded.
 # plugins_dir = "plugins"
 
 # --- Observability dashboard ---
