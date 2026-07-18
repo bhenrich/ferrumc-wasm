@@ -3,10 +3,10 @@
 /// The schema version stamped on a persisted record.
 ///
 /// Every record type ([`crate::ChunkRecord`], [`crate::EntityRecord`],
-/// [`crate::PlayerRecord`]) carries one of these so a future backend can detect
-/// data written by an older build and migrate or reject it, rather than
-/// misreading a changed layout. Storage preserves the value verbatim on
-/// save/load; it does not interpret it.
+/// [`crate::PlayerRecord`]) carries one of these so its owning layer can detect
+/// and refuse incompatible payload metadata rather than misreading it. The
+/// pre-alpha policy does not migrate persisted records. Storage preserves the
+/// value verbatim on save/load; it does not interpret it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SchemaVersion(u32);
 

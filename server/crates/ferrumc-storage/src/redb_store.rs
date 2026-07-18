@@ -52,7 +52,7 @@ use crate::{JournalAppendReceipt, JournalBatchId};
 /// Distinct from a record's [`crate::SchemaVersion`]: this versions the overall
 /// table/byte layout of the database file. Opening a file written under a
 /// different value fails rather than risking a misread.
-const STORE_FORMAT_VERSION: u64 = 2;
+const STORE_FORMAT_VERSION: u64 = 3;
 
 /// Metadata key under which [`STORE_FORMAT_VERSION`] is stored.
 const META_FORMAT_KEY: &str = "format_version";
@@ -921,7 +921,8 @@ mod tests {
     use ferrumc_core::{DimensionId, WorldId};
     use ferrumc_math::{BlockPos, ChunkPos};
     use ferrumc_world::{
-        BlockEntity, BlockStateId, Chunk, Sign, SignKind, MAX_BLOCK_ENTITY_PAYLOAD_LEN,
+        BlockEntity, BlockStateId, ChestInventory, Chunk, Sign, SignKind,
+        MAX_BLOCK_ENTITY_PAYLOAD_LEN,
     };
     use tempfile::TempDir;
     use tokio::sync::Barrier;
@@ -956,6 +957,15 @@ mod tests {
                 .expect("seed format version");
         }
         txn.commit().expect("commit format marker");
+    }
+
+    fn stored_format_version(path: &Path) -> Option<u64> {
+        let db = Database::open(path).expect("open raw store");
+        let txn = db.begin_read().expect("read transaction");
+        let meta = txn.open_table(META_TABLE).expect("metadata table");
+        meta.get(META_FORMAT_KEY)
+            .expect("read format marker")
+            .map(|guard| guard.value())
     }
 
     fn seed_fixture_data_tables(txn: &redb::WriteTransaction, include_chunk: bool) {
@@ -1252,6 +1262,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redb_overlay_reopen_preserves_schema_two_sign_and_chest() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("overlay.redb");
+        let pos = ChunkPos::new(-4, 7);
+        let key = chunk_key(pos);
+        let sign_pos = pos.origin_block(64);
+        let chest_pos = BlockPos::new(sign_pos.x() + 1, 70, sign_pos.z() + 1);
+        let mut sign = Sign::new(SignKind::Sign);
+        sign.set_face_lines(
+            true,
+            [
+                "schema".to_owned(),
+                "metadata".to_owned(),
+                String::new(),
+                String::new(),
+            ],
+        );
+        let mut chunk = Chunk::new(pos);
+        chunk
+            .set_block_entity(sign_pos, BlockEntity::Sign(sign))
+            .expect("set sign");
+        chunk
+            .set_block_entity(chest_pos, BlockEntity::Chest(ChestInventory::new()))
+            .expect("set chest");
+        chunk.mark_persist_dirty(sign_pos);
+        let record = ChunkOverlayRecord::from_chunk(SchemaVersion::new(2), pos, &chunk, 41);
+
+        {
+            let store = RedbStore::open(&path).expect("open store");
+            store
+                .save_chunk_overlays(vec![(key, record.clone())])
+                .await
+                .expect("save overlay");
+        }
+
+        let reopened = RedbStore::open(&path).expect("reopen current store");
+        let loaded = reopened
+            .load_chunk_overlay(key)
+            .await
+            .expect("load overlay")
+            .expect("stored overlay");
+        assert_eq!(loaded, record);
+        assert_eq!(loaded.schema_version(), SchemaVersion::new(2));
+        assert_eq!(loaded.block_entity_count(), 2);
+    }
+
+    #[tokio::test]
     async fn failed_chunk_batch_encoding_rolls_back_prior_replacement() {
         let dir = TempDir::new().expect("temp dir");
         let store = RedbStore::open(dir.path().join("chunk.redb")).expect("open store");
@@ -1304,8 +1361,8 @@ mod tests {
     }
 
     #[test]
-    fn current_store_format_is_v2() {
-        assert_eq!(STORE_FORMAT_VERSION, 2);
+    fn current_store_format_is_v3() {
+        assert_eq!(STORE_FORMAT_VERSION, 3);
     }
 
     #[test]
@@ -1314,16 +1371,27 @@ mod tests {
         for (name, version) in [
             ("bogus.redb", 0),
             ("pre-packet-31.redb", 1),
+            ("pre-overlay-envelope.redb", 2),
             ("future.redb", STORE_FORMAT_VERSION + 1),
+            ("far-future.redb", u64::MAX),
         ] {
             let path = dir.path().join(name);
             seed_store_version(&path, version);
             assert_incompatible_open(&path);
+            assert_eq!(
+                stored_format_version(&path),
+                Some(version),
+                "refusing {name} must not rewrite its format marker"
+            );
         }
 
         let current_path = dir.path().join("current.redb");
         drop(RedbStore::open(&current_path).expect("create current store"));
         drop(RedbStore::open(&current_path).expect("current store must reopen"));
+        assert_eq!(
+            stored_format_version(&current_path),
+            Some(STORE_FORMAT_VERSION)
+        );
 
         assert_missing_headers_are_refused(dir.path());
         assert_incomplete_current_catalog_is_refused(dir.path());

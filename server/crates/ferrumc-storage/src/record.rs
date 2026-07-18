@@ -1,7 +1,8 @@
 //! Versioned record types that the store persists and returns.
 //!
-//! Each record carries a [`SchemaVersion`] so a future backend can detect and
-//! migrate data written by an older build. A [`ChunkRecord`] holds a structured
+//! Each record carries a [`SchemaVersion`] so its owning layer can detect and
+//! refuse payload metadata from an incompatible build. The pre-alpha policy
+//! does not migrate persisted records. A [`ChunkRecord`] holds a structured
 //! [`Chunk`] because the world model lives in a dependency of this crate;
 //! entities and players have no shared model yet, so their records carry an
 //! opaque, length-bounded serialized payload owned by the simulation layer.
@@ -114,15 +115,6 @@ pub const MAX_OVERLAY_SECTIONS: usize = SECTION_COUNT;
 /// record cannot drive an unbounded reservation.
 pub const MAX_OVERLAY_BLOCK_ENTITIES: usize = MAX_BLOCK_ENTITIES;
 
-/// First overlay [`SchemaVersion`] whose on-disk encoding carries a block-entity
-/// section.
-///
-/// Overlays written under an earlier version (v2, block states only) carry no
-/// block-entity bytes; the codec keys its block-entity (de)serialization on this
-/// threshold so an old record loads with an empty block-entity set instead of
-/// being misread. The simulation stamps current overlays at or above this version.
-pub const OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES: u32 = 3;
-
 /// One modified chunk section inside a [`ChunkOverlayRecord`].
 ///
 /// Holds the section's full dense block-state list (`SECTION_VOLUME` entries in
@@ -182,11 +174,13 @@ impl OverlaySection {
 /// Unlike block states (carried only for the persist-dirty sections, with the
 /// clean sections reconstructed from the regenerated baseline), block entities
 /// have **no** baseline source — the flat generator produces none — so an overlay
-/// carries the chunk's **entire** block-entity set whenever it is emitted. Each is
-/// stored as its [`BlockPos`] plus an opaque, length-bounded payload produced by
-/// `ferrumc-world` (storage stays ignorant of sign/chest internals); the payload
-/// is decoded back into a block entity by [`apply_to_chunk`](Self::apply_to_chunk),
-/// which skips an individually corrupt one rather than failing the chunk load.
+/// attempts to carry every block entity whenever it is emitted. Each is stored
+/// as its [`BlockPos`] plus an opaque payload produced by `ferrumc-world`
+/// (storage stays ignorant of sign/chest internals). The current infallible
+/// capture omits an entity whose encoded payload exceeds
+/// [`MAX_BLOCK_ENTITY_PAYLOAD_LEN`]; representable payloads are decoded by
+/// [`apply_to_chunk`](Self::apply_to_chunk), which skips an individually corrupt
+/// one rather than failing the chunk load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkOverlayRecord {
     schema_version: SchemaVersion,
@@ -196,7 +190,7 @@ pub struct ChunkOverlayRecord {
     updated_at_tick: u64,
     /// The chunk's block entities as `(position, opaque payload)`, bounded by
     /// [`MAX_OVERLAY_BLOCK_ENTITIES`] entries and [`MAX_BLOCK_ENTITY_PAYLOAD_LEN`]
-    /// bytes each. Empty for a record written under a pre-v3 schema.
+    /// bytes each.
     block_entities: Vec<(BlockPos, Vec<u8>)>,
 }
 
@@ -214,12 +208,13 @@ impl ChunkOverlayRecord {
     /// *flush* on [`Chunk::persist_dirty_sections`]`.any()`, but the *capture* reads
     /// the cumulative [`Chunk::persist_edited_sections`] (a superset of that gate).
     ///
-    /// The chunk's **entire** block-entity set is captured (not just those in the
-    /// dirty sections) whenever `schema_version` is at least
-    /// [`OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES`], because block entities have no
-    /// baseline to reconstruct from. Each is serialized with `ferrumc-world` into a
-    /// bounded payload; the capture is bounded to [`MAX_OVERLAY_BLOCK_ENTITIES`]
-    /// entries (a chunk already caps its own block-entity count there).
+    /// Every representable block entity is captured regardless of dirty section,
+    /// because block entities have no baseline to reconstruct from.
+    /// `schema_version` remains caller-owned payload metadata and does not select
+    /// the record grammar. Each entity is serialized with `ferrumc-world`; an
+    /// encoded payload over [`MAX_BLOCK_ENTITY_PAYLOAD_LEN`] is omitted rather
+    /// than creating a record the decoder must reject. The entry count is bounded
+    /// by [`MAX_OVERLAY_BLOCK_ENTITIES`] (a chunk already enforces the same cap).
     #[must_use]
     pub fn from_chunk(
         schema_version: SchemaVersion,
@@ -247,21 +242,19 @@ impl ChunkOverlayRecord {
         }
 
         let mut block_entities = Vec::new();
-        if schema_version.get() >= OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES {
-            for (be_pos, entity) in chunk.block_entities() {
-                if block_entities.len() >= MAX_OVERLAY_BLOCK_ENTITIES {
-                    break;
-                }
-                let mut payload = Vec::new();
-                encode_block_entity(entity, &mut payload);
-                // A real block entity encodes well under the cap; defensively skip a
-                // pathological oversized payload rather than persisting a blob the
-                // decoder would reject anyway.
-                if payload.len() > MAX_BLOCK_ENTITY_PAYLOAD_LEN {
-                    continue;
-                }
-                block_entities.push((be_pos, payload));
+        for (be_pos, entity) in chunk.block_entities() {
+            if block_entities.len() >= MAX_OVERLAY_BLOCK_ENTITIES {
+                break;
             }
+            let mut payload = Vec::new();
+            encode_block_entity(entity, &mut payload);
+            // The infallible capture cannot report a representability failure;
+            // omit an oversized payload rather than persist bytes the decoder
+            // must reject. A fallible capture API is tracked as durability debt.
+            if payload.len() > MAX_BLOCK_ENTITY_PAYLOAD_LEN {
+                continue;
+            }
+            block_entities.push((be_pos, payload));
         }
 
         Self {

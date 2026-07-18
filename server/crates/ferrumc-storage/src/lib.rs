@@ -19,7 +19,7 @@ pub use memory::InMemoryStore;
 pub use record::{
     BlockMutationLogRecord, ChunkOverlayRecord, ChunkRecord, EntityRecord, MutationActor,
     MutationLogCause, PlayerRecord, MAX_ENTITY_DATA_LEN, MAX_OVERLAY_BLOCK_ENTITIES,
-    MAX_OVERLAY_SECTIONS, MAX_PLAYER_DATA_LEN, OVERLAY_SCHEMA_WITH_BLOCK_ENTITIES,
+    MAX_OVERLAY_SECTIONS, MAX_PLAYER_DATA_LEN,
 };
 pub use redb_store::RedbStore;
 pub use schema::SchemaVersion;
