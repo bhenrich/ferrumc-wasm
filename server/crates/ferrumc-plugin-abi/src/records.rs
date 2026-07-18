@@ -153,17 +153,23 @@ impl FcEventKind {
     /// Payload: one player id.
     pub const PLAYER_LEAVE: Self = Self(2);
 
-    /// A committed block-break event.
+    /// A block-break notification.
     ///
     /// Its payload is one [`FcBlockBreakEventPayloadV1`] record.
     pub const BLOCK_BREAK: Self = Self(3);
 
-    /// A committed block-placement event.
+    /// A block placement accepted at the intent boundary and routed.
+    ///
+    /// The simulation may still reject the edit, so this is not a
+    /// tick-confirmed mutation event.
     ///
     /// Payload: player id, block position, then a `u32` block-state id.
     pub const AFTER_BLOCK_PLACE: Self = Self(4);
 
-    /// A committed block-break event delivered after mutation routing.
+    /// A block break accepted at the intent boundary and routed.
+    ///
+    /// The simulation may still reject the edit, so this is not a
+    /// tick-confirmed mutation event.
     ///
     /// Its payload is one [`FcBlockBreakEventPayloadV1`] record.
     pub const AFTER_BLOCK_BREAK: Self = Self(5);
@@ -899,7 +905,11 @@ impl FcCommandV1 {
     }
 }
 
-/// Payload for [`FcEventKind::BLOCK_BREAK`].
+/// Shared payload for block-break events.
+///
+/// Used by [`FcEventKind::BLOCK_BREAK`],
+/// [`FcEventKind::AFTER_BLOCK_BREAK`], and
+/// [`FcEventKind::BLOCK_BREAK_ATTEMPT`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FcBlockBreakEventPayloadV1 {
@@ -912,7 +922,7 @@ impl FcBlockBreakEventPayloadV1 {
     /// Exact size of this ABI v1 payload.
     pub const STRUCT_SIZE: u32 = 36;
 
-    /// Creates a committed block-break payload.
+    /// Creates a block-break event payload.
     pub const fn new(player: FcPlayerIdV1, pos: FcBlockPosV1) -> Self {
         Self {
             header: FcAbiHeader::current(Self::STRUCT_SIZE),
@@ -931,7 +941,7 @@ impl FcBlockBreakEventPayloadV1 {
         self.player
     }
 
-    /// Returns the committed block position.
+    /// Returns the block position.
     pub const fn pos(self) -> FcBlockPosV1 {
         self.pos
     }
