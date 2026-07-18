@@ -33,12 +33,16 @@
 //! - [`DurabilityFaultBattery`]: a fixed, seeded matrix that applies those
 //!   cutpoints to world, player, and journal writes and returns exact attempted,
 //!   committed, outcome, and trace reports.
+//! - [`DurabilitySoakHarness`]: a 43-step deterministic lifecycle soak that
+//!   composes the complete battery with capacity-one edit/persist/restart cycles
+//!   and a canonical end-state digest.
 //! - [`PluginTestHost`]: deterministic, bounded shared-SDK lifecycle and event
 //!   replay through compiled-in and trusted native plugin packaging, with
 //!   comparable semantic effects, final state, and canonical digests.
 
 mod client;
 mod durability_battery;
+mod durability_soak;
 mod fault_store;
 mod hex;
 mod oracle;
@@ -50,6 +54,12 @@ pub use client::ScriptedClient;
 pub use durability_battery::{
     DurabilityBatteryError, DurabilityBatteryReport, DurabilityCaseReport, DurabilityFaultBattery,
     DurabilityOutcome, DurabilityScenario, DurabilitySurface,
+};
+pub use durability_soak::{
+    DurabilitySoakAction, DurabilitySoakDigest, DurabilitySoakEndState, DurabilitySoakError,
+    DurabilitySoakFault, DurabilitySoakHarness, DurabilitySoakReport, DurabilitySoakScenario,
+    DurabilitySoakStep, DurabilitySoakStepOutcome, DURABILITY_SOAK_CYCLES,
+    DURABILITY_SOAK_PENDING_CAPACITY, DURABILITY_SOAK_STEPS, MAX_DURABILITY_SOAK_STORE_TRACE,
 };
 pub use fault_store::{
     FaultGate, FaultInjectingStore, FaultOperation, FaultStage, FaultStoreAttempt,

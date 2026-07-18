@@ -6,10 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Async trait implementation and deterministic synchronization gates for the
-# fault-injecting storage harness. No wall-clock sleeps are used.
+# Async trait implementation, deterministic synchronization gates, and paused
+# virtual-time deadlines for storage harnesses. No wall-clock sleeps are used.
 async-trait = "0.1"
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 # Typed server errors and the storage contract/records exercised by durability
 # tests in downstream crates.
 ferrumc-core.workspace = true
