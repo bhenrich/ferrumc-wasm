@@ -41,16 +41,30 @@
 //! lives in one audited `#[allow(unsafe_code)]` module; see
 //! `docs/safety/ferrumc-plugin-host.md`.
 //!
+//! ## Trusted-native ABI runtime
+//!
 //! The current trusted-native path accepts
 //! [`LoadedPlugin`](ferrumc_plugin_loader::LoadedPlugin) through
-//! [`PluginHost::register_trusted_native`]. Callers use
-//! [`PluginHost::dispatch_event_with_native_context`] to provide tick/shard
-//! metadata. Native callbacks can subscribe to events and stage the `MESSAGE`
-//! and `TELEPORT` intent subset in a bounded transaction; after callback
-//! success, those effects are submitted to the same caller-owned
-//! [`CommandSink`](ferrumc_plugin_api::CommandSink) used by compiled-in
-//! plugins. The context-free [`PluginHost::dispatch_event`] deliberately does
-//! not fabricate native ABI metadata.
+//! [`PluginHost::register_trusted_native`]. It supports event subscription,
+//! the `MESSAGE` and `TELEPORT` intent subset, and vetoable block edits through
+//! [`ferrumc_plugin_api::Capability::ReceiveEvents`],
+//! [`ferrumc_plugin_api::Capability::SubmitIntents`], and
+//! [`ferrumc_plugin_api::Capability::VetoBlockEdits`], respectively. Callers
+//! use [`PluginHost::dispatch_event_with_native_context`],
+//! [`PluginHost::dispatch_block_place_decision_with_native_context`], or
+//! [`PluginHost::dispatch_block_break_decision_with_native_context`] to provide
+//! a [`NativeEventContext`]. That context can carry caller-attested simulation
+//! metadata or the documented connection-side sentinels: tick zero and an
+//! invalid shard resource handle.
+//!
+//! Native callbacks stage intents and exactly one block decision in a bounded
+//! transaction. After callback success, intents are submitted to the same
+//! caller-owned [`CommandSink`](ferrumc_plugin_api::CommandSink) used by
+//! compiled-in plugins, and the native decision participates in the same
+//! registration-order fold. The context-free [`PluginHost::dispatch_event`]
+//! deliberately does not fabricate native ABI metadata; context-free block
+//! decision dispatch likewise fails closed when an enabled trusted-native veto
+//! plugin cannot be called.
 //!
 //! The host does not catch panics inside trusted native code. When cooperating
 //! SDK or plugin code returns normally with

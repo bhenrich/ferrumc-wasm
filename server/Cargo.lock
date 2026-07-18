@@ -582,6 +582,7 @@ dependencies = [
  "ferrumc-plugin-abi",
  "ferrumc-plugin-api",
  "ferrumc-plugin-loader",
+ "ferrumc-registry",
  "libloading",
  "semver",
  "serde_json",

@@ -1,25 +1,29 @@
 #![forbid(unsafe_code)]
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use ferrumc_core::{DimensionId, PlayerId, PluginId, TextComponent, Tick, WorldId};
 use ferrumc_math::{BlockPos, ChunkPos, ShardPos, Vec3};
 use ferrumc_permission::{PermissionNode, Resolution};
 use ferrumc_plugin_abi::FC_CAPABILITY_DENIED;
 use ferrumc_plugin_api::{
-    Capability, CapabilityManifest, CommandSink, EventContext, EventKind, IntentError,
-    PermissionApi, Plugin, PluginError, PluginEvent, PluginMetadata, SetupContext, Version,
-    WorldIntent, WorldView,
+    BlockPlaceAttempt, Capability, CapabilityManifest, CommandSink, EventContext, EventKind,
+    IntentError, PermissionApi, Plugin, PluginBlockDecision, PluginError, PluginEvent,
+    PluginMetadata, SetupContext, Version, WorldIntent, WorldView,
 };
 use ferrumc_plugin_host::{
     DisableReason, HostConfig, HostError, InMemoryPluginStorage, NativeCallbackFailure,
-    NativeEventContext, PluginHost, PluginState, PluginStats,
+    NativeEventContext, PluginHost, PluginState, PluginStats, ResolvedDecision,
 };
 use ferrumc_plugin_loader::{
     LoadedPlugin, PluginCapabilities, PluginCapability, PluginLoader as TrustedNativeLoader,
 };
+use sha2::{Digest, Sha256};
 
 #[path = "../../../plugins/ferrumc-plugin-fixture-dynamic/tests/support/mod.rs"]
 mod fixture_support;
@@ -157,6 +161,46 @@ impl Plugin for MessagePlugin {
     }
 }
 
+struct CountingDecisionPlugin {
+    id: &'static str,
+    decision: PluginBlockDecision,
+    place_calls: Arc<AtomicUsize>,
+}
+
+impl CountingDecisionPlugin {
+    fn boxed(
+        id: &'static str,
+        decision: PluginBlockDecision,
+        place_calls: Arc<AtomicUsize>,
+    ) -> Box<dyn Plugin> {
+        Box::new(Self {
+            id,
+            decision,
+            place_calls,
+        })
+    }
+}
+
+impl Plugin for CountingDecisionPlugin {
+    fn metadata(&self) -> PluginMetadata {
+        PluginMetadata::new(
+            PluginId::new(self.id),
+            self.id,
+            Version::new(1, 0, 0),
+            CapabilityManifest::empty().with(Capability::VetoBlockEdits),
+        )
+    }
+
+    fn before_block_place(
+        &mut self,
+        _event: &BlockPlaceAttempt,
+        _context: &mut EventContext<'_>,
+    ) -> PluginBlockDecision {
+        self.place_calls.fetch_add(1, Ordering::Relaxed);
+        self.decision.clone()
+    }
+}
+
 #[test]
 fn compiled_and_trusted_native_hooks_have_one_deterministic_order() {
     let (native, scratch) = load_fixture("deterministic-order");
@@ -240,6 +284,154 @@ fn compiled_and_trusted_native_hooks_have_one_deterministic_order() {
             &["compiled first", DYNAMIC_MESSAGE, "compiled second"],
         );
     }
+
+    drop(host);
+    cleanup_loaded_bundle(&scratch);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn trusted_native_block_votes_share_registration_order_and_fail_closed() {
+    use ferrumc_registry::block_state::ids::{BEDROCK, GLASS, STONE, TINTED_GLASS};
+
+    let (native, scratch) = load_block_rules();
+    let before_calls = Arc::new(AtomicUsize::new(0));
+    let after_calls = Arc::new(AtomicUsize::new(0));
+    let mut host = PluginHost::with_config(
+        Box::new(InMemoryPluginStorage::new()),
+        HostConfig::new().with_max_plugins(3),
+    );
+    let before = host
+        .register(CountingDecisionPlugin::boxed(
+            "compiled-before-native",
+            PluginBlockDecision::Replace {
+                block_state_id: 101,
+            },
+            Arc::clone(&before_calls),
+        ))
+        .expect("register compiled plugin before native");
+    let native_id = host
+        .register_trusted_native(native)
+        .expect("register trusted native block-rules plugin");
+    let after = host
+        .register(CountingDecisionPlugin::boxed(
+            "compiled-after-native",
+            PluginBlockDecision::Replace {
+                block_state_id: 202,
+            },
+            Arc::clone(&after_calls),
+        ))
+        .expect("register compiled plugin after native");
+
+    // Enable order is deliberately unrelated to the one registration order.
+    host.enable(&native_id)
+        .expect("enable trusted native block-rules plugin");
+    host.enable(&before)
+        .expect("enable leading compiled plugin");
+
+    let player = PlayerId::offline("P66Decisions");
+    let pos = BlockPos::new(7, 65, -9);
+    let context = NativeEventContext::connection_side();
+    let world = EmptyWorld;
+    let permissions = DenyAllPermissions;
+    let mut sink = RecordingSink::default();
+
+    let replaced = host.dispatch_block_place_decision_with_native_context(
+        &BlockPlaceAttempt::new(player, pos, GLASS),
+        context,
+        &world,
+        &mut sink,
+        &permissions,
+    );
+    assert_eq!(
+        replaced.decision(),
+        &ResolvedDecision::Replace {
+            block_state_id: TINTED_GLASS,
+        },
+        "the native glass rewrite runs after the earlier compiled replacement"
+    );
+    assert_eq!(replaced.report().delivered(), 2);
+    assert!(replaced.report().native_failures().is_empty());
+
+    host.enable(&after)
+        .expect("enable trailing compiled plugin after the first dispatch");
+    let allowed = host.dispatch_block_place_decision_with_native_context(
+        &BlockPlaceAttempt::new(player, pos, STONE),
+        context,
+        &world,
+        &mut sink,
+        &permissions,
+    );
+    assert_eq!(
+        allowed.decision(),
+        &ResolvedDecision::Replace {
+            block_state_id: 202,
+        }
+    );
+    assert_eq!(allowed.report().delivered(), 3);
+    assert!(allowed.report().native_failures().is_empty());
+
+    let denied = host.dispatch_block_place_decision_with_native_context(
+        &BlockPlaceAttempt::new(player, pos, BEDROCK),
+        context,
+        &world,
+        &mut sink,
+        &permissions,
+    );
+    assert!(matches!(
+        denied.decision(),
+        ResolvedDecision::Deny {
+            message: Some(message)
+        } if message.content() == "You cannot place that block here."
+    ));
+    assert_eq!(denied.report().delivered(), 2);
+    assert!(
+        denied.report().native_failures().is_empty(),
+        "the absorbing Deny is a successful native callback"
+    );
+    assert_eq!(before_calls.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        after_calls.load(Ordering::Relaxed),
+        1,
+        "the native Deny short-circuits the later compiled plugin"
+    );
+
+    let reports = host.plugin_decision_reports();
+    let native_report = reports
+        .iter()
+        .find(|report| report.name == "Block Rules")
+        .expect("native plugin has an observability row");
+    assert_eq!(native_report.allow, 1);
+    assert_eq!(native_report.deny, 1);
+    assert_eq!(native_report.replace, 1);
+
+    let fail_closed = host.dispatch_block_place_decision(
+        &BlockPlaceAttempt::new(player, pos, STONE),
+        &world,
+        &mut sink,
+        &permissions,
+    );
+    assert!(matches!(
+        fail_closed.decision(),
+        ResolvedDecision::Deny { message: None }
+    ));
+    assert!(matches!(
+        fail_closed.report().native_failures(),
+        [failure]
+            if failure.plugin_id() == &native_id
+                && failure.hook() == EventKind::BlockPlace
+                && matches!(
+                    failure.failure(),
+                    NativeCallbackFailure::EventContextUnavailable
+                )
+    ));
+    assert!(host.is_enabled(&native_id));
+    assert_eq!(before_calls.load(Ordering::Relaxed), 4);
+    assert_eq!(after_calls.load(Ordering::Relaxed), 1);
+    assert!(
+        sink.intents.is_empty(),
+        "none of the three decision-only plugins emits an intent"
+    );
 
     drop(host);
     cleanup_loaded_bundle(&scratch);
@@ -547,6 +739,98 @@ fn assert_messages(intents: &[WorldIntent], player: PlayerId, expected: &[&str])
         assert_eq!(*recipient, player);
         assert_eq!(message.content(), *expected_text);
     }
+}
+
+fn load_block_rules() -> (LoadedPlugin, PathBuf) {
+    let server_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("plugin-host crate is nested under server/crates");
+    let repo_root = server_root
+        .parent()
+        .expect("server directory is nested under the repository");
+    let target_dir = repo_root.join(".codex-tmp/p66-block-rules-target");
+    let output = Command::new(env!("CARGO"))
+        .current_dir(server_root)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .args([
+            "build",
+            "--locked",
+            "--offline",
+            "--jobs",
+            "1",
+            "-p",
+            "ferrumc-plugin-block-rules",
+            "--lib",
+            "--release",
+            "--no-default-features",
+            "--features",
+            "dynamic",
+        ])
+        .output()
+        .expect("spawn nested block-rules dynamic build");
+    assert!(
+        output.status.success(),
+        "block-rules dynamic build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let library = target_dir.join("release").join(format!(
+        "{}ferrumc_plugin_block_rules{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX,
+    ));
+    assert!(
+        library.is_file(),
+        "block-rules dynamic library missing at {}",
+        library.display()
+    );
+    let scratch = repo_root
+        .join(".codex-tmp/p66-trusted-native-block-rules")
+        .join(std::process::id().to_string());
+    remove_if_present(&scratch);
+    let plugins_root = scratch.join("plugins");
+    package_block_rules(server_root, &library, &plugins_root);
+
+    let available = PluginCapabilities::empty().with(PluginCapability::VetoBlockEdits);
+    let loader = TrustedNativeLoader::current(available).expect("construct current native loader");
+    let native_set = loader
+        .load_directory(&plugins_root)
+        .expect("load real block-rules dynamic bundle");
+    let mut plugins = native_set.into_plugins().into_iter();
+    let plugin = plugins.next().expect("one block-rules plugin is loaded");
+    assert!(
+        plugins.next().is_none(),
+        "only one block-rules plugin is loaded"
+    );
+    (plugin, scratch)
+}
+
+fn package_block_rules(server_root: &Path, library: &Path, plugins_root: &Path) {
+    let bundle = plugins_root.join("block-rules");
+    fs::create_dir_all(&bundle).expect("create block-rules bundle directory");
+    let library_name = library
+        .file_name()
+        .expect("block-rules artifact has a filename");
+    let copied_library = bundle.join(library_name);
+    fs::copy(library, &copied_library).expect("copy block-rules dynamic library");
+
+    let digest =
+        Sha256::digest(fs::read(&copied_library).expect("read copied block-rules dynamic library"));
+    let mut digest_hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut digest_hex, "{byte:02x}").expect("format SHA-256 byte");
+    }
+
+    let template =
+        fs::read_to_string(server_root.join("plugins/ferrumc-plugin-block-rules/plugin.toml.in"))
+            .expect("read block-rules manifest template");
+    let library_name = library_name.to_string_lossy();
+    let manifest = template
+        .replace("{{SERVER_API}}", env!("CARGO_PKG_VERSION"))
+        .replace("{{LIBRARY}}", &library_name)
+        .replace("{{LIBRARY_SHA256}}", &digest_hex);
+    fs::write(bundle.join("plugin.toml"), manifest).expect("write block-rules bundle manifest");
 }
 
 fn load_fixture(case: &str) -> (LoadedPlugin, PathBuf) {

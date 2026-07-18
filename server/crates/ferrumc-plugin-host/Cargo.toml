@@ -28,6 +28,9 @@ libloading = { workspace = true }
 # coordinates.
 semver = { workspace = true }
 ferrumc-permission = { workspace = true }
+# The trusted-native decision integration uses named block-state constants to
+# drive the real block-rules plugin's allow/deny/replace branches.
+ferrumc-registry = { workspace = true }
 # Real-library integration tests parse Cargo's exact artifact report.
 serde_json = { workspace = true }
 # Test-only bundle packaging hashes the exact copied fixture library.

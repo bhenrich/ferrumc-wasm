@@ -17,7 +17,8 @@ use ferrumc_plugin_abi::{
     FC_DIAGNOSTIC_WARN, FC_ERROR, FC_EVENT_FLAGS_NONE, FC_INVALID_ARGUMENT, FC_OK,
 };
 use ferrumc_plugin_api::{
-    Capability, CapabilityManifest, EventKind, PluginEvent, MAX_EMITTED_INTENTS,
+    BlockBreakAttempt, BlockPlaceAttempt, Capability, CapabilityManifest, EventKind,
+    PluginBlockDecision, PluginEvent, MAX_EMITTED_INTENTS,
 };
 use ferrumc_plugin_loader::{
     HostCallOutcome, HostServices, OwnedCommand, OwnedEvent, OwnedHostRequest,
@@ -33,6 +34,18 @@ const MAX_DIAGNOSTICS: usize = 64;
 
 /// Total diagnostic UTF-8 bytes retained from one callback.
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+
+/// Maximum staged effects for a decision callback.
+///
+/// The decision is mandatory protocol output, not one of the plugin's bounded
+/// mutation intents, so a callback may stage all 64 intents plus one decision.
+const MAX_DECISION_EFFECTS: usize = MAX_EMITTED_INTENTS + 1;
+
+/// Maximum accepted byte length of plain-text decision feedback.
+///
+/// This matches the shared SDK bound, while keeping the host independent of
+/// the author-facing SDK crate.
+const MAX_DECISION_FEEDBACK_BYTES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativeCallPhase {
@@ -92,6 +105,11 @@ pub(crate) enum NativeServiceError {
     UnsupportedRequest {
         kind: u32,
     },
+    MissingDecision,
+    DuplicateDecision,
+    UnexpectedDecision {
+        kind: u32,
+    },
     CommandBufferFull {
         maximum: usize,
     },
@@ -120,6 +138,9 @@ impl NativeServiceError {
             | Self::MalformedPayload { .. }
             | Self::UnsupportedCommand { .. }
             | Self::UnsupportedRequest { .. }
+            | Self::MissingDecision
+            | Self::DuplicateDecision
+            | Self::UnexpectedDecision { .. }
             | Self::InvalidDiagnosticLevel { .. } => FC_INVALID_ARGUMENT,
         }
     }
@@ -164,6 +185,18 @@ impl fmt::Display for NativeServiceError {
             Self::UnsupportedRequest { kind } => {
                 write!(formatter, "native host request kind {kind} is unsupported")
             }
+            Self::MissingDecision => {
+                formatter.write_str("native decision callback emitted no decision")
+            }
+            Self::DuplicateDecision => {
+                formatter.write_str("native decision callback emitted more than one decision")
+            }
+            Self::UnexpectedDecision { kind } => {
+                write!(
+                    formatter,
+                    "native decision command {kind} is invalid for this event"
+                )
+            }
             Self::CommandBufferFull { maximum } => {
                 write!(formatter, "native command buffer reached {maximum} entries")
             }
@@ -190,6 +223,14 @@ impl fmt::Display for NativeServiceError {
 pub(crate) enum NativeEffect {
     Intent(WorldIntent),
     Subscribe(EventKind),
+    BlockDecision(PluginBlockDecision),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeEventRoute {
+    Notification,
+    BlockPlaceDecision,
+    BlockBreakDecision,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -253,6 +294,7 @@ pub(crate) const fn supported_native_capabilities() -> CapabilityManifest {
     CapabilityManifest::empty()
         .with(Capability::ReceiveEvents)
         .with(Capability::SubmitIntents)
+        .with(Capability::VetoBlockEdits)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -319,6 +361,40 @@ pub(crate) fn encode_event(
     ))
 }
 
+pub(crate) fn encode_block_place_attempt(
+    attempt: &BlockPlaceAttempt,
+    tick: u64,
+    shard: FcResourceHandle,
+) -> OwnedEvent {
+    let mut payload = Vec::with_capacity(32);
+    push_player(&mut payload, attempt.player());
+    push_block_pos(&mut payload, attempt.pos());
+    payload.extend_from_slice(&attempt.block_state_id().to_le_bytes());
+    OwnedEvent::new(
+        FcEventKind::BLOCK_PLACE_ATTEMPT,
+        FC_EVENT_FLAGS_NONE,
+        tick,
+        shard,
+        payload,
+    )
+}
+
+pub(crate) fn encode_block_break_attempt(
+    attempt: &BlockBreakAttempt,
+    tick: u64,
+    shard: FcResourceHandle,
+) -> OwnedEvent {
+    let mut payload = Vec::with_capacity(36);
+    push_block_break_payload(&mut payload, attempt.player(), attempt.pos());
+    OwnedEvent::new(
+        FcEventKind::BLOCK_BREAK_ATTEMPT,
+        FC_EVENT_FLAGS_NONE,
+        tick,
+        shard,
+        payload,
+    )
+}
+
 fn push_block_break_payload(payload: &mut Vec<u8>, player: PlayerId, pos: BlockPos) {
     const STRUCT_SIZE: u32 = 36;
     push_record_header(payload, STRUCT_SIZE);
@@ -344,8 +420,10 @@ fn push_block_pos(payload: &mut Vec<u8>, pos: BlockPos) {
 
 pub(crate) struct NativeCallbackServices {
     phase: NativeCallPhase,
+    event_route: NativeEventRoute,
     capabilities: CapabilityManifest,
     effects: Vec<NativeEffect>,
+    intent_count: usize,
     buffered_payload_bytes: usize,
     diagnostics: Vec<NativeDiagnostic>,
     diagnostic_bytes: usize,
@@ -358,7 +436,13 @@ pub(crate) struct NativeCallbackServices {
 
 impl NativeCallbackServices {
     pub(crate) fn for_initialization(capabilities: CapabilityManifest) -> Self {
-        Self::new(NativeCallPhase::Initialization, capabilities, None, None)
+        Self::new(
+            NativeCallPhase::Initialization,
+            NativeEventRoute::Notification,
+            capabilities,
+            None,
+            None,
+        )
     }
 
     pub(crate) fn for_event(
@@ -366,8 +450,32 @@ impl NativeCallbackServices {
         event_shard: FcResourceHandle,
         event_context: NativeEventContext,
     ) -> Self {
+        Self::for_event_route(
+            capabilities,
+            event_shard,
+            event_context,
+            NativeEventRoute::Notification,
+        )
+    }
+
+    pub(crate) fn for_block_decision(
+        capabilities: CapabilityManifest,
+        event_shard: FcResourceHandle,
+        event_context: NativeEventContext,
+        event_route: NativeEventRoute,
+    ) -> Self {
+        Self::for_event_route(capabilities, event_shard, event_context, event_route)
+    }
+
+    fn for_event_route(
+        capabilities: CapabilityManifest,
+        event_shard: FcResourceHandle,
+        event_context: NativeEventContext,
+        event_route: NativeEventRoute,
+    ) -> Self {
         Self::new(
             NativeCallPhase::Event,
+            event_route,
             capabilities,
             Some(event_shard),
             Some(event_context),
@@ -375,19 +483,37 @@ impl NativeCallbackServices {
     }
 
     pub(crate) fn for_shutdown(capabilities: CapabilityManifest) -> Self {
-        Self::new(NativeCallPhase::Shutdown, capabilities, None, None)
+        Self::new(
+            NativeCallPhase::Shutdown,
+            NativeEventRoute::Notification,
+            capabilities,
+            None,
+            None,
+        )
     }
 
     fn new(
         phase: NativeCallPhase,
+        event_route: NativeEventRoute,
         capabilities: CapabilityManifest,
         event_shard: Option<FcResourceHandle>,
         event_context: Option<NativeEventContext>,
     ) -> Self {
         Self {
             phase,
+            event_route,
             capabilities,
-            effects: Vec::with_capacity(MAX_EMITTED_INTENTS),
+            effects: Vec::with_capacity(
+                if matches!(
+                    event_route,
+                    NativeEventRoute::BlockPlaceDecision | NativeEventRoute::BlockBreakDecision
+                ) {
+                    MAX_DECISION_EFFECTS
+                } else {
+                    MAX_EMITTED_INTENTS
+                },
+            ),
+            intent_count: 0,
             buffered_payload_bytes: 0,
             diagnostics: Vec::with_capacity(MAX_DIAGNOSTICS),
             diagnostic_bytes: 0,
@@ -400,6 +526,16 @@ impl NativeCallbackServices {
     }
 
     pub(crate) fn complete(mut self, callback_status: FcStatus) -> NativeCompletion {
+        if callback_status == FC_OK
+            && !self.poisoned
+            && self.expects_decision()
+            && !self
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, NativeEffect::BlockDecision(_)))
+        {
+            let _status = self.record_error(NativeServiceError::MissingDecision, true);
+        }
         let committed = callback_status == FC_OK && !self.poisoned;
         if !committed {
             self.effects.clear();
@@ -411,6 +547,24 @@ impl NativeCallbackServices {
             diagnostics: self.diagnostics,
             first_error: self.first_error,
             capability_denial: self.capability_denial,
+        }
+    }
+
+    const fn expects_decision(&self) -> bool {
+        matches!(
+            self.event_route,
+            NativeEventRoute::BlockPlaceDecision | NativeEventRoute::BlockBreakDecision
+        )
+    }
+
+    const fn poison_on_command_error(&self, kind: FcCommandKind) -> bool {
+        self.expects_decision() || is_decision_command(kind)
+    }
+
+    const fn has_valid_event_scope(&self) -> bool {
+        match (self.event_shard, self.event_context) {
+            (Some(resource), Some(context)) => resource.is_valid() != context.is_connection_side(),
+            _ => false,
         }
     }
 
@@ -458,6 +612,17 @@ impl NativeCallbackServices {
             require_target(command, FcResourceHandle::INVALID)?;
             return Ok(());
         }
+        if is_decision_command(command.kind()) {
+            self.require_phase(command.kind(), NativeCallPhase::Event)?;
+            require_target(command, FcResourceHandle::INVALID)?;
+            if !self.expects_decision()
+                || (command.kind() == FcCommandKind::DECISION_REPLACE_BLOCK
+                    && self.event_route != NativeEventRoute::BlockPlaceDecision)
+            {
+                return Err(NativeServiceError::UnexpectedDecision { kind });
+            }
+            return Ok(());
+        }
 
         Err(NativeServiceError::UnsupportedCommand { kind })
     }
@@ -469,6 +634,12 @@ impl NativeCallbackServices {
             decode_teleport(command.payload()).map(NativeEffect::Intent)
         } else if command.kind() == FcCommandKind::SUBSCRIBE_EVENT {
             decode_subscription(command.payload()).map(NativeEffect::Subscribe)
+        } else if command.kind() == FcCommandKind::DECISION_ALLOW {
+            decode_allow(command.payload()).map(NativeEffect::BlockDecision)
+        } else if command.kind() == FcCommandKind::DECISION_DENY {
+            decode_deny(command.payload()).map(NativeEffect::BlockDecision)
+        } else if command.kind() == FcCommandKind::DECISION_REPLACE_BLOCK {
+            decode_replace(command.payload()).map(NativeEffect::BlockDecision)
         } else {
             Err(NativeServiceError::UnsupportedCommand {
                 kind: command.kind().raw(),
@@ -497,10 +668,7 @@ impl NativeCallbackServices {
                 return self.record_error(error, true);
             }
         }
-        if self.phase == NativeCallPhase::Event
-            && (self.event_shard.is_none_or(|resource| !resource.is_valid())
-                || self.event_context.is_none())
-        {
+        if self.phase == NativeCallPhase::Event && !self.has_valid_event_scope() {
             return self.record_error(
                 NativeServiceError::FacadeUnavailable {
                     capability: Capability::ReceiveEvents,
@@ -509,7 +677,15 @@ impl NativeCallbackServices {
             );
         }
         if let Err(error) = self.validate_command_envelope(command) {
-            return self.record_error(error, false);
+            return self.record_error(error, self.poison_on_command_error(command.kind()));
+        }
+        if is_decision_command(command.kind())
+            && self
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, NativeEffect::BlockDecision(_)))
+        {
+            return self.record_error(NativeServiceError::DuplicateDecision, true);
         }
 
         let Some(buffered) = self
@@ -520,7 +696,7 @@ impl NativeCallbackServices {
                 NativeServiceError::PayloadBudgetExceeded {
                     maximum: MAX_BUFFERED_PAYLOAD_BYTES,
                 },
-                false,
+                self.expects_decision(),
             );
         };
         if buffered > MAX_BUFFERED_PAYLOAD_BYTES {
@@ -528,23 +704,41 @@ impl NativeCallbackServices {
                 NativeServiceError::PayloadBudgetExceeded {
                     maximum: MAX_BUFFERED_PAYLOAD_BYTES,
                 },
-                false,
+                self.expects_decision(),
             );
         }
 
         let effect = match Self::decode_command(command) {
             Ok(effect) => effect,
-            Err(error) => return self.record_error(error, false),
+            Err(error) => {
+                return self.record_error(error, self.poison_on_command_error(command.kind()));
+            }
         };
-        if self.effects.len() >= MAX_EMITTED_INTENTS {
+        if matches!(effect, NativeEffect::Intent(_)) && self.intent_count >= MAX_EMITTED_INTENTS {
             return self.record_error(
                 NativeServiceError::CommandBufferFull {
                     maximum: MAX_EMITTED_INTENTS,
                 },
-                false,
+                self.expects_decision(),
+            );
+        }
+        let effect_limit = if self.expects_decision() {
+            MAX_DECISION_EFFECTS
+        } else {
+            MAX_EMITTED_INTENTS
+        };
+        if self.effects.len() >= effect_limit {
+            return self.record_error(
+                NativeServiceError::CommandBufferFull {
+                    maximum: effect_limit,
+                },
+                self.expects_decision(),
             );
         }
         self.buffered_payload_bytes = buffered;
+        if matches!(effect, NativeEffect::Intent(_)) {
+            self.intent_count += 1;
+        }
         self.effects.push(effect);
         FC_OK
     }
@@ -563,7 +757,7 @@ impl NativeCallbackServices {
                     kind,
                     flags: request.flags(),
                 },
-                false,
+                self.expects_decision(),
             );
             return HostCallOutcome::Status(status);
         }
@@ -575,7 +769,7 @@ impl NativeCallbackServices {
                         command: kind,
                         phase: self.phase,
                     },
-                    false,
+                    self.expects_decision(),
                 );
                 return HostCallOutcome::Status(status);
             }
@@ -585,7 +779,7 @@ impl NativeCallbackServices {
                         kind,
                         target: request.target().raw(),
                     },
-                    false,
+                    self.expects_decision(),
                 );
                 return HostCallOutcome::Status(status);
             }
@@ -595,7 +789,7 @@ impl NativeCallbackServices {
                         kind,
                         source: NativePayloadError::TrailingBytes,
                     },
-                    false,
+                    self.expects_decision(),
                 );
                 return HostCallOutcome::Status(status);
             }
@@ -607,20 +801,26 @@ impl NativeCallbackServices {
             );
             return HostCallOutcome::Status(status);
         }
-        let status = self.record_error(NativeServiceError::UnsupportedRequest { kind }, false);
+        let status = self.record_error(
+            NativeServiceError::UnsupportedRequest { kind },
+            self.expects_decision(),
+        );
         HostCallOutcome::Status(status)
     }
 
     fn record_diagnostic(&mut self, level: u32, message: String) -> FcStatus {
         if !valid_diagnostic_level(level) {
-            return self.record_error(NativeServiceError::InvalidDiagnosticLevel { level }, false);
+            return self.record_error(
+                NativeServiceError::InvalidDiagnosticLevel { level },
+                self.expects_decision(),
+            );
         }
         if self.diagnostics.len() >= MAX_DIAGNOSTICS {
             return self.record_error(
                 NativeServiceError::DiagnosticBufferFull {
                     maximum: MAX_DIAGNOSTICS,
                 },
-                false,
+                self.expects_decision(),
             );
         }
         let Some(total) = self.diagnostic_bytes.checked_add(message.len()) else {
@@ -628,7 +828,7 @@ impl NativeCallbackServices {
                 NativeServiceError::DiagnosticBufferFull {
                     maximum: MAX_DIAGNOSTIC_BYTES,
                 },
-                false,
+                self.expects_decision(),
             );
         };
         if total > MAX_DIAGNOSTIC_BYTES {
@@ -636,7 +836,7 @@ impl NativeCallbackServices {
                 NativeServiceError::DiagnosticBufferFull {
                     maximum: MAX_DIAGNOSTIC_BYTES,
                 },
-                false,
+                self.expects_decision(),
             );
         }
 
@@ -652,6 +852,8 @@ fn required_command_capability(kind: FcCommandKind) -> Option<Capability> {
         FcCommandKind::SET_BLOCK | FcCommandKind::MESSAGE | FcCommandKind::TELEPORT
     ) {
         Some(Capability::SubmitIntents)
+    } else if is_decision_command(kind) {
+        Some(Capability::VetoBlockEdits)
     } else if kind == FcCommandKind::SUBSCRIBE_EVENT {
         Some(Capability::ReceiveEvents)
     } else if kind == FcCommandKind::REGISTER_COMMAND {
@@ -664,6 +866,15 @@ fn required_command_capability(kind: FcCommandKind) -> Option<Capability> {
     } else {
         None
     }
+}
+
+const fn is_decision_command(kind: FcCommandKind) -> bool {
+    matches!(
+        kind,
+        FcCommandKind::DECISION_ALLOW
+            | FcCommandKind::DECISION_DENY
+            | FcCommandKind::DECISION_REPLACE_BLOCK
+    )
 }
 
 fn required_request_capability(kind: FcHostRequestKind) -> Option<Capability> {
@@ -770,6 +981,44 @@ fn decode_teleport(payload: &[u8]) -> Result<WorldIntent, NativeServiceError> {
         player,
         position: Vec3::new(x, y, z),
     })
+}
+
+fn decode_allow(payload: &[u8]) -> Result<PluginBlockDecision, NativeServiceError> {
+    if payload.is_empty() {
+        Ok(PluginBlockDecision::Allow)
+    } else {
+        Err(malformed(
+            FcCommandKind::DECISION_ALLOW,
+            NativePayloadError::TrailingBytes,
+        ))
+    }
+}
+
+fn decode_deny(payload: &[u8]) -> Result<PluginBlockDecision, NativeServiceError> {
+    if payload.is_empty() {
+        return Ok(PluginBlockDecision::Deny { message: None });
+    }
+    let mut cursor = PayloadCursor::new(payload);
+    let message = cursor
+        .read_text(MAX_DECISION_FEEDBACK_BYTES)
+        .map_err(|source| malformed(FcCommandKind::DECISION_DENY, source))?;
+    cursor
+        .finish()
+        .map_err(|source| malformed(FcCommandKind::DECISION_DENY, source))?;
+    Ok(PluginBlockDecision::Deny {
+        message: Some(TextComponent::text(message)),
+    })
+}
+
+fn decode_replace(payload: &[u8]) -> Result<PluginBlockDecision, NativeServiceError> {
+    let mut cursor = PayloadCursor::new(payload);
+    let block_state_id = cursor
+        .read_u32()
+        .map_err(|source| malformed(FcCommandKind::DECISION_REPLACE_BLOCK, source))?;
+    cursor
+        .finish()
+        .map_err(|source| malformed(FcCommandKind::DECISION_REPLACE_BLOCK, source))?;
+    Ok(PluginBlockDecision::Replace { block_state_id })
 }
 
 fn decode_subscription(payload: &[u8]) -> Result<EventKind, NativeServiceError> {
@@ -936,6 +1185,15 @@ mod tests {
         OwnedCommand::new(kind, FC_COMMAND_FLAGS_NONE, target, payload)
     }
 
+    fn feedback_payload(message: &[u8]) -> Vec<u8> {
+        let mut payload = u32::try_from(message.len())
+            .expect("test feedback length fits")
+            .to_le_bytes()
+            .to_vec();
+        payload.extend_from_slice(message);
+        payload
+    }
+
     #[test]
     fn event_encoder_maps_current_events_to_binary_abi_payloads() {
         let pos = BlockPos::new(-3, 72, 41);
@@ -971,6 +1229,444 @@ mod tests {
         .expect("join event encodes");
         assert_eq!(joined.kind(), FcEventKind::PLAYER_JOIN);
         assert_eq!(joined.payload(), player().as_uuid().as_bytes());
+    }
+
+    #[test]
+    fn block_attempt_encoders_use_exact_wire_bytes_and_connection_sentinels() {
+        let context = NativeEventContext::connection_side();
+        assert_eq!(context.tick(), ferrumc_core::Tick::ZERO);
+        assert_eq!(context.world().get(), 0);
+        assert_eq!(context.dimension().get(), 0);
+        assert_eq!(context.shard(), ferrumc_math::ShardPos::new(0, 0));
+
+        let pos = BlockPos::new(-17, 72, 41);
+        let shard = FcResourceHandle::INVALID;
+        let place = encode_block_place_attempt(
+            &BlockPlaceAttempt::new(player(), pos, 0x1020_3040),
+            context.tick().get(),
+            shard,
+        );
+        assert_eq!(place.kind(), FcEventKind::BLOCK_PLACE_ATTEMPT);
+        assert_eq!(place.flags(), FC_EVENT_FLAGS_NONE);
+        assert_eq!(place.tick(), 0);
+        assert_eq!(place.shard(), shard);
+        assert_eq!(place.payload().len(), 32);
+        assert_eq!(&place.payload()[0..16], player().as_uuid().as_bytes());
+        assert_eq!(&place.payload()[16..20], &pos.x().to_le_bytes());
+        assert_eq!(&place.payload()[20..24], &pos.y().to_le_bytes());
+        assert_eq!(&place.payload()[24..28], &pos.z().to_le_bytes());
+        assert_eq!(&place.payload()[28..32], &0x1020_3040_u32.to_le_bytes());
+
+        let block_break = encode_block_break_attempt(
+            &BlockBreakAttempt::new(player(), pos),
+            context.tick().get(),
+            shard,
+        );
+        assert_eq!(block_break.kind(), FcEventKind::BLOCK_BREAK_ATTEMPT);
+        assert_eq!(block_break.flags(), FC_EVENT_FLAGS_NONE);
+        assert_eq!(block_break.tick(), 0);
+        assert_eq!(block_break.shard(), shard);
+        assert_eq!(block_break.payload().len(), 36);
+        assert_eq!(&block_break.payload()[0..4], &36_u32.to_le_bytes());
+        assert_eq!(&block_break.payload()[4..6], &ABI_MAJOR.to_le_bytes());
+        assert_eq!(&block_break.payload()[6..8], &ABI_MINOR.to_le_bytes());
+        assert_eq!(&block_break.payload()[8..24], player().as_uuid().as_bytes());
+        assert_eq!(&block_break.payload()[24..28], &pos.x().to_le_bytes());
+        assert_eq!(&block_break.payload()[28..32], &pos.y().to_le_bytes());
+        assert_eq!(&block_break.payload()[32..36], &pos.z().to_le_bytes());
+    }
+
+    #[test]
+    fn event_scope_requires_resource_provenance_to_match_context() {
+        let veto = CapabilityManifest::empty().with(Capability::VetoBlockEdits);
+        let decision = || {
+            command(
+                FcCommandKind::DECISION_ALLOW,
+                FcResourceHandle::INVALID,
+                Vec::new(),
+            )
+        };
+
+        let mut connection_side = NativeCallbackServices::for_block_decision(
+            veto,
+            FcResourceHandle::INVALID,
+            NativeEventContext::connection_side(),
+            NativeEventRoute::BlockPlaceDecision,
+        );
+        assert_eq!(connection_side.emit(decision()), FC_OK);
+        assert!(connection_side.complete(FC_OK).is_committed());
+
+        let mut fabricated_connection_resource = NativeCallbackServices::for_block_decision(
+            veto,
+            FcResourceHandle::from_raw(1),
+            NativeEventContext::connection_side(),
+            NativeEventRoute::BlockPlaceDecision,
+        );
+        assert_eq!(fabricated_connection_resource.emit(decision()), FC_ERROR);
+        assert!(!fabricated_connection_resource
+            .complete(FC_OK)
+            .is_committed());
+
+        let exact_context = event_context();
+        let mut exact = NativeCallbackServices::for_block_decision(
+            veto,
+            FcResourceHandle::from_raw(1),
+            exact_context,
+            NativeEventRoute::BlockPlaceDecision,
+        );
+        assert_eq!(exact.emit(decision()), FC_OK);
+        assert!(exact.complete(FC_OK).is_committed());
+
+        let mut missing_exact_resource = NativeCallbackServices::for_block_decision(
+            veto,
+            FcResourceHandle::INVALID,
+            exact_context,
+            NativeEventRoute::BlockPlaceDecision,
+        );
+        assert_eq!(missing_exact_resource.emit(decision()), FC_ERROR);
+        assert!(!missing_exact_resource.complete(FC_OK).is_committed());
+    }
+
+    #[test]
+    fn block_decision_commands_decode_and_commit_exactly_once() {
+        let caps = CapabilityManifest::empty()
+            .with(Capability::VetoBlockEdits)
+            .with(Capability::SubmitIntents);
+        assert!(supported_native_capabilities().grants(Capability::VetoBlockEdits));
+
+        let mut denied = NativeCallbackServices::for_block_decision(
+            caps,
+            FcResourceHandle::from_raw(1),
+            event_context(),
+            NativeEventRoute::BlockPlaceDecision,
+        );
+        assert_eq!(
+            denied.emit(command(
+                FcCommandKind::MESSAGE,
+                FcResourceHandle::INVALID,
+                message_payload(b"staged with decision"),
+            )),
+            FC_OK
+        );
+        assert_eq!(
+            denied.emit(command(
+                FcCommandKind::DECISION_DENY,
+                FcResourceHandle::INVALID,
+                feedback_payload(b"protected"),
+            )),
+            FC_OK
+        );
+        let denied = denied.complete(FC_OK);
+        assert!(denied.is_committed());
+        assert_eq!(
+            denied.effects(),
+            &[
+                NativeEffect::Intent(WorldIntent::Message {
+                    player: player(),
+                    message: TextComponent::text("staged with decision"),
+                }),
+                NativeEffect::BlockDecision(PluginBlockDecision::Deny {
+                    message: Some(TextComponent::text("protected")),
+                }),
+            ]
+        );
+
+        let mut replaced = NativeCallbackServices::for_block_decision(
+            caps,
+            FcResourceHandle::from_raw(2),
+            event_context(),
+            NativeEventRoute::BlockPlaceDecision,
+        );
+        assert_eq!(
+            replaced.emit(command(
+                FcCommandKind::DECISION_REPLACE_BLOCK,
+                FcResourceHandle::INVALID,
+                731_u32.to_le_bytes().to_vec(),
+            )),
+            FC_OK
+        );
+        assert_eq!(
+            replaced.complete(FC_OK).effects(),
+            &[NativeEffect::BlockDecision(PluginBlockDecision::Replace {
+                block_state_id: 731,
+            })]
+        );
+
+        let mut allowed = NativeCallbackServices::for_block_decision(
+            caps,
+            FcResourceHandle::from_raw(3),
+            event_context(),
+            NativeEventRoute::BlockBreakDecision,
+        );
+        assert_eq!(
+            allowed.emit(command(
+                FcCommandKind::DECISION_ALLOW,
+                FcResourceHandle::INVALID,
+                Vec::new(),
+            )),
+            FC_OK
+        );
+        assert_eq!(
+            allowed.complete(FC_OK).effects(),
+            &[NativeEffect::BlockDecision(PluginBlockDecision::Allow)]
+        );
+    }
+
+    #[test]
+    fn block_decisions_fail_closed_when_missing_duplicate_or_ungranted() {
+        let veto = CapabilityManifest::empty().with(Capability::VetoBlockEdits);
+        let missing = NativeCallbackServices::for_block_decision(
+            veto,
+            FcResourceHandle::from_raw(1),
+            event_context(),
+            NativeEventRoute::BlockPlaceDecision,
+        )
+        .complete(FC_OK);
+        assert!(!missing.is_committed());
+        assert!(missing.effects().is_empty());
+        assert_eq!(
+            missing.first_error(),
+            Some(&NativeServiceError::MissingDecision)
+        );
+
+        let mut duplicate = NativeCallbackServices::for_block_decision(
+            veto,
+            FcResourceHandle::from_raw(1),
+            event_context(),
+            NativeEventRoute::BlockPlaceDecision,
+        );
+        assert_eq!(
+            duplicate.emit(command(
+                FcCommandKind::DECISION_ALLOW,
+                FcResourceHandle::INVALID,
+                Vec::new(),
+            )),
+            FC_OK
+        );
+        assert_eq!(
+            duplicate.emit(command(
+                FcCommandKind::DECISION_DENY,
+                FcResourceHandle::INVALID,
+                Vec::new(),
+            )),
+            FC_INVALID_ARGUMENT
+        );
+        let duplicate = duplicate.complete(FC_OK);
+        assert!(!duplicate.is_committed());
+        assert!(duplicate.effects().is_empty());
+        assert_eq!(
+            duplicate.first_error(),
+            Some(&NativeServiceError::DuplicateDecision)
+        );
+
+        let mut ungranted = NativeCallbackServices::for_block_decision(
+            CapabilityManifest::empty(),
+            FcResourceHandle::from_raw(1),
+            event_context(),
+            NativeEventRoute::BlockPlaceDecision,
+        );
+        assert_eq!(
+            ungranted.emit(command(
+                FcCommandKind::DECISION_ALLOW,
+                FcResourceHandle::INVALID,
+                Vec::new(),
+            )),
+            FC_CAPABILITY_DENIED
+        );
+        let ungranted = ungranted.complete(FC_OK);
+        assert!(!ungranted.is_committed());
+        assert!(ungranted.effects().is_empty());
+        assert_eq!(
+            ungranted.capability_denial(),
+            Some(Capability::VetoBlockEdits)
+        );
+    }
+
+    #[test]
+    fn malformed_and_misrouted_block_decisions_are_rejected_transactionally() {
+        let veto = CapabilityManifest::empty().with(Capability::VetoBlockEdits);
+        let malformed = [
+            (FcCommandKind::DECISION_ALLOW, vec![0]),
+            (FcCommandKind::DECISION_DENY, vec![1, 0, 0]),
+            (FcCommandKind::DECISION_DENY, feedback_payload(&[0xff])),
+            (
+                FcCommandKind::DECISION_DENY,
+                (u32::try_from(MAX_DECISION_FEEDBACK_BYTES).expect("feedback bound fits u32") + 1)
+                    .to_le_bytes()
+                    .to_vec(),
+            ),
+            (FcCommandKind::DECISION_REPLACE_BLOCK, Vec::new()),
+            (FcCommandKind::DECISION_REPLACE_BLOCK, vec![1, 0, 0, 0, 0]),
+        ];
+        for (kind, payload) in malformed {
+            let mut services = NativeCallbackServices::for_block_decision(
+                veto,
+                FcResourceHandle::from_raw(1),
+                event_context(),
+                NativeEventRoute::BlockPlaceDecision,
+            );
+            assert_eq!(
+                services.emit(command(kind, FcResourceHandle::INVALID, payload)),
+                FC_INVALID_ARGUMENT,
+                "malformed decision kind {}",
+                kind.raw()
+            );
+            let completion = services.complete(FC_OK);
+            assert!(!completion.is_committed());
+            assert!(completion.effects().is_empty());
+            assert!(matches!(
+                completion.first_error(),
+                Some(NativeServiceError::MalformedPayload { .. })
+            ));
+        }
+
+        let mut replace_on_break = NativeCallbackServices::for_block_decision(
+            veto,
+            FcResourceHandle::from_raw(1),
+            event_context(),
+            NativeEventRoute::BlockBreakDecision,
+        );
+        assert_eq!(
+            replace_on_break.emit(command(
+                FcCommandKind::DECISION_REPLACE_BLOCK,
+                FcResourceHandle::INVALID,
+                1_u32.to_le_bytes().to_vec(),
+            )),
+            FC_INVALID_ARGUMENT
+        );
+        assert!(!replace_on_break.complete(FC_OK).is_committed());
+
+        let mut notification =
+            NativeCallbackServices::for_event(veto, FcResourceHandle::from_raw(1), event_context());
+        assert_eq!(
+            notification.emit(command(
+                FcCommandKind::DECISION_ALLOW,
+                FcResourceHandle::INVALID,
+                Vec::new(),
+            )),
+            FC_INVALID_ARGUMENT
+        );
+        assert!(!notification.complete(FC_OK).is_committed());
+
+        let mut poisoned_after_decision = NativeCallbackServices::for_block_decision(
+            veto.with(Capability::SubmitIntents),
+            FcResourceHandle::from_raw(1),
+            event_context(),
+            NativeEventRoute::BlockPlaceDecision,
+        );
+        assert_eq!(
+            poisoned_after_decision.emit(command(
+                FcCommandKind::DECISION_ALLOW,
+                FcResourceHandle::INVALID,
+                Vec::new(),
+            )),
+            FC_OK
+        );
+        assert_eq!(
+            poisoned_after_decision.emit(command(
+                FcCommandKind::MESSAGE,
+                FcResourceHandle::INVALID,
+                Vec::new(),
+            )),
+            FC_INVALID_ARGUMENT
+        );
+        let poisoned_after_decision = poisoned_after_decision.complete(FC_OK);
+        assert!(!poisoned_after_decision.is_committed());
+        assert!(poisoned_after_decision.effects().is_empty());
+    }
+
+    #[test]
+    fn decision_stage_accepts_the_full_intent_budget_plus_one_decision() {
+        let caps = CapabilityManifest::empty()
+            .with(Capability::SubmitIntents)
+            .with(Capability::VetoBlockEdits);
+        let mut services = NativeCallbackServices::for_block_decision(
+            caps,
+            FcResourceHandle::from_raw(1),
+            event_context(),
+            NativeEventRoute::BlockPlaceDecision,
+        );
+        for _ in 0..MAX_EMITTED_INTENTS {
+            assert_eq!(
+                services.emit(command(
+                    FcCommandKind::MESSAGE,
+                    FcResourceHandle::INVALID,
+                    message_payload(b"bounded"),
+                )),
+                FC_OK
+            );
+        }
+        assert_eq!(
+            services.emit(command(
+                FcCommandKind::DECISION_ALLOW,
+                FcResourceHandle::INVALID,
+                Vec::new(),
+            )),
+            FC_OK
+        );
+
+        let completion = services.complete(FC_OK);
+        assert!(completion.is_committed());
+        assert_eq!(completion.effects().len(), MAX_DECISION_EFFECTS);
+        assert_eq!(
+            completion
+                .effects()
+                .iter()
+                .filter(|effect| matches!(effect, NativeEffect::Intent(_)))
+                .count(),
+            MAX_EMITTED_INTENTS
+        );
+        assert!(matches!(
+            completion.effects().last(),
+            Some(NativeEffect::BlockDecision(PluginBlockDecision::Allow))
+        ));
+    }
+
+    #[test]
+    fn decision_stage_intent_overflow_rolls_back_every_effect() {
+        let caps = CapabilityManifest::empty()
+            .with(Capability::SubmitIntents)
+            .with(Capability::VetoBlockEdits);
+        let mut services = NativeCallbackServices::for_block_decision(
+            caps,
+            FcResourceHandle::from_raw(1),
+            event_context(),
+            NativeEventRoute::BlockPlaceDecision,
+        );
+        assert_eq!(
+            services.emit(command(
+                FcCommandKind::DECISION_ALLOW,
+                FcResourceHandle::INVALID,
+                Vec::new(),
+            )),
+            FC_OK
+        );
+        for _ in 0..MAX_EMITTED_INTENTS {
+            assert_eq!(
+                services.emit(command(
+                    FcCommandKind::MESSAGE,
+                    FcResourceHandle::INVALID,
+                    message_payload(b"bounded"),
+                )),
+                FC_OK
+            );
+        }
+        assert_eq!(
+            services.emit(command(
+                FcCommandKind::MESSAGE,
+                FcResourceHandle::INVALID,
+                message_payload(b"overflow"),
+            )),
+            FC_COMMAND_BUFFER_FULL
+        );
+
+        let completion = services.complete(FC_OK);
+        assert!(!completion.is_committed());
+        assert!(completion.effects().is_empty());
+        assert!(matches!(
+            completion.first_error(),
+            Some(NativeServiceError::CommandBufferFull { .. })
+        ));
     }
 
     #[test]

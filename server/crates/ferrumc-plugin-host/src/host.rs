@@ -23,8 +23,9 @@ use ferrumc_plugin_loader::{
 use crate::budget::CallBudget;
 use crate::error::{HostError, NativeLifecycleHook};
 use crate::native_runtime::{
-    encode_event, supported_native_capabilities, NativeCallbackServices, NativeCompletion,
-    NativeDiagnostic, NativeEffect,
+    encode_block_break_attempt, encode_block_place_attempt, encode_event,
+    supported_native_capabilities, NativeCallbackServices, NativeCompletion, NativeDiagnostic,
+    NativeEffect, NativeEventRoute,
 };
 use crate::state::{DisableReason, PluginState, PluginStats};
 use crate::storage::{InMemoryPluginStorage, NamespacedStorage, PluginStorageBackend};
@@ -132,6 +133,39 @@ enum RegisteredPlugin {
     TrustedNative(usize),
 }
 
+#[derive(Clone, Copy)]
+enum NativeBlockAttempt<'a> {
+    Place(&'a BlockPlaceAttempt),
+    Break(&'a BlockBreakAttempt),
+}
+
+impl NativeBlockAttempt<'_> {
+    const fn hook(self) -> EventKind {
+        match self {
+            Self::Place(_) => EventKind::BlockPlace,
+            Self::Break(_) => EventKind::BlockBreak,
+        }
+    }
+
+    const fn route(self) -> NativeEventRoute {
+        match self {
+            Self::Place(_) => NativeEventRoute::BlockPlaceDecision,
+            Self::Break(_) => NativeEventRoute::BlockBreakDecision,
+        }
+    }
+
+    fn encode(self, context: NativeEventContext, shard_resource: FcResourceHandle) -> OwnedEvent {
+        match self {
+            Self::Place(attempt) => {
+                encode_block_place_attempt(attempt, context.tick().get(), shard_resource)
+            }
+            Self::Break(attempt) => {
+                encode_block_break_attempt(attempt, context.tick().get(), shard_resource)
+            }
+        }
+    }
+}
+
 /// One capability-gated host call denied during a trusted native callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeCapabilityDenial {
@@ -189,48 +223,75 @@ impl NativePanicRecord {
     }
 }
 
-/// Authoritative metadata required to deliver an event to trusted native plugins.
+/// Caller-supplied metadata used to deliver an event to trusted native plugins.
 ///
-/// Construct this at the simulation tick boundary that owns the event. The
-/// caller attests the typed world, dimension, and logical shard identity; the
-/// host associates them with a fresh callback-scoped ABI resource handle.
+/// Simulation-owned callers may construct exact tick and shard metadata with
+/// [`NativeEventContext::new`]. The current application dispatches gameplay
+/// callbacks connection-side and off-tick; it uses
+/// [`NativeEventContext::connection_side`] so the ABI receives documented
+/// sentinel values instead of fabricated simulation identity. Exact simulation
+/// contexts receive a fresh callback-scoped shard resource handle;
+/// connection-side contexts carry an invalid handle as the ABI's
+/// "shard unavailable" sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeEventContext {
     tick: Tick,
     world: WorldId,
     dimension: DimensionId,
     shard: ShardPos,
+    connection_side: bool,
 }
 
 impl NativeEventContext {
-    /// Creates authoritative metadata for one logical shard's event.
+    /// Creates caller-attested metadata for one logical shard's event.
     pub const fn new(tick: Tick, world: WorldId, dimension: DimensionId, shard: ShardPos) -> Self {
         Self {
             tick,
             world,
             dimension,
             shard,
+            connection_side: false,
         }
     }
 
-    /// Returns the authoritative simulation tick.
+    /// Creates the documented metadata sentinels for connection-side dispatch.
+    ///
+    /// This path has no authoritative simulation tick or shard identity. Zero
+    /// therefore means "unavailable", not tick zero or shard `(0, 0)`, and the
+    /// ABI event carries [`FcResourceHandle::INVALID`] rather than inventing a
+    /// live shard resource.
+    pub const fn connection_side() -> Self {
+        Self {
+            tick: Tick::ZERO,
+            world: WorldId::new(0),
+            dimension: DimensionId::new(0),
+            shard: ShardPos::new(0, 0),
+            connection_side: true,
+        }
+    }
+
+    /// Returns the caller-supplied tick or the connection-side zero sentinel.
     pub const fn tick(self) -> Tick {
         self.tick
     }
 
-    /// Returns the world that owns the event.
+    /// Returns the caller-supplied world or its connection-side sentinel.
     pub const fn world(self) -> WorldId {
         self.world
     }
 
-    /// Returns the dimension that owns the event.
+    /// Returns the caller-supplied dimension or its connection-side sentinel.
     pub const fn dimension(self) -> DimensionId {
         self.dimension
     }
 
-    /// Returns the logical shard position that owns the event.
+    /// Returns the caller-supplied shard position or its connection-side sentinel.
     pub const fn shard(self) -> ShardPos {
         self.shard
+    }
+
+    pub(crate) const fn is_connection_side(self) -> bool {
+        self.connection_side
     }
 }
 
@@ -580,10 +641,10 @@ impl PluginHost {
     /// Dispatch preserves the host's global registration order. Registering a
     /// [`ferrumc_plugin_loader::LoadedPlugins`] set in its iterator order also
     /// preserves the loader's deterministic plugin-id order. This host currently
-    /// resolves event subscriptions plus the `MESSAGE` and `TELEPORT` subset of
-    /// intent submission. A manifest requesting another facade is rejected
-    /// before initialization; `SET_BLOCK` remains unavailable until a live
-    /// dimension-resource facade is wired.
+    /// resolves event subscriptions, vetoable block-place/break callbacks, and
+    /// the `MESSAGE` and `TELEPORT` subset of intent submission. A manifest
+    /// requesting another facade is rejected before initialization; `SET_BLOCK`
+    /// remains unavailable until a live dimension-resource facade is wired.
     pub fn register_trusted_native(&mut self, plugin: LoadedPlugin) -> Result<PluginId, HostError> {
         if self.len() >= self.config.max_plugins {
             return Err(HostError::CapacityExceeded {
@@ -797,7 +858,7 @@ impl PluginHost {
                 NativeEffect::Subscribe(kind) => {
                     subscriptions.insert(kind);
                 }
-                NativeEffect::Intent(_) => {
+                NativeEffect::Intent(_) | NativeEffect::BlockDecision(_) => {
                     shutdown_after_failed_enable(active, slot.capabilities);
                     slot.state = PluginState::Disabled(DisableReason::EnableFailed);
                     return Err(HostError::NativeLifecycle {
@@ -878,9 +939,10 @@ impl PluginHost {
     /// [`DispatchReport`]. An eligible trusted native plugin is not invoked:
     /// its report contains
     /// [`NativeCallbackFailure::EventContextUnavailable`] because this
-    /// compatibility method has no authoritative simulation tick. Use
-    /// [`PluginHost::dispatch_event_with_native_context`] at a tick boundary to
-    /// drive both packaging representations.
+    /// compatibility method has no caller-supplied ABI metadata. Use
+    /// [`PluginHost::dispatch_event_with_native_context`] with exact simulation
+    /// metadata or [`NativeEventContext::connection_side`] to drive both
+    /// packaging representations.
     pub fn dispatch_event(
         &mut self,
         event: &PluginEvent,
@@ -894,10 +956,10 @@ impl PluginHost {
     /// Dispatches `event` to compiled-in and trusted native subscribers in one
     /// deterministic registration order.
     ///
-    /// `native_context` supplies the caller-attested simulation tick and typed
-    /// shard identity required by the ABI envelope. The host mints a fresh
-    /// shard resource for each native callback and submits a successful
-    /// callback's staged `MESSAGE` or `TELEPORT` intents to the same
+    /// `native_context` supplies exact caller-attested simulation metadata or
+    /// documented connection-side sentinels for the ABI envelope. The host
+    /// mints a fresh shard resource for each native callback and submits a
+    /// successful callback's staged `MESSAGE` or `TELEPORT` intents to the same
     /// caller-owned bounded `sink` used by compiled-in plugins. Callback
     /// failures or capability denials discard the native stage before the sink
     /// is touched.
@@ -967,7 +1029,8 @@ impl PluginHost {
                         });
                         continue;
                     };
-                    let Some(shard_resource) = next_event_resource(slot) else {
+                    let Some(shard_resource) = event_resource_for_context(slot, native_context)
+                    else {
                         report.native_failures.push(NativeCallbackFailureRecord {
                             plugin_id: slot.id.clone(),
                             hook: kind,
@@ -1002,7 +1065,11 @@ impl PluginHost {
     ///
     /// See [`PluginHost::dispatch_block_break_decision`] for the shared semantics
     /// (precedence, catch-and-disable handling, fail-safe); this is the
-    /// placement-side entry point.
+    /// placement-side entry point. This compatibility method has no native ABI
+    /// metadata: an enabled trusted-native veto plugin therefore fails the edit
+    /// closed with [`NativeCallbackFailure::EventContextUnavailable`]. Use
+    /// [`PluginHost::dispatch_block_place_decision_with_native_context`] to
+    /// invoke both packaging representations.
     pub fn dispatch_block_place_decision(
         &mut self,
         attempt: &BlockPlaceAttempt,
@@ -1010,14 +1077,50 @@ impl PluginHost {
         sink: &mut dyn CommandSink,
         permissions: &dyn PermissionApi,
     ) -> ResolvedBlockDecision {
-        self.fold_before(world, sink, permissions, |plugin, ctx| {
-            plugin.before_block_place(attempt, ctx)
-        })
+        self.fold_before(
+            NativeBlockAttempt::Place(attempt),
+            None,
+            world,
+            sink,
+            permissions,
+            |plugin, ctx| plugin.before_block_place(attempt, ctx),
+        )
+    }
+
+    /// Consults compiled-in and trusted native plugins about a pending block
+    /// placement using caller-supplied native callback metadata.
+    ///
+    /// The decision precedence and fail-closed behavior are identical to
+    /// [`PluginHost::dispatch_block_place_decision`]. The current application
+    /// supplies [`NativeEventContext::connection_side`] because this dispatch
+    /// runs connection-side and off-tick.
+    pub fn dispatch_block_place_decision_with_native_context(
+        &mut self,
+        attempt: &BlockPlaceAttempt,
+        native_context: NativeEventContext,
+        world: &dyn WorldView,
+        sink: &mut dyn CommandSink,
+        permissions: &dyn PermissionApi,
+    ) -> ResolvedBlockDecision {
+        self.fold_before(
+            NativeBlockAttempt::Place(attempt),
+            Some(native_context),
+            world,
+            sink,
+            permissions,
+            |plugin, ctx| plugin.before_block_place(attempt, ctx),
+        )
     }
 
     /// Consults every enabled, [`VetoBlockEdits`](Capability::VetoBlockEdits)-capable
     /// plugin about a pending block *break* and folds their decisions into one
     /// [`ResolvedBlockDecision`].
+    ///
+    /// This compatibility method has no native ABI metadata: an enabled
+    /// trusted-native veto plugin therefore fails the edit closed with
+    /// [`NativeCallbackFailure::EventContextUnavailable`]. Use
+    /// [`PluginHost::dispatch_block_break_decision_with_native_context`] to
+    /// invoke both packaging representations.
     ///
     /// # Precedence (deterministic, fail-safe)
     ///
@@ -1033,13 +1136,14 @@ impl PluginHost {
     ///
     /// # Catch-and-disable and fail-safe
     ///
-    /// Each hook is wrapped in [`catch_unwind`], exactly like
-    /// [`dispatch_event`](Self::dispatch_event). A plugin that *panics* is disabled
-    /// ([`DisableReason::Panicked`]), counted in [`PluginStats`], logged, and — the
-    /// fail-safe — treated as a [`Deny`](ResolvedDecision::Deny) so a broken plugin
-    /// cannot silently let a destructive edit through. Per-call budgets apply as
-    /// for event dispatch. The returned decision is `Deny`; callers must reject
-    /// the attempted edit.
+    /// A compiled-in hook is wrapped in [`catch_unwind`], exactly like
+    /// [`dispatch_event`](Self::dispatch_event). A compiled-in panic disables
+    /// that plugin. A trusted-native callback uses its ABI status; a returned
+    /// `FC_PLUGIN_PANIC` disables that plugin, while another callback failure
+    /// leaves it enabled. Every failure is treated as a
+    /// [`Deny`](ResolvedDecision::Deny), so a broken plugin cannot silently let
+    /// a destructive edit through. Per-call budgets apply as for event
+    /// dispatch. Callers must reject the attempted edit.
     pub fn dispatch_block_break_decision(
         &mut self,
         attempt: &BlockBreakAttempt,
@@ -1047,9 +1151,39 @@ impl PluginHost {
         sink: &mut dyn CommandSink,
         permissions: &dyn PermissionApi,
     ) -> ResolvedBlockDecision {
-        self.fold_before(world, sink, permissions, |plugin, ctx| {
-            plugin.before_block_break(attempt, ctx)
-        })
+        self.fold_before(
+            NativeBlockAttempt::Break(attempt),
+            None,
+            world,
+            sink,
+            permissions,
+            |plugin, ctx| plugin.before_block_break(attempt, ctx),
+        )
+    }
+
+    /// Consults compiled-in and trusted native plugins about a pending block
+    /// break using caller-supplied native callback metadata.
+    ///
+    /// The decision precedence and fail-closed behavior are identical to
+    /// [`PluginHost::dispatch_block_break_decision`]. The current application
+    /// supplies [`NativeEventContext::connection_side`] because this dispatch
+    /// runs connection-side and off-tick.
+    pub fn dispatch_block_break_decision_with_native_context(
+        &mut self,
+        attempt: &BlockBreakAttempt,
+        native_context: NativeEventContext,
+        world: &dyn WorldView,
+        sink: &mut dyn CommandSink,
+        permissions: &dyn PermissionApi,
+    ) -> ResolvedBlockDecision {
+        self.fold_before(
+            NativeBlockAttempt::Break(attempt),
+            Some(native_context),
+            world,
+            sink,
+            permissions,
+            |plugin, ctx| plugin.before_block_break(attempt, ctx),
+        )
     }
 
     /// The shared fold driving both `before_block_*` decision paths.
@@ -1057,8 +1191,11 @@ impl PluginHost {
     /// `call` invokes the appropriate hook on one plugin; everything else (the
     /// capability gate, catch-and-disable handling, budgeting, and the precedence
     /// fold) is identical for placement and break.
+    #[allow(clippy::too_many_lines)]
     fn fold_before<F>(
         &mut self,
+        native_attempt: NativeBlockAttempt<'_>,
+        native_context: Option<NativeEventContext>,
         world: &dyn WorldView,
         sink: &mut dyn CommandSink,
         permissions: &dyn PermissionApi,
@@ -1069,6 +1206,8 @@ impl PluginHost {
     {
         let Self {
             plugins,
+            native_plugins,
+            registration_order,
             storage,
             config,
             ..
@@ -1080,85 +1219,115 @@ impl PluginHost {
         let mut emitted: Vec<WorldIntent> = Vec::new();
         let mut report = DispatchReport::default();
 
-        for slot in plugins.iter_mut() {
+        for registered in registration_order.iter().copied() {
             // A Deny is absorbing: once denied, stop consulting plugins.
             if matches!(decision, ResolvedDecision::Deny { .. }) {
                 break;
             }
-            if !slot.state.is_enabled() || !slot.capabilities.grants(Capability::VetoBlockEdits) {
-                continue;
-            }
-
-            let namespaced = NamespacedStorage::new(storage.as_ref(), slot.id.clone());
-            let mut ctx = EventContext::new(
-                slot.capabilities,
-                world,
-                &mut *sink,
-                permissions,
-                &namespaced,
-            );
-
-            let start = Instant::now();
-            let outcome = catch_unwind(AssertUnwindSafe(|| call(&mut *slot.plugin, &mut ctx)));
-            let elapsed = start.elapsed();
-
-            let Ok(plugin_decision) = outcome else {
-                // Fail-safe: a panicking plugin denies the edit and is disabled.
-                slot.stats.panics += 1;
-                slot.state = PluginState::Disabled(DisableReason::Panicked);
-                report.panicked.push(slot.id.clone());
-                tracing::warn!(
-                    plugin = %slot.id,
-                    "plugin panicked during a before_block_* decision; disabled and treated as Deny"
-                );
-                decision = ResolvedDecision::Deny { message: None };
-                continue;
-            };
-
-            report.delivered += 1;
-            if budget.is_exceeded(elapsed) {
-                slot.stats.budget_overruns += 1;
-                report.budget_exceeded.push(slot.id.clone());
-                tracing::warn!(
-                    plugin = %slot.id,
-                    ?elapsed,
-                    "plugin exceeded its time budget during a before_block_* decision"
-                );
-                if disable_on_overrun {
-                    slot.state = PluginState::Disabled(DisableReason::BudgetExceeded);
-                }
-            }
-
-            match plugin_decision {
-                PluginBlockDecision::Deny { message } => {
-                    slot.stats.deny = slot.stats.deny.saturating_add(1);
-                    decision = ResolvedDecision::Deny { message };
-                }
-                PluginBlockDecision::Replace { block_state_id } => {
-                    slot.stats.replace = slot.stats.replace.saturating_add(1);
-                    decision = ResolvedDecision::Replace { block_state_id };
-                }
-                PluginBlockDecision::EmitIntents(intents) => {
-                    // Emitting intents lets the original edit proceed, so it counts
-                    // as an allow for the per-plugin decision tally.
-                    slot.stats.allow = slot.stats.allow.saturating_add(1);
-                    for intent in intents {
-                        if emitted.len() >= MAX_EMITTED_INTENTS {
-                            tracing::warn!(
-                                plugin = %slot.id,
-                                cap = MAX_EMITTED_INTENTS,
-                                "plugin exceeded the emitted-intent cap; dropping the rest"
-                            );
-                            break;
-                        }
-                        emitted.push(intent);
+            match registered {
+                RegisteredPlugin::Compiled(index) => {
+                    let Some(slot) = plugins.get_mut(index) else {
+                        continue;
+                    };
+                    if !slot.state.is_enabled()
+                        || !slot.capabilities.grants(Capability::VetoBlockEdits)
+                    {
+                        continue;
                     }
+
+                    let namespaced = NamespacedStorage::new(storage.as_ref(), slot.id.clone());
+                    let mut ctx = EventContext::new(
+                        slot.capabilities,
+                        world,
+                        &mut *sink,
+                        permissions,
+                        &namespaced,
+                    );
+
+                    let start = Instant::now();
+                    let outcome =
+                        catch_unwind(AssertUnwindSafe(|| call(&mut *slot.plugin, &mut ctx)));
+                    let elapsed = start.elapsed();
+
+                    let Ok(plugin_decision) = outcome else {
+                        // Fail-safe: a panicking plugin denies the edit and is disabled.
+                        slot.stats.panics += 1;
+                        slot.state = PluginState::Disabled(DisableReason::Panicked);
+                        report.panicked.push(slot.id.clone());
+                        tracing::warn!(
+                            plugin = %slot.id,
+                            "plugin panicked during a before_block_* decision; disabled and treated as Deny"
+                        );
+                        decision = ResolvedDecision::Deny { message: None };
+                        continue;
+                    };
+
+                    report.delivered += 1;
+                    if budget.is_exceeded(elapsed) {
+                        slot.stats.budget_overruns += 1;
+                        report.budget_exceeded.push(slot.id.clone());
+                        tracing::warn!(
+                            plugin = %slot.id,
+                            ?elapsed,
+                            "plugin exceeded its time budget during a before_block_* decision"
+                        );
+                        if disable_on_overrun {
+                            slot.state = PluginState::Disabled(DisableReason::BudgetExceeded);
+                        }
+                    }
+
+                    fold_compiled_block_decision(
+                        slot,
+                        plugin_decision,
+                        &mut decision,
+                        &mut emitted,
+                    );
                 }
-                // `PluginBlockDecision::Allow` (no-op) and — since the enum is
-                // `#[non_exhaustive]` — any unknown future variant leave the fold
-                // unchanged, and count as an allow (the edit was not vetoed).
-                _ => {
-                    slot.stats.allow = slot.stats.allow.saturating_add(1);
+                RegisteredPlugin::TrustedNative(index) => {
+                    let Some(slot) = native_plugins.get_mut(index) else {
+                        continue;
+                    };
+                    if !slot.state.is_enabled()
+                        || !slot.capabilities.grants(Capability::VetoBlockEdits)
+                    {
+                        continue;
+                    }
+                    let hook = native_attempt.hook();
+                    let Some(native_context) = native_context else {
+                        report.native_failures.push(NativeCallbackFailureRecord {
+                            plugin_id: slot.id.clone(),
+                            hook,
+                            failure: NativeCallbackFailure::EventContextUnavailable,
+                        });
+                        decision = ResolvedDecision::Deny { message: None };
+                        continue;
+                    };
+                    let Some(shard_resource) = event_resource_for_context(slot, native_context)
+                    else {
+                        report.native_failures.push(NativeCallbackFailureRecord {
+                            plugin_id: slot.id.clone(),
+                            hook,
+                            failure: NativeCallbackFailure::ResourceHandleExhausted,
+                        });
+                        decision = ResolvedDecision::Deny { message: None };
+                        continue;
+                    };
+                    let encoded_event = native_attempt.encode(native_context, shard_resource);
+                    let Some(plugin_decision) = dispatch_native_block_decision(
+                        slot,
+                        &encoded_event,
+                        native_context,
+                        native_attempt.route(),
+                        hook,
+                        sink,
+                        budget,
+                        disable_on_overrun,
+                        &mut report,
+                    ) else {
+                        decision = ResolvedDecision::Deny { message: None };
+                        continue;
+                    };
+                    fold_native_block_decision(slot, plugin_decision, &mut decision);
                 }
             }
         }
@@ -1432,6 +1601,61 @@ impl PluginHost {
     }
 }
 
+fn fold_compiled_block_decision(
+    slot: &mut PluginSlot,
+    plugin_decision: PluginBlockDecision,
+    decision: &mut ResolvedDecision,
+    emitted: &mut Vec<WorldIntent>,
+) {
+    match plugin_decision {
+        PluginBlockDecision::Deny { message } => {
+            slot.stats.deny = slot.stats.deny.saturating_add(1);
+            *decision = ResolvedDecision::Deny { message };
+        }
+        PluginBlockDecision::Replace { block_state_id } => {
+            slot.stats.replace = slot.stats.replace.saturating_add(1);
+            *decision = ResolvedDecision::Replace { block_state_id };
+        }
+        PluginBlockDecision::EmitIntents(intents) => {
+            slot.stats.allow = slot.stats.allow.saturating_add(1);
+            for intent in intents {
+                if emitted.len() >= MAX_EMITTED_INTENTS {
+                    tracing::warn!(
+                        plugin = %slot.id,
+                        cap = MAX_EMITTED_INTENTS,
+                        "plugin exceeded the emitted-intent cap; dropping the rest"
+                    );
+                    break;
+                }
+                emitted.push(intent);
+            }
+        }
+        _ => {
+            slot.stats.allow = slot.stats.allow.saturating_add(1);
+        }
+    }
+}
+
+fn fold_native_block_decision(
+    slot: &mut TrustedNativeSlot,
+    plugin_decision: PluginBlockDecision,
+    decision: &mut ResolvedDecision,
+) {
+    match plugin_decision {
+        PluginBlockDecision::Deny { message } => {
+            slot.stats.deny = slot.stats.deny.saturating_add(1);
+            *decision = ResolvedDecision::Deny { message };
+        }
+        PluginBlockDecision::Replace { block_state_id } => {
+            slot.stats.replace = slot.stats.replace.saturating_add(1);
+            *decision = ResolvedDecision::Replace { block_state_id };
+        }
+        _ => {
+            slot.stats.allow = slot.stats.allow.saturating_add(1);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_compiled_event(
     slot: &mut PluginSlot,
@@ -1481,6 +1705,141 @@ fn dispatch_compiled_event(
         report.panicked.push(slot.id.clone());
         tracing::warn!(plugin = %slot.id, "plugin panicked during on_event; disabled");
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_native_block_decision(
+    slot: &mut TrustedNativeSlot,
+    encoded_event: &OwnedEvent,
+    event_context: NativeEventContext,
+    event_route: NativeEventRoute,
+    hook: EventKind,
+    sink: &mut dyn CommandSink,
+    budget: CallBudget,
+    disable_on_overrun: bool,
+    report: &mut DispatchReport,
+) -> Option<PluginBlockDecision> {
+    let Some(active) = slot.active.as_mut() else {
+        report.native_failures.push(NativeCallbackFailureRecord {
+            plugin_id: slot.id.clone(),
+            hook,
+            failure: NativeCallbackFailure::Status(FC_ERROR),
+        });
+        return None;
+    };
+
+    let mut services = NativeCallbackServices::for_block_decision(
+        slot.capabilities,
+        encoded_event.shard(),
+        event_context,
+        event_route,
+    );
+    let start = Instant::now();
+    let outcome = active.on_event(encoded_event, &mut services);
+    let elapsed = start.elapsed();
+    let (completion, boundary_error) = match outcome {
+        Ok(status) => (services.complete(status), None),
+        Err(error) => (services.complete(FC_ERROR), Some(error)),
+    };
+    let cooperatively_panicked =
+        boundary_error.is_none() && completion.callback_status() == FC_PLUGIN_PANIC;
+    let panic_diagnostic = if cooperatively_panicked {
+        native_panic_diagnostic(&completion)
+    } else {
+        String::new()
+    };
+    let over_budget = budget.is_exceeded(elapsed);
+    let disposition =
+        native_post_call_disposition(cooperatively_panicked, over_budget, disable_on_overrun);
+
+    let decision =
+        record_native_block_completion(slot, hook, completion, boundary_error, sink, report);
+    if disposition.over_budget {
+        slot.stats.budget_overruns += 1;
+        report.budget_exceeded.push(slot.id.clone());
+        tracing::warn!(
+            plugin = %slot.id,
+            ?elapsed,
+            "trusted native plugin exceeded its time budget during block decision dispatch"
+        );
+    }
+    match disposition.action {
+        NativePostCallAction::KeepEnabled => {}
+        NativePostCallAction::DisableForBudget => {
+            shutdown_native_instance(slot);
+            slot.subscriptions.clear();
+            slot.state = PluginState::Disabled(DisableReason::BudgetExceeded);
+        }
+        NativePostCallAction::DisableForPanic => {
+            disable_after_native_panic(slot, hook, panic_diagnostic, report);
+        }
+    }
+    decision
+}
+
+fn record_native_block_completion(
+    slot: &TrustedNativeSlot,
+    hook: EventKind,
+    completion: NativeCompletion,
+    boundary_error: Option<CallbackError>,
+    sink: &mut dyn CommandSink,
+    report: &mut DispatchReport,
+) -> Option<PluginBlockDecision> {
+    log_native_diagnostics(&slot.id, completion.diagnostics());
+    if let Some(capability) = completion.capability_denial() {
+        report
+            .native_capability_denials
+            .push(NativeCapabilityDenial {
+                plugin_id: slot.id.clone(),
+                capability,
+            });
+    }
+
+    if let Some(error) = boundary_error {
+        report.native_failures.push(NativeCallbackFailureRecord {
+            plugin_id: slot.id.clone(),
+            hook,
+            failure: NativeCallbackFailure::Boundary(error),
+        });
+        return None;
+    }
+    if !completion.is_committed() {
+        report.native_failures.push(NativeCallbackFailureRecord {
+            plugin_id: slot.id.clone(),
+            hook,
+            failure: NativeCallbackFailure::Status(completion_failure_status(&completion)),
+        });
+        return None;
+    }
+
+    report.delivered += 1;
+    let mut decision = None;
+    for effect in completion.into_effects() {
+        match effect {
+            NativeEffect::Intent(intent) => {
+                if let Err(error) = sink.submit(intent) {
+                    report.native_failures.push(NativeCallbackFailureRecord {
+                        plugin_id: slot.id.clone(),
+                        hook,
+                        failure: NativeCallbackFailure::CommandSink(error),
+                    });
+                    return None;
+                }
+            }
+            NativeEffect::BlockDecision(value) => {
+                decision = Some(value);
+            }
+            NativeEffect::Subscribe(_) => {
+                report.native_failures.push(NativeCallbackFailureRecord {
+                    plugin_id: slot.id.clone(),
+                    hook,
+                    failure: NativeCallbackFailure::Status(FC_ERROR),
+                });
+                return None;
+            }
+        }
+    }
+    decision
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1582,6 +1941,17 @@ fn next_event_resource(slot: &mut TrustedNativeSlot) -> Option<FcResourceHandle>
     Some(FcResourceHandle::from_raw(raw))
 }
 
+fn event_resource_for_context(
+    slot: &mut TrustedNativeSlot,
+    context: NativeEventContext,
+) -> Option<FcResourceHandle> {
+    if context.is_connection_side() {
+        Some(FcResourceHandle::INVALID)
+    } else {
+        next_event_resource(slot)
+    }
+}
+
 fn record_native_completion(
     slot: &TrustedNativeSlot,
     kind: EventKind,
@@ -1631,9 +2001,11 @@ fn commit_native_effects(
     for effect in effects {
         let result = match effect {
             NativeEffect::Intent(intent) => sink.submit(intent),
-            NativeEffect::Subscribe(_) => Err(IntentError::rejected(
-                "event subscriptions are initialization-only",
-            )),
+            NativeEffect::Subscribe(_) | NativeEffect::BlockDecision(_) => {
+                Err(IntentError::rejected(
+                    "non-intent native effect cannot be committed as an event intent",
+                ))
+            }
         };
         if let Err(error) = result {
             report.native_failures.push(NativeCallbackFailureRecord {
