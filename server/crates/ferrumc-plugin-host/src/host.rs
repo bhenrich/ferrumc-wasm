@@ -1,20 +1,29 @@
-//! The plugin registry: registration, lifecycle, and panic-isolated dispatch.
+//! The plugin registry: registration, lifecycle, and panic-contained dispatch.
 
 use std::collections::BTreeSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
 
 use ferrumc_command::CommandTree;
-use ferrumc_core::{PluginId, TextComponent};
+use ferrumc_core::{DimensionId, PluginId, TextComponent, Tick, WorldId};
+use ferrumc_math::ShardPos;
+use ferrumc_plugin_abi::{FcResourceHandle, FcStatus, FC_CAPABILITY_DENIED, FC_ERROR, FC_OK};
 use ferrumc_plugin_api::{
     BlockBreakAttempt, BlockPlaceAttempt, Capability, CapabilityManifest, ChatAttempt,
-    CommandRegistrar, CommandSink, EventContext, EventKind, EventRegistrar, InteractAttempt,
-    PermissionApi, Plugin, PluginBlockDecision, PluginEvent, PluginEventDecision, PluginMetadata,
-    SetupContext, TeardownContext, WorldIntent, WorldView, MAX_EMITTED_INTENTS,
+    CommandRegistrar, CommandSink, EventContext, EventKind, EventRegistrar, IntentError,
+    InteractAttempt, PermissionApi, Plugin, PluginBlockDecision, PluginEvent, PluginEventDecision,
+    PluginMetadata, SetupContext, TeardownContext, WorldIntent, WorldView, MAX_EMITTED_INTENTS,
+};
+use ferrumc_plugin_loader::{
+    ActivePlugin, CallbackError, LoadedPlugin, OwnedEvent, PluginCapability as NativeCapability,
 };
 
 use crate::budget::CallBudget;
-use crate::error::HostError;
+use crate::error::{HostError, NativeLifecycleHook};
+use crate::native_runtime::{
+    encode_event, supported_native_capabilities, NativeCallbackServices, NativeCompletion,
+    NativeDiagnostic, NativeEffect,
+};
 use crate::state::{DisableReason, PluginState, PluginStats};
 use crate::storage::{InMemoryPluginStorage, NamespacedStorage, PluginStorageBackend};
 
@@ -97,6 +106,139 @@ struct PluginSlot {
     stats: PluginStats,
 }
 
+/// A validated trusted native plugin and the host bookkeeping around its
+/// reusable factory and current instance.
+struct TrustedNativeSlot {
+    id: PluginId,
+    factory: LoadedPlugin,
+    active: Option<ActivePlugin>,
+    metadata: PluginMetadata,
+    capabilities: CapabilityManifest,
+    state: PluginState,
+    subscriptions: BTreeSet<EventKind>,
+    stats: PluginStats,
+    next_event_resource: u64,
+}
+
+/// Stable index into one of the host's two storage cohorts.
+#[derive(Clone, Copy)]
+enum RegisteredPlugin {
+    Compiled(usize),
+    TrustedNative(usize),
+}
+
+/// One capability-gated host call denied during a trusted native callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCapabilityDenial {
+    plugin_id: PluginId,
+    capability: Capability,
+}
+
+impl NativeCapabilityDenial {
+    /// Returns the plugin whose callback made the denied request.
+    pub const fn plugin_id(&self) -> &PluginId {
+        &self.plugin_id
+    }
+
+    /// Returns the undeclared capability required by the request.
+    pub const fn capability(&self) -> Capability {
+        self.capability
+    }
+}
+
+/// Authoritative metadata required to deliver an event to trusted native plugins.
+///
+/// Construct this at the simulation tick boundary that owns the event. The
+/// caller attests the typed world, dimension, and logical shard identity; the
+/// host associates them with a fresh callback-scoped ABI resource handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeEventContext {
+    tick: Tick,
+    world: WorldId,
+    dimension: DimensionId,
+    shard: ShardPos,
+}
+
+impl NativeEventContext {
+    /// Creates authoritative metadata for one logical shard's event.
+    pub const fn new(tick: Tick, world: WorldId, dimension: DimensionId, shard: ShardPos) -> Self {
+        Self {
+            tick,
+            world,
+            dimension,
+            shard,
+        }
+    }
+
+    /// Returns the authoritative simulation tick.
+    pub const fn tick(self) -> Tick {
+        self.tick
+    }
+
+    /// Returns the world that owns the event.
+    pub const fn world(self) -> WorldId {
+        self.world
+    }
+
+    /// Returns the dimension that owns the event.
+    pub const fn dimension(self) -> DimensionId {
+        self.dimension
+    }
+
+    /// Returns the logical shard position that owns the event.
+    pub const fn shard(self) -> ShardPos {
+        self.shard
+    }
+}
+
+/// Why one trusted native event callback or its command commit did not finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NativeCallbackFailure {
+    /// The caller used the context-free compatibility dispatch method.
+    ///
+    /// Native callbacks are not invoked because the host will not fabricate
+    /// ABI tick or shard metadata.
+    EventContextUnavailable,
+    /// The plugin's callback-scoped resource generation cannot advance.
+    ResourceHandleExhausted,
+    /// The callback cooperatively returned a non-success ABI status.
+    Status(FcStatus),
+    /// The audited callback boundary rejected the invocation.
+    Boundary(CallbackError),
+    /// The simulation-provided command sink rejected a staged intent.
+    ///
+    /// Earlier intents from the same successful callback may already have been
+    /// accepted by that sink; the rejected intent and remaining suffix are not
+    /// submitted.
+    CommandSink(IntentError),
+}
+
+/// A trusted native callback or commit failure attributed to its plugin and hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCallbackFailureRecord {
+    plugin_id: PluginId,
+    hook: EventKind,
+    failure: NativeCallbackFailure,
+}
+
+impl NativeCallbackFailureRecord {
+    /// Returns the plugin whose callback failed.
+    pub const fn plugin_id(&self) -> &PluginId {
+        &self.plugin_id
+    }
+
+    /// Returns the event hook being delivered.
+    pub const fn hook(&self) -> EventKind {
+        self.hook
+    }
+
+    /// Returns the typed callback failure.
+    pub const fn failure(&self) -> &NativeCallbackFailure {
+        &self.failure
+    }
+}
+
 /// A summary of one [`PluginHost::dispatch_event`] call.
 ///
 /// Reports how many enabled, subscribed plugins received the event, plus the
@@ -107,10 +249,16 @@ pub struct DispatchReport {
     delivered: usize,
     panicked: Vec<PluginId>,
     budget_exceeded: Vec<PluginId>,
+    native_capability_denials: Vec<NativeCapabilityDenial>,
+    native_failures: Vec<NativeCallbackFailureRecord>,
 }
 
 impl DispatchReport {
-    /// Returns how many plugins successfully received the event.
+    /// Returns how many plugins completed their event callback successfully.
+    ///
+    /// For a trusted native callback this counts an `FC_OK` callback even when
+    /// the caller-owned command sink later rejects one of its staged intents;
+    /// inspect [`DispatchReport::native_failures`] for commit failures.
     pub const fn delivered(&self) -> usize {
         self.delivered
     }
@@ -123,6 +271,20 @@ impl DispatchReport {
     /// Returns the ids of plugins that exceeded their per-call budget.
     pub fn budget_exceeded(&self) -> &[PluginId] {
         &self.budget_exceeded
+    }
+
+    /// Returns the first undeclared-capability denial from each native callback.
+    ///
+    /// Every denied host call still receives `FC_CAPABILITY_DENIED`; this
+    /// bounded report retains one representative denial per callback.
+    pub fn native_capability_denials(&self) -> &[NativeCapabilityDenial] {
+        &self.native_capability_denials
+    }
+
+    /// Returns trusted native delivery, callback, boundary, and command-commit
+    /// failures.
+    pub fn native_failures(&self) -> &[NativeCallbackFailureRecord] {
+        &self.native_failures
     }
 }
 
@@ -247,16 +409,16 @@ impl ResolvedEventOutcome {
 }
 
 /// An in-process plugin host: a registry that owns plugins and drives their
-/// lifecycle with panic isolation and a per-call time budget.
+/// lifecycle with panic containment and a per-call time budget.
 ///
-/// The host loads [`Plugin`] trait objects directly (in-process; dynamic-library
-/// loading is a later milestone), grants each a [`CapabilityManifest`], enables
-/// them, and dispatches events to subscribers. Every call into plugin code is
-/// wrapped so a panicking plugin is caught and disabled rather than crashing the
-/// host. Plugin-registered commands are aggregated into a single
-/// [`CommandTree`].
+/// The host owns compiled-in [`Plugin`] trait objects and validated trusted
+/// native factories. Compiled-in calls use `catch_unwind`; trusted native
+/// callbacks use ABI statuses and a transactional bounded command stage.
+/// Plugin-registered commands are aggregated into a single [`CommandTree`].
 pub struct PluginHost {
     plugins: Vec<PluginSlot>,
+    native_plugins: Vec<TrustedNativeSlot>,
+    registration_order: Vec<RegisteredPlugin>,
     storage: Box<dyn PluginStorageBackend>,
     command_tree: CommandTree,
     config: HostConfig,
@@ -272,6 +434,8 @@ impl PluginHost {
     pub fn with_config(storage: Box<dyn PluginStorageBackend>, config: HostConfig) -> Self {
         Self {
             plugins: Vec::new(),
+            native_plugins: Vec::new(),
+            registration_order: Vec::new(),
             storage,
             command_tree: CommandTree::new(),
             config,
@@ -313,13 +477,13 @@ impl PluginHost {
         plugin: Box<dyn Plugin>,
         granted: Option<CapabilityManifest>,
     ) -> Result<PluginId, HostError> {
-        if self.plugins.len() >= self.config.max_plugins {
+        if self.len() >= self.config.max_plugins {
             return Err(HostError::CapacityExceeded {
                 max: self.config.max_plugins,
             });
         }
 
-        // Reading metadata calls into plugin code, so isolate it too. If it
+        // Reading metadata calls into plugin code, so protect this boundary too. If it
         // panics we have no real id (reading it is what failed), so report the
         // panic against a placeholder id.
         let Ok(metadata) = catch_unwind(AssertUnwindSafe(|| plugin.metadata())) else {
@@ -329,11 +493,12 @@ impl PluginHost {
         };
 
         let id = metadata.id().clone();
-        if self.plugins.iter().any(|slot| slot.id == id) {
+        if self.has_plugin(&id) {
             return Err(HostError::DuplicateId(id));
         }
 
         let capabilities = granted.unwrap_or_else(|| metadata.requested_capabilities());
+        let index = self.plugins.len();
         self.plugins.push(PluginSlot {
             id: id.clone(),
             plugin,
@@ -343,6 +508,62 @@ impl PluginHost {
             subscriptions: BTreeSet::new(),
             stats: PluginStats::default(),
         });
+        self.registration_order
+            .push(RegisteredPlugin::Compiled(index));
+        Ok(id)
+    }
+
+    /// Registers one fully validated trusted native plugin factory.
+    ///
+    /// Dispatch preserves the host's global registration order. Registering a
+    /// [`ferrumc_plugin_loader::LoadedPlugins`] set in its iterator order also
+    /// preserves the loader's deterministic plugin-id order. This host currently
+    /// resolves event subscriptions plus the `MESSAGE` and `TELEPORT` subset of
+    /// intent submission. A manifest requesting another facade is rejected
+    /// before initialization; `SET_BLOCK` remains unavailable until a live
+    /// dimension-resource facade is wired.
+    pub fn register_trusted_native(&mut self, plugin: LoadedPlugin) -> Result<PluginId, HostError> {
+        if self.len() >= self.config.max_plugins {
+            return Err(HostError::CapacityExceeded {
+                max: self.config.max_plugins,
+            });
+        }
+
+        let manifest = plugin.manifest();
+        let id = PluginId::new(manifest.id());
+        if self.has_plugin(&id) {
+            return Err(HostError::DuplicateId(id));
+        }
+
+        let mut capabilities = CapabilityManifest::empty();
+        for native_capability in manifest.capabilities().iter() {
+            let capability = map_native_capability(native_capability);
+            if !supported_native_capabilities().grants(capability) {
+                return Err(HostError::UnsupportedNativeCapability { id, capability });
+            }
+            capabilities = capabilities.with(capability);
+        }
+
+        let metadata = PluginMetadata::new(
+            id.clone(),
+            manifest.name(),
+            manifest.version().clone(),
+            capabilities,
+        );
+        let index = self.native_plugins.len();
+        self.native_plugins.push(TrustedNativeSlot {
+            id: id.clone(),
+            factory: plugin,
+            active: None,
+            metadata,
+            capabilities,
+            state: PluginState::Registered,
+            subscriptions: BTreeSet::new(),
+            stats: PluginStats::default(),
+            next_event_resource: 1,
+        });
+        self.registration_order
+            .push(RegisteredPlugin::TrustedNative(index));
         Ok(id)
     }
 
@@ -352,14 +573,21 @@ impl PluginHost {
     /// On success the plugin's subscriptions are recorded and its registered
     /// commands are merged into the host's command tree. If the hook returns an
     /// error the plugin is left disabled and [`HostError::PluginFailed`] is
-    /// returned; if it panics the plugin is disabled and [`HostError::Panicked`]
-    /// is returned. Either way the host keeps running.
+    /// returned. If a compiled-in hook unwinds, that plugin is disabled and
+    /// [`HostError::Panicked`] is returned. A trusted native initialization
+    /// failure reported through the ABI returns [`HostError::NativeLifecycle`];
+    /// process-aborting native failures cannot be recovered here.
     pub fn enable(&mut self, id: &PluginId) -> Result<(), HostError> {
+        if self.native_plugins.iter().any(|slot| &slot.id == id) {
+            return self.enable_trusted_native(id);
+        }
+
         let Self {
             plugins,
             storage,
             command_tree,
             config,
+            ..
         } = self;
 
         let slot = plugins
@@ -416,10 +644,16 @@ impl PluginHost {
     /// Disables the enabled plugin with id `id`, running its
     /// [`on_disable`](Plugin::on_disable) hook.
     ///
-    /// A panic in the hook is caught and ignored (the plugin is being disabled
-    /// regardless). Returns [`HostError::NotEnabled`] if the plugin is not
-    /// currently enabled.
+    /// An unwind from a compiled-in hook is caught and ignored because the
+    /// plugin is being disabled regardless. Returns [`HostError::NotEnabled`]
+    /// if the plugin is not currently enabled. A trusted native shutdown
+    /// failure reported through the ABI leaves the plugin disabled and returns
+    /// [`HostError::NativeLifecycle`].
     pub fn disable(&mut self, id: &PluginId) -> Result<(), HostError> {
+        if self.native_plugins.iter().any(|slot| &slot.id == id) {
+            return self.disable_trusted_native(id);
+        }
+
         let Self {
             plugins, storage, ..
         } = self;
@@ -443,15 +677,142 @@ impl PluginHost {
         Ok(())
     }
 
-    /// Dispatches `event` to every enabled plugin subscribed to its kind, with
-    /// panic isolation and per-call budgeting.
+    fn enable_trusted_native(&mut self, id: &PluginId) -> Result<(), HostError> {
+        let config = self.config;
+        let slot = self
+            .native_plugins
+            .iter_mut()
+            .find(|slot| &slot.id == id)
+            .ok_or_else(|| HostError::UnknownPlugin(id.clone()))?;
+        if slot.state.is_enabled() {
+            return Err(HostError::AlreadyEnabled(id.clone()));
+        }
+        shutdown_native_instance(slot);
+        slot.subscriptions.clear();
+
+        let mut services = NativeCallbackServices::for_initialization(slot.capabilities);
+        let start = Instant::now();
+        let outcome = slot.factory.initialize(&mut services);
+        let elapsed = start.elapsed();
+
+        let active = match outcome {
+            Ok(active) => active,
+            Err(source) => {
+                let status = callback_error_status(&source);
+                let completion = services.complete(status);
+                log_native_diagnostics(&slot.id, completion.diagnostics());
+                slot.state = PluginState::Disabled(DisableReason::EnableFailed);
+                return Err(HostError::NativeLifecycle {
+                    id: id.clone(),
+                    hook: NativeLifecycleHook::Initialize,
+                    source,
+                });
+            }
+        };
+
+        let completion = services.complete(FC_OK);
+        log_native_diagnostics(&slot.id, completion.diagnostics());
+        if !completion.is_committed() {
+            let status = completion_failure_status(&completion);
+            shutdown_after_failed_enable(active, slot.capabilities);
+            slot.state = PluginState::Disabled(DisableReason::EnableFailed);
+            return Err(HostError::NativeLifecycle {
+                id: id.clone(),
+                hook: NativeLifecycleHook::Initialize,
+                source: CallbackError::Status(status),
+            });
+        }
+
+        let mut subscriptions = BTreeSet::new();
+        for effect in completion.into_effects() {
+            match effect {
+                NativeEffect::Subscribe(kind) => {
+                    subscriptions.insert(kind);
+                }
+                NativeEffect::Intent(_) => {
+                    shutdown_after_failed_enable(active, slot.capabilities);
+                    slot.state = PluginState::Disabled(DisableReason::EnableFailed);
+                    return Err(HostError::NativeLifecycle {
+                        id: id.clone(),
+                        hook: NativeLifecycleHook::Initialize,
+                        source: CallbackError::Status(FC_ERROR),
+                    });
+                }
+            }
+        }
+
+        slot.active = Some(active);
+        slot.subscriptions = subscriptions;
+        slot.state = PluginState::Enabled;
+        if config.call_budget().is_exceeded(elapsed) {
+            slot.stats.budget_overruns += 1;
+            tracing::warn!(
+                plugin = %slot.id,
+                ?elapsed,
+                "trusted native plugin exceeded its time budget during initialization"
+            );
+        }
+        Ok(())
+    }
+
+    fn disable_trusted_native(&mut self, id: &PluginId) -> Result<(), HostError> {
+        let slot = self
+            .native_plugins
+            .iter_mut()
+            .find(|slot| &slot.id == id)
+            .ok_or_else(|| HostError::UnknownPlugin(id.clone()))?;
+        if !slot.state.is_enabled() {
+            return Err(HostError::NotEnabled(id.clone()));
+        }
+
+        let Some(active) = slot.active.take() else {
+            slot.state = PluginState::Disabled(DisableReason::Manual);
+            slot.subscriptions.clear();
+            return Err(HostError::NotEnabled(id.clone()));
+        };
+        let mut services = NativeCallbackServices::for_shutdown(slot.capabilities);
+        let outcome = active.shutdown(&mut services);
+        slot.state = PluginState::Disabled(DisableReason::Manual);
+        slot.subscriptions.clear();
+
+        match outcome {
+            Ok(status) => {
+                let completion = services.complete(status);
+                log_native_diagnostics(&slot.id, completion.diagnostics());
+                if status == FC_OK && completion.is_committed() {
+                    Ok(())
+                } else {
+                    Err(HostError::NativeLifecycle {
+                        id: id.clone(),
+                        hook: NativeLifecycleHook::Shutdown,
+                        source: CallbackError::Status(completion_failure_status(&completion)),
+                    })
+                }
+            }
+            Err(source) => {
+                let status = callback_error_status(&source);
+                let completion = services.complete(status);
+                log_native_diagnostics(&slot.id, completion.diagnostics());
+                Err(HostError::NativeLifecycle {
+                    id: id.clone(),
+                    hook: NativeLifecycleHook::Shutdown,
+                    source,
+                })
+            }
+        }
+    }
+
+    /// Dispatches `event` to enabled compiled-in plugins subscribed to its kind.
     ///
-    /// The world, sink, and permission facades are injected by the caller (the
-    /// simulation layer); the host supplies each plugin its own namespaced
-    /// storage. A plugin that panics is disabled and recorded in the returned
-    /// [`DispatchReport`]; the host (and the remaining plugins) keep running. A
-    /// plugin that overruns the call budget is recorded, and disabled too if
-    /// [`HostConfig::disable_on_overrun`] is set.
+    /// The world, sink, and permission facades are injected by the caller; the
+    /// host supplies each plugin its own namespaced storage. An unwinding
+    /// compiled-in plugin is disabled and recorded in the returned
+    /// [`DispatchReport`]. An eligible trusted native plugin is not invoked:
+    /// its report contains
+    /// [`NativeCallbackFailure::EventContextUnavailable`] because this
+    /// compatibility method has no authoritative simulation tick. Use
+    /// [`PluginHost::dispatch_event_with_native_context`] at a tick boundary to
+    /// drive both packaging representations.
     pub fn dispatch_event(
         &mut self,
         event: &PluginEvent,
@@ -459,9 +820,43 @@ impl PluginHost {
         sink: &mut dyn CommandSink,
         permissions: &dyn PermissionApi,
     ) -> DispatchReport {
+        self.dispatch_event_inner(event, None, world, sink, permissions)
+    }
+
+    /// Dispatches `event` to compiled-in and trusted native subscribers in one
+    /// deterministic registration order.
+    ///
+    /// `native_context` supplies the caller-attested simulation tick and typed
+    /// shard identity required by the ABI envelope. The host mints a fresh
+    /// shard resource for each native callback and submits a successful
+    /// callback's staged `MESSAGE` or `TELEPORT` intents to the same
+    /// caller-owned bounded `sink` used by compiled-in plugins. Callback
+    /// failures or capability denials discard the native stage before the sink
+    /// is touched.
+    pub fn dispatch_event_with_native_context(
+        &mut self,
+        event: &PluginEvent,
+        native_context: NativeEventContext,
+        world: &dyn WorldView,
+        sink: &mut dyn CommandSink,
+        permissions: &dyn PermissionApi,
+    ) -> DispatchReport {
+        self.dispatch_event_inner(event, Some(native_context), world, sink, permissions)
+    }
+
+    fn dispatch_event_inner(
+        &mut self,
+        event: &PluginEvent,
+        native_context: Option<NativeEventContext>,
+        world: &dyn WorldView,
+        sink: &mut dyn CommandSink,
+        permissions: &dyn PermissionApi,
+    ) -> DispatchReport {
         let kind = event.kind();
         let Self {
             plugins,
+            native_plugins,
+            registration_order,
             storage,
             config,
             ..
@@ -470,43 +865,64 @@ impl PluginHost {
         let disable_on_overrun = config.disable_on_overrun();
 
         let mut report = DispatchReport::default();
-        for slot in plugins.iter_mut() {
-            if !slot.state.is_enabled() || !slot.subscriptions.contains(&kind) {
-                continue;
-            }
-
-            let namespaced = NamespacedStorage::new(storage.as_ref(), slot.id.clone());
-            let mut ctx = EventContext::new(
-                slot.capabilities,
-                world,
-                &mut *sink,
-                permissions,
-                &namespaced,
-            );
-
-            let start = Instant::now();
-            let outcome = catch_unwind(AssertUnwindSafe(|| slot.plugin.on_event(event, &mut ctx)));
-            let elapsed = start.elapsed();
-
-            if outcome.is_ok() {
-                report.delivered += 1;
-                if budget.is_exceeded(elapsed) {
-                    slot.stats.budget_overruns += 1;
-                    report.budget_exceeded.push(slot.id.clone());
-                    tracing::warn!(
-                        plugin = %slot.id,
-                        ?elapsed,
-                        "plugin exceeded its time budget during on_event"
+        for registered in registration_order.iter().copied() {
+            match registered {
+                RegisteredPlugin::Compiled(index) => {
+                    let Some(slot) = plugins.get_mut(index) else {
+                        continue;
+                    };
+                    dispatch_compiled_event(
+                        slot,
+                        event,
+                        kind,
+                        world,
+                        sink,
+                        permissions,
+                        storage.as_ref(),
+                        budget,
+                        disable_on_overrun,
+                        &mut report,
                     );
-                    if disable_on_overrun {
-                        slot.state = PluginState::Disabled(DisableReason::BudgetExceeded);
-                    }
                 }
-            } else {
-                slot.stats.panics += 1;
-                slot.state = PluginState::Disabled(DisableReason::Panicked);
-                report.panicked.push(slot.id.clone());
-                tracing::warn!(plugin = %slot.id, "plugin panicked during on_event; disabled");
+                RegisteredPlugin::TrustedNative(index) => {
+                    let Some(slot) = native_plugins.get_mut(index) else {
+                        continue;
+                    };
+                    if !slot.state.is_enabled() || !slot.subscriptions.contains(&kind) {
+                        continue;
+                    }
+                    let Some(native_context) = native_context else {
+                        report.native_failures.push(NativeCallbackFailureRecord {
+                            plugin_id: slot.id.clone(),
+                            hook: kind,
+                            failure: NativeCallbackFailure::EventContextUnavailable,
+                        });
+                        continue;
+                    };
+                    let Some(shard_resource) = next_event_resource(slot) else {
+                        report.native_failures.push(NativeCallbackFailureRecord {
+                            plugin_id: slot.id.clone(),
+                            hook: kind,
+                            failure: NativeCallbackFailure::ResourceHandleExhausted,
+                        });
+                        continue;
+                    };
+                    let Ok(encoded_event) =
+                        encode_event(event, native_context.tick().get(), shard_resource)
+                    else {
+                        continue;
+                    };
+                    dispatch_native_event(
+                        slot,
+                        &encoded_event,
+                        native_context,
+                        kind,
+                        sink,
+                        budget,
+                        disable_on_overrun,
+                        &mut report,
+                    );
+                }
             }
         }
         report
@@ -517,7 +933,7 @@ impl PluginHost {
     /// [`ResolvedBlockDecision`].
     ///
     /// See [`PluginHost::dispatch_block_break_decision`] for the shared semantics
-    /// (precedence, isolation, fail-safe); this is the placement-side entry point.
+    /// (precedence, containment, fail-safe); this is the placement-side entry point.
     pub fn dispatch_block_place_decision(
         &mut self,
         attempt: &BlockPlaceAttempt,
@@ -546,7 +962,7 @@ impl PluginHost {
     ///    vectors concatenate (capped at [`MAX_EMITTED_INTENTS`]).
     /// 3. If nobody objects, the result is [`Allow`](ResolvedDecision::Allow).
     ///
-    /// # Isolation and fail-safe
+    /// # Containment and fail-safe
     ///
     /// Each hook is wrapped in [`catch_unwind`], exactly like
     /// [`dispatch_event`](Self::dispatch_event). A plugin that *panics* is disabled
@@ -570,7 +986,7 @@ impl PluginHost {
     /// The shared fold driving both `before_block_*` decision paths.
     ///
     /// `call` invokes the appropriate hook on one plugin; everything else (the
-    /// capability gate, panic isolation, budgeting, and the precedence fold) is
+    /// capability gate, panic containment, budgeting, and the precedence fold) is
     /// identical for placement and break.
     fn fold_before<F>(
         &mut self,
@@ -700,7 +1116,7 @@ impl PluginHost {
     /// [`ResolvedEventOutcome`].
     ///
     /// See [`PluginHost::dispatch_interact_decision`] for the shared semantics
-    /// (precedence, isolation, fail-safe); this is the chat-side entry point. Any
+    /// (precedence, containment, fail-safe); this is the chat-side entry point. Any
     /// intents a plugin submits during the hook are pushed to `sink`.
     pub fn dispatch_chat_decision(
         &mut self,
@@ -725,7 +1141,7 @@ impl PluginHost {
     /// plugins are skipped, and its message (the first non-`None`) is carried. If
     /// nobody objects the result is [`Allow`](PluginEventDecision::Allow).
     ///
-    /// # Isolation and fail-safe
+    /// # Containment and fail-safe
     ///
     /// Each hook is wrapped in [`catch_unwind`], exactly like
     /// [`dispatch_event`](Self::dispatch_event). A plugin that *panics* is disabled,
@@ -748,7 +1164,7 @@ impl PluginHost {
     /// paths.
     ///
     /// `call` invokes the appropriate hook on one plugin; everything else (the
-    /// [`VetoEvents`](Capability::VetoEvents) gate, panic isolation, budgeting, and
+    /// [`VetoEvents`](Capability::VetoEvents) gate, panic containment, budgeting, and
     /// the absorbing-`Deny` precedence) is identical for chat and interact.
     fn fold_event_decision<F>(
         &mut self,
@@ -843,17 +1259,19 @@ impl PluginHost {
 
     /// Returns the number of registered plugins.
     pub fn len(&self) -> usize {
-        self.plugins.len()
+        self.plugins.len() + self.native_plugins.len()
     }
 
     /// Returns whether no plugins are registered.
     pub fn is_empty(&self) -> bool {
-        self.plugins.is_empty()
+        self.plugins.is_empty() && self.native_plugins.is_empty()
     }
 
     /// Returns the lifecycle state of the plugin with id `id`, if registered.
     pub fn state(&self, id: &PluginId) -> Option<PluginState> {
-        self.slot(id).map(|slot| slot.state)
+        self.slot(id)
+            .map(|slot| slot.state)
+            .or_else(|| self.native_slot(id).map(|slot| slot.state))
     }
 
     /// Returns whether the plugin with id `id` is registered and enabled.
@@ -863,17 +1281,23 @@ impl PluginHost {
 
     /// Returns the capabilities granted to the plugin with id `id`.
     pub fn capabilities(&self, id: &PluginId) -> Option<CapabilityManifest> {
-        self.slot(id).map(|slot| slot.capabilities)
+        self.slot(id)
+            .map(|slot| slot.capabilities)
+            .or_else(|| self.native_slot(id).map(|slot| slot.capabilities))
     }
 
     /// Returns the metadata of the plugin with id `id`, if registered.
     pub fn metadata(&self, id: &PluginId) -> Option<&PluginMetadata> {
-        self.slot(id).map(|slot| &slot.metadata)
+        self.slot(id)
+            .map(|slot| &slot.metadata)
+            .or_else(|| self.native_slot(id).map(|slot| &slot.metadata))
     }
 
     /// Returns the accumulated statistics for the plugin with id `id`.
     pub fn stats(&self, id: &PluginId) -> Option<PluginStats> {
-        self.slot(id).map(|slot| slot.stats)
+        self.slot(id)
+            .map(|slot| slot.stats)
+            .or_else(|| self.native_slot(id).map(|slot| slot.stats))
     }
 
     /// Returns a per-plugin block-edit decision report for every registered
@@ -883,14 +1307,24 @@ impl PluginHost {
     /// [`HostConfig::max_plugins`]) the host or its embedder can fold into a
     /// metrics snapshot each tick without touching the decision hot path.
     pub fn plugin_decision_reports(&self) -> Vec<PluginDecisionReport> {
-        self.plugins
+        self.registration_order
             .iter()
-            .map(|slot| PluginDecisionReport {
-                name: slot.metadata.name().to_string(),
-                allow: slot.stats.allow(),
-                deny: slot.stats.deny(),
-                replace: slot.stats.replace(),
-                panic: u64::from(slot.stats.panics()),
+            .filter_map(|registered| match registered {
+                RegisteredPlugin::Compiled(index) => self
+                    .plugins
+                    .get(*index)
+                    .map(|slot| (&slot.metadata, slot.stats)),
+                RegisteredPlugin::TrustedNative(index) => self
+                    .native_plugins
+                    .get(*index)
+                    .map(|slot| (&slot.metadata, slot.stats)),
+            })
+            .map(|(metadata, stats)| PluginDecisionReport {
+                name: metadata.name().to_string(),
+                allow: stats.allow(),
+                deny: stats.deny(),
+                replace: stats.replace(),
+                panic: u64::from(stats.panics()),
             })
             .collect()
     }
@@ -899,6 +1333,9 @@ impl PluginHost {
     pub fn is_subscribed(&self, id: &PluginId, kind: EventKind) -> bool {
         self.slot(id)
             .is_some_and(|slot| slot.subscriptions.contains(&kind))
+            || self
+                .native_slot(id)
+                .is_some_and(|slot| slot.subscriptions.contains(&kind))
     }
 
     /// Returns the aggregated command tree of all enabled plugins' commands.
@@ -913,6 +1350,263 @@ impl PluginHost {
 
     fn slot(&self, id: &PluginId) -> Option<&PluginSlot> {
         self.plugins.iter().find(|slot| &slot.id == id)
+    }
+
+    fn native_slot(&self, id: &PluginId) -> Option<&TrustedNativeSlot> {
+        self.native_plugins.iter().find(|slot| &slot.id == id)
+    }
+
+    fn has_plugin(&self, id: &PluginId) -> bool {
+        self.slot(id).is_some() || self.native_slot(id).is_some()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_compiled_event(
+    slot: &mut PluginSlot,
+    event: &PluginEvent,
+    kind: EventKind,
+    world: &dyn WorldView,
+    sink: &mut dyn CommandSink,
+    permissions: &dyn PermissionApi,
+    storage: &dyn PluginStorageBackend,
+    budget: CallBudget,
+    disable_on_overrun: bool,
+    report: &mut DispatchReport,
+) {
+    if !slot.state.is_enabled() || !slot.subscriptions.contains(&kind) {
+        return;
+    }
+
+    let namespaced = NamespacedStorage::new(storage, slot.id.clone());
+    let mut ctx = EventContext::new(
+        slot.capabilities,
+        world,
+        &mut *sink,
+        permissions,
+        &namespaced,
+    );
+    let start = Instant::now();
+    let outcome = catch_unwind(AssertUnwindSafe(|| slot.plugin.on_event(event, &mut ctx)));
+    let elapsed = start.elapsed();
+
+    if outcome.is_ok() {
+        report.delivered += 1;
+        if budget.is_exceeded(elapsed) {
+            slot.stats.budget_overruns += 1;
+            report.budget_exceeded.push(slot.id.clone());
+            tracing::warn!(
+                plugin = %slot.id,
+                ?elapsed,
+                "plugin exceeded its time budget during on_event"
+            );
+            if disable_on_overrun {
+                slot.state = PluginState::Disabled(DisableReason::BudgetExceeded);
+            }
+        }
+    } else {
+        slot.stats.panics += 1;
+        slot.state = PluginState::Disabled(DisableReason::Panicked);
+        report.panicked.push(slot.id.clone());
+        tracing::warn!(plugin = %slot.id, "plugin panicked during on_event; disabled");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_native_event(
+    slot: &mut TrustedNativeSlot,
+    encoded_event: &OwnedEvent,
+    event_context: NativeEventContext,
+    kind: EventKind,
+    sink: &mut dyn CommandSink,
+    budget: CallBudget,
+    disable_on_overrun: bool,
+    report: &mut DispatchReport,
+) {
+    if !slot.state.is_enabled() || !slot.subscriptions.contains(&kind) {
+        return;
+    }
+    let Some(active) = slot.active.as_mut() else {
+        return;
+    };
+
+    let mut services =
+        NativeCallbackServices::for_event(slot.capabilities, encoded_event.shard(), event_context);
+    let start = Instant::now();
+    let outcome = active.on_event(encoded_event, &mut services);
+    let elapsed = start.elapsed();
+    let (completion, boundary_error) = match outcome {
+        Ok(status) => (services.complete(status), None),
+        Err(error) => (services.complete(FC_ERROR), Some(error)),
+    };
+
+    record_native_completion(slot, kind, completion, boundary_error, sink, report);
+    if budget.is_exceeded(elapsed) {
+        slot.stats.budget_overruns += 1;
+        report.budget_exceeded.push(slot.id.clone());
+        tracing::warn!(
+            plugin = %slot.id,
+            ?elapsed,
+            "trusted native plugin exceeded its time budget during event dispatch"
+        );
+        if disable_on_overrun {
+            shutdown_native_instance(slot);
+            slot.subscriptions.clear();
+            slot.state = PluginState::Disabled(DisableReason::BudgetExceeded);
+        }
+    }
+}
+
+fn next_event_resource(slot: &mut TrustedNativeSlot) -> Option<FcResourceHandle> {
+    let raw = slot.next_event_resource;
+    let next = raw.checked_add(1)?;
+    slot.next_event_resource = next;
+    Some(FcResourceHandle::from_raw(raw))
+}
+
+fn record_native_completion(
+    slot: &TrustedNativeSlot,
+    kind: EventKind,
+    completion: NativeCompletion,
+    boundary_error: Option<CallbackError>,
+    sink: &mut dyn CommandSink,
+    report: &mut DispatchReport,
+) {
+    log_native_diagnostics(&slot.id, completion.diagnostics());
+    if let Some(capability) = completion.capability_denial() {
+        report
+            .native_capability_denials
+            .push(NativeCapabilityDenial {
+                plugin_id: slot.id.clone(),
+                capability,
+            });
+    }
+
+    if let Some(error) = boundary_error {
+        report.native_failures.push(NativeCallbackFailureRecord {
+            plugin_id: slot.id.clone(),
+            hook: kind,
+            failure: NativeCallbackFailure::Boundary(error),
+        });
+        return;
+    }
+    if !completion.is_committed() {
+        report.native_failures.push(NativeCallbackFailureRecord {
+            plugin_id: slot.id.clone(),
+            hook: kind,
+            failure: NativeCallbackFailure::Status(completion_failure_status(&completion)),
+        });
+        return;
+    }
+
+    report.delivered += 1;
+    commit_native_effects(slot, kind, completion.into_effects(), sink, report);
+}
+
+fn commit_native_effects(
+    slot: &TrustedNativeSlot,
+    kind: EventKind,
+    effects: Vec<NativeEffect>,
+    sink: &mut dyn CommandSink,
+    report: &mut DispatchReport,
+) {
+    for effect in effects {
+        let result = match effect {
+            NativeEffect::Intent(intent) => sink.submit(intent),
+            NativeEffect::Subscribe(_) => Err(IntentError::rejected(
+                "event subscriptions are initialization-only",
+            )),
+        };
+        if let Err(error) = result {
+            report.native_failures.push(NativeCallbackFailureRecord {
+                plugin_id: slot.id.clone(),
+                hook: kind,
+                failure: NativeCallbackFailure::CommandSink(error),
+            });
+            break;
+        }
+    }
+}
+
+impl Drop for PluginHost {
+    fn drop(&mut self) {
+        for slot in &mut self.native_plugins {
+            let Some(active) = slot.active.take() else {
+                continue;
+            };
+            let mut services = NativeCallbackServices::for_shutdown(slot.capabilities);
+            let status = match active.shutdown(&mut services) {
+                Ok(status) => status,
+                Err(error) => callback_error_status(&error),
+            };
+            let completion = services.complete(status);
+            log_native_diagnostics(&slot.id, completion.diagnostics());
+        }
+    }
+}
+
+fn callback_error_status(error: &CallbackError) -> FcStatus {
+    match error {
+        CallbackError::Status(status) => *status,
+        _ => FC_ERROR,
+    }
+}
+
+fn completion_failure_status(completion: &NativeCompletion) -> FcStatus {
+    if completion.callback_status() != FC_OK {
+        completion.callback_status()
+    } else if completion.capability_denial().is_some() {
+        FC_CAPABILITY_DENIED
+    } else {
+        completion
+            .first_error()
+            .map_or(FC_ERROR, crate::native_runtime::NativeServiceError::status)
+    }
+}
+
+fn log_native_diagnostics(id: &PluginId, diagnostics: &[NativeDiagnostic]) {
+    for diagnostic in diagnostics {
+        tracing::debug!(
+            plugin = %id,
+            abi_level = diagnostic.level(),
+            message = diagnostic.message(),
+            "trusted native plugin diagnostic"
+        );
+    }
+}
+
+fn shutdown_after_failed_enable(active: ActivePlugin, capabilities: CapabilityManifest) {
+    let mut services = NativeCallbackServices::for_shutdown(capabilities);
+    let status = match active.shutdown(&mut services) {
+        Ok(status) => status,
+        Err(error) => callback_error_status(&error),
+    };
+    let _completion = services.complete(status);
+}
+
+fn shutdown_native_instance(slot: &mut TrustedNativeSlot) {
+    let Some(active) = slot.active.take() else {
+        return;
+    };
+    let mut services = NativeCallbackServices::for_shutdown(slot.capabilities);
+    let status = match active.shutdown(&mut services) {
+        Ok(status) => status,
+        Err(error) => callback_error_status(&error),
+    };
+    let completion = services.complete(status);
+    log_native_diagnostics(&slot.id, completion.diagnostics());
+}
+
+fn map_native_capability(capability: NativeCapability) -> Capability {
+    match capability {
+        NativeCapability::ReadWorld => Capability::ReadWorld,
+        NativeCapability::SubmitIntents => Capability::SubmitIntents,
+        NativeCapability::RegisterCommands => Capability::RegisterCommands,
+        NativeCapability::ReceiveEvents => Capability::ReceiveEvents,
+        NativeCapability::ReadPermissions => Capability::ReadPermissions,
+        NativeCapability::Storage => Capability::Storage,
+        NativeCapability::VetoBlockEdits => Capability::VetoBlockEdits,
+        NativeCapability::VetoEvents => Capability::VetoEvents,
     }
 }
 

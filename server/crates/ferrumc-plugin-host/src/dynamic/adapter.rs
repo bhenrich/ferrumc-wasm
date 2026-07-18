@@ -1,11 +1,10 @@
 //! The bridge type that makes a dynamically-loaded plugin look like an ordinary
 //! in-process [`Plugin`].
 //!
-//! Once a library is loaded and its vtable validated, the host wants to treat it
-//! exactly like a compiled-in plugin: register it, enable it, and rely on the
-//! existing panic/budget isolation in [`PluginHost`](crate::PluginHost). This
-//! adapter provides that — it implements [`Plugin`] by forwarding the lifecycle
-//! hooks across the C ABI as plain function-pointer calls.
+//! Once a library is loaded and its vtable validated, this compatibility
+//! adapter registers and enables it through [`PluginHost`](crate::PluginHost).
+//! Calls that return enter ordinary lifecycle/status and budget bookkeeping;
+//! the host cannot recover an abort or an unwind crossing the C boundary.
 //!
 //! There is deliberately **no `unsafe` here**: the only unsafe work (opening the
 //! library and reading the vtable) happened in [`super::ffi`]; calling a

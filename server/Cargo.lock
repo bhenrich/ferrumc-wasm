@@ -571,9 +571,13 @@ dependencies = [
  "ferrumc-core",
  "ferrumc-math",
  "ferrumc-permission",
+ "ferrumc-plugin-abi",
  "ferrumc-plugin-api",
+ "ferrumc-plugin-loader",
  "libloading",
  "semver",
+ "serde_json",
+ "sha2",
  "thiserror",
  "tracing",
 ]

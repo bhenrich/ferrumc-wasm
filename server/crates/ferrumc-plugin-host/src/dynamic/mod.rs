@@ -3,9 +3,9 @@
 //!
 //! This module builds on the in-process host: a loaded library is wrapped in an
 //! [`adapter::LoadedPlugin`] that implements
-//! [`Plugin`](ferrumc_plugin_api::Plugin), so once registered it goes through
-//! exactly the same panic-catching and budget-timing machinery as a compiled-in
-//! plugin (see [`PluginHost`](crate::PluginHost)).
+//! [`Plugin`](ferrumc_plugin_api::Plugin). Calls that return use the host's
+//! lifecycle/status and budget bookkeeping; native process failures cannot be
+//! recovered by this compatibility path (see [`PluginHost`](crate::PluginHost)).
 //!
 //! The C ABI itself is defined in
 //! [`ferrumc_plugin_api::abi`](ferrumc_plugin_api::abi). Only one submodule

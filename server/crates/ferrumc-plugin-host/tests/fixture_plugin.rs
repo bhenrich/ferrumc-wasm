@@ -1,8 +1,8 @@
 //! Integration tests exercising the host through in-process fixture plugins.
 //!
 //! These cover the milestone's required scenarios: registering and enabling a
-//! plugin, event dispatch reaching it, panic isolation, command registration,
-//! capability gating, and storage namespace isolation.
+//! plugin, event dispatch reaching it, panic containment, command registration,
+//! capability gating, and storage namespace separation.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -265,7 +265,7 @@ fn panicking_plugin_is_caught_and_disabled_host_survives() {
     host.enable(&panic_id).expect("enables panic plugin");
     host.enable(&counter_id).expect("enables counter plugin");
 
-    // First dispatch: the panic plugin blows up but is isolated; the counter
+    // First dispatch: the panic plugin blows up but is contained; the counter
     // plugin still receives the event and the host keeps running.
     let report = dispatch_join(&mut host);
     assert_eq!(report.panicked(), std::slice::from_ref(&panic_id));
@@ -364,7 +364,7 @@ fn capability_gating_controls_event_facade_access() {
 }
 
 #[test]
-fn storage_namespaces_are_isolated_per_plugin() {
+fn storage_namespaces_are_separate_per_plugin() {
     let store = InMemoryPluginStorage::new();
     let mut host = PluginHost::new(Box::new(store.clone()));
 

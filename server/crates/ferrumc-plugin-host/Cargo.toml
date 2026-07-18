@@ -8,6 +8,12 @@ repository.workspace = true
 [dependencies]
 ferrumc-plugin-api = { workspace = true }
 ferrumc-core = { workspace = true }
+# Safe trusted-native lifecycle values and host-service callbacks.
+ferrumc-plugin-loader = { workspace = true }
+# ABI status, event, command, and capability discriminants interpreted by the host.
+ferrumc-plugin-abi = { workspace = true }
+# Native ABI commands are translated into typed positions, vectors, and intents.
+ferrumc-math = { workspace = true }
 # The host aggregates plugin-registered commands into a CommandTree.
 ferrumc-command = { workspace = true }
 # Classifying error types for registry/lifecycle failures.
@@ -22,7 +28,10 @@ libloading = { workspace = true }
 # coordinates.
 semver = { workspace = true }
 ferrumc-permission = { workspace = true }
-ferrumc-math = { workspace = true }
+# Real-library integration tests parse Cargo's exact artifact report.
+serde_json = { workspace = true }
+# Test-only bundle packaging hashes the exact copied fixture library.
+sha2 = "0.10"
 
 # This crate cannot inherit the workspace `forbid(unsafe_code)`: it needs FFI
 # (libloading + `extern "C"`) for dynamic plugin loading. We mirror the

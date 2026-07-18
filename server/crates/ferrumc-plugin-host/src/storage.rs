@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn namespaces_are_isolated() {
+    fn namespaces_are_separate() {
         let store = InMemoryPluginStorage::new();
         let a = pid("a");
         let b = pid("b");

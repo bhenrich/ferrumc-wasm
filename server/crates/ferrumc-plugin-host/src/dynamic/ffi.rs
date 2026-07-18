@@ -133,7 +133,7 @@ mod tests {
 
     // In-process vtable fixtures: these exercise the ABI-parsing logic without
     // needing a real dynamic library, so the parsing branches are covered even
-    // where building a cdylib in the test sandbox is impractical.
+    // where building a cdylib in the test environment is impractical.
 
     extern "C" fn id_ok() -> *const c_char {
         c"in-proc".as_ptr()

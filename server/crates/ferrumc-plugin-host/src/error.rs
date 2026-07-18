@@ -1,14 +1,34 @@
 //! Errors the plugin host returns from registry and lifecycle operations.
 
 use ferrumc_core::PluginId;
-use ferrumc_plugin_api::PluginError;
+use ferrumc_plugin_api::{Capability, PluginError};
+use ferrumc_plugin_loader::CallbackError;
+
+/// A lifecycle callback exposed by a trusted native plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeLifecycleHook {
+    /// The initialization callback run when the plugin is enabled.
+    Initialize,
+    /// The shutdown callback run when the plugin is disabled.
+    Shutdown,
+}
+
+impl core::fmt::Display for NativeLifecycleHook {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Initialize => formatter.write_str("initialize"),
+            Self::Shutdown => formatter.write_str("shutdown"),
+        }
+    }
+}
 
 /// A failure performing a host registry or lifecycle operation.
 ///
 /// Variants classify *why* an operation failed so callers can react without
-/// parsing strings. A plugin that panics never reaches the caller as a panic:
-/// it is reported as [`HostError::Panicked`] (for explicit operations) or
-/// recorded in the dispatch report (for event dispatch).
+/// parsing strings. An unwinding compiled-in plugin is reported as
+/// [`HostError::Panicked`] (for explicit operations) or recorded in the
+/// dispatch report. Trusted native lifecycle failures cross the audited
+/// boundary as [`HostError::NativeLifecycle`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum HostError {
@@ -45,10 +65,32 @@ pub enum HostError {
         source: PluginError,
     },
 
-    /// The plugin panicked; it has been disabled and the host kept running.
+    /// A compiled-in Rust plugin unwound; it has been disabled.
     #[error("plugin '{id}' panicked and was disabled")]
     Panicked {
-        /// The plugin that panicked.
+        /// The compiled-in plugin that unwound.
         id: PluginId,
+    },
+
+    /// A trusted native plugin requested a host facade this host version does
+    /// not implement.
+    #[error("trusted native plugin '{id}' requests unsupported host capability '{capability}'")]
+    UnsupportedNativeCapability {
+        /// The plugin whose manifest requested the unsupported facade.
+        id: PluginId,
+        /// The unsupported capability.
+        capability: Capability,
+    },
+
+    /// A trusted native lifecycle callback could not be completed.
+    #[error("trusted native plugin '{id}' failed during {hook}: {source}")]
+    NativeLifecycle {
+        /// The plugin whose callback failed.
+        id: PluginId,
+        /// The lifecycle callback being run.
+        hook: NativeLifecycleHook,
+        /// The typed callback-boundary failure.
+        #[source]
+        source: CallbackError,
     },
 }

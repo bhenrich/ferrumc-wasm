@@ -6,7 +6,7 @@
 //! 1. a well-formed plugin loads, registers, and enables successfully;
 //! 2. an ABI-version mismatch is rejected;
 //! 3. a missing entrypoint symbol is rejected;
-//! 4. a plugin whose `init` fails is isolated — the host survives and other
+//! 4. a plugin whose `init` fails is contained — the host survives and other
 //!    plugins keep working.
 //!
 //! The fixture is built on demand (see [`fixture_dylib`]). If that build cannot
@@ -183,7 +183,7 @@ fn returns_null_vtable_error() {
 }
 
 #[test]
-fn plugin_init_failure_is_isolated() {
+fn plugin_init_failure_is_contained() {
     let dylib = fixture_dylib();
     let mut host = PluginHost::in_memory();
     let loader = PluginLoader::new();
@@ -216,7 +216,7 @@ fn plugin_init_failure_is_isolated() {
 
 #[test]
 fn load_dir_scans_and_registers_libraries() {
-    // Build the fixture, then copy it into an isolated directory and scan that,
+    // Build the fixture, then copy it into a dedicated directory and scan that,
     // so the scan sees a clean plugins folder rather than the whole target dir.
     let dylib = fixture_dylib();
     let dir = std::env::temp_dir().join(format!(

@@ -2,9 +2,10 @@
 //!
 //! [`PluginLoader`] turns dynamic libraries on disk into registered plugins in a
 //! [`PluginHost`]. It validates the ABI version, reads metadata across the C
-//! ABI, and registers each plugin through the host so it inherits the host's
-//! panic and time-budget isolation. A bad plugin yields a classified
-//! [`LoadError`] and never takes down its neighbours or the host.
+//! ABI, and registers each plugin through the compatibility adapter. Load and
+//! registration errors that return are classified as [`LoadError`]. Native
+//! library initialization, aborts, and invalid memory behavior remain
+//! process-wide risks.
 
 use std::ffi::CStr;
 use std::fs;
@@ -52,8 +53,8 @@ impl PluginLoader {
     ///
     /// Returns the registered plugin's [`PluginId`], or a classified
     /// [`LoadError`]. The plugin is registered but **not** enabled; the caller
-    /// drives the lifecycle through `host` (so a failing `init` surfaces as a
-    /// host enable error, isolated like any other plugin call).
+    /// drives the lifecycle through `host` (so an `init` status failure that
+    /// returns surfaces as a host enable error).
     pub fn load_file(&self, path: &Path, host: &mut PluginHost) -> Result<PluginId, LoadError> {
         self.load_file_with_entry(path, self.entry_symbol, host)
     }
