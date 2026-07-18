@@ -1,0 +1,29 @@
+[package]
+name = "ferrumc-plugin-abi-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ferrumc-plugin-abi = { workspace = true }
+# Pre-approved by Packet 46 for the platform library and symbol boundary.
+libloading = { workspace = true }
+
+# This is the designated unsafe-code crate for FerrumC's new plugin runtime. It
+# cannot inherit the workspace prohibition, but unsafe operations remain denied
+# inside unsafe functions unless each operation has its own audited block.
+[lints.rust]
+unsafe_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"

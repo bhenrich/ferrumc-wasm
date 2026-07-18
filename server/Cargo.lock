@@ -504,6 +504,14 @@ name = "ferrumc-plugin-abi"
 version = "0.2.0-dev"
 
 [[package]]
+name = "ferrumc-plugin-abi-sys"
+version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-plugin-abi",
+ "libloading",
+]
+
+[[package]]
 name = "ferrumc-plugin-api"
 version = "0.2.0-dev"
 dependencies = [
