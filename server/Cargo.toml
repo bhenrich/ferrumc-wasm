@@ -30,6 +30,7 @@ members = [
     "crates/ferrumc-bench",
     "crates/ferrumc-testkit",
     "plugins/ferrumc-plugin-fixture",
+    "plugins/ferrumc-plugin-fixture-dynamic",
     "plugins/ferrumc-plugin-spawn-protect",
     "plugins/ferrumc-plugin-block-rules",
     "plugins/ferrumc-plugin-greeter",

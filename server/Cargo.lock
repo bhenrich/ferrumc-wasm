@@ -542,6 +542,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrumc-plugin-fixture-dynamic"
+version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-plugin-abi",
+ "ferrumc-plugin-abi-sys",
+ "ferrumc-plugin-loader",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "ferrumc-plugin-greeter"
 version = "0.2.0-dev"
 dependencies = [

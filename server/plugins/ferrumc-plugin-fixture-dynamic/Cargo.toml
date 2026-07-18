@@ -1,0 +1,25 @@
+[package]
+name = "ferrumc-plugin-fixture-dynamic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferrumc-plugin-abi = { workspace = true }
+ferrumc-plugin-abi-sys = { workspace = true }
+
+[dev-dependencies]
+ferrumc-plugin-loader = { workspace = true }
+serde_json = { workspace = true }
+# Test-only packaging hashes the exact built artifact. This package is already
+# locked transitively and never enters the fixture cdylib's production graph.
+sha2 = "0.10"
+
+[lints]
+workspace = true

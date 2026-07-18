@@ -1,0 +1,9 @@
+id = "ferrumc-fixture-dynamic"
+name = "FerrumC Dynamic Fixture"
+version = "1.0.0"
+abi_major = 1
+abi_minor = 0
+server_api = "={{SERVER_API}}"
+library = "{{LIBRARY}}"
+library_sha256 = "{{LIBRARY_SHA256}}"
+capabilities = ["receive-events", "submit-intents"]
