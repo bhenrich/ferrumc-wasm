@@ -35,6 +35,8 @@ use ferrumc_world::{Chunk, FlatWorldGenerator};
 
 use crate::error::{SimError, SimResult};
 use crate::spawn::SpawnChunkTickets;
+#[cfg(test)]
+use crate::ticket::TicketReason;
 use crate::ticket::{ChunkTicket, TicketLevel};
 
 /// The schema version the simulation stamps on chunks it hands off to be saved.
@@ -389,6 +391,42 @@ impl LoadedChunkMap {
         self.resident
             .get(&pos)
             .map_or(0, |r| r.tickets.values().sum())
+    }
+
+    /// Returns one canonical complete ticket-state record for a resident chunk.
+    ///
+    /// The test-only record carries world, dimension, chunk position, and every
+    /// distinct `(reason, level, holder count)` entry. Ticket entries inherit
+    /// the resident map's deterministic [`ChunkTicket`] ordering. `None` means
+    /// `pos` is not resident.
+    #[cfg(test)]
+    pub(crate) fn canonical_ticket_state_record(&self, pos: ChunkPos) -> Option<Vec<u8>> {
+        let resident = self.resident.get(&pos)?;
+        let mut record = Vec::new();
+        record.extend_from_slice(&self.world.get().to_be_bytes());
+        record.extend_from_slice(&self.dimension.get().to_be_bytes());
+        record.extend_from_slice(&pos.x().to_be_bytes());
+        record.extend_from_slice(&pos.z().to_be_bytes());
+        record.extend_from_slice(
+            &u64::try_from(resident.tickets.len())
+                .expect("test ticket entry count fits u64")
+                .to_be_bytes(),
+        );
+        for (ticket, holders) in &resident.tickets {
+            let reason = match ticket.reason() {
+                TicketReason::Spawn => 0,
+                TicketReason::Player => 1,
+                TicketReason::Forced => 2,
+            };
+            record.push(reason);
+            record.extend_from_slice(&ticket.level().get().to_be_bytes());
+            record.extend_from_slice(
+                &u64::try_from(*holders)
+                    .expect("test ticket holder count fits u64")
+                    .to_be_bytes(),
+            );
+        }
+        Some(record)
     }
 
     /// Returns the chunk's *effective* (strongest, i.e. lowest) ticket level, or

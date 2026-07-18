@@ -430,6 +430,50 @@ impl SimShard {
         !self.mutation_log.is_empty()
     }
 
+    /// Iterates canonical complete pending-mutation records for determinism tests.
+    ///
+    /// Each item pairs its typed position (for coordinate-derived logical-owner
+    /// grouping) with a record carrying world and dimension scope, the complete
+    /// mutation cause (including the player UUID when present), block position,
+    /// and exact old/new block-state ids. Iteration preserves the journal
+    /// buffer's deterministic insertion order.
+    #[cfg(test)]
+    pub(crate) fn canonical_pending_mutation_records(
+        &self,
+    ) -> impl Iterator<Item = (BlockPos, Vec<u8>)> + '_ {
+        let world = self.chunks.world();
+        let dimension = self.chunks.dimension();
+        self.mutation_log.iter().map(move |mutation| {
+            let mut record = Vec::with_capacity(45);
+            record.extend_from_slice(&world.get().to_be_bytes());
+            record.extend_from_slice(&dimension.get().to_be_bytes());
+            match mutation.cause() {
+                MutationCause::PlayerCreative { player } => {
+                    record.push(0);
+                    record.extend_from_slice(player.as_uuid().as_bytes());
+                }
+                MutationCause::Command => record.push(1),
+                MutationCause::Plugin => record.push(2),
+                MutationCause::Test => record.push(3),
+            }
+            let position = mutation.position();
+            record.extend_from_slice(&position.x().to_be_bytes());
+            record.extend_from_slice(&position.y().to_be_bytes());
+            record.extend_from_slice(&position.z().to_be_bytes());
+            record.extend_from_slice(&mutation.old_state().as_u32().to_be_bytes());
+            record.extend_from_slice(&mutation.new_state().as_u32().to_be_bytes());
+            (position, record)
+        })
+    }
+
+    /// Returns whether any player owns at least one undo-history entry.
+    #[cfg(test)]
+    pub(crate) fn has_undo_history(&self) -> bool {
+        self.undo_history
+            .values()
+            .any(|history| !history.is_empty())
+    }
+
     /// Drains and returns the buffered gameplay mutations for the storage
     /// journal, leaving the buffer empty.
     ///
@@ -454,6 +498,32 @@ impl SimShard {
     /// Returns the authoritative game mode of `player`, or `None` if absent.
     pub fn player_game_mode(&self, player: PlayerId) -> Option<GameMode> {
         self.players.get(&player).map(|state| state.game_mode)
+    }
+
+    /// Iterates canonical complete-player records for determinism tests.
+    ///
+    /// This remains test-only so the shadow harness can digest every currently
+    /// modelled player field without expanding the production simulation API.
+    /// World and dimension are semantic identity; physical shard position is
+    /// deliberately absent because the compared topologies partition owners
+    /// differently.
+    #[cfg(test)]
+    pub(crate) fn canonical_player_state_records(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
+        let world = self.chunks.world();
+        let dimension = self.chunks.dimension();
+        self.players.iter().map(move |(&player, state)| {
+            let mut record = Vec::with_capacity(57);
+            record.extend_from_slice(&world.get().to_be_bytes());
+            record.extend_from_slice(&dimension.get().to_be_bytes());
+            record.extend_from_slice(player.as_uuid().as_bytes());
+            record.extend_from_slice(&state.position.x.to_bits().to_be_bytes());
+            record.extend_from_slice(&state.position.y.to_bits().to_be_bytes());
+            record.extend_from_slice(&state.position.z.to_bits().to_be_bytes());
+            record.extend_from_slice(&state.yaw.to_bits().to_be_bytes());
+            record.extend_from_slice(&state.pitch.to_bits().to_be_bytes());
+            record.push(state.game_mode.as_id());
+            record
+        })
     }
 
     /// Enqueues `input` for application at the next tick boundary.

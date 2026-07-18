@@ -1566,9 +1566,12 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use ferrumc_core::{DimensionId, GameMode, PlayerId, Tick, WorldId};
-    use ferrumc_math::{BlockPos, ChunkPos, ShardPos, Vec3};
+    use ferrumc_items::{ComponentPatch, ComponentValue, ItemId, ItemStack, OpaqueComponent};
+    use ferrumc_math::{BlockPos, ChunkPos, LocalBlockPos, ShardPos, Vec3};
     use ferrumc_storage::{ChunkKey, InMemoryStore, MAX_SAVE_BATCH};
-    use ferrumc_world::{BlockStateId, FlatWorldGenerator};
+    use ferrumc_world::{
+        BlockEntity, BlockStateId, Chunk, FlatWorldGenerator, SECTION_COUNT, SECTION_VOLUME,
+    };
 
     use super::{
         ExecutionPlan, SchedulerMode, ShardScheduler, TestCompletionOrder, TestWorkerProbe,
@@ -3081,5 +3084,779 @@ mod tests {
             scheduler.tick(),
             Err(SimError::ShardSchedulerPoisoned { tick: terminal })
         );
+    }
+
+    /// Exact, topology-independent canonical bytes for one completed tick.
+    ///
+    /// Equality compares the bytes rather than a hash, so the regression cannot
+    /// pass because of a digest collision. The stable FNV-1a fingerprint exists
+    /// only to keep divergence diagnostics compact.
+    #[derive(Clone, PartialEq, Eq)]
+    struct ShadowStateDigest(Vec<u8>);
+
+    impl ShadowStateDigest {
+        /// Returns a stable compact fingerprint for diagnostics.
+        fn fingerprint(&self) -> u128 {
+            const FNV_128_OFFSET_BASIS: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+            const FNV_128_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+            self.0.iter().fold(FNV_128_OFFSET_BASIS, |hash, byte| {
+                (hash ^ u128::from(*byte)).wrapping_mul(FNV_128_PRIME)
+            })
+        }
+    }
+
+    impl std::fmt::Debug for ShadowStateDigest {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "ShadowStateDigest({:032x}, {} bytes)",
+                self.fingerprint(),
+                self.0.len()
+            )
+        }
+    }
+
+    impl std::fmt::Display for ShadowStateDigest {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "{:032x}", self.fingerprint())
+        }
+    }
+
+    /// First tick where the one-owner and partitioned shadow states differed.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ShadowDigestMismatch {
+        tick: Tick,
+        one_shard: ShadowStateDigest,
+        n_shard: ShadowStateDigest,
+    }
+
+    impl ShadowDigestMismatch {
+        /// Returns the first divergent completed tick.
+        const fn tick(&self) -> Tick {
+            self.tick
+        }
+
+        /// Returns the digest from the authoritative one-owner configuration.
+        const fn one_shard(&self) -> &ShadowStateDigest {
+            &self.one_shard
+        }
+
+        /// Returns the digest from the partitioned shadow configuration.
+        const fn n_shard(&self) -> &ShadowStateDigest {
+            &self.n_shard
+        }
+    }
+
+    impl std::fmt::Display for ShadowDigestMismatch {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "shadow state diverged at tick {}: one-shard={}, n-shard={}",
+                self.tick, self.one_shard, self.n_shard
+            )
+        }
+    }
+
+    /// Drives one authoritative owner and an N-owner shadow from one semantic
+    /// shard-addressed input log.
+    struct ShadowDeterminismHarness {
+        one_shard: ShardScheduler,
+        n_shard: ShardScheduler,
+        one_shard_id: ShardId,
+        shadow_routes: BTreeMap<ShardPos, ShardId>,
+    }
+
+    impl ShadowDeterminismHarness {
+        /// Creates both configurations at tick zero with the same logical
+        /// chunks but deliberately different ownership and registration order.
+        async fn new<const N: usize>(
+            shard_positions: [ShardPos; N],
+            worker_slots: NonZeroUsize,
+        ) -> Result<Self, SimError> {
+            let authoritative_position = shard_positions
+                .first()
+                .copied()
+                .expect("the fixed shadow topology has at least one shard");
+            let store = InMemoryStore::new();
+            let generator = FlatWorldGenerator::new();
+
+            let mut authoritative_shard = SimShard::new(authoritative_position);
+            for position in shard_positions {
+                authoritative_shard
+                    .loaded_chunks_mut()
+                    .acquire(
+                        &store,
+                        &generator,
+                        position.origin_chunk(),
+                        ChunkTicket::of(TicketReason::Forced),
+                    )
+                    .await?;
+            }
+            let one_shard_id = logical_id(
+                authoritative_shard.loaded_chunks().world(),
+                authoritative_shard.loaded_chunks().dimension(),
+                authoritative_position,
+            );
+            let one_shard = ShardScheduler::authoritative(
+                TickCoordinator::new(TickRate::VANILLA),
+                authoritative_shard,
+            )?;
+
+            let mut n_shard = ShardScheduler::with_shadow_workers(
+                TickCoordinator::new(TickRate::VANILLA),
+                worker_slots,
+            )?;
+            let mut shadow_routes = BTreeMap::new();
+            for position in shard_positions.into_iter().rev() {
+                let mut shard = SimShard::new(position);
+                shard
+                    .loaded_chunks_mut()
+                    .acquire(
+                        &store,
+                        &generator,
+                        position.origin_chunk(),
+                        ChunkTicket::of(TicketReason::Forced),
+                    )
+                    .await?;
+                let id = n_shard.register(shard)?;
+                n_shard.activate(id)?;
+                assert!(
+                    shadow_routes.insert(position, id).is_none(),
+                    "the fixed topology has unique logical positions"
+                );
+            }
+
+            Ok(Self {
+                one_shard,
+                n_shard,
+                one_shard_id,
+                shadow_routes,
+            })
+        }
+
+        /// Replays the fixed log, optionally injecting one shadow-only input.
+        ///
+        /// The injected path exists solely for the negative control proving the
+        /// comparator reports the first divergent tick and both digests.
+        fn replay(
+            &mut self,
+            input_log: &[Vec<(ShardPos, GameInput)>],
+            shadow_only: Option<&(Tick, ShardPos, GameInput)>,
+        ) -> Result<Vec<(Tick, ShadowStateDigest)>, ShadowDigestMismatch> {
+            let mut digests = Vec::with_capacity(input_log.len());
+            for (index, inputs) in input_log.iter().enumerate() {
+                let tick = Tick::new(
+                    u64::try_from(index + 1).expect("the fixed input log length fits u64"),
+                );
+                for (target, input) in inputs {
+                    let shadow_shard = *self
+                        .shadow_routes
+                        .get(target)
+                        .expect("the fixed input log names a registered logical shard");
+                    self.one_shard
+                        .enqueue(self.one_shard_id, input.clone())
+                        .expect("authoritative test inbox has capacity");
+                    self.n_shard
+                        .enqueue(shadow_shard, input.clone())
+                        .expect("shadow test inbox has capacity");
+                }
+                if let Some((divergent_tick, target, input)) = shadow_only {
+                    if *divergent_tick == tick {
+                        let shadow_shard = *self
+                            .shadow_routes
+                            .get(target)
+                            .expect("the deliberate divergence names a logical shard");
+                        self.n_shard
+                            .enqueue(shadow_shard, input.clone())
+                            .expect("shadow test inbox has capacity");
+                    }
+                }
+
+                let one_outcome = self.one_shard.tick().expect("authoritative test tick");
+                let n_outcome = self.n_shard.tick().expect("shadow test tick");
+                assert_eq!(one_outcome.tick(), tick);
+                assert_eq!(n_outcome.tick(), tick);
+                let one_digest = semantic_state_digest(&self.one_shard, &one_outcome, tick);
+                let n_digest = semantic_state_digest(&self.n_shard, &n_outcome, tick);
+                if one_digest != n_digest {
+                    return Err(ShadowDigestMismatch {
+                        tick,
+                        one_shard: one_digest,
+                        n_shard: n_digest,
+                    });
+                }
+                digests.push((tick, one_digest));
+            }
+            Ok(digests)
+        }
+    }
+
+    /// Appends one full storage key without relying on `Debug` or layout.
+    fn append_chunk_key(bytes: &mut Vec<u8>, key: ChunkKey) {
+        bytes.extend_from_slice(&key.world().get().to_be_bytes());
+        bytes.extend_from_slice(&key.dimension().get().to_be_bytes());
+        bytes.extend_from_slice(&key.pos().x().to_be_bytes());
+        bytes.extend_from_slice(&key.pos().z().to_be_bytes());
+    }
+
+    /// Converts a fixed-width dirty set into its stable low-bit mask.
+    fn dirty_mask(dirty: ferrumc_world::DirtySections) -> u32 {
+        dirty
+            .dirty_indices()
+            .fold(0u32, |mask, index| mask | (1u32 << index))
+    }
+
+    /// Maps the world's documented YZX flat order back to a local coordinate.
+    fn shadow_local_position(flat: usize) -> LocalBlockPos {
+        let x = u8::try_from(flat & 0x0f).expect("local x fits u8");
+        let z = u8::try_from((flat >> 4) & 0x0f).expect("local z fits u8");
+        let y = u8::try_from((flat >> 8) & 0x0f).expect("local y fits u8");
+        LocalBlockPos::new(x, y, z).expect("masked local position is valid")
+    }
+
+    /// Appends an untruncated UTF-8 value for exact semantic comparison.
+    fn append_exact_string(bytes: &mut Vec<u8>, value: &str) {
+        append_len(bytes, value.len());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    /// Appends every modeled field of one sign face without storage-codec
+    /// truncation.
+    fn append_exact_sign_face(bytes: &mut Vec<u8>, face: &SignFace) {
+        for line in face.lines() {
+            append_exact_string(bytes, line);
+        }
+        append_exact_string(bytes, face.color());
+        bytes.push(u8::from(face.has_glowing_text()));
+    }
+
+    /// Appends the complete item model, including variant identity that the
+    /// trusted wire encoding intentionally does not distinguish.
+    fn append_exact_item_stack(bytes: &mut Vec<u8>, stack: &ItemStack) {
+        match stack.item() {
+            Some(item) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&item.id().to_be_bytes());
+            }
+            None => bytes.push(0),
+        }
+        bytes.push(stack.count());
+        append_len(bytes, stack.components().added().len());
+        for component in stack.components().added() {
+            match component {
+                ComponentValue::MaxStackSize(value) => {
+                    bytes.push(0);
+                    bytes.push(*value);
+                }
+                ComponentValue::Damage(value) => {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&value.to_be_bytes());
+                }
+                ComponentValue::MaxDamage(value) => {
+                    bytes.push(2);
+                    bytes.extend_from_slice(&value.to_be_bytes());
+                }
+                ComponentValue::Unbreakable => bytes.push(3),
+                ComponentValue::CustomName(_) => bytes.push(4),
+                ComponentValue::CustomData(_) => bytes.push(5),
+                ComponentValue::Opaque(component) => {
+                    bytes.push(6);
+                    bytes.extend_from_slice(&component.type_id().to_be_bytes());
+                    append_len(bytes, component.raw().len());
+                    bytes.extend_from_slice(component.raw());
+                }
+            }
+        }
+        append_len(bytes, stack.components().removed().len());
+        for removed in stack.components().removed() {
+            bytes.extend_from_slice(&removed.get().to_be_bytes());
+        }
+
+        // The slot body supplies the exact bounded NBT bytes for CustomName and
+        // CustomData. The explicit shape above makes typed and opaque variants
+        // distinct even when their trusted wire payload happens to be identical.
+        let mut slot = Vec::new();
+        stack
+            .encode_slot(&mut slot)
+            .expect("modeled chest stack is valid and encodable");
+        append_len(bytes, slot.len());
+        bytes.extend_from_slice(&slot);
+    }
+
+    /// Appends one block entity with an encoding that is injective over the
+    /// currently modeled semantic fields.
+    fn append_exact_block_entity(bytes: &mut Vec<u8>, entity: &BlockEntity) {
+        match entity {
+            BlockEntity::Sign(sign) => {
+                bytes.push(0);
+                bytes.extend_from_slice(&sign.kind().block_entity_type().to_be_bytes());
+                bytes.push(u8::from(sign.is_waxed()));
+                append_exact_sign_face(bytes, sign.front());
+                append_exact_sign_face(bytes, sign.back());
+            }
+            BlockEntity::Chest(chest) => {
+                bytes.push(1);
+                append_len(bytes, chest.slots().len());
+                for stack in chest.slots() {
+                    append_exact_item_stack(bytes, stack);
+                }
+            }
+            _ => panic!("new block-entity variants require shadow digest encoding"),
+        }
+    }
+
+    /// Appends every modelled field of a live chunk, independent of palette
+    /// representation.
+    fn append_live_chunk(
+        bytes: &mut Vec<u8>,
+        key: ChunkKey,
+        schema_version: u32,
+        chunk: &Chunk,
+        tickets: &[u8],
+    ) {
+        assert_eq!(
+            chunk.pos(),
+            key.pos(),
+            "resident chunk position must match its full storage key"
+        );
+        append_chunk_key(bytes, key);
+        bytes.extend_from_slice(&chunk.pos().x().to_be_bytes());
+        bytes.extend_from_slice(&chunk.pos().z().to_be_bytes());
+        bytes.extend_from_slice(&schema_version.to_be_bytes());
+        bytes.extend_from_slice(&dirty_mask(*chunk.dirty_sections()).to_be_bytes());
+        bytes.extend_from_slice(&dirty_mask(*chunk.persist_dirty_sections()).to_be_bytes());
+        bytes.extend_from_slice(&dirty_mask(*chunk.persist_edited_sections()).to_be_bytes());
+        bytes.push(u8::from(chunk.light().is_some()));
+        append_len(bytes, SECTION_COUNT);
+        for (section_index, section) in chunk.sections().iter().enumerate() {
+            append_len(bytes, section_index);
+            for flat in 0..SECTION_VOLUME {
+                bytes.extend_from_slice(
+                    &section
+                        .get(shadow_local_position(flat))
+                        .as_u32()
+                        .to_be_bytes(),
+                );
+            }
+        }
+
+        append_len(bytes, chunk.block_entity_count());
+        for (position, entity) in chunk.block_entities() {
+            append_block_position(bytes, position);
+            append_exact_block_entity(bytes, entity);
+        }
+        append_len(bytes, tickets.len());
+        bytes.extend_from_slice(tickets);
+    }
+
+    /// Appends the exact semantic payload of one emitted overlay.
+    fn canonical_overlay_record(
+        key: ChunkKey,
+        record: &ferrumc_storage::ChunkOverlayRecord,
+    ) -> Vec<u8> {
+        assert_eq!(
+            key.pos(),
+            record.pos(),
+            "persist record position must match its full storage key"
+        );
+        let mut bytes = Vec::new();
+        append_chunk_key(&mut bytes, key);
+        bytes.extend_from_slice(&record.schema_version().get().to_be_bytes());
+        bytes.extend_from_slice(&record.dirty_section_mask().to_be_bytes());
+        bytes.extend_from_slice(&record.updated_at_tick().to_be_bytes());
+        append_len(&mut bytes, record.section_count());
+        append_len(&mut bytes, record.block_entity_count());
+
+        let mut reconstructed = Chunk::new(record.pos());
+        record
+            .apply_to_chunk(&mut reconstructed)
+            .expect("scheduler-created overlay applies to its own chunk");
+        for section_index in record.section_indices() {
+            append_len(&mut bytes, section_index);
+            let section = reconstructed
+                .section(section_index)
+                .expect("overlay section index is validated");
+            for flat in 0..SECTION_VOLUME {
+                bytes.extend_from_slice(
+                    &section
+                        .get(shadow_local_position(flat))
+                        .as_u32()
+                        .to_be_bytes(),
+                );
+            }
+        }
+        append_len(&mut bytes, reconstructed.block_entity_count());
+        for (position, entity) in reconstructed.block_entities() {
+            append_block_position(&mut bytes, position);
+            append_exact_block_entity(&mut bytes, entity);
+        }
+        bytes
+    }
+
+    /// Builds exact canonical bytes for topology-neutral state and move-owned
+    /// persistence produced by the completed tick.
+    fn semantic_state_digest(
+        scheduler: &ShardScheduler,
+        outcome: &super::SchedulerTickOutcome,
+        tick: Tick,
+    ) -> ShadowStateDigest {
+        let mut players = Vec::new();
+        let mut chunks = BTreeMap::new();
+        let mut mutations: BTreeMap<ShardId, Vec<Vec<u8>>> = BTreeMap::new();
+
+        for scheduled in scheduler.shards.values() {
+            assert!(
+                scheduled.shard.is_tick_quiescent(),
+                "a completed replay tick must drain every admitted operation"
+            );
+            assert!(
+                !scheduled.shard.has_undo_history(),
+                "the fixed replay intentionally creates no topology-local undo state"
+            );
+            players.extend(scheduled.shard.canonical_player_state_records());
+
+            let loaded = scheduled.shard.loaded_chunks();
+            for position in loaded.loaded_positions() {
+                let key = ChunkKey::new(loaded.world(), loaded.dimension(), position);
+                let chunk = loaded
+                    .get(position)
+                    .expect("loaded position remains resident");
+                let tickets = loaded
+                    .canonical_ticket_state_record(position)
+                    .expect("loaded chunk has resident ticket state");
+                let mut record = Vec::new();
+                append_live_chunk(
+                    &mut record,
+                    key,
+                    loaded.schema_version().get(),
+                    chunk,
+                    &tickets,
+                );
+                assert!(
+                    chunks.insert(key, record).is_none(),
+                    "a semantic chunk key has exactly one owner"
+                );
+            }
+
+            for (position, record) in scheduled.shard.canonical_pending_mutation_records() {
+                let logical_owner = logical_id(
+                    loaded.world(),
+                    loaded.dimension(),
+                    position.to_chunk_pos().to_shard_pos(),
+                );
+                mutations.entry(logical_owner).or_default().push(record);
+            }
+        }
+
+        players.sort_unstable();
+        let mut overlays = BTreeMap::new();
+        for batch in outcome.persist_batches() {
+            for (key, record) in batch.records() {
+                let canonical = canonical_overlay_record(*key, record);
+                assert!(
+                    overlays.insert(*key, canonical).is_none(),
+                    "a completed tick emits at most one overlay per semantic chunk"
+                );
+            }
+        }
+
+        let mut canonical = Vec::new();
+        canonical.extend_from_slice(&tick.get().to_be_bytes());
+        append_len(&mut canonical, players.len());
+        for player in players {
+            canonical.push(0);
+            append_len(&mut canonical, player.len());
+            canonical.extend_from_slice(&player);
+        }
+        append_len(&mut canonical, chunks.len());
+        for chunk in chunks.into_values() {
+            canonical.push(1);
+            append_len(&mut canonical, chunk.len());
+            canonical.extend_from_slice(&chunk);
+        }
+        append_len(&mut canonical, mutations.len());
+        for (logical_owner, records) in mutations {
+            canonical.push(2);
+            canonical.extend_from_slice(&logical_owner.world().get().to_be_bytes());
+            canonical.extend_from_slice(&logical_owner.dimension().get().to_be_bytes());
+            canonical.extend_from_slice(&logical_owner.position().x().to_be_bytes());
+            canonical.extend_from_slice(&logical_owner.position().z().to_be_bytes());
+            append_len(&mut canonical, records.len());
+            for record in records {
+                append_len(&mut canonical, record.len());
+                canonical.extend_from_slice(&record);
+            }
+        }
+        append_len(&mut canonical, overlays.len());
+        for overlay in overlays.into_values() {
+            canonical.push(3);
+            append_len(&mut canonical, overlay.len());
+            canonical.extend_from_slice(&overlay);
+        }
+        ShadowStateDigest(canonical)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keeping the fixed replay in one literal makes its exact tick schedule auditable"
+    )]
+    fn fixed_shadow_input_log() -> Vec<Vec<(ShardPos, GameInput)>> {
+        let first = PlayerId::offline("shadow-digest-first");
+        let second = PlayerId::offline("shadow-digest-second");
+        let third = PlayerId::offline("shadow-digest-third");
+        let west = ShardPos::new(-1, 0);
+        let center = ShardPos::new(0, 0);
+        let east = ShardPos::new(1, 0);
+        vec![
+            vec![
+                (
+                    east,
+                    GameInput::PlayerJoin {
+                        player: third,
+                        position: Vec3::new(136.0, 70.0, 8.0),
+                    },
+                ),
+                (
+                    west,
+                    GameInput::PlayerJoin {
+                        player: first,
+                        position: Vec3::new(-120.0, 64.0, 8.0),
+                    },
+                ),
+                (
+                    center,
+                    GameInput::PlayerJoin {
+                        player: second,
+                        position: Vec3::new(8.0, 68.0, 8.0),
+                    },
+                ),
+            ],
+            vec![
+                (
+                    west,
+                    GameInput::PlayerMove {
+                        player: first,
+                        position: Some(Vec3::new(-119.5, 64.5, 8.5)),
+                        yaw: Some(45.0),
+                        pitch: Some(-10.0),
+                    },
+                ),
+                (
+                    center,
+                    GameInput::PlayerMove {
+                        player: second,
+                        position: None,
+                        yaw: Some(180.0),
+                        pitch: Some(15.0),
+                    },
+                ),
+                (
+                    east,
+                    GameInput::SetGameMode {
+                        player: third,
+                        mode: GameMode::Creative,
+                    },
+                ),
+            ],
+            vec![
+                (
+                    center,
+                    GameInput::PlayerMove {
+                        player: second,
+                        position: Some(Vec3::new(9.0, 68.0, 8.0)),
+                        yaw: None,
+                        pitch: None,
+                    },
+                ),
+                (
+                    west,
+                    GameInput::SetGameMode {
+                        player: first,
+                        mode: GameMode::Adventure,
+                    },
+                ),
+                (
+                    east,
+                    GameInput::PlayerMove {
+                        player: third,
+                        position: Some(Vec3::new(137.0, 70.5, 9.0)),
+                        yaw: Some(-90.0),
+                        pitch: None,
+                    },
+                ),
+                (
+                    west,
+                    GameInput::SetBlockExact {
+                        player: first,
+                        position: BlockPos::new(-120, 65, 8),
+                        sequence: 31,
+                        state: BlockStateId::new(5),
+                    },
+                ),
+                (
+                    center,
+                    GameInput::SetBlockExact {
+                        player: second,
+                        position: BlockPos::new(8, 68, 8),
+                        sequence: 32,
+                        state: BlockStateId::new(6),
+                    },
+                ),
+                (
+                    center,
+                    GameInput::SetBlockExact {
+                        player: second,
+                        position: BlockPos::new(9, 68, 8),
+                        sequence: 34,
+                        state: BlockStateId::new(8),
+                    },
+                ),
+                (
+                    east,
+                    GameInput::SetBlockExact {
+                        player: third,
+                        position: BlockPos::new(136, 70, 8),
+                        sequence: 33,
+                        state: BlockStateId::new(7),
+                    },
+                ),
+            ],
+            vec![
+                (center, GameInput::PlayerLeave { player: second }),
+                (
+                    center,
+                    GameInput::PlayerMove {
+                        player: second,
+                        position: Some(Vec3::new(99.0, 99.0, 99.0)),
+                        yaw: Some(12.0),
+                        pitch: Some(34.0),
+                    },
+                ),
+                (
+                    west,
+                    GameInput::PlayerMove {
+                        player: first,
+                        position: None,
+                        yaw: Some(90.0),
+                        pitch: Some(0.0),
+                    },
+                ),
+                (
+                    east,
+                    GameInput::SetGameMode {
+                        player: third,
+                        mode: GameMode::Spectator,
+                    },
+                ),
+            ],
+            vec![
+                (
+                    center,
+                    GameInput::PlayerJoin {
+                        player: second,
+                        position: Vec3::new(10.0, 69.0, 8.0),
+                    },
+                ),
+                (
+                    west,
+                    GameInput::PlayerMove {
+                        player: first,
+                        position: Some(Vec3::new(-118.0, 65.0, 9.0)),
+                        yaw: None,
+                        pitch: None,
+                    },
+                ),
+                (east, GameInput::PlayerLeave { player: third }),
+            ],
+            Vec::new(),
+        ]
+    }
+
+    #[test]
+    fn shadow_item_digest_distinguishes_typed_and_opaque_components() {
+        let item = ItemId::from_name("stone").expect("stone item exists");
+        let count = std::num::NonZeroU8::new(1).expect("one is nonzero");
+        let typed = ItemStack::new(
+            item,
+            count,
+            ComponentPatch::new(vec![ComponentValue::MaxStackSize(1)], Vec::new()),
+        );
+        let opaque = ItemStack::new(
+            item,
+            count,
+            ComponentPatch::new(
+                vec![ComponentValue::Opaque(
+                    OpaqueComponent::new(1, vec![1]).expect("bounded component"),
+                )],
+                Vec::new(),
+            ),
+        );
+        let mut typed_bytes = Vec::new();
+        append_exact_item_stack(&mut typed_bytes, &typed);
+        let mut opaque_bytes = Vec::new();
+        append_exact_item_stack(&mut opaque_bytes, &opaque);
+        assert_ne!(typed, opaque);
+        assert_ne!(typed_bytes, opaque_bytes);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shadow_determinism_one_vs_n_shard_identical_digests() {
+        let schedule = fixed_shadow_input_log();
+        let mut harness = ShadowDeterminismHarness::new(
+            [
+                ShardPos::new(-1, 0),
+                ShardPos::new(0, 0),
+                ShardPos::new(1, 0),
+            ],
+            NonZeroUsize::new(2).expect("nonzero worker slots"),
+        )
+        .await
+        .expect("determinism harness");
+
+        let digests = harness
+            .replay(&schedule, None)
+            .expect("identical schedule must not diverge");
+        assert_eq!(digests.len(), schedule.len());
+        assert_eq!(
+            digests.iter().map(|(tick, _)| *tick).collect::<Vec<_>>(),
+            (1..=u64::try_from(schedule.len()).expect("fixed schedule fits u64"))
+                .map(Tick::new)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shadow_determinism_reports_the_first_deliberate_divergence() {
+        let schedule = fixed_shadow_input_log();
+        let second = PlayerId::offline("shadow-digest-second");
+        let mut harness = ShadowDeterminismHarness::new(
+            [
+                ShardPos::new(-1, 0),
+                ShardPos::new(0, 0),
+                ShardPos::new(1, 0),
+            ],
+            NonZeroUsize::new(2).expect("nonzero worker slots"),
+        )
+        .await
+        .expect("determinism harness");
+
+        let divergence = (
+            Tick::new(3),
+            ShardPos::new(0, 0),
+            GameInput::PlayerMove {
+                player: second,
+                position: None,
+                yaw: Some(270.0),
+                pitch: None,
+            },
+        );
+        let error = harness
+            .replay(&schedule, Some(&divergence))
+            .expect_err("shadow-only state mutation must be detected");
+        assert_eq!(error.tick(), Tick::new(3));
+        assert_ne!(error.one_shard(), error.n_shard());
+        assert!(error.to_string().contains("diverged at tick 3"));
+        assert!(error.to_string().contains("one-shard="));
+        assert!(error.to_string().contains("n-shard="));
     }
 }
