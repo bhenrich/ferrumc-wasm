@@ -25,11 +25,23 @@ ferrumc-codec.workspace = true
 # `Direction`/`ProtoError` model transcript entries and round-trip failures; the
 # generated packets are exercised by this crate's tests.
 ferrumc-proto.workspace = true
+# Packet 57 drives the packaging-independent author contract through both its
+# compiled-in adapter and the raw-validated trusted native plugin ABI boundary.
+ferrumc-plugin-sdk.workspace = true
+ferrumc-plugin-sdk-builtin.workspace = true
+ferrumc-plugin-abi.workspace = true
+ferrumc-plugin-abi-sys.workspace = true
+# ABI semantic decoding must honor the permission crate's full validated node
+# bound rather than the unrelated shorter command-name limit.
+ferrumc-permission.workspace = true
+# Canonical semantic run digests use SHA-256 with an explicitly versioned
+# binary grammar. The digest never includes platform or packaging metadata.
+sha2 = "0.10"
+# ABI event payloads carry UUID bytes and must round-trip without text
+# normalization.
+uuid.workspace = true
 
 [dev-dependencies]
-# Golden fixtures construct UUID-bearing packets (LoginSuccess, PlayerInfoUpdate,
-# RemovePlayerInfo) by literal bytes.
-uuid.workspace = true
 # SystemChat's golden builds its network-NBT `content` via the NBT value tree.
 ferrumc-nbt.workspace = true
 # Fault-store journal fixtures use typed coordinates and block states.
@@ -37,15 +49,10 @@ ferrumc-math.workspace = true
 ferrumc-world.workspace = true
 # Packet 52's negative-path QA validates the trusted native plugin loader and
 # proves host rollback without adding any production dependency or public API.
-ferrumc-plugin-abi.workspace = true
-ferrumc-plugin-abi-sys.workspace = true
 ferrumc-plugin-loader.workspace = true
 ferrumc-plugin-host.workspace = true
 ferrumc-plugin-api.workspace = true
-ferrumc-permission.workspace = true
 serde_json.workspace = true
-# Test-only bundle packaging hashes the exact copied cdylib bytes.
-sha2 = "0.10"
 
 [lints]
 workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "ferrumc-plugin-testhost-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["builtin"]
+builtin = []
+dynamic = ["dep:ferrumc-plugin-sdk-dynamic"]
+
+[dependencies]
+# One safe authoring source is linked directly by the integration test and
+# exported as a cdylib by the nested fixture build.
+ferrumc-plugin-sdk = { path = "../../../ferrumc-plugin-sdk" }
+ferrumc-plugin-sdk-dynamic = { path = "../../../ferrumc-plugin-sdk-dynamic", optional = true }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+
+[workspace]

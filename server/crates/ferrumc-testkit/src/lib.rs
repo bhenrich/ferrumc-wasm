@@ -33,12 +33,16 @@
 //! - [`DurabilityFaultBattery`]: a fixed, seeded matrix that applies those
 //!   cutpoints to world, player, and journal writes and returns exact attempted,
 //!   committed, outcome, and trace reports.
+//! - [`PluginTestHost`]: deterministic, bounded shared-SDK lifecycle and event
+//!   replay through compiled-in and trusted native plugin packaging, with
+//!   comparable semantic effects, final state, and canonical digests.
 
 mod client;
 mod durability_battery;
 mod fault_store;
 mod hex;
 mod oracle;
+pub mod plugin_testhost;
 mod roundtrip;
 mod transcript;
 
@@ -54,5 +58,11 @@ pub use fault_store::{
 };
 pub use hex::{hex_diff, parse_hex, to_hex, HexDiff, HexError, HexFixture};
 pub use oracle::{assert_frame_length, assert_wire_frame, frame, FrameOracleError};
+pub use plugin_testhost::{
+    PermissionSetting, PluginCallbackPhase, PluginDiagnostic, PluginDiagnosticPhase, PluginEffect,
+    PluginFailureKind, PluginReplayFailure, PluginRun, PluginStateSnapshot, PluginTestHost,
+    PluginTestHostError, ScheduledPluginEvent, ScheduledTimer, SemanticDigest, StorageEntry,
+    MAX_CALLBACK_EFFECTS, MAX_SCHEDULED_EVENTS,
+};
 pub use roundtrip::{assert_packet_roundtrip, RoundtripError};
 pub use transcript::{PacketScript, Replay, ScriptEntry, ScriptMismatch, TranscriptError};

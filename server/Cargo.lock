@@ -731,6 +731,8 @@ dependencies = [
  "ferrumc-plugin-api",
  "ferrumc-plugin-host",
  "ferrumc-plugin-loader",
+ "ferrumc-plugin-sdk",
+ "ferrumc-plugin-sdk-builtin",
  "ferrumc-proto",
  "ferrumc-storage",
  "ferrumc-world",
