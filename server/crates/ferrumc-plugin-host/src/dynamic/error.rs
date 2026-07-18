@@ -52,8 +52,11 @@ pub enum LoadError {
 
     /// The plugin's ABI version does not match the host's.
     ///
-    /// This is the guard that turns a binary compiled against a different host
-    /// version into a clean rejection instead of undefined behavior.
+    /// This compatibility check runs after the operator-trusted entrypoint has
+    /// returned a raw pointer, the loader has rejected null, and the loader has
+    /// constructed the reference promised by the ABI. It prevents use of the
+    /// remaining fields when the reported version differs; it does not validate
+    /// an arbitrary symbol signature or pointer.
     #[error(
         "plugin '{}' was built against ABI version {found}, but this host requires {expected}",
         path.display()
@@ -118,10 +121,12 @@ impl LoadError {
 
 /// The outcome of scanning and loading a whole plugin directory.
 ///
-/// A bad plugin never aborts the scan: every library is attempted, successes are
-/// collected in [`DirLoadReport::loaded`] and failures (with their classified
-/// [`LoadError`]) in [`DirLoadReport::failed`]. Fields are private; read them
-/// through the accessors.
+/// Every per-entry failure that returns is collected in
+/// [`DirLoadReport::failed`], and scanning then attempts the next entry.
+/// Successful registrations are collected in [`DirLoadReport::loaded`].
+/// Native initializers or entrypoints that abort, hang, or violate the ABI may
+/// prevent the scan from returning. Fields are private; read them through the
+/// accessors.
 #[derive(Debug, Default)]
 pub struct DirLoadReport {
     loaded: Vec<PluginId>,

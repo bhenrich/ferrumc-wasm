@@ -20,8 +20,11 @@
 //! - **Capability gating.** Each plugin is granted a
 //!   [`CapabilityManifest`](ferrumc_plugin_api::CapabilityManifest); the
 //!   contexts handed to its hooks deny any facade it was not granted.
-//! - **Time budgeting.** Each call is timed against a [`CallBudget`]; overruns
-//!   are recorded (and optionally disable the plugin).
+//! - **Time budgeting.** Successful compiled enable/event/decision hooks,
+//!   successful trusted-native initialization, and returning trusted-native
+//!   event/decision calls are measured against a [`CallBudget`]. Dispatch
+//!   overruns can optionally disable later calls. The budget cannot preempt a
+//!   call that has not returned.
 //!
 //! Storage is partitioned per plugin by a [`PluginStorageBackend`]; the host
 //! hands each plugin a view bound to its own namespace, so namespaces are
@@ -31,15 +34,19 @@
 //!
 //! Beyond compiled-in plugins, [`PluginLoader`] loads plugins from `cdylib`
 //! files in a directory across the narrow C ABI defined in
-//! [`ferrumc_plugin_api::abi`] (see ADR-0006). Each library is opened, its ABI
-//! version checked, its metadata read across the boundary, and the result
-//! wrapped in an adapter that implements [`Plugin`](ferrumc_plugin_api::Plugin)
-//! for legacy app compatibility. Calls that return enter the host's ordinary
-//! budget accounting; a process-aborting library failure cannot be recovered by
-//! that adapter. Per-entry read, load, and registration failures that return are
-//! reported as classified [`LoadError`]s, and later entries are attempted; an
-//! unreadable directory is returned as the outer error. All compatibility FFI
-//! lives in one audited `#[allow(unsafe_code)]` module; see
+//! [`ferrumc_plugin_api::abi`] (see ADR-0006). The operator-trusted entrypoint
+//! returns a raw pointer; the loader rejects null, constructs the reference
+//! promised by that ABI, and checks its reported version before using the
+//! remaining fields. Metadata is then copied across the boundary and the result
+//! wrapped in an adapter that implements
+//! [`Plugin`](ferrumc_plugin_api::Plugin) for legacy app compatibility.
+//! Registration and lifecycle use the ordinary host API: enable calls are
+//! timed, while shutdown calls are not. A process-aborting library failure
+//! cannot be recovered by that adapter. Per-entry read, load, and registration
+//! failures that return are reported as classified [`LoadError`]s, and later
+//! entries are attempted; an unreadable directory is returned as the outer
+//! error. All compatibility FFI lives in one audited `#[allow(unsafe_code)]`
+//! module; see
 //! `docs/safety/ferrumc-plugin-host.md`.
 //!
 //! ## Trusted-native ABI runtime
@@ -58,20 +65,29 @@
 //! metadata or the documented connection-side sentinels: tick zero and an
 //! invalid shard resource handle.
 //!
-//! Native callbacks stage intents and exactly one block decision in a bounded
-//! transaction. After callback success, intents are submitted to the same
-//! caller-owned [`CommandSink`](ferrumc_plugin_api::CommandSink) used by
-//! compiled-in plugins, and the native decision participates in the same
-//! registration-order fold. The context-free [`PluginHost::dispatch_event`]
-//! deliberately does not fabricate native ABI metadata; context-free block
-//! decision dispatch likewise fails closed when an enabled trusted-native veto
-//! plugin cannot be called.
+//! Native event callbacks retain bounded intents in a callback-local stage.
+//! Block-decision callbacks may retain the full intent bound plus exactly one
+//! required decision. A non-success callback status, boundary error, or
+//! capability denial discards that stage before the caller-owned
+//! [`CommandSink`](ferrumc_plugin_api::CommandSink) is touched. Every service
+//! error on a decision stage, and a decision command routed to another stage,
+//! also discards it. Invalid event-resource provenance and an unavailable
+//! dimension facade are stage-poisoning on every route. Other validation or
+//! capacity errors on notification and initialization stages reject only that
+//! operation, so earlier intents may remain staged if the callback returns
+//! success. Successful intents are submitted to the sink in order; if a later
+//! submission is rejected, an earlier accepted intent can remain. A native
+//! decision participates in the same registration-order fold as compiled-in
+//! decisions. The context-free [`PluginHost::dispatch_event`] deliberately
+//! does not fabricate native ABI metadata; context-free block decision dispatch
+//! likewise fails closed when an enabled trusted-native veto plugin cannot be
+//! called.
 //!
 //! The host does not catch panics inside trusted native code. When cooperating
-//! SDK or plugin code returns normally with
-//! [`FC_PLUGIN_PANIC`](ferrumc_plugin_abi::FC_PLUGIN_PANIC), the host discards
-//! that callback's staged commands, disables the plugin, and produces a
-//! [`NativePanicRecord`].
+//! SDK or plugin code returns normally from an event or block-decision callback
+//! with [`FC_PLUGIN_PANIC`](ferrumc_plugin_abi::FC_PLUGIN_PANIC), the host
+//! discards that callback's staged commands, disables the plugin, and produces
+//! a [`NativePanicRecord`].
 //! This fail-stop path cannot recover from `panic=abort`,
 //! `std::process::abort`, segmentation faults, undefined behavior, deadlocks,
 //! foreign exceptions, or malicious memory corruption; those failures may

@@ -1,9 +1,12 @@
-//! The single, fully-documented `unsafe` boundary of this crate.
+//! Host-authored `unsafe` operations for the earlier lifecycle-only C ABI.
 //!
-//! Everything that actually crosses the FFI line lives here: opening a dynamic
-//! library, resolving its entrypoint symbol, dereferencing the plugin-owned
-//! vtable pointer, and reading C strings out of it. Each `unsafe` block has a
-//! `SAFETY:` comment justifying it. The rest of the crate stays safe Rust.
+//! Opening a dynamic library, resolving its assumed-signature entrypoint,
+//! dereferencing the plugin-owned vtable pointer, and reading C strings happen
+//! here. Each operation relies on the operator-trusted library honoring the ABI
+//! and has a `SAFETY:` comment stating that assumption. The compatibility
+//! adapter later calls copied `extern "C"` function pointers from safe Rust.
+//! The strict trusted-native path delegates its raw ABI work to
+//! `ferrumc-plugin-abi-sys`.
 //!
 //! See `docs/safety/ferrumc-plugin-host.md` for the full invariant write-up.
 
@@ -19,17 +22,19 @@ use ferrumc_plugin_api::{CapabilityManifest, PluginMetadata, Version};
 use super::adapter::LoadedPlugin;
 use super::error::LoadError;
 
-/// Opens the library at `path`, resolves `entry_symbol`, validates the vtable it
-/// returns, and builds a [`LoadedPlugin`] holding the library open.
+/// Opens the library at `path`, resolves `entry_symbol`, checks the reported ABI
+/// version, copies metadata under the operator-trusted pointer contract, and
+/// builds a [`LoadedPlugin`] holding the library open.
 ///
-/// All FFI hazards are contained in this function. On any failure the library is
-/// dropped (unloaded) before returning, because the `LoadedPlugin` that would
-/// have kept it alive is never constructed.
+/// This function and [`read_str`] contain the host-authored FFI operations for
+/// this compatibility path. On any returned failure the library handle is
+/// dropped before returning because the `LoadedPlugin` that would retain it is
+/// not constructed.
 pub(crate) fn load(path: &Path, entry_symbol: &CStr) -> Result<LoadedPlugin, LoadError> {
     // SAFETY: `Library::new` runs the platform loader on an arbitrary file,
-    // which executes that library's initializers. We only ever point it at files
-    // an operator placed in the trusted plugins directory; loading untrusted
-    // code is out of scope (and would be unsound for any dlopen-based loader).
+    // which executes that library's initializers. The caller and operator must
+    // supply a library they trust to run in the server process; this API does
+    // not enforce that precondition.
     let library = unsafe { Library::new(path) }.map_err(|source| LoadError::Open {
         path: path.to_path_buf(),
         source,
@@ -37,14 +42,16 @@ pub(crate) fn load(path: &Path, entry_symbol: &CStr) -> Result<LoadedPlugin, Loa
 
     // Resolve and call the entrypoint inside a block so the `Symbol`'s borrow of
     // `library` ends here, leaving `library` free to move into the adapter.
-    // Calling the resolved function pointer is itself a safe operation; it
-    // returns a raw pointer we validate below.
+    // Calling the typed function pointer does not require an `unsafe` block in
+    // Rust syntax, but its signature still relies on the operator-trusted ABI
+    // contract. It returns a raw pointer whose nullness and reported ABI version
+    // we check below; actual pointer validity remains part of that contract.
     let vtable_ptr: *const PluginVTable = {
         // SAFETY: we assert the symbol has the agreed `PluginEntryFn` type. If
         // the plugin exported it with a different signature the call is
-        // undefined; the ABI version check immediately after is the contract
-        // that makes this assertion sound for any plugin built against this
-        // crate's `abi` module.
+        // undefined. Operator trust plus the ABI contract is the safety basis;
+        // the later version check can reject a cooperating mismatch but cannot
+        // validate this already-resolved symbol or call.
         let entry: Symbol<PluginEntryFn> = unsafe { library.get(entry_symbol.to_bytes_with_nul()) }
             .map_err(|source| LoadError::MissingEntrypoint {
                 path: path.to_path_buf(),
@@ -75,9 +82,10 @@ pub(crate) fn load(path: &Path, entry_symbol: &CStr) -> Result<LoadedPlugin, Loa
         });
     }
 
-    // Reading the metadata strings calls plugin-provided function pointers
-    // (safe) and dereferences the `*const c_char` they return (unsafe; handled
-    // inside `read_str`).
+    // Reading metadata calls plugin-provided typed function pointers. No
+    // `unsafe` block is required for those calls, but their assumed signatures
+    // remain part of the operator-trusted ABI. `read_str` handles the unsafe
+    // pointer dereference.
     let id = read_str(path, (vtable.id)(), "id")?;
     let name = read_str(path, (vtable.name)(), "name")?;
 
@@ -115,7 +123,7 @@ fn read_str(path: &Path, ptr: *const c_char, field: &'static str) -> Result<Stri
     // SAFETY: the ABI requires `ptr` to be a nul-terminated, `'static` string
     // owned by the plugin and valid while the library is loaded. We read it
     // immediately, validate it is UTF-8, copy it out, and never free it. A
-    // misbehaving plugin that returns a non-terminated pointer is the one
+    // misbehaving plugin that returns a non-terminated pointer is an
     // unavoidable trust we place in `extern "C"` plugin code.
     let cstr = unsafe { CStr::from_ptr(ptr) };
     cstr.to_str()
@@ -175,7 +183,7 @@ mod tests {
 
     #[test]
     fn version_components_map_into_metadata() {
-        // Mirror what `load` does once it holds a validated vtable, minus the
+        // Mirror what `load` does after the reported-version check, minus the
         // libloading machinery, to confirm the field mapping.
         let vt = vtable(ABI_VERSION);
         assert_eq!(vt.abi_version, ABI_VERSION);

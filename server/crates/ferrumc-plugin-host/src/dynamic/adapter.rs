@@ -1,15 +1,18 @@
 //! The bridge type that makes a dynamically-loaded plugin look like an ordinary
 //! in-process [`Plugin`].
 //!
-//! Once a library is loaded and its vtable validated, this compatibility
-//! adapter registers and enables it through [`PluginHost`](crate::PluginHost).
-//! Calls that return enter ordinary lifecycle/status and budget bookkeeping;
-//! the host cannot recover an abort or an unwind crossing the C boundary.
+//! After the earlier lifecycle-only loader checks the reported ABI version and
+//! copies fields under the operator-trusted pointer contract, this adapter
+//! registers the result through [`PluginHost`](crate::PluginHost). Successful
+//! enable enters ordinary lifecycle/status and budget bookkeeping; shutdown is
+//! not timed. The host cannot recover an abort or an unwind crossing the C
+//! boundary.
 //!
-//! There is deliberately **no `unsafe` here**: the only unsafe work (opening the
-//! library and reading the vtable) happened in [`super::ffi`]; calling a
-//! validated `extern "C"` function pointer is a safe operation. The adapter just
-//! holds the [`Library`] alive and the two lifecycle function pointers.
+//! There is deliberately **no `unsafe` block here**: opening the library and
+//! reading the vtable happen in [`super::ffi`]. Calling a copied `extern "C"`
+//! function pointer does not require an `unsafe` block in Rust syntax, but its
+//! soundness still relies on the operator-trusted library honoring the ABI. The
+//! adapter holds the [`Library`] handle and the two lifecycle function pointers.
 
 use libloading::Library;
 
@@ -18,8 +21,8 @@ use ferrumc_plugin_api::{Plugin, PluginError, PluginMetadata, SetupContext, Tear
 
 /// A dynamically-loaded plugin presented to the host as a [`Plugin`].
 pub(crate) struct LoadedPlugin {
-    /// Metadata copied out of the vtable at load time (never re-read across the
-    /// ABI, so it cannot fail or panic later).
+    /// Metadata copied out of the vtable at load time and never re-read across
+    /// the ABI.
     metadata: PluginMetadata,
     /// The plugin's `extern "C"` init function.
     init: PluginInitFn,
@@ -35,8 +38,8 @@ pub(crate) struct LoadedPlugin {
 }
 
 impl LoadedPlugin {
-    /// Assembles an adapter from the parts [`super::ffi`] extracted from a
-    /// validated vtable.
+    /// Assembles an adapter from the fields [`super::ffi`] copied after the
+    /// reported ABI-version check.
     pub(crate) fn new(
         library: Library,
         metadata: PluginMetadata,
@@ -55,8 +58,9 @@ impl LoadedPlugin {
     /// Calls the plugin's shutdown hook exactly once, if init had succeeded.
     fn run_shutdown(&mut self) {
         if self.initialized {
-            // Calling a validated `extern "C"` function pointer is safe; the
-            // plugin is responsible for not unwinding across the boundary.
+            // No `unsafe` block is required to call this typed pointer, but its
+            // soundness still relies on the operator-trusted ABI. The plugin
+            // must not unwind across the boundary.
             (self.shutdown)();
             self.initialized = false;
         }
@@ -91,8 +95,9 @@ impl Plugin for LoadedPlugin {
 impl Drop for LoadedPlugin {
     fn drop(&mut self) {
         // Last-resort teardown: if the plugin was enabled but never explicitly
-        // disabled, still give it a chance to clean up before the library
-        // unloads. `run_shutdown` is idempotent via the `initialized` flag.
+        // disabled, still give it a chance to clean up before releasing the
+        // library handle. `run_shutdown` is idempotent via the `initialized`
+        // flag.
         self.run_shutdown();
     }
 }

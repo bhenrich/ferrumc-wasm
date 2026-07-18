@@ -7,9 +7,11 @@ const DEFAULT_BUDGET: Duration = Duration::from_millis(5);
 
 /// A wall-clock budget for a single plugin call.
 ///
-/// The host times each lifecycle/event call and compares the elapsed duration
-/// against this budget. The comparison ([`CallBudget::evaluate`]) is a pure
-/// function so it can be tested deterministically without sleeping.
+/// The host compares successful compiled enable/event/decision hooks,
+/// successful trusted-native initialization, and returning trusted-native
+/// event/decision calls against this budget. Metadata and shutdown calls are
+/// not timed. The comparison ([`CallBudget::evaluate`]) is a pure function so
+/// it can be tested deterministically without sleeping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallBudget {
     limit: Duration,

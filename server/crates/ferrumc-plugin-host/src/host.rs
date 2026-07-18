@@ -533,10 +533,13 @@ impl ResolvedEventOutcome {
 ///
 /// The host owns compiled-in [`Plugin`] trait objects and validated trusted
 /// native factories. Compiled-in calls use `catch_unwind`; trusted native
-/// callbacks use ABI statuses and a transactional bounded command stage.
-/// A normally returned `FC_PLUGIN_PANIC` triggers fail-stop handling for that
-/// native instance; process-ending and non-returning failures cannot be
-/// recovered here. See [`NativePanicRecord`] for the exact boundary.
+/// callbacks use ABI statuses and a bounded callback-local command stage.
+/// Callback failure and capability denial discard that stage before the
+/// caller's sink is touched; successful sink submission is ordered but can
+/// preserve an accepted prefix. A normally returned `FC_PLUGIN_PANIC` triggers
+/// fail-stop handling for that native instance; process-ending and
+/// non-returning failures cannot be recovered here. See [`NativePanicRecord`]
+/// for the exact boundary.
 /// Plugin-registered commands are aggregated into a single [`CommandTree`].
 pub struct PluginHost {
     plugins: Vec<PluginSlot>,
