@@ -957,12 +957,14 @@ impl PluginHost {
     /// deterministic registration order.
     ///
     /// `native_context` supplies exact caller-attested simulation metadata or
-    /// documented connection-side sentinels for the ABI envelope. The host
-    /// mints a fresh shard resource for each native callback and submits a
-    /// successful callback's staged `MESSAGE` or `TELEPORT` intents to the same
-    /// caller-owned bounded `sink` used by compiled-in plugins. Callback
-    /// failures or capability denials discard the native stage before the sink
-    /// is touched.
+    /// documented connection-side sentinels for the ABI envelope. For exact
+    /// simulation metadata, the host mints a fresh shard resource for each
+    /// native callback. Connection-side callbacks pass
+    /// `FcResourceHandle::INVALID` as the metadata-unavailable sentinel. A
+    /// successful callback's staged `MESSAGE` or `TELEPORT` intents are
+    /// submitted to the same caller-owned bounded `sink` used by compiled-in
+    /// plugins. Callback failures or capability denials discard the native
+    /// stage before the sink is touched.
     pub fn dispatch_event_with_native_context(
         &mut self,
         event: &PluginEvent,
