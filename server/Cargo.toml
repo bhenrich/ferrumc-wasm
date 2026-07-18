@@ -20,6 +20,7 @@ members = [
     "crates/ferrumc-command",
     "crates/ferrumc-permission",
     "crates/ferrumc-plugin-api",
+    "crates/ferrumc-plugin-abi",
     "crates/ferrumc-plugin-host",
     "crates/ferrumc-anvil",
     "crates/ferrumc-placement",
@@ -130,6 +131,7 @@ ferrumc-sim = { path = "crates/ferrumc-sim" }
 ferrumc-command = { path = "crates/ferrumc-command" }
 ferrumc-permission = { path = "crates/ferrumc-permission" }
 ferrumc-plugin-api = { path = "crates/ferrumc-plugin-api" }
+ferrumc-plugin-abi = { path = "crates/ferrumc-plugin-abi" }
 ferrumc-plugin-host = { path = "crates/ferrumc-plugin-host" }
 ferrumc-anvil = { path = "crates/ferrumc-anvil" }
 ferrumc-placement = { path = "crates/ferrumc-placement" }
