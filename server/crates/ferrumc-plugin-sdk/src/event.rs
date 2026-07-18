@@ -16,7 +16,7 @@ pub enum EventKind {
     PlayerJoin,
     /// A player left.
     PlayerLeave,
-    /// A block-break notification accepted at the intent boundary.
+    /// A block-break notification.
     BlockBreak,
     /// A block placement accepted at the intent boundary and routed.
     AfterBlockPlace,
@@ -285,7 +285,7 @@ pub enum Event {
     PlayerJoin(PlayerEvent),
     /// A player left.
     PlayerLeave(PlayerEvent),
-    /// A block-break notification accepted at the intent boundary.
+    /// A block-break notification.
     BlockBreak(BlockEvent),
     /// A block placement accepted at the intent boundary and routed.
     ///
