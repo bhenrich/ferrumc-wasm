@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use ferrumc_core::PluginId;
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::plugin_metrics::PLUGIN_METRIC_ID_MAX_BYTES;
 use crate::RingBuffer;
 
 /// Maximum number of callbacks monitored concurrently.
@@ -38,7 +39,6 @@ pub const DIAGNOSTIC_HISTORY_CAPACITY: usize = 256;
 pub const RETIRED_THREAD_CAPACITY: usize = 1_024;
 
 const CRASH_REPORT_HISTORY_CAPACITY: usize = 64;
-const MAX_PLUGIN_ID_BYTES: usize = 128;
 const MAX_HOOK_BYTES: usize = 128;
 const MAX_SHARD_LABEL_BYTES: usize = 64;
 const MAX_THREAD_LABEL_BYTES: usize = 160;
@@ -288,7 +288,7 @@ impl WatchdogCallback {
         hook: impl Into<String>,
         shard: impl Into<String>,
     ) -> Result<Self, WatchdogLabelError> {
-        validate_label("plugin_id", plugin_id.as_str(), MAX_PLUGIN_ID_BYTES)?;
+        validate_label("plugin_id", plugin_id.as_str(), PLUGIN_METRIC_ID_MAX_BYTES)?;
         let hook = hook.into();
         validate_label("hook", &hook, MAX_HOOK_BYTES)?;
         let shard = shard.into();
@@ -1562,13 +1562,13 @@ mod tests {
         );
         assert!(matches!(
             WatchdogCallback::new(
-                PluginId::new("p".repeat(MAX_PLUGIN_ID_BYTES + 1)),
+                PluginId::new("p".repeat(PLUGIN_METRIC_ID_MAX_BYTES + 1)),
                 "hook",
                 "0,0"
             ),
             Err(WatchdogLabelError::TooLong {
                 field: "plugin_id",
-                maximum: MAX_PLUGIN_ID_BYTES,
+                maximum: PLUGIN_METRIC_ID_MAX_BYTES,
                 ..
             })
         ));
@@ -1718,6 +1718,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn one_completion_cannot_clear_another_hard_call() {
         let (watchdog, clock, _reporter) = start_manual(PluginWatchdogConfig::default());
+        let metrics = crate::CounterRegistry::new();
+        let unrelated =
+            crate::PluginInvocationObservation::new(PluginId::new("unrelated"), Duration::ZERO)
+                .expect("bounded unrelated plugin");
+        assert_eq!(
+            metrics.record_plugin_invocation(unrelated),
+            crate::PluginMetricRecordOutcome::Recorded
+        );
+        let assert_unrelated_not_hung = || {
+            assert!(!metrics
+                .snapshot()
+                .plugin_metrics
+                .entry(&PluginId::new("unrelated"))
+                .expect("unrelated plugin row")
+                .is_hung());
+        };
         let first = watchdog
             .handle()
             .begin_callback(callback("same-plugin"))
@@ -1733,14 +1749,104 @@ mod tests {
             watchdog.snapshot().hung_plugins(),
             vec![PluginId::new("same-plugin")]
         );
+        metrics.sync_plugin_hung_status(&watchdog.snapshot());
+        assert!(metrics
+            .snapshot()
+            .plugin_metrics
+            .entry(&PluginId::new("same-plugin"))
+            .expect("hung plugin row")
+            .is_hung());
+        assert_unrelated_not_hung();
         assert_eq!(first.finish(), WatchdogThreadDisposition::Retire);
+        let first_observation = crate::PluginInvocationObservation::new(
+            PluginId::new("same-plugin"),
+            Duration::from_secs(10),
+        )
+        .expect("bounded hard callback")
+        .with_over_budget();
+        assert_eq!(
+            metrics.record_plugin_invocation(first_observation),
+            crate::PluginMetricRecordOutcome::Recorded
+        );
         assert_eq!(watchdog.snapshot().health(), WatchdogHealth::Failed);
         assert_eq!(
             watchdog.snapshot().hung_plugins(),
             vec![PluginId::new("same-plugin")]
         );
+        metrics.sync_plugin_hung_status(&watchdog.snapshot());
+        assert!(metrics
+            .snapshot()
+            .plugin_metrics
+            .entry(&PluginId::new("same-plugin"))
+            .expect("still-hung plugin row")
+            .is_hung());
+        assert_unrelated_not_hung();
         assert_eq!(second.finish(), WatchdogThreadDisposition::Retire);
+        let second_observation = crate::PluginInvocationObservation::new(
+            PluginId::new("same-plugin"),
+            Duration::from_secs(10),
+        )
+        .expect("bounded hard callback")
+        .with_over_budget();
+        assert_eq!(
+            metrics.record_plugin_invocation(second_observation),
+            crate::PluginMetricRecordOutcome::Recorded
+        );
         assert_eq!(watchdog.snapshot().health(), WatchdogHealth::Healthy);
+        metrics.sync_plugin_hung_status(&watchdog.snapshot());
+        assert!(!metrics
+            .snapshot()
+            .plugin_metrics
+            .entry(&PluginId::new("same-plugin"))
+            .expect("cleared plugin row")
+            .is_hung());
+        assert_eq!(
+            metrics
+                .snapshot()
+                .plugin_metrics
+                .entry(&PluginId::new("same-plugin"))
+                .expect("completed plugin row")
+                .invocation_count(),
+            2
+        );
+        assert_unrelated_not_hung();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_full_table_hung_projection_is_a_current_gauge() {
+        let (watchdog, clock, _reporter) = start_manual(PluginWatchdogConfig::default());
+        let metrics = crate::CounterRegistry::new();
+        for index in 0..crate::PLUGIN_METRIC_CAPACITY {
+            let observation = crate::PluginInvocationObservation::new(
+                PluginId::new(format!("retained-{index:03}")),
+                Duration::ZERO,
+            )
+            .expect("bounded retained plugin");
+            assert_eq!(
+                metrics.record_plugin_invocation(observation),
+                crate::PluginMetricRecordOutcome::Recorded
+            );
+        }
+        let guard = watchdog
+            .handle()
+            .begin_callback(callback("untracked-hung"))
+            .expect("hard call");
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        drive_and_wait(&watchdog, &clock, Duration::from_secs(10));
+        for _ in 0..2 {
+            metrics.sync_plugin_hung_status(&watchdog.snapshot());
+            let snapshot = metrics.snapshot().plugin_metrics;
+            assert_eq!(snapshot.entries().len(), crate::PLUGIN_METRIC_CAPACITY);
+            assert_eq!(snapshot.overflowed_observations(), 0);
+            assert_eq!(snapshot.untracked_hung_plugins(), 1);
+        }
+
+        assert_eq!(guard.finish(), WatchdogThreadDisposition::Retire);
+        metrics.sync_plugin_hung_status(&watchdog.snapshot());
+        let snapshot = metrics.snapshot().plugin_metrics;
+        assert_eq!(snapshot.overflowed_observations(), 0);
+        assert_eq!(snapshot.untracked_hung_plugins(), 0);
     }
 
     #[test]

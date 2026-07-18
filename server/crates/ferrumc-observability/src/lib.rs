@@ -24,9 +24,12 @@
 //! - A dedicated-thread [`PluginWatchdog`] that detects slow or non-returning
 //!   plugin callbacks and publishes bounded diagnostics. Detection is not
 //!   preemption: the watchdog never cancels a callback or unloads native code.
+//! - Bounded per-plugin callback metrics submitted as one authoritative
+//!   [`PluginInvocationObservation`] per completed callback.
 
 mod metrics;
 mod net_telemetry;
+mod plugin_metrics;
 mod ring;
 mod snapshot;
 mod trace;
@@ -40,6 +43,11 @@ pub use metrics::{
 pub use net_telemetry::{
     ConnNetTelemetry, NetTelemetryHub, NetTelemetryParts, PacketTally, PlayerNetCounters,
     DEFAULT_TOP_N, HUB_CAPACITY, TALLY_CAPACITY,
+};
+pub use plugin_metrics::{
+    PluginInvocationObservation, PluginMetricEntry, PluginMetricLabelError,
+    PluginMetricRecordOutcome, PluginMetricsSnapshot, PLUGIN_METRIC_CAPACITY,
+    PLUGIN_METRIC_ID_MAX_BYTES,
 };
 pub use ring::RingBuffer;
 pub use snapshot::{

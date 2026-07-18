@@ -9,11 +9,12 @@
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use ferrumc_core::Tick;
+use ferrumc_core::{PluginId, Tick};
 use ferrumc_observability::{
     CounterRegistry, Direction, MutationKind, MutationResult, PacketState, PacketTrace,
-    SessionDebug,
+    PluginInvocationObservation, PluginMetricRecordOutcome, SessionDebug,
 };
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -116,6 +117,15 @@ fn metrics_dump_emits_a_tracing_event_with_exact_metric_keys() {
         reg.incr_chunk_unloaded(1);
         reg.record_block_mutation(MutationKind::Break, MutationResult::Accepted);
         reg.record_packet_decode_error(PacketState::Play, "malformed_play");
+        let plugin = PluginInvocationObservation::new(
+            PluginId::new("fixture-dynamic"),
+            Duration::from_micros(12),
+        )
+        .expect("bounded fixture plugin");
+        assert_eq!(
+            reg.record_plugin_invocation(plugin),
+            PluginMetricRecordOutcome::Recorded
+        );
         reg.dump();
     });
 
@@ -131,4 +141,8 @@ fn metrics_dump_emits_a_tracing_event_with_exact_metric_keys() {
     let decode = &json["ferrumc_packet_decode_error_total"]["entries"];
     assert_eq!(decode[0]["packet"], "malformed_play");
     assert_eq!(decode[0]["count"], 1);
+    let plugin = &json["ferrumc_plugin_metrics"]["entries"][0];
+    assert_eq!(plugin["plugin_id"], "fixture-dynamic");
+    assert_eq!(plugin["invocation_count"], 1);
+    assert_eq!(plugin["invocation_time_us_total"], 12);
 }

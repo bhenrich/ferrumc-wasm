@@ -22,6 +22,7 @@ use std::sync::{Arc, PoisonError, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::metrics::CounterRegistry;
+use crate::plugin_metrics::PluginMetricsSnapshot;
 use crate::trace::PacketState;
 
 /// A comprehensive, bounded, read-only snapshot of the server's current state.
@@ -100,6 +101,9 @@ pub struct ServerSnapshot {
     pub decode_errors_overflow: u64,
 
     // --- Plugins ---
+    /// Bounded per-plugin callback metrics derived from the metric registry.
+    #[serde(default)]
+    pub plugin_metrics: PluginMetricsSnapshot,
     /// Per-plugin decision counts. Populated by the plugin lane; empty here.
     pub plugin_decisions: Vec<PluginDecisionSnapshot>,
 
@@ -343,6 +347,7 @@ impl CounterRegistry {
             },
             decode_errors_recent,
             decode_errors_overflow: metrics.packet_decode_error_total.overflow,
+            plugin_metrics: metrics.plugin_metrics,
             plugin_decisions: parts.plugin_decisions,
             inbound_trace_summary: parts.inbound_trace_summary,
             outbound_trace_summary: parts.outbound_trace_summary,

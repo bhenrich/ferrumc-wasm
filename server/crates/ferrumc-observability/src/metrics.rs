@@ -2,7 +2,7 @@
 //! metric set, plus the per-tick record, the shared server clock, and the JSON
 //! snapshot a future exporter can scrape.
 //!
-//! The seven metric names are fixed now so they survive into a real exporter:
+//! The metric names are fixed now so they survive into a real exporter:
 //!
 //! - `ferrumc_tick_ms{shard}`
 //! - `ferrumc_session_outbound_queue_len{session}`
@@ -11,13 +11,15 @@
 //! - `ferrumc_block_mutation_total{kind,result}`
 //! - `ferrumc_storage_flush_ms`
 //! - `ferrumc_packet_decode_error_total{state,packet}`
+//! - `ferrumc_plugin_metrics` (bounded per-plugin JSON snapshot group)
 //!
 //! Cardinality-free counters are plain [`AtomicU64`]s touched lock-free on the
-//! hot path. The two *labelled* tables (`tick_ms{shard}` and
-//! `packet_decode_error_total{state,packet}`) are fixed-capacity and sit behind a
-//! small per-registry [`Mutex`] that is only taken on cold or low-frequency
-//! paths (a tick is recorded by the single driver task ~20x/s; decode errors are
-//! rare; snapshots are on demand) — never on the per-packet / per-chunk hot path.
+//! hot path. The *labelled* tables (`tick_ms{shard}`,
+//! `packet_decode_error_total{state,packet}`, and the per-plugin group) are
+//! fixed-capacity and sit behind small per-registry [`Mutex`]es that are only
+//! taken on cold or low-frequency paths (a tick is recorded by the single driver
+//! task ~20x/s; decode errors and plugin completions are comparatively rare;
+//! snapshots are on demand) — never on the per-packet / per-chunk hot path.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -25,7 +27,12 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use ferrumc_core::Tick;
 use serde::Serialize;
 
+use crate::plugin_metrics::{
+    PluginInvocationObservation, PluginMetricRecordOutcome, PluginMetricRegistry,
+    PluginMetricsSnapshot,
+};
 use crate::trace::PacketState;
+use crate::watchdog::WatchdogSnapshot;
 
 /// Number of distinct shards the `ferrumc_tick_ms{shard}` table can hold before
 /// further shards fold into the overflow counter. One shard runs today; 16 keeps
@@ -215,8 +222,8 @@ fn nearest_rank(sorted: &[u32], p: usize) -> u32 {
 /// The shared, lock-light metric sink.
 ///
 /// Cloned behind an [`Arc`] and threaded through the app; every method takes
-/// `&self`, so connection tasks and the driver share one instance. The seven
-/// public recording methods are named exactly after the metric they feed.
+/// `&self`, so connection tasks and the driver share one instance. Public
+/// recording methods are named after the metric family they feed.
 #[derive(Debug)]
 pub struct CounterRegistry {
     /// `ferrumc_chunk_sent_total`.
@@ -243,6 +250,8 @@ pub struct CounterRegistry {
     /// Sliding window of recent tick durations for percentile reporting; fed from
     /// the same single-writer `record_tick` path as the tick table.
     tick_durations: Mutex<TickDurationRing>,
+    /// Bounded per-plugin callback metrics.
+    plugin_metrics: PluginMetricRegistry,
 }
 
 impl CounterRegistry {
@@ -263,6 +272,7 @@ impl CounterRegistry {
             tick_table: Mutex::new(TickTable::new()),
             decode_errors: Mutex::new(DecodeErrorTable::new()),
             tick_durations: Mutex::new(TickDurationRing::new()),
+            plugin_metrics: PluginMetricRegistry::new(),
         }
     }
 
@@ -355,6 +365,33 @@ impl CounterRegistry {
         }
     }
 
+    /// Records one completed plugin callback into the bounded per-plugin table.
+    ///
+    /// The observation is one authoritative callback outcome, so an overlapping
+    /// panic or capability-denial representation must not be submitted again.
+    /// Capacity loss is telemetry-only and never changes callback behavior.
+    pub fn record_plugin_invocation(
+        &self,
+        observation: PluginInvocationObservation,
+    ) -> PluginMetricRecordOutcome {
+        self.plugin_metrics.record(observation)
+    }
+
+    /// Replaces every retained plugin's `hung` gauge from one watchdog snapshot.
+    ///
+    /// The caller must be the single publication owner and supply snapshots in
+    /// order from the one authoritative process watchdog. Applying snapshots
+    /// from multiple watchdogs independently would make each projection replace
+    /// the others.
+    ///
+    /// A plugin is hung while at least one of its active callbacks has crossed
+    /// the hard watchdog threshold. Completing one of multiple hard callbacks
+    /// therefore cannot clear the gauge. The monotonic callback counters are
+    /// unchanged by this projection.
+    pub fn sync_plugin_hung_status(&self, watchdog: &WatchdogSnapshot) {
+        self.plugin_metrics.sync_hung_from_watchdog(watchdog);
+    }
+
     /// Builds an owned, serializable snapshot of every metric.
     ///
     /// The top-level JSON keys are the exact metric names so a future exporter
@@ -439,6 +476,7 @@ impl CounterRegistry {
                 },
             },
             packet_decode_error_total,
+            plugin_metrics: self.plugin_metrics.snapshot(),
         }
     }
 
@@ -501,6 +539,9 @@ pub struct MetricsSnapshot {
     /// `ferrumc_packet_decode_error_total{state,packet}`.
     #[serde(rename = "ferrumc_packet_decode_error_total")]
     pub packet_decode_error_total: DecodeErrorTotals,
+    /// Bounded per-plugin callback rows and degradation counts.
+    #[serde(rename = "ferrumc_plugin_metrics")]
+    pub plugin_metrics: PluginMetricsSnapshot,
 }
 
 /// One shard's row in the `ferrumc_tick_ms` snapshot.
@@ -736,6 +777,7 @@ mod tests {
             "ferrumc_block_mutation_total",
             "ferrumc_storage_flush_ms",
             "ferrumc_packet_decode_error_total",
+            "ferrumc_plugin_metrics",
         ] {
             assert!(json.get(key).is_some(), "missing metric key {key}");
         }
