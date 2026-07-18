@@ -1,0 +1,28 @@
+[package]
+name = "ferrumc-plugin-sdk-dynamic-test-plugin"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+panic-create = []
+panic-drop = []
+panic-load = []
+panic-unload = []
+
+[dependencies]
+# The fixture proves that plugin authors need only the safe shared SDK plus its
+# dynamic packaging adapter.
+ferrumc-plugin-sdk = { path = "../../../../ferrumc-plugin-sdk" }
+ferrumc-plugin-sdk-dynamic = { path = "../../.." }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+
+[workspace]

@@ -1,0 +1,21 @@
+[package]
+name = "ferrumc-plugin-sdk-dynamic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Trusted native packaging adapter for FerrumC SDK plugins"
+build = "build.rs"
+
+[dependencies]
+# Stable binary records and status assignments used by the native boundary.
+ferrumc-plugin-abi = { workspace = true }
+# Audited raw trampolines and the call-scoped safe PluginCall wrapper.
+ferrumc-plugin-abi-sys = { workspace = true }
+# Packaging-independent plugin trait, contexts, and capability facades.
+ferrumc-plugin-sdk = { workspace = true }
+# Direct UUID construction keeps player-id decoding allocation-free.
+uuid = { workspace = true }
+
+[lints]
+workspace = true

@@ -608,6 +608,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrumc-plugin-sdk-dynamic"
+version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-plugin-abi",
+ "ferrumc-plugin-abi-sys",
+ "ferrumc-plugin-sdk",
+ "uuid",
+]
+
+[[package]]
 name = "ferrumc-plugin-spawn-protect"
 version = "0.2.0-dev"
 dependencies = [
