@@ -1,0 +1,36 @@
+[package]
+name = "ferrumc-testkit-abi-invalid-input"
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = []
+short-function-table = []
+missing-entrypoint = []
+missing-functions-value = []
+missing-init-callback = []
+missing-event-callback = []
+missing-shutdown-callback = []
+missing-metadata-buffer = []
+excess-declared-length = []
+
+[dependencies]
+ferrumc-plugin-abi = { path = "../../../ferrumc-plugin-abi" }
+ferrumc-plugin-abi-sys = { path = "../../../ferrumc-plugin-abi-sys" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+
+# This negative-path test fixture is a standalone package rather than a
+# production workspace member. Its compiled artifacts are redirected into
+# repository-local `.codex-tmp` by the integration test.
+[workspace]

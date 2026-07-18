@@ -35,6 +35,17 @@ ferrumc-nbt.workspace = true
 # Fault-store journal fixtures use typed coordinates and block states.
 ferrumc-math.workspace = true
 ferrumc-world.workspace = true
+# Packet 52's negative-path QA validates the trusted native plugin loader and
+# proves host rollback without adding any production dependency or public API.
+ferrumc-plugin-abi.workspace = true
+ferrumc-plugin-abi-sys.workspace = true
+ferrumc-plugin-loader.workspace = true
+ferrumc-plugin-host.workspace = true
+ferrumc-plugin-api.workspace = true
+ferrumc-permission.workspace = true
+serde_json.workspace = true
+# Test-only bundle packaging hashes the exact copied cdylib bytes.
+sha2 = "0.10"
 
 [lints]
 workspace = true
