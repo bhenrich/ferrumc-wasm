@@ -1,0 +1,39 @@
+[package]
+name = "ferrumc-codec-fuzz"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# libFuzzer is an opt-in local assurance tool. Keeping it in this standalone
+# package prevents its nightly-only build path from entering the stable gate.
+libfuzzer-sys = "0.4"
+# Targets exercise the public hostile-input boundary exactly as downstream
+# packet decoders do.
+ferrumc-codec = { path = ".." }
+
+[[bin]]
+name = "var_int"
+path = "fuzz_targets/var_int.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "var_long"
+path = "fuzz_targets/var_long.rs"
+test = false
+doc = false
+bench = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# This nightly/libFuzzer package is deliberately not a member of the stable
+# server workspace and is never resolved by the stable gate.
+[workspace]
