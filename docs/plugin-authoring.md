@@ -7,12 +7,14 @@ complete two-mode example is
 [`ferrumc-plugin-region-guard`](../server/plugins/ferrumc-plugin-region-guard/README.md).
 
 > **Deployment status:** the SDK, both packaging adapters, the native bundle
-> validator, and the deterministic testhost are implemented. The shipping
-> `ferrumc-app` does not yet provide a supported install-and-enable path for an
-> SDK plugin. Its configured `plugins_dir` still uses the older lifecycle-only
-> loader with a temporary host, does not enable the loaded adapters, and does
-> not deliver gameplay callbacks to them. Copying an SDK library into that
-> directory will not make it a live gameplay plugin.
+> validator, and the deterministic testhost are implemented. At startup, the
+> shipping `ferrumc-app` validates, registers, and enables strict bundles from
+> `plugins_dir` in the same long-lived host used by live connections. Production
+> activation currently covers a deliberately narrow, connection-side subset of
+> the SDK: block-edit decisions, block notifications, block-boundary movement
+> notifications, and bounded message or teleport intents. The
+> [production capability table](#shipping-app-capability-subset) lists the exact
+> boundary.
 
 ## Quick start
 
@@ -32,6 +34,15 @@ The regression builds a real platform library, replays the same six-event log
 through both adapters, and requires identical effects, final state, and digest.
 It proves adapter parity in the deterministic testhost; it is not a shipping
 server installation test.
+
+The shipping socket path has a separate regression. It builds and packages the
+block-rules trusted native plugin, disables all compiled-in samples, starts the
+server, and proves that a glass placement is rewritten:
+
+```bash
+cargo test -p ferrumc-app --test trusted_native_plugin \
+  dynamic_block_rules_rewrites_glass_on_the_production_socket_path -- --exact
+```
 
 The first build selects the example's default `builtin` feature. The final
 build selects only `dynamic` and emits the target-specific library under
@@ -119,6 +130,11 @@ ferrumc_plugin_sdk_dynamic::export_plugin!(crate::JoinGreeter);
 Call `export_plugin!` exactly once in a dynamic artifact. The macro provides the
 audited ABI entrypoint, so ordinary plugin code needs no `unsafe`.
 
+This greeter demonstrates the shared authoring API and can be exercised with
+`PluginTestHost`. The shipping app does not currently deliver `PlayerJoin` to
+trusted native plugins; production plugins must use the supported event subset
+below.
+
 ## Lifecycle and callback outcomes
 
 All callbacks are synchronous. A context lends its facades only for that call;
@@ -158,7 +174,7 @@ same set. Missing access returns a typed error.
 | `read-world` | `EventContext::world`: loaded-chunk, block-state, and player-position queries through a read-only view. |
 | `submit-intents` | `EventContext::operations`: bounded block-write, teleport, and player-message requests. |
 | `register-commands` | `LoadContext::commands` and later command callbacks routed by a nonzero handler ID. |
-| `receive-events` | Load-time subscriptions and passive player, movement, and committed block notifications. |
+| `receive-events` | Load-time subscriptions and passive player, movement, and block notifications. |
 | `read-permissions` | `EventContext::permissions`: read-only resolution of validated permission nodes. |
 | `storage` | Bounded key-value access in the host-selected plugin namespace during load, calls, and unload. |
 | `veto-block-edits` | Block-place and block-break decision callbacks, including placement replacement. |
@@ -167,12 +183,41 @@ same set. Missing access returns a typed error.
 Diagnostics and deterministic timers are packaging services and have no ABI-v1
 capability bit.
 
-One current ABI-v1 detail affects `set_block`: the dynamic adapter must obtain a
-current-dimension handle through the world-read request before it can submit
-the block operation. A dynamic plugin that calls `set_block` therefore needs
-both `submit-intents` and `read-world`. If `read-world` is absent, the call
-returns a typed failure; the adapter does not substitute another handle or
-expand the grant.
+### Shipping app capability subset
+
+The shipping app makes exactly `receive-events`, `submit-intents`, and
+`veto-block-edits` available to trusted native plugins. Each bundle receives its
+requested subset; requesting anything outside that set rejects startup.
+
+| Capability or service | Production behavior |
+|---|---|
+| `receive-events` | Emits subscribed `AfterBlockPlace`, `AfterBlockBreak`, and `PlayerMove` notifications; movement is throttled to integer `BlockPos` changes. Join, leave, chat, and interaction callbacks are not delivered to trusted native plugins yet. |
+| `submit-intents` | Routes bounded player-message and teleport intents. `set_block` is unavailable because its dynamic facade first needs the current-dimension handle supplied by `read-world`. |
+| `veto-block-edits` | Consults place decisions (`Allow`, `Deny`, or `Replace`) and break decisions (`Allow` or `Deny`) before routing the edit. |
+| `read-world`, `register-commands`, `read-permissions`, `storage`, `veto-events` | Not granted; requesting one rejects the bundle at startup. |
+| Diagnostics | Bounded diagnostics are accepted by the native callback host. |
+| Timers | Scheduling and cancellation are rejected as unsupported with a typed facade failure, and no `Timer` callback is delivered. Propagating that failure from `on_load` aborts plugin enablement and server startup. |
+
+Native initialization creates the instance and runs `on_load` synchronously
+during startup; failure aborts startup. On a normal host drop, shutdown attempts
+`on_unload`; the native library remains resident until process exit.
+
+These callbacks run on the connection side, outside the simulation tick. Native
+event envelopes therefore carry tick `0` and
+`FcResourceHandle::INVALID` as explicit metadata-unavailable sentinels. An
+`AfterBlockPlace` or `AfterBlockBreak` notification means the edit was accepted
+at the intent boundary and routed toward the simulation; it is not confirmation
+that a simulation tick committed the edit. The simulation may still reject it,
+for example because of reach or chunk-residency validation.
+
+Outside the shipping app, one current ABI-v1 detail affects `set_block`: the
+dynamic adapter must obtain a current-dimension handle through the world-read
+request before it can submit the block operation. A dynamic host that supports
+this call must grant both `submit-intents` and `read-world`. If `read-world` is
+absent, the call returns a typed failure; the adapter does not substitute
+another handle or expand the grant. The shipping app rejects `read-world`
+during bundle admission, so its trusted native plugins cannot call
+`set_block`.
 
 Capabilities govern cooperative FerrumC facade access. They are not
 operating-system permissions and are not a security boundary.
@@ -220,9 +265,25 @@ version, ABI version, and capabilities must match the exported descriptor.
 The loader also requires an exact build-target match and checks that the
 running FerrumC API version satisfies `server_api`.
 
-This bundle format is implemented and tested by `ferrumc-plugin-loader`, but it
-is not wired into the shipping app's active gameplay host yet. Treat bundle
-creation as packaging preparation, not as a supported deployment procedure.
+Configure the shipping app with the parent directory that contains the bundle:
+
+```toml
+plugins_dir = "/srv/ferrumc/plugins"
+builtin_plugins = false
+```
+
+Each immediate child directory containing `plugin.toml` is a strict bundle
+candidate; child directories without that file are ignored. Candidates are
+loaded in deterministic plugin-ID order. Any directory-read, bundle-load,
+validation, duplicate-ID, host-registration, initialization, or enable failure
+aborts startup before the server accepts connections. A library already mapped
+before a later candidate fails remains resident until process exit.
+
+`builtin_plugins` defaults to `true`, which registers the compiled-in
+spawn-protect, block-rules, and greeter samples. Set it to `false` for a purely
+trusted-native deployment or to avoid an ID collision with a native version of
+one of those samples. A third-party compiled-in plugin still requires explicit
+application wiring; `plugins_dir` installs trusted native bundles only.
 
 ## Trust, hangs, panics, and crashes
 
@@ -282,16 +343,15 @@ release you distribute.
 
 ## Current operational boundary
 
-Today, use the SDK contract tests, `PluginTestHost`, and the region-guard parity
-regression to develop plugin logic and verify both adapters. Do not advertise
-an SDK library as installable on the shipping binary yet:
+Use the SDK contract tests, `PluginTestHost`, and the region-guard parity
+regression to develop packaging-independent plugin logic. Use the production
+socket regression as evidence for the narrower shipping path. The app now keeps
+configured trusted native plugins active in its live, shared host, but this does
+not make every SDK facade or event available in production.
 
-- the app's live host contains hard-coded plugins written against the older
-  internal plugin API;
-- `plugins_dir` uses a separate legacy loader and a temporary host;
-- loaded entries are not enabled there; and
-- the live connection-side dispatcher never sends those entries gameplay
-  events or decisions.
-
-Production SDK activation, durable production plugin storage, and
-simulation-tick-owned dispatch remain separate integration work.
+The exact production surface is the capability subset above. Dispatch remains
+connection-side rather than simulation-owned; durable plugin storage, command
+registration, authoritative world reads, join/leave delivery, chat/interaction
+decisions, and timer execution remain future integration work. Treat the
+startup scan as immutable for the process lifetime: there is no live install,
+reload, or unload operation.
