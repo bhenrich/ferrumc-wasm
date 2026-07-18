@@ -56,4 +56,5 @@ memory-mapped zero-copy reads; the trait boundary keeps that swap cheap.
   stays for tests and the test harness.
 - The LMDB benchmark and any backend swap are still open and cheap, as designed.
 - The byte `codec` is an internal format; changing it bumps `STORE_FORMAT_VERSION`
-  and requires a migration path before shipping persisted worlds.
+  and causes older pre-alpha data to be refused rather than interpreted or
+  rewritten.
