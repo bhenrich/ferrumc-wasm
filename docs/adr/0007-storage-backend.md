@@ -42,8 +42,8 @@ memory-mapped zero-copy reads; the trait boundary keeps that swap cheap.
 - redb stores raw `&[u8]` keys/values; a private `codec` module is the only
   place that encodes typed keys and versioned records to bytes and back, and
   validates every length on read (no panics on corrupt bytes).
-- Plugin keys are namespaced as `plugin_len ++ plugin_id ++ key`, so plugins are
-  isolated and one plugin's keys enumerate via a single prefix range scan.
+- Plugin keys are namespaced as `plugin_len ++ plugin_id ++ key`, so each
+  plugin's keys enumerate via a single prefix range scan.
 - redb transactions are synchronous and blocking, so every async trait method
   runs the transaction inside `tokio::task::spawn_blocking` — DB work never runs
   on an async executor worker. Batched saves commit in one transaction.
