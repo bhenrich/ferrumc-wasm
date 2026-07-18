@@ -767,8 +767,11 @@ impl FcOutputBufferV1 {
 /// A versioned event envelope delivered to a plugin callback.
 ///
 /// The payload has a kind-specific binary encoding; JSON is not part of the
-/// per-event ABI. `shard` is the live shard resource that owns the event and is
-/// valid only for this callback.
+/// per-event ABI. Simulation-owned dispatch carries its exact tick plus the
+/// callback-scoped live shard resource that owns the event. Connection-side,
+/// off-tick dispatch carries tick `0` and [`FcResourceHandle::INVALID`] as
+/// documented "metadata unavailable" sentinels; consumers must not interpret
+/// those values as authoritative tick or shard identity.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct FcEventV1 {
@@ -817,12 +820,13 @@ impl FcEventV1 {
         self.flags
     }
 
-    /// Returns the deterministic simulation tick.
+    /// Returns the exact simulation tick, or `0` when unavailable off-tick.
     pub const fn tick(self) -> u64 {
         self.tick
     }
 
-    /// Returns the opaque shard resource.
+    /// Returns the opaque live shard resource, or
+    /// [`FcResourceHandle::INVALID`] when unavailable.
     pub const fn shard(self) -> FcResourceHandle {
         self.shard
     }
