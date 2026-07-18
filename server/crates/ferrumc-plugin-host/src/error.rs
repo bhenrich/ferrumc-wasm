@@ -48,6 +48,13 @@ pub enum HostError {
     #[error("plugin '{0}' is already enabled")]
     AlreadyEnabled(PluginId),
 
+    /// A trusted native plugin reported `FC_PLUGIN_PANIC`; its retired instance
+    /// cannot be re-enabled for this host registration.
+    #[error(
+        "trusted native plugin '{0}' reported FC_PLUGIN_PANIC and cannot be re-enabled for this host registration"
+    )]
+    NativePanicDisabled(PluginId),
+
     /// The registry is full and cannot accept another plugin.
     #[error("plugin registry is full (capacity {max})")]
     CapacityExceeded {

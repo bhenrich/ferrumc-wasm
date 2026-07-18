@@ -7,7 +7,9 @@ use std::time::Instant;
 use ferrumc_command::CommandTree;
 use ferrumc_core::{DimensionId, PluginId, TextComponent, Tick, WorldId};
 use ferrumc_math::ShardPos;
-use ferrumc_plugin_abi::{FcResourceHandle, FcStatus, FC_CAPABILITY_DENIED, FC_ERROR, FC_OK};
+use ferrumc_plugin_abi::{
+    FcResourceHandle, FcStatus, FC_CAPABILITY_DENIED, FC_ERROR, FC_OK, FC_PLUGIN_PANIC,
+};
 use ferrumc_plugin_api::{
     BlockBreakAttempt, BlockPlaceAttempt, Capability, CapabilityManifest, ChatAttempt,
     CommandRegistrar, CommandSink, EventContext, EventKind, EventRegistrar, IntentError,
@@ -29,6 +31,9 @@ use crate::storage::{InMemoryPluginStorage, NamespacedStorage, PluginStorageBack
 
 /// Default maximum number of registered plugins.
 const DEFAULT_MAX_PLUGINS: usize = 256;
+
+/// Stable host-authored context retained when a callback reports a panic.
+const NATIVE_PANIC_DIAGNOSTIC: &str = "trusted native callback returned FC_PLUGIN_PANIC; staged commands were discarded and the plugin was disabled";
 
 /// Tunable host policy.
 ///
@@ -146,6 +151,44 @@ impl NativeCapabilityDenial {
     }
 }
 
+/// A cooperatively reported trusted-native panic attributed to its plugin and hook.
+///
+/// This record exists only when a callback returns `FC_PLUGIN_PANIC` normally
+/// through the ABI. The host then discards that callback's staged commands and
+/// disables the plugin. The failed instance is retired without another plugin
+/// callback because its state may be inconsistent; plugin-owned resources tied
+/// to that opaque handle may therefore remain until process exit. The host
+/// refuses to re-enable this registration after that terminal disposition.
+///
+/// This handling cannot recover from `panic=abort`,
+/// `std::process::abort`, segmentation faults, undefined behavior, deadlocks,
+/// foreign exceptions, or malicious memory corruption. Those failures may
+/// hang, corrupt, or terminate the process before any status returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePanicRecord {
+    plugin_id: PluginId,
+    hook: EventKind,
+    diagnostic: String,
+}
+
+impl NativePanicRecord {
+    /// Returns the plugin that cooperatively reported the panic.
+    pub const fn plugin_id(&self) -> &PluginId {
+        &self.plugin_id
+    }
+
+    /// Returns the event hook being delivered.
+    pub const fn hook(&self) -> EventKind {
+        self.hook
+    }
+
+    /// Returns the final non-empty callback diagnostic, or the host-authored
+    /// fail-stop fallback when the callback emitted none.
+    pub fn diagnostic(&self) -> &str {
+        &self.diagnostic
+    }
+}
+
 /// Authoritative metadata required to deliver an event to trusted native plugins.
 ///
 /// Construct this at the simulation tick boundary that owns the event. The
@@ -241,8 +284,8 @@ impl NativeCallbackFailureRecord {
 
 /// A summary of one [`PluginHost::dispatch_event`] call.
 ///
-/// Reports how many enabled, subscribed plugins received the event, plus the
-/// ids of any that panicked or overran their budget during it. Fields are
+/// Reports how many enabled, subscribed plugins received the event, plus any
+/// panic, budget, capability, callback, or command-commit outcomes. Fields are
 /// private; read them through the accessors.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DispatchReport {
@@ -250,6 +293,7 @@ pub struct DispatchReport {
     panicked: Vec<PluginId>,
     budget_exceeded: Vec<PluginId>,
     native_capability_denials: Vec<NativeCapabilityDenial>,
+    native_panics: Vec<NativePanicRecord>,
     native_failures: Vec<NativeCallbackFailureRecord>,
 }
 
@@ -263,7 +307,11 @@ impl DispatchReport {
         self.delivered
     }
 
-    /// Returns the ids of plugins that panicked (and were disabled).
+    /// Returns the ids of plugins disabled after a panic outcome.
+    ///
+    /// Compiled-in plugins appear here when their Rust callback unwinds.
+    /// Trusted native plugins appear only when their callback cooperatively
+    /// returns `FC_PLUGIN_PANIC`.
     pub fn panicked(&self) -> &[PluginId] {
         &self.panicked
     }
@@ -279,6 +327,17 @@ impl DispatchReport {
     /// bounded report retains one representative denial per callback.
     pub fn native_capability_denials(&self) -> &[NativeCapabilityDenial] {
         &self.native_capability_denials
+    }
+
+    /// Returns trusted-native panic records with plugin, hook, and diagnostic.
+    ///
+    /// This is the detailed subset also represented by
+    /// [`DispatchReport::panicked`] and
+    /// [`NativeCallbackFailure::Status`] in
+    /// [`DispatchReport::native_failures`]; consumers should not sum those
+    /// surfaces as independent panic events.
+    pub fn native_panics(&self) -> &[NativePanicRecord] {
+        &self.native_panics
     }
 
     /// Returns trusted native delivery, callback, boundary, and command-commit
@@ -414,6 +473,9 @@ impl ResolvedEventOutcome {
 /// The host owns compiled-in [`Plugin`] trait objects and validated trusted
 /// native factories. Compiled-in calls use `catch_unwind`; trusted native
 /// callbacks use ABI statuses and a transactional bounded command stage.
+/// A normally returned `FC_PLUGIN_PANIC` triggers fail-stop handling for that
+/// native instance; process-ending and non-returning failures cannot be
+/// recovered here. See [`NativePanicRecord`] for the exact boundary.
 /// Plugin-registered commands are aggregated into a single [`CommandTree`].
 pub struct PluginHost {
     plugins: Vec<PluginSlot>,
@@ -576,7 +638,10 @@ impl PluginHost {
     /// returned. If a compiled-in hook unwinds, that plugin is disabled and
     /// [`HostError::Panicked`] is returned. A trusted native initialization
     /// failure reported through the ABI returns [`HostError::NativeLifecycle`];
-    /// process-aborting native failures cannot be recovered here.
+    /// process-aborting native failures cannot be recovered here. A native
+    /// registration previously disabled by `FC_PLUGIN_PANIC` returns
+    /// [`HostError::NativePanicDisabled`] instead of allocating another
+    /// instance.
     pub fn enable(&mut self, id: &PluginId) -> Result<(), HostError> {
         if self.native_plugins.iter().any(|slot| &slot.id == id) {
             return self.enable_trusted_native(id);
@@ -686,6 +751,9 @@ impl PluginHost {
             .ok_or_else(|| HostError::UnknownPlugin(id.clone()))?;
         if slot.state.is_enabled() {
             return Err(HostError::AlreadyEnabled(id.clone()));
+        }
+        if slot.state == PluginState::Disabled(DisableReason::Panicked) {
+            return Err(HostError::NativePanicDisabled(id.clone()));
         }
         shutdown_native_instance(slot);
         slot.subscriptions.clear();
@@ -1439,9 +1507,19 @@ fn dispatch_native_event(
         Ok(status) => (services.complete(status), None),
         Err(error) => (services.complete(FC_ERROR), Some(error)),
     };
+    let cooperatively_panicked =
+        boundary_error.is_none() && completion.callback_status() == FC_PLUGIN_PANIC;
+    let panic_diagnostic = if cooperatively_panicked {
+        native_panic_diagnostic(&completion)
+    } else {
+        String::new()
+    };
+    let over_budget = budget.is_exceeded(elapsed);
+    let disposition =
+        native_post_call_disposition(cooperatively_panicked, over_budget, disable_on_overrun);
 
     record_native_completion(slot, kind, completion, boundary_error, sink, report);
-    if budget.is_exceeded(elapsed) {
+    if disposition.over_budget {
         slot.stats.budget_overruns += 1;
         report.budget_exceeded.push(slot.id.clone());
         tracing::warn!(
@@ -1449,11 +1527,48 @@ fn dispatch_native_event(
             ?elapsed,
             "trusted native plugin exceeded its time budget during event dispatch"
         );
-        if disable_on_overrun {
+    }
+    match disposition.action {
+        NativePostCallAction::KeepEnabled => {}
+        NativePostCallAction::DisableForBudget => {
             shutdown_native_instance(slot);
             slot.subscriptions.clear();
             slot.state = PluginState::Disabled(DisableReason::BudgetExceeded);
         }
+        NativePostCallAction::DisableForPanic => {
+            disable_after_native_panic(slot, kind, panic_diagnostic, report);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativePostCallAction {
+    KeepEnabled,
+    DisableForBudget,
+    DisableForPanic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativePostCallDisposition {
+    over_budget: bool,
+    action: NativePostCallAction,
+}
+
+const fn native_post_call_disposition(
+    cooperatively_panicked: bool,
+    over_budget: bool,
+    disable_on_overrun: bool,
+) -> NativePostCallDisposition {
+    let action = if cooperatively_panicked {
+        NativePostCallAction::DisableForPanic
+    } else if over_budget && disable_on_overrun {
+        NativePostCallAction::DisableForBudget
+    } else {
+        NativePostCallAction::KeepEnabled
+    };
+    NativePostCallDisposition {
+        over_budget,
+        action,
     }
 }
 
@@ -1526,6 +1641,46 @@ fn commit_native_effects(
             break;
         }
     }
+}
+
+fn disable_after_native_panic(
+    slot: &mut TrustedNativeSlot,
+    kind: EventKind,
+    diagnostic: String,
+    report: &mut DispatchReport,
+) {
+    // An unwind may have left plugin-owned state inconsistent. Retire the
+    // opaque instance without invoking another plugin callback. The library
+    // stays resident, and the host rejects re-enable so this retirement can
+    // happen at most once for the registration.
+    let _retired = slot.active.take();
+    slot.subscriptions.clear();
+    slot.state = PluginState::Disabled(DisableReason::Panicked);
+    slot.stats.panics = slot.stats.panics.saturating_add(1);
+    report.panicked.push(slot.id.clone());
+    tracing::warn!(
+        plugin = %slot.id,
+        hook = ?kind,
+        diagnostic = %diagnostic,
+        "trusted native plugin cooperatively reported a panic; disabled"
+    );
+    report.native_panics.push(NativePanicRecord {
+        plugin_id: slot.id.clone(),
+        hook: kind,
+        diagnostic,
+    });
+}
+
+fn native_panic_diagnostic(completion: &NativeCompletion) -> String {
+    completion
+        .diagnostics()
+        .iter()
+        .rev()
+        .find(|diagnostic| !diagnostic.message().is_empty())
+        .map_or_else(
+            || NATIVE_PANIC_DIAGNOSTIC.to_owned(),
+            |diagnostic| diagnostic.message().to_owned(),
+        )
 }
 
 impl Drop for PluginHost {
@@ -1613,7 +1768,9 @@ fn map_native_capability(capability: NativeCapability) -> Capability {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrumc_plugin_abi::{FC_DIAGNOSTIC_ERROR, FC_DIAGNOSTIC_INFO};
     use ferrumc_plugin_api::Version;
+    use ferrumc_plugin_loader::HostServices;
 
     /// A trivial plugin used to exercise registry bookkeeping.
     struct NoopPlugin {
@@ -1655,6 +1812,46 @@ mod tests {
             .register(Box::new(NoopPlugin { id: "b" }))
             .expect_err("second overflows");
         assert_eq!(err, HostError::CapacityExceeded { max: 1 });
+    }
+
+    #[test]
+    fn native_panic_record_prefers_the_final_nonempty_callback_diagnostic() {
+        let mut services = NativeCallbackServices::for_shutdown(CapabilityManifest::empty());
+        assert_eq!(
+            services.diagnostic(FC_DIAGNOSTIC_INFO, "earlier context".to_owned()),
+            FC_OK
+        );
+        assert_eq!(
+            services.diagnostic(FC_DIAGNOSTIC_INFO, String::new()),
+            FC_OK
+        );
+        assert_eq!(
+            services.diagnostic(FC_DIAGNOSTIC_ERROR, "panic detail".to_owned()),
+            FC_OK
+        );
+
+        let completion = services.complete(FC_PLUGIN_PANIC);
+        assert_eq!(native_panic_diagnostic(&completion), "panic detail");
+    }
+
+    #[test]
+    fn native_panic_disposition_wins_over_budget_disabling() {
+        assert_eq!(
+            native_post_call_disposition(true, true, true),
+            NativePostCallDisposition {
+                over_budget: true,
+                action: NativePostCallAction::DisableForPanic,
+            },
+            "the overrun remains observable without replacing panic disposition"
+        );
+        assert_eq!(
+            native_post_call_disposition(false, true, true).action,
+            NativePostCallAction::DisableForBudget,
+        );
+        assert_eq!(
+            native_post_call_disposition(false, true, false).action,
+            NativePostCallAction::KeepEnabled,
+        );
     }
 
     #[test]

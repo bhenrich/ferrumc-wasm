@@ -15,7 +15,7 @@ use ferrumc_plugin_api::{
 };
 use ferrumc_plugin_host::{
     DisableReason, HostConfig, HostError, InMemoryPluginStorage, NativeCallbackFailure,
-    NativeEventContext, PluginHost, PluginState,
+    NativeEventContext, PluginHost, PluginState, PluginStats,
 };
 use ferrumc_plugin_loader::{
     LoadedPlugin, PluginCapabilities, PluginCapability, PluginLoader as TrustedNativeLoader,
@@ -138,18 +138,20 @@ impl Plugin for MessagePlugin {
 
     fn on_enable(&mut self, ctx: &mut SetupContext<'_>) -> Result<(), PluginError> {
         ctx.events()?.subscribe(EventKind::BlockBreak);
+        ctx.events()?.subscribe(EventKind::PlayerJoin);
         Ok(())
     }
 
     fn on_event(&mut self, event: &PluginEvent, ctx: &mut EventContext<'_>) {
-        let PluginEvent::BlockBreak { player, .. } = event else {
-            return;
+        let player = match event {
+            PluginEvent::BlockBreak { player, .. } | PluginEvent::PlayerJoin { player } => *player,
+            _ => return,
         };
         let _ = ctx
             .sink()
             .expect("compiled fixture has submit-intents")
             .submit(WorldIntent::Message {
-                player: *player,
+                player,
                 message: TextComponent::text(self.message),
             });
     }
@@ -326,7 +328,10 @@ fn undeclared_native_capability_is_typed_and_rolls_back_staged_intents() {
         failures[0].failure(),
         NativeCallbackFailure::Status(status) if *status == FC_CAPABILITY_DENIED
     ));
+    assert!(denied.panicked().is_empty());
+    assert!(denied.native_panics().is_empty());
     assert!(host.is_enabled(&native_id));
+    assert_eq!(host.stats(&native_id).map(PluginStats::panics), Some(0));
 
     let world = EmptyWorld;
     let mut success_sink = RecordingSink::default();
@@ -341,6 +346,94 @@ fn undeclared_native_capability_is_typed_and_rolls_back_staged_intents() {
     assert!(success.native_capability_denials().is_empty());
     assert!(success.native_failures().is_empty());
     assert_messages(&success_sink.intents, player, &[DYNAMIC_MESSAGE]);
+
+    drop(host);
+    cleanup_loaded_bundle(&scratch);
+}
+
+#[test]
+fn trusted_native_panic_status_discards_disables_and_records_context() {
+    let (native, scratch) = load_fixture("panic-status");
+    let mut host = PluginHost::in_memory();
+    let native_id = host
+        .register_trusted_native(native)
+        .expect("register trusted native fixture");
+    let compiled_id = host
+        .register(Box::new(MessagePlugin {
+            id: "compiled-after-native-panic",
+            message: "compiled continued",
+        }))
+        .expect("register unrelated compiled plugin");
+    host.enable(&native_id).expect("enable native fixture");
+    host.enable(&compiled_id)
+        .expect("enable unrelated compiled plugin");
+
+    let player = PlayerId::offline("P49Panic");
+    let event = PluginEvent::PlayerJoin { player };
+    let world = EmptyWorld;
+    let permissions = DenyAllPermissions;
+    let mut sink = RecordingSink::default();
+    let report = host.dispatch_event_with_native_context(
+        &event,
+        native_event_context(350),
+        &world,
+        &mut sink,
+        &permissions,
+    );
+
+    assert_messages(&sink.intents, player, &["compiled continued"]);
+    assert_eq!(report.delivered(), 1);
+    assert_eq!(report.panicked(), std::slice::from_ref(&native_id));
+    assert!(matches!(
+        report.native_failures(),
+        [failure]
+            if failure.plugin_id() == &native_id
+                && failure.hook() == EventKind::PlayerJoin
+                && matches!(
+                    failure.failure(),
+                    NativeCallbackFailure::Status(status)
+                        if *status == ferrumc_plugin_abi::FC_PLUGIN_PANIC
+                )
+    ));
+    let panic_records = report.native_panics();
+    assert!(matches!(
+        panic_records,
+        [record]
+            if record.plugin_id() == &native_id
+                && record.hook() == EventKind::PlayerJoin
+                && record.diagnostic()
+                    == "trusted native callback returned FC_PLUGIN_PANIC; staged commands were discarded and the plugin was disabled"
+    ));
+    assert_eq!(
+        host.state(&native_id),
+        Some(PluginState::Disabled(DisableReason::Panicked))
+    );
+    assert_eq!(host.stats(&native_id).map(PluginStats::panics), Some(1));
+    assert!(!host.is_subscribed(&native_id, EventKind::PlayerJoin));
+    assert_eq!(
+        host.disable(&native_id),
+        Err(HostError::NotEnabled(native_id.clone())),
+        "the failed instance was already retired without another callback"
+    );
+    assert_eq!(
+        host.enable(&native_id),
+        Err(HostError::NativePanicDisabled(native_id.clone())),
+        "this registration cannot allocate another instance after panic retirement"
+    );
+
+    let prior = sink.intents.len();
+    let later = host.dispatch_event_with_native_context(
+        &event,
+        native_event_context(351),
+        &world,
+        &mut sink,
+        &permissions,
+    );
+    assert_eq!(later.delivered(), 1);
+    assert!(later.panicked().is_empty());
+    assert!(later.native_panics().is_empty());
+    assert_messages(&sink.intents[prior..], player, &["compiled continued"]);
+    assert_eq!(host.stats(&native_id).map(PluginStats::panics), Some(1));
 
     drop(host);
     cleanup_loaded_bundle(&scratch);

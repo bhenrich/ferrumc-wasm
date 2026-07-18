@@ -51,6 +51,16 @@
 //! plugins. The context-free [`PluginHost::dispatch_event`] deliberately does
 //! not fabricate native ABI metadata.
 //!
+//! The host does not catch panics inside trusted native code. When cooperating
+//! SDK or plugin code returns normally with
+//! [`FC_PLUGIN_PANIC`](ferrumc_plugin_abi::FC_PLUGIN_PANIC), the host discards
+//! that callback's staged commands, disables the plugin, and produces a
+//! [`NativePanicRecord`].
+//! This fail-stop path cannot recover from `panic=abort`,
+//! `std::process::abort`, segmentation faults, undefined behavior, deadlocks,
+//! foreign exceptions, or malicious memory corruption; those failures may
+//! hang, corrupt, or terminate the process before a status returns.
+//!
 //! ## A note on `catch_unwind` and unwind safety
 //!
 //! Catching panics is the one place this crate must reason about unwinding. The
@@ -77,8 +87,8 @@ pub use dynamic::{DirLoadReport, LoadError, PluginLoader};
 pub use error::{HostError, NativeLifecycleHook};
 pub use host::{
     DispatchReport, HostConfig, NativeCallbackFailure, NativeCallbackFailureRecord,
-    NativeCapabilityDenial, NativeEventContext, PluginDecisionReport, PluginHost,
-    ResolvedBlockDecision, ResolvedDecision, ResolvedEventOutcome,
+    NativeCapabilityDenial, NativeEventContext, NativePanicRecord, PluginDecisionReport,
+    PluginHost, ResolvedBlockDecision, ResolvedDecision, ResolvedEventOutcome,
 };
 pub use state::{DisableReason, PluginState, PluginStats};
 pub use storage::{InMemoryPluginStorage, PluginStorageBackend};

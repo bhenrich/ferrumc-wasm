@@ -3,7 +3,8 @@
 /// Why a plugin was disabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisableReason {
-    /// The plugin panicked during a host call.
+    /// A compiled-in callback unwound or a native callback returned
+    /// `FC_PLUGIN_PANIC`.
     Panicked,
     /// The plugin exceeded its per-call time budget (with overrun-disabling on).
     BudgetExceeded,
@@ -21,7 +22,9 @@ pub enum PluginState {
     /// Enabled and receiving events.
     Enabled,
     /// Disabled for the given reason; it will not be called again unless
-    /// re-enabled.
+    /// re-enabled. A trusted native plugin disabled for
+    /// [`DisableReason::Panicked`] cannot be re-enabled for that
+    /// [`PluginHost`](crate::PluginHost) registration.
     Disabled(DisableReason),
 }
 
@@ -51,7 +54,8 @@ pub struct PluginStats {
 }
 
 impl PluginStats {
-    /// Returns how many times the plugin has panicked.
+    /// Returns how many compiled-in unwinds or native `FC_PLUGIN_PANIC`
+    /// statuses the host has observed.
     pub const fn panics(self) -> u32 {
         self.panics
     }
