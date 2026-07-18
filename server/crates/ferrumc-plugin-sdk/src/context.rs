@@ -108,7 +108,12 @@ impl<'call> EventContext<'call> {
         self.capabilities
     }
 
-    /// Returns the deterministic tick associated with this callback.
+    /// Returns the host-supplied tick associated with this callback.
+    ///
+    /// The shipping app's trusted-native gameplay callbacks run connection-side
+    /// and off-tick, so they receive [`Tick::ZERO`] as a
+    /// metadata-unavailable sentinel. That value must not be interpreted as an
+    /// authoritative simulation tick or tick phase.
     pub const fn tick(&self) -> Tick {
         self.tick
     }

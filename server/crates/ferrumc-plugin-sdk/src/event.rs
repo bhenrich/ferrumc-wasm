@@ -16,11 +16,11 @@ pub enum EventKind {
     PlayerJoin,
     /// A player left.
     PlayerLeave,
-    /// A block break was committed.
+    /// A block-break notification accepted at the intent boundary.
     BlockBreak,
-    /// A block placement was committed.
+    /// A block placement accepted at the intent boundary and routed.
     AfterBlockPlace,
-    /// A block break was committed after its decision phase.
+    /// A block break accepted at the intent boundary and routed.
     AfterBlockBreak,
     /// A player crossed a block boundary.
     PlayerMove,
@@ -80,7 +80,10 @@ impl BlockEvent {
     }
 }
 
-/// A committed block-placement event.
+/// A block-placement notification accepted at the intent boundary and routed.
+///
+/// The simulation may still reject the edit, so this is not a tick-confirmed
+/// mutation event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockPlaceEvent {
     player: PlayerId,
@@ -89,7 +92,7 @@ pub struct BlockPlaceEvent {
 }
 
 impl BlockPlaceEvent {
-    /// Creates a committed block-placement event.
+    /// Creates a block-placement notification.
     pub const fn new(player: PlayerId, pos: BlockPos, block_state_id: u32) -> Self {
         Self {
             player,
@@ -282,11 +285,17 @@ pub enum Event {
     PlayerJoin(PlayerEvent),
     /// A player left.
     PlayerLeave(PlayerEvent),
-    /// A block break was committed.
+    /// A block-break notification accepted at the intent boundary.
     BlockBreak(BlockEvent),
-    /// A block placement was committed.
+    /// A block placement accepted at the intent boundary and routed.
+    ///
+    /// The simulation may still reject the edit, so this is not a
+    /// tick-confirmed mutation event.
     AfterBlockPlace(BlockPlaceEvent),
-    /// A block break was committed after its decision phase.
+    /// A block break accepted at the intent boundary and routed.
+    ///
+    /// The simulation may still reject the edit, so this is not a
+    /// tick-confirmed mutation event.
     AfterBlockBreak(BlockEvent),
     /// A player crossed a block boundary.
     PlayerMove(MoveEvent),
