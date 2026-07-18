@@ -1,0 +1,9 @@
+id = "block-rules"
+name = "Block Rules"
+version = "0.1.0"
+abi_major = 1
+abi_minor = 0
+server_api = "={{SERVER_API}}"
+library = "{{LIBRARY}}"
+library_sha256 = "{{LIBRARY_SHA256}}"
+capabilities = ["veto-block-edits"]

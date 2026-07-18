@@ -533,7 +533,13 @@ dependencies = [
  "ferrumc-math",
  "ferrumc-permission",
  "ferrumc-plugin-api",
+ "ferrumc-plugin-loader",
+ "ferrumc-plugin-sdk",
+ "ferrumc-plugin-sdk-dynamic",
  "ferrumc-registry",
+ "ferrumc-testkit",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

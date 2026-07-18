@@ -4,11 +4,12 @@
 //! prove two of the three `before_*` decision outcomes end to end.
 //!
 //! - It **denies** placing a configured block (by default
-//!   [`DENIED_BLOCK_STATE_ID`], `minecraft:bedrock`) by returning
+//!   [`crate::DENIED_BLOCK_STATE_ID`], `minecraft:bedrock`) by returning
 //!   [`PluginBlockDecision::Deny`] from
 //!   [`before_block_place`](BlockRulesPlugin::before_block_place).
 //! - It **replaces** a configured block on placement (by default
-//!   [`GLASS_BLOCK_STATE_ID`] → [`TINTED_GLASS_BLOCK_STATE_ID`]) by returning
+//!   [`crate::GLASS_BLOCK_STATE_ID`] → [`crate::TINTED_GLASS_BLOCK_STATE_ID`])
+//!   by returning
 //!   [`PluginBlockDecision::Replace`].
 //! - Everything else is [`PluginBlockDecision::Allow`]ed, and breaks are never
 //!   touched (the default `before_block_break` returns `Allow`).
@@ -23,40 +24,7 @@ use ferrumc_plugin_api::{
     PluginMetadata, Version,
 };
 
-/// The plugin's stable identifier, shared by the in-process plugin and the
-/// `cdylib` C-ABI export.
-pub const PLUGIN_ID: &str = "block-rules";
-
-/// The plugin's human-readable display name.
-pub const PLUGIN_NAME: &str = "Block Rules";
-
-/// Default block-state id the plugin refuses to let players place.
-///
-/// Sourced from `ferrumc_registry::block_state::ids::BEDROCK` — the default state
-/// of `minecraft:bedrock` in the pinned 1.21.8 registry — so it tracks the
-/// generated registry constant instead of hardcoding a raw id.
-pub const DENIED_BLOCK_STATE_ID: u32 = ferrumc_registry::block_state::ids::BEDROCK;
-
-/// Default block-state id the plugin rewrites on placement.
-///
-/// Sourced from `ferrumc_registry::block_state::ids::GLASS` (`minecraft:glass`'s
-/// default state). The exact value is load-bearing: `before_block_place` receives
-/// the *resolved block-state* (not the item id), so this must equal the runtime
-/// block-state a glass placement produces — i.e. what
-/// `ferrumc_registry::item::item_to_block_state(item::ids::GLASS)` resolves to — or
-/// the [`Replace`](PluginBlockDecision::Replace) rule never fires. A deployment may
-/// still override it via [`BlockRulesPlugin::with_blocks`].
-pub const GLASS_BLOCK_STATE_ID: u32 = ferrumc_registry::block_state::ids::GLASS;
-
-/// Default block-state id glass placements are rewritten to.
-///
-/// Sourced from `ferrumc_registry::block_state::ids::TINTED_GLASS`
-/// (`minecraft:tinted_glass`'s default state); see [`GLASS_BLOCK_STATE_ID`] for
-/// why the exact value matters.
-pub const TINTED_GLASS_BLOCK_STATE_ID: u32 = ferrumc_registry::block_state::ids::TINTED_GLASS;
-
-/// The message shown to a player whose placement of the denied block is rejected.
-const DENIED_MESSAGE: &str = "You cannot place that block here.";
+use crate::policy::{BlockPolicy, PlacementOutcome, DENIED_MESSAGE, PLUGIN_ID, PLUGIN_NAME};
 
 /// A plugin that denies placing one block-state and rewrites another.
 ///
@@ -64,32 +32,25 @@ const DENIED_MESSAGE: &str = "You cannot place that block here.";
 /// [`BlockRulesPlugin::new`], or override the ids with
 /// [`BlockRulesPlugin::with_blocks`].
 pub struct BlockRulesPlugin {
-    /// Block-state id that may never be placed.
-    denied: u32,
-    /// Block-state id rewritten on placement.
-    rewrite_from: u32,
-    /// Block-state id [`rewrite_from`](Self::rewrite_from) becomes.
-    rewrite_to: u32,
+    policy: BlockPolicy,
 }
 
 impl BlockRulesPlugin {
-    /// Builds the plugin with the default rules: deny [`DENIED_BLOCK_STATE_ID`]
-    /// and rewrite [`GLASS_BLOCK_STATE_ID`] to [`TINTED_GLASS_BLOCK_STATE_ID`].
+    /// Builds the plugin with the default rules: deny
+    /// [`crate::DENIED_BLOCK_STATE_ID`] and rewrite
+    /// [`crate::GLASS_BLOCK_STATE_ID`] to
+    /// [`crate::TINTED_GLASS_BLOCK_STATE_ID`].
     pub const fn new() -> Self {
-        Self::with_blocks(
-            DENIED_BLOCK_STATE_ID,
-            GLASS_BLOCK_STATE_ID,
-            TINTED_GLASS_BLOCK_STATE_ID,
-        )
+        Self {
+            policy: BlockPolicy::standard(),
+        }
     }
 
     /// Builds the plugin with custom block-state ids: deny `denied`, and rewrite a
     /// placement of `rewrite_from` to `rewrite_to`.
     pub const fn with_blocks(denied: u32, rewrite_from: u32, rewrite_to: u32) -> Self {
         Self {
-            denied,
-            rewrite_from,
-            rewrite_to,
+            policy: BlockPolicy::new(denied, rewrite_from, rewrite_to),
         }
     }
 
@@ -129,17 +90,14 @@ impl Plugin for BlockRulesPlugin {
         ev: &BlockPlaceAttempt,
         _ctx: &mut EventContext<'_>,
     ) -> PluginBlockDecision {
-        let state = ev.block_state_id();
-        if state == self.denied {
-            PluginBlockDecision::Deny {
+        match self.policy.decide(ev.block_state_id()) {
+            PlacementOutcome::Allow => PluginBlockDecision::Allow,
+            PlacementOutcome::Deny => PluginBlockDecision::Deny {
                 message: Some(TextComponent::text(DENIED_MESSAGE)),
+            },
+            PlacementOutcome::Replace(block_state_id) => {
+                PluginBlockDecision::Replace { block_state_id }
             }
-        } else if state == self.rewrite_from {
-            PluginBlockDecision::Replace {
-                block_state_id: self.rewrite_to,
-            }
-        } else {
-            PluginBlockDecision::Allow
         }
     }
 }
@@ -158,6 +116,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::{DENIED_BLOCK_STATE_ID, GLASS_BLOCK_STATE_ID, TINTED_GLASS_BLOCK_STATE_ID};
 
     /// An in-memory storage facade for one namespace.
     #[derive(Default)]
@@ -306,6 +265,18 @@ mod tests {
         assert_eq!(
             decide_place(&mut plugin, ferrumc_registry::block_state::ids::BEDROCK),
             PluginBlockDecision::Allow
+        );
+    }
+
+    #[test]
+    fn metadata_matches_the_dynamic_bundle_contract() {
+        let metadata = BlockRulesPlugin::new().metadata();
+        assert_eq!(metadata.id().as_str(), PLUGIN_ID);
+        assert_eq!(metadata.name(), PLUGIN_NAME);
+        assert_eq!(metadata.version(), &Version::new(0, 1, 0));
+        assert_eq!(
+            metadata.requested_capabilities(),
+            BlockRulesPlugin::capabilities()
         );
     }
 

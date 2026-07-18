@@ -6,22 +6,29 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
-# Built as both:
-# - a `cdylib` so the host's C-ABI loader can load it from a `/plugins` directory
-#   (proving the dynamic loader), and
-# - an `rlib` so the application can drive its block-decision hooks in-process
-#   (the block-decision surface is in-process only — the C ABI carries no event
-#   hook), the same dual shape as `ferrumc-plugin-spawn-protect`.
+# The default rlib preserves the application's established in-process plugin
+# API. Selecting only `dynamic` produces the trusted-native ABI-v1 artifact.
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["builtin"]
+builtin = ["dep:ferrumc-core", "dep:ferrumc-plugin-api"]
+dynamic = ["dep:ferrumc-plugin-sdk", "dep:ferrumc-plugin-sdk-dynamic"]
+
+[[test]]
+name = "dynamic_bundle"
+path = "tests/dynamic_bundle.rs"
+required-features = ["builtin"]
+
 [dependencies]
-# Text components for the Deny message, and the plugin id.
-ferrumc-core = { workspace = true }
-# The stable plugin SDK: the in-process `Plugin` trait, the block-decision
-# surface (before_* hooks + `PluginBlockDecision`), the capability manifest, and
-# the narrow C ABI the cdylib exports.
-ferrumc-plugin-api = { workspace = true }
+# The default compatibility wrapper uses the established in-process plugin API.
+ferrumc-core = { workspace = true, optional = true }
+ferrumc-plugin-api = { workspace = true, optional = true }
+# The dynamic wrapper targets the packaging-independent author contract, and
+# the audited adapter owns the complete modern ABI export.
+ferrumc-plugin-sdk = { workspace = true, optional = true }
+ferrumc-plugin-sdk-dynamic = { workspace = true, optional = true }
 # Generated named block-state / item id constants (`block_state::ids`,
 # `item::ids`) so the deny/rewrite rules reference names (BEDROCK, GLASS,
 # TINTED_GLASS) instead of magic numbers. Registry is a leaf data crate that
@@ -34,21 +41,14 @@ ferrumc-registry = { workspace = true }
 ferrumc-math = { workspace = true }
 # Permission node/resolution types for the permission-facade stub.
 ferrumc-permission = { workspace = true }
+# The integration regression loads the real modern ABI artifact and validates
+# its strict bundle manifest before replaying decision events.
+ferrumc-plugin-loader = { workspace = true }
+ferrumc-plugin-sdk = { workspace = true }
+ferrumc-testkit = { workspace = true }
+serde_json = { workspace = true }
+# Test-only packaging hashes the exact copied artifact bytes.
+sha2 = "0.10"
 
-# This crate cannot inherit the workspace `forbid(unsafe_code)`: exporting the
-# `#[no_mangle]` C entrypoint counts as unsafe code under modern rustc. We
-# downgrade to `deny` and scope a single `#[allow(unsafe_code)]` to that export.
-[lints.rust]
-unsafe_code = "deny"
-missing_docs = "warn"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-cast_possible_truncation = "allow"
-cast_sign_loss = "allow"
-cast_precision_loss = "allow"
+[lints]
+workspace = true
