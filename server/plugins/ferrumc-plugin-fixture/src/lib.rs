@@ -9,8 +9,8 @@
 //!   successfully.
 //! - [`ferrumc_plugin_entry_bad_abi`] — reports an incompatible ABI version so
 //!   the loader rejects it.
-//! - [`ferrumc_plugin_entry_failinit`] — loads fine but fails initialization, so
-//!   the host can prove the failure is isolated.
+//! - [`ferrumc_plugin_entry_failinit`] — loads and registers, then reports a
+//!   nonzero initialization status when the host enables it.
 //!
 //! The only thing here that counts as "unsafe code" is exporting the
 //! `no_mangle` C entrypoints (a single scoped `#[allow(unsafe_code)]`);
@@ -64,8 +64,8 @@ extern "C" fn init_ok(_abi_version: u32, _granted_capabilities: u32) -> i32 {
     .unwrap_or(STATUS_PANIC)
 }
 
-/// An init shim that always reports failure, isolated behind the same
-/// panic-catching wrapper.
+/// An init shim that returns a nonzero status through the panic-catching
+/// wrapper.
 extern "C" fn init_fail(_abi_version: u32, _granted_capabilities: u32) -> i32 {
     catch_unwind(|| {
         // A nonzero status the host classifies as an initialization failure.
