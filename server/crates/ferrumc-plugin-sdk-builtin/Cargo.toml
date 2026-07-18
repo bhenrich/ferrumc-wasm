@@ -1,0 +1,14 @@
+[package]
+name = "ferrumc-plugin-sdk-builtin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Compiled-in packaging adapter for FerrumC SDK plugins"
+
+[dependencies]
+# The adapter deliberately uses only the shared author API and its host-services seam.
+ferrumc-plugin-sdk = { workspace = true }
+
+[lints]
+workspace = true

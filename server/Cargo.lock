@@ -608,6 +608,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrumc-plugin-sdk-builtin"
+version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-plugin-sdk",
+]
+
+[[package]]
 name = "ferrumc-plugin-sdk-dynamic"
 version = "0.2.0-dev"
 dependencies = [
