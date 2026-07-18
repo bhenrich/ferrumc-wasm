@@ -597,6 +597,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrumc-plugin-region-guard"
+version = "0.2.0-dev"
+dependencies = [
+ "ferrumc-plugin-abi-sys",
+ "ferrumc-plugin-sdk",
+ "ferrumc-plugin-sdk-builtin",
+ "ferrumc-plugin-sdk-dynamic",
+ "ferrumc-testkit",
+ "serde_json",
+]
+
+[[package]]
 name = "ferrumc-plugin-sdk"
 version = "0.2.0-dev"
 dependencies = [

@@ -37,6 +37,7 @@ members = [
     "plugins/ferrumc-plugin-spawn-protect",
     "plugins/ferrumc-plugin-block-rules",
     "plugins/ferrumc-plugin-greeter",
+    "plugins/ferrumc-plugin-region-guard",
     "xtask",
 ]
 
@@ -153,6 +154,7 @@ ferrumc-plugin-fixture = { path = "plugins/ferrumc-plugin-fixture" }
 ferrumc-plugin-spawn-protect = { path = "plugins/ferrumc-plugin-spawn-protect" }
 ferrumc-plugin-block-rules = { path = "plugins/ferrumc-plugin-block-rules" }
 ferrumc-plugin-greeter = { path = "plugins/ferrumc-plugin-greeter" }
+ferrumc-plugin-region-guard = { path = "plugins/ferrumc-plugin-region-guard" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

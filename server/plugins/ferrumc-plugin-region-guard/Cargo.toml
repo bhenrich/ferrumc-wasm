@@ -1,0 +1,40 @@
+[package]
+name = "ferrumc-plugin-region-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[[test]]
+name = "region_guard"
+path = "tests/region_guard.rs"
+required-features = ["builtin"]
+
+[features]
+default = ["builtin"]
+builtin = ["dep:ferrumc-plugin-sdk-builtin"]
+dynamic = ["dep:ferrumc-plugin-sdk-dynamic"]
+
+[dependencies]
+# The plugin logic targets only the packaging-independent author contract.
+ferrumc-plugin-sdk.workspace = true
+# Packaging adapters stay optional so the same source can be selected for a
+# compiled-in artifact or a trusted native library.
+ferrumc-plugin-sdk-builtin = { workspace = true, optional = true }
+ferrumc-plugin-sdk-dynamic = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The integration regression replays the same log through both packaging modes.
+ferrumc-testkit.workspace = true
+# Metadata is copied from the real library through the audited system boundary.
+ferrumc-plugin-abi-sys.workspace = true
+# Cargo's JSON artifact stream identifies the platform library without guessing
+# a target-directory layout.
+serde_json.workspace = true
+
+[lints]
+workspace = true
