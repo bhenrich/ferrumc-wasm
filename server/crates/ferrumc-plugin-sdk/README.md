@@ -4,6 +4,9 @@
 authors. A plugin implements one [`Plugin`](crate::Plugin) type and can later be
 packaged through either the built-in or trusted native plugin adapter.
 
+See the canonical [plugin-authoring guide](../../../docs/plugin-authoring.md)
+for lifecycle, capability, packaging, trust, and current deployment details.
+
 The SDK exposes only call-scoped, capability-gated facades. World access is
 read-only. Changes are bounded operations submitted for later validation and
 application. Storage is fixed to the current plugin namespace by the host.
