@@ -63,6 +63,35 @@ impl AbiVersionPolicy {
     /// Major compatibility is checked first so a mismatch can be rejected
     /// before plugin initialization. For the same major, this host accepts its
     /// current minor and every earlier minor, and rejects later minors.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferrumc_plugin_abi::{AbiVersion, AbiVersionError, AbiVersionPolicy};
+    ///
+    /// let host = AbiVersion::new(1, 2);
+    /// let policy = AbiVersionPolicy::new(host);
+    /// let earlier = AbiVersion::new(1, 1);
+    /// assert_eq!(policy.negotiate(earlier), Ok(earlier));
+    ///
+    /// let future = AbiVersion::new(1, 3);
+    /// assert_eq!(
+    ///     policy.negotiate(future),
+    ///     Err(AbiVersionError::MinorTooNew {
+    ///         host,
+    ///         plugin: future,
+    ///     }),
+    /// );
+    ///
+    /// let wrong_major = AbiVersion::new(2, 0);
+    /// assert_eq!(
+    ///     policy.negotiate(wrong_major),
+    ///     Err(AbiVersionError::MajorMismatch {
+    ///         host,
+    ///         plugin: wrong_major,
+    ///     }),
+    /// );
+    /// ```
     pub const fn negotiate(self, plugin: AbiVersion) -> Result<AbiVersion, AbiVersionError> {
         if plugin.major != self.host.major {
             return Err(AbiVersionError::MajorMismatch {
