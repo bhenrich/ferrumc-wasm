@@ -31,9 +31,11 @@
   caller's concern.
 - Chunk loading selects a stored full `ChunkRecord` when present, otherwise a
   deterministic generated base, and then applies the stored overlay. Overlay
-  sections replace only the sections they carry; an empty overlay is a no-op.
-  A non-empty schema-v3 overlay carries the complete block-entity snapshot, so
-  removals persist while imported entities survive legacy and empty overlays.
+  records must use exactly the current schema; old and future schemas are
+  refused as `IncompatiblePreAlphaData`. Overlay sections replace only the
+  sections they carry; an empty overlay is a no-op. A non-empty current overlay
+  carries the complete block-entity snapshot, so removals persist while imported
+  entities survive empty overlays.
 - Resident chunks and their tickets live in ordered containers (`BTreeMap`), so
   the resident set, its iteration order, and dirty batches are deterministic for
   identical acquire/release/mutate sequences.

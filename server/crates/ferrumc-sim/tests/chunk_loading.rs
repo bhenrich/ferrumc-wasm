@@ -5,12 +5,12 @@
 use ferrumc_core::{DimensionId, WorldId};
 use ferrumc_math::{BlockPos, ChunkPos, ShardPos};
 use ferrumc_sim::{
-    ChunkProvenance, ChunkTicket, LoadedChunkMap, SimShard, SpawnChunkTickets, TicketLevel,
-    TicketReason,
+    ChunkProvenance, ChunkTicket, LoadedChunkMap, SimError, SimShard, SpawnChunkTickets,
+    TicketLevel, TicketReason, OVERLAY_SCHEMA_VERSION,
 };
 use ferrumc_storage::{
-    ChunkKey, ChunkOverlayRecord, ChunkRecord, InMemoryStore, SchemaVersion, WorldStore,
-    MAX_SAVE_BATCH,
+    ChunkKey, ChunkOverlayRecord, ChunkRecord, InMemoryStore, SchemaVersion, StorageError,
+    WorldStore, MAX_SAVE_BATCH,
 };
 use ferrumc_world::{
     BlockEntity, BlockStateId, ChestInventory, Chunk, FlatWorldGenerator, Sign, SignKind,
@@ -371,8 +371,7 @@ async fn deleted_imported_block_entity_does_not_resurrect() {
     assert_eq!(chunk.block_entity(fixture.chest_pos), Some(&fixture.chest));
 }
 
-#[tokio::test]
-async fn legacy_overlay_does_not_erase_imported_block_entities() {
+async fn assert_incompatible_overlay_schema_is_refused(schema_version: SchemaVersion) {
     let store = InMemoryStore::new();
     let generator = FlatWorldGenerator::new();
     let fixture = ImportedChunkFixture::new();
@@ -388,26 +387,43 @@ async fn legacy_overlay_does_not_erase_imported_block_entities() {
     let mut overlay_source = imported;
     overlay_source
         .set_block(fixture.edited, BlockStateId::new(71))
-        .expect("legacy overlay edit in chunk");
+        .expect("overlay edit in chunk");
     overlay_source.mark_persist_dirty(fixture.edited);
-    let legacy_overlay =
-        ChunkOverlayRecord::from_chunk(SchemaVersion::new(2), fixture.pos, &overlay_source, 1);
-    assert_eq!(legacy_overlay.section_count(), 1);
-    assert_eq!(legacy_overlay.block_entity_count(), 0);
+    let overlay = ChunkOverlayRecord::from_chunk(schema_version, fixture.pos, &overlay_source, 1);
+    assert_eq!(overlay.section_count(), 1);
     store
-        .save_chunk_overlays(vec![(key(fixture.pos), legacy_overlay)])
+        .save_chunk_overlays(vec![(key(fixture.pos), overlay)])
         .await
-        .expect("persist legacy overlay");
+        .expect("persist incompatible overlay fixture");
 
     let mut loaded = map();
-    loaded
+    let error = loaded
         .acquire(&store, &generator, fixture.pos, spawn_ticket())
         .await
-        .expect("reload imported base plus legacy overlay");
-    let chunk = loaded.get(fixture.pos).expect("resident chunk");
-    assert_eq!(chunk.get_block(fixture.edited), Some(BlockStateId::new(71)));
-    assert_eq!(chunk.block_entity(fixture.sign_pos), Some(&fixture.sign));
-    assert_eq!(chunk.block_entity(fixture.chest_pos), Some(&fixture.chest));
+        .expect_err("incompatible overlay schema must be refused");
+    assert_eq!(
+        error,
+        SimError::ChunkLoad {
+            pos: fixture.pos,
+            source: StorageError::IncompatiblePreAlphaData.into(),
+        }
+    );
+    assert!(
+        !loaded.is_loaded(fixture.pos),
+        "a refused overlay must not make the chunk resident"
+    );
+}
+
+#[tokio::test]
+async fn old_overlay_schema_is_refused_as_incompatible_pre_alpha_data() {
+    assert_eq!(OVERLAY_SCHEMA_VERSION, SchemaVersion::new(3));
+    assert_incompatible_overlay_schema_is_refused(SchemaVersion::new(2)).await;
+}
+
+#[tokio::test]
+async fn future_overlay_schema_is_refused_as_incompatible_pre_alpha_data() {
+    assert_eq!(OVERLAY_SCHEMA_VERSION, SchemaVersion::new(3));
+    assert_incompatible_overlay_schema_is_refused(SchemaVersion::new(4)).await;
 }
 
 #[tokio::test]
