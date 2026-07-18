@@ -58,5 +58,8 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc
 
+      - name: Forbidden public claims
+        run: python3 ../scripts/check-forbidden-claims.py --self-test --check-index
+
       - name: Generated files are current
         run: cargo xtask generate --check

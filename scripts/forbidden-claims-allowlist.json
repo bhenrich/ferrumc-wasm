@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "exceptions": [
+    {
+      "rule": "plugin-context-term",
+      "path": "docs/adr/0008-trusted-native-plugins-c-abi.md",
+      "term": "sandbox",
+      "start_line": 27,
+      "end_line": 30,
+      "sha256": "e830c1871644a4745d14dffa2ab088286e40a425c29425cc2baadafdf8f82c28",
+      "reason": "Owner-mandated ADR-0008 prohibition paragraph."
+    }
+  ]
+}
