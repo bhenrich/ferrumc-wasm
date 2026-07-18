@@ -4,6 +4,7 @@ use std::io::ErrorKind;
 
 use ferrumc_core::{ServerError, Tick};
 use ferrumc_math::{ChunkPos, ShardPos};
+use ferrumc_storage::ChunkKey;
 
 use crate::ownership::{ShardId, ShardLifecycleState, ShardRegion};
 
@@ -189,6 +190,20 @@ pub enum SimError {
         shard: ShardId,
     },
 
+    /// Two registered shard containers held the same storage chunk key.
+    ///
+    /// This is rejected before tick advancement so two owners can never publish
+    /// competing persist records for one world/dimension/chunk identity.
+    #[error("persist chunk {key:?} is resident in both logical shards {first} and {second}")]
+    PersistChunkAliased {
+        /// Full world/dimension/chunk key claimed by both containers.
+        key: ChunkKey,
+        /// Canonically first registered container holding the key.
+        first: ShardId,
+        /// Later conflicting registered container.
+        second: ShardId,
+    },
+
     /// One shard's bounded per-tick cross-shard outbox rejected a new intent.
     #[error("logical shard {shard} cross-shard outbox is full (capacity {capacity})")]
     CrossShardOutboxFull {
@@ -287,6 +302,11 @@ impl From<SimError> for ServerError {
             SimError::ShardDrainIncomplete { shard } => ServerError::invalid_state(format!(
                 "logical shard {shard} cannot stop before its admitted tick work drains"
             )),
+            SimError::PersistChunkAliased { key, first, second } => {
+                ServerError::invalid_state(format!(
+                    "persist chunk {key:?} is resident in both logical shards {first} and {second}"
+                ))
+            }
             SimError::CrossShardOutboxFull { shard, capacity } => ServerError::capacity(format!(
                 "logical shard {shard} cross-shard outbox full (capacity {capacity})"
             )),

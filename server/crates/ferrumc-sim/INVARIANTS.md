@@ -74,3 +74,22 @@
   prepared scheduler metadata identities, never floating-point payload
   equality. A draining destination cannot stop while an admitted envelope still
   targets it.
+- Before a multi-shard tick advances, every resident full `ChunkKey`
+  (world/dimension/typed chunk position) must occur in exactly one registered
+  shard container. The scan includes clean chunks, so aliases cannot become
+  competing persist records on a later tick; conflicts leave tick, inbox, and
+  dirty state unchanged. Spatial region membership is not enforced by this
+  packet; unique out-of-region residency remains valid until that separate
+  architecture step lands.
+- A successful scheduler tick transfers nonempty per-shard
+  `ChunkOverlayRecord` batches in canonical `ShardId`/`ChunkPos` order only
+  after every fallible worker and cross-shard phase succeeds. Each batch is
+  capped at storage's `MAX_SAVE_BATCH` (4,096); a canonical overflow tail stays
+  persist-dirty and is emitted by a later tick without blocking or loss. A
+  deterministic per-map continuation cursor visits that tail before wrapping,
+  so repeatedly re-dirtying lower chunk keys cannot starve it.
+- Persist output is collected from every registered lifecycle state, including
+  a stopped shard with a deferred tail. Clearing a dirty mask transfers
+  ownership only into the move-owned scheduler outcome; the simulation still
+  holds no database handle and mutation-journal output remains a separate
+  bounded seam.

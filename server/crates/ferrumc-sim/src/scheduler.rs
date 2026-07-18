@@ -6,9 +6,10 @@
 //! [`SimShard::run_tick`]. Cross-shard intents now return with worker results,
 //! enter one scheduler-owned bounded queue in canonical order, and become a
 //! separate destination prefix at exactly the next tick boundary. Storage
-//! completions, plugin tasks, dirty batching, and metrics do not yet have
-//! scheduler-owned carriers; later packets add those real values without fake
-//! no-op phases.
+//! overlay output now leaves a successful tick as move-owned, storage-bounded
+//! per-shard batches after a full-key alias preflight. Storage completions,
+//! plugin tasks, and metrics do not yet have scheduler-owned carriers; later
+//! packets add those real values without fake no-op phases.
 //!
 //! The default mode calls the existing single-shard primitive directly. The
 //! non-default shadow mode builds a canonical worker-slot plan, transfers owned
@@ -30,6 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex};
 
 use ferrumc_core::Tick;
+use ferrumc_storage::{ChunkKey, ChunkOverlayRecord, MAX_SAVE_BATCH};
 
 use crate::coordinator::TickCoordinator;
 use crate::cross_shard::{
@@ -469,16 +471,58 @@ struct ShardTickOutput {
     outputs: Vec<GameOutput>,
 }
 
+/// One move-owned, storage-trait-shaped overlay batch from one shard.
+///
+/// Records remain grouped under the container that exclusively owned their
+/// chunks. The scheduler is the only constructor and never places more than
+/// `capacity` records in one batch; an overflow tail remains persist-dirty for a
+/// later tick.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ShardPersistBatch {
+    shard: ShardId,
+    capacity: usize,
+    has_deferred: bool,
+    records: Vec<(ChunkKey, ChunkOverlayRecord)>,
+}
+
+impl ShardPersistBatch {
+    /// Returns the logical shard container that produced this batch.
+    pub(crate) const fn shard(&self) -> ShardId {
+        self.shard
+    }
+
+    /// Returns the fixed record ceiling applied to this batch.
+    pub(crate) const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Returns whether this shard retained a persist-dirty overflow tail.
+    pub(crate) const fn has_deferred(&self) -> bool {
+        self.has_deferred
+    }
+
+    /// Borrows storage-ready chunk overlay records in canonical chunk order.
+    pub(crate) fn records(&self) -> &[(ChunkKey, ChunkOverlayRecord)] {
+        &self.records
+    }
+
+    /// Transfers the storage-ready records without cloning.
+    pub(crate) fn into_records(self) -> Vec<(ChunkKey, ChunkOverlayRecord)> {
+        self.records
+    }
+}
+
 /// Cross-shard payload prefixes grouped by canonical destination.
 type CrossShardBoundaryInputs = BTreeMap<ShardId, Vec<CrossShardPayload>>;
 
 /// The result of one scheduler tick.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct SchedulerTickOutcome {
     tick: Tick,
     visits: Vec<WorkerVisit>,
     shards: Vec<ShardTickOutput>,
     cross_shard_rejections: Vec<CrossShardRejection>,
+    persist_batches: Vec<ShardPersistBatch>,
 }
 
 impl SchedulerTickOutcome {
@@ -508,10 +552,21 @@ impl SchedulerTickOutcome {
         &self.cross_shard_rejections
     }
 
-    /// Consumes this outcome and transfers every rejected envelope to the
-    /// caller without cloning.
-    pub(crate) fn into_cross_shard_rejections(self) -> Vec<CrossShardRejection> {
-        self.cross_shard_rejections
+    /// Transfers every rejected envelope without discarding other move-owned
+    /// tick results.
+    pub(crate) fn take_cross_shard_rejections(&mut self) -> Vec<CrossShardRejection> {
+        std::mem::take(&mut self.cross_shard_rejections)
+    }
+
+    /// Borrows nonempty per-shard persist batches in canonical shard order.
+    pub(crate) fn persist_batches(&self) -> &[ShardPersistBatch] {
+        &self.persist_batches
+    }
+
+    /// Transfers every persist batch while retaining this outcome's other
+    /// outputs and rejections.
+    pub(crate) fn take_persist_batches(&mut self) -> Vec<ShardPersistBatch> {
+        std::mem::take(&mut self.persist_batches)
     }
 }
 
@@ -579,6 +634,30 @@ const DEFAULT_CROSS_SHARD_QUEUE_CAPACITY: usize = 1024;
 /// Builds the fixed nonzero default without a production `unwrap`.
 const fn nonzero_cross_shard_capacity() -> NonZeroUsize {
     match NonZeroUsize::new(DEFAULT_CROSS_SHARD_QUEUE_CAPACITY) {
+        Some(capacity) => capacity,
+        None => NonZeroUsize::MIN,
+    }
+}
+
+/// Default per-shard overlay records transferred in one completed tick.
+///
+/// This equals [`MAX_SAVE_BATCH`], so every produced vector can be moved
+/// directly into [`ferrumc_storage::WorldStore::save_chunk_overlays`] without
+/// exceeding the storage trait's atomic batch ceiling. Overflow remains dirty
+/// and is emitted by a later fair canonical-order batch.
+const DEFAULT_PERSIST_BATCH_CAPACITY: usize = MAX_SAVE_BATCH;
+
+/// Builds the storage-aligned nonzero default without a production `unwrap`.
+const fn nonzero_persist_batch_capacity() -> NonZeroUsize {
+    match NonZeroUsize::new(DEFAULT_PERSIST_BATCH_CAPACITY) {
+        Some(capacity) => capacity,
+        None => NonZeroUsize::MIN,
+    }
+}
+
+/// Caps an internal requested capacity at the downstream trait ceiling.
+fn bounded_persist_batch_capacity(capacity: NonZeroUsize) -> NonZeroUsize {
+    match NonZeroUsize::new(capacity.get().min(DEFAULT_PERSIST_BATCH_CAPACITY)) {
         Some(capacity) => capacity,
         None => NonZeroUsize::MIN,
     }
@@ -769,6 +848,7 @@ impl ShardWorkerPool {
                     visits: Vec::new(),
                     shards: Vec::new(),
                     cross_shard_rejections: Vec::new(),
+                    persist_batches: Vec::new(),
                 },
                 cross_shard: Vec::new(),
             });
@@ -838,6 +918,7 @@ impl ShardWorkerPool {
                 visits: plan.visits,
                 shards: outputs,
                 cross_shard_rejections: Vec::new(),
+                persist_batches: Vec::new(),
             },
             cross_shard,
         })
@@ -902,6 +983,7 @@ pub(crate) struct ShardScheduler {
     worker_pool: Option<ShardWorkerPool>,
     shards: BTreeMap<ShardId, ScheduledShard>,
     cross_shard: CrossShardQueue,
+    persist_batch_capacity: NonZeroUsize,
     /// A worker failure after tick advance is fail-stop: retry could double-run
     /// peers whose state was already returned.
     poisoned_at: Option<Tick>,
@@ -917,6 +999,7 @@ impl ShardScheduler {
             worker_pool: None,
             shards: BTreeMap::new(),
             cross_shard: CrossShardQueue::new(nonzero_cross_shard_capacity()),
+            persist_batch_capacity: nonzero_persist_batch_capacity(),
             poisoned_at: None,
         };
         let shard_id = scheduler.register(shard)?;
@@ -947,12 +1030,32 @@ impl ShardScheduler {
         worker_slots: NonZeroUsize,
         cross_shard_capacity: NonZeroUsize,
     ) -> SimResult<Self> {
+        Self::with_shadow_workers_and_capacities(
+            coordinator,
+            worker_slots,
+            cross_shard_capacity,
+            nonzero_persist_batch_capacity(),
+        )
+    }
+
+    /// Creates an empty shadow scheduler with explicit internal queue ceilings.
+    ///
+    /// Tiny capacities make both reject-newest cross-shard admission and
+    /// deferred persist-batch behavior deterministic in tests. Production
+    /// shadow construction uses the documented defaults.
+    pub(crate) fn with_shadow_workers_and_capacities(
+        coordinator: TickCoordinator,
+        worker_slots: NonZeroUsize,
+        cross_shard_capacity: NonZeroUsize,
+        persist_batch_capacity: NonZeroUsize,
+    ) -> SimResult<Self> {
         Ok(Self {
             coordinator,
             mode: SchedulerMode::shadow(worker_slots),
             worker_pool: Some(ShardWorkerPool::new(worker_slots)?),
             shards: BTreeMap::new(),
             cross_shard: CrossShardQueue::new(cross_shard_capacity),
+            persist_batch_capacity: bounded_persist_batch_capacity(persist_batch_capacity),
             poisoned_at: None,
         })
     }
@@ -983,6 +1086,61 @@ impl ShardScheduler {
         self.shards
             .insert(shard_id, ScheduledShard::new(shard_id, shard));
         Ok(shard_id)
+    }
+
+    /// Rejects a chunk storage key resident in more than one shard container.
+    ///
+    /// Every resident key is checked, not only today's dirty keys, so an alias
+    /// cannot become two competing persist records on a later tick. This
+    /// read-only preflight runs before coordinator advance and therefore leaves
+    /// ticks, inboxes, and dirty masks unchanged on conflict.
+    fn validate_unique_persist_residency(&self) -> SimResult<()> {
+        if self.shards.len() < 2 {
+            return Ok(());
+        }
+        let mut owners = BTreeMap::new();
+        for (&shard_id, scheduled) in &self.shards {
+            let chunks = scheduled.shard.loaded_chunks();
+            for position in chunks.loaded_positions() {
+                let key = ChunkKey::new(chunks.world(), chunks.dimension(), position);
+                if let Some(first) = owners.get(&key).copied() {
+                    return Err(SimError::PersistChunkAliased {
+                        key,
+                        first,
+                        second: shard_id,
+                    });
+                }
+                owners.insert(key, shard_id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Transfers one bounded canonical overlay prefix from every dirty shard.
+    ///
+    /// This is deliberately the final, infallible scheduler phase. Failures
+    /// after workers have returned their shards but before this capture leave
+    /// every persist-dirty mask in place. Worker ownership failures remain
+    /// independently fail-stop and make no recovery claim.
+    fn take_persist_batches(&mut self, tick: Tick) -> Vec<ShardPersistBatch> {
+        let capacity = self.persist_batch_capacity;
+        let mut batches = Vec::new();
+        for (&shard_id, scheduled) in &mut self.shards {
+            let records = scheduled
+                .shard
+                .loaded_chunks_mut()
+                .take_persist_dirty_bounded(tick.get(), capacity);
+            if records.is_empty() {
+                continue;
+            }
+            batches.push(ShardPersistBatch {
+                shard: shard_id,
+                capacity: capacity.get(),
+                has_deferred: scheduled.shard.loaded_chunks().has_persist_dirty(),
+                records,
+            });
+        }
+        batches
     }
 
     /// Makes a created shard eligible for tick planning.
@@ -1189,6 +1347,7 @@ impl ShardScheduler {
             .current()
             .next()
             .ok_or(SimError::TickOverflow)?;
+        self.validate_unique_persist_residency()?;
         let plan = ExecutionPlan::for_ids(
             self.mode,
             self.shards
@@ -1246,6 +1405,7 @@ impl ShardScheduler {
             }
         };
         execution.outcome.cross_shard_rejections = rejections;
+        execution.outcome.persist_batches = self.take_persist_batches(execution.outcome.tick());
         Ok(execution.outcome)
     }
 
@@ -1307,6 +1467,7 @@ impl ShardScheduler {
                 visits: plan.visits,
                 shards: outputs,
                 cross_shard_rejections: Vec::new(),
+                persist_batches: Vec::new(),
             },
             cross_shard,
         })
@@ -1399,13 +1560,15 @@ impl ShardScheduler {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     use ferrumc_core::{DimensionId, GameMode, PlayerId, Tick, WorldId};
-    use ferrumc_math::{BlockPos, ShardPos, Vec3};
+    use ferrumc_math::{BlockPos, ChunkPos, ShardPos, Vec3};
+    use ferrumc_storage::{ChunkKey, InMemoryStore, MAX_SAVE_BATCH};
+    use ferrumc_world::{BlockStateId, FlatWorldGenerator};
 
     use super::{
         ExecutionPlan, SchedulerMode, ShardScheduler, TestCompletionOrder, TestWorkerProbe,
@@ -1413,12 +1576,51 @@ mod tests {
     };
     use crate::{
         cross_shard::{CrossShardPayload, CrossShardRejectionReason},
-        GameInput, GameOutput, MutationCause, ShardId, ShardLifecycleState, SignFace, SimError,
-        SimShard, TickCoordinator, TickRate,
+        ChunkTicket, GameInput, GameOutput, MutationCause, ShardId, ShardLifecycleState, SignFace,
+        SimError, SimShard, TickCoordinator, TickRate, TicketReason,
     };
 
     fn logical_id(world: WorldId, dimension: DimensionId, position: ShardPos) -> ShardId {
         ShardId::try_new(world, dimension, position).expect("valid test shard position")
+    }
+
+    async fn persist_dirty_shard(position: ShardPos, chunks: &[ChunkPos]) -> SimShard {
+        persist_dirty_shard_in_dimension(position, WorldId::new(0), DimensionId::new(0), chunks)
+            .await
+    }
+
+    async fn persist_dirty_shard_in_dimension(
+        position: ShardPos,
+        world: WorldId,
+        dimension: DimensionId,
+        chunks: &[ChunkPos],
+    ) -> SimShard {
+        let store = InMemoryStore::new();
+        let generator = FlatWorldGenerator::new();
+        let mut shard = SimShard::in_dimension(position, world, dimension);
+        for (index, chunk_pos) in chunks.iter().copied().enumerate() {
+            shard
+                .loaded_chunks_mut()
+                .acquire(
+                    &store,
+                    &generator,
+                    chunk_pos,
+                    ChunkTicket::of(TicketReason::Forced),
+                )
+                .await
+                .expect("load test chunk");
+            let edited = chunk_pos.origin_block(70);
+            let state = BlockStateId::new(u32::try_from(index + 5).expect("small test state"));
+            let chunk = shard
+                .loaded_chunks_mut()
+                .get_mut(chunk_pos)
+                .expect("resident test chunk");
+            chunk
+                .set_block(edited, state)
+                .expect("test height is in range");
+            chunk.mark_persist_dirty(edited);
+        }
+        shard
     }
 
     fn append_len(bytes: &mut Vec<u8>, len: usize) {
@@ -2312,13 +2514,13 @@ mod tests {
             )
             .expect("source b second");
 
-        let production = scheduler.tick().expect("production tick");
+        let mut production = scheduler.tick().expect("production tick");
         assert_eq!(completion.observed(), vec![source_b, source_a]);
         assert_eq!(global_max.load(Ordering::SeqCst), 2);
         assert!(production
             .shard_outputs()
             .all(|(_, outputs)| outputs.is_empty()));
-        let mut rejections = production.into_cross_shard_rejections();
+        let mut rejections = production.take_cross_shard_rejections();
         assert_eq!(rejections.len(), 1);
         let rejection = rejections.pop().expect("one owned rejection");
         assert_eq!(
@@ -2557,5 +2759,327 @@ mod tests {
             .expect("destination")
             .contains_player(player));
         assert_eq!(scheduler.cross_shard_queue_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn single_shard_persist_batch_matches_legacy_drain() {
+        let chunks = [
+            ChunkPos::new(0, 0),
+            // Current authoritative shards intentionally retain arbitrary
+            // view-distance chunks outside their nominal 8x8 region.
+            ChunkPos::new(8, 0),
+        ];
+        let mut legacy = persist_dirty_shard(ShardPos::new(0, 0), &chunks).await;
+        let scheduled = legacy.clone();
+        let expected = legacy.loaded_chunks_mut().take_persist_dirty(1);
+        let expected_shard = logical_id(
+            scheduled.loaded_chunks().world(),
+            scheduled.loaded_chunks().dimension(),
+            scheduled.shard_pos(),
+        );
+        let mut runtime =
+            ShardScheduler::authoritative(TickCoordinator::new(TickRate::VANILLA), scheduled)
+                .expect("authoritative scheduler");
+
+        let mut outcome = runtime.tick().expect("single-shard tick");
+        assert_eq!(outcome.persist_batches().len(), 1);
+        let batch = &outcome.persist_batches()[0];
+        assert_eq!(batch.shard(), expected_shard);
+        assert_eq!(batch.capacity(), MAX_SAVE_BATCH);
+        assert_eq!(batch.records(), expected.as_slice());
+        assert!(!batch.has_deferred());
+        assert!(!runtime
+            .shard(expected_shard)
+            .expect("scheduled shard")
+            .loaded_chunks()
+            .has_persist_dirty());
+        let mut owned_batches = outcome.take_persist_batches();
+        assert_eq!(owned_batches.len(), 1);
+        assert_eq!(
+            owned_batches.pop().expect("one owned batch").into_records(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn per_shard_persist_batches_are_canonical_and_non_overlapping() {
+        let definitions = [
+            (
+                ShardPos::new(1, 0),
+                [ChunkPos::new(9, 0), ChunkPos::new(8, 0)],
+            ),
+            (
+                ShardPos::new(-1, 0),
+                [ChunkPos::new(-1, 0), ChunkPos::new(-8, 0)],
+            ),
+            (
+                ShardPos::new(0, 0),
+                [ChunkPos::new(0, 0), ChunkPos::new(7, 0)],
+            ),
+        ];
+        let mut scheduler = ShardScheduler::with_shadow_workers(
+            TickCoordinator::new(TickRate::VANILLA),
+            NonZeroUsize::new(2).expect("nonzero workers"),
+        )
+        .expect("worker pool");
+        let mut expected_batches = BTreeMap::new();
+        for (position, chunks) in definitions {
+            let id = scheduler
+                .register(persist_dirty_shard(position, &chunks).await)
+                .expect("unique shard");
+            scheduler.activate(id).expect("activate");
+            let mut keys = chunks
+                .map(|chunk| ChunkKey::new(WorldId::new(0), DimensionId::new(0), chunk))
+                .to_vec();
+            keys.sort_unstable_by_key(|key| key.pos());
+            assert!(expected_batches.insert(id, keys).is_none());
+        }
+
+        let outcome = scheduler.tick().expect("multi-shard tick");
+        let batches = outcome.persist_batches();
+        assert_eq!(
+            batches
+                .iter()
+                .map(super::ShardPersistBatch::shard)
+                .collect::<Vec<_>>(),
+            expected_batches.keys().copied().collect::<Vec<_>>()
+        );
+
+        let mut seen = BTreeSet::new();
+        for batch in batches {
+            assert_eq!(batch.records().len(), 2);
+            assert!(!batch.has_deferred());
+            let actual_keys = batch
+                .records()
+                .iter()
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual_keys,
+                expected_batches
+                    .remove(&batch.shard())
+                    .expect("registered shard has an expected batch")
+            );
+            for (key, _) in batch.records() {
+                assert!(seen.insert(*key), "a chunk key may occur in one batch only");
+            }
+        }
+        assert!(expected_batches.is_empty());
+        assert_eq!(seen.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn persist_batch_capacity_defers_overflow_without_clearing_it() {
+        let chunks = [ChunkPos::new(0, 0), ChunkPos::new(1, 0)];
+        let mut scheduler = ShardScheduler::with_shadow_workers_and_capacities(
+            TickCoordinator::new(TickRate::VANILLA),
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(4).expect("nonzero cross-shard capacity"),
+            NonZeroUsize::MIN,
+        )
+        .expect("worker pool");
+        let shard = scheduler
+            .register(persist_dirty_shard(ShardPos::new(0, 0), &chunks).await)
+            .expect("shard");
+        scheduler.activate(shard).expect("activate");
+
+        let first = scheduler.tick().expect("first bounded drain");
+        let first_batch = &first.persist_batches()[0];
+        assert_eq!(first_batch.capacity(), 1);
+        assert_eq!(first_batch.records().len(), 1);
+        assert_eq!(first_batch.records()[0].0.pos(), chunks[0]);
+        assert!(first_batch.has_deferred());
+        assert!(scheduler
+            .shard(shard)
+            .expect("scheduled shard")
+            .loaded_chunks()
+            .has_persist_dirty());
+        scheduler
+            .shards
+            .get_mut(&shard)
+            .expect("scheduled shard")
+            .shard
+            .loaded_chunks_mut()
+            .get_mut(chunks[0])
+            .expect("first chunk remains resident")
+            .mark_persist_dirty(chunks[0].origin_block(70));
+        scheduler
+            .transition(shard, ShardLifecycleState::Draining)
+            .expect("begin drain");
+        scheduler
+            .transition(shard, ShardLifecycleState::Stopped)
+            .expect("persist output does not keep a shard runnable");
+
+        let second = scheduler.tick().expect("deferred drain");
+        assert_eq!(second.visit_order().count(), 0);
+        let second_batch = &second.persist_batches()[0];
+        assert_eq!(second_batch.shard(), shard);
+        assert_eq!(second_batch.records().len(), 1);
+        assert_eq!(second_batch.records()[0].0.pos(), chunks[1]);
+        assert!(second_batch.has_deferred());
+        assert!(scheduler
+            .shard(shard)
+            .expect("scheduled shard")
+            .loaded_chunks()
+            .has_persist_dirty());
+
+        let third = scheduler.tick().expect("wrapped re-dirty drain");
+        assert_eq!(third.visit_order().count(), 0);
+        let third_batch = &third.persist_batches()[0];
+        assert_eq!(third_batch.records().len(), 1);
+        assert_eq!(third_batch.records()[0].0.pos(), chunks[0]);
+        assert!(!third_batch.has_deferred());
+        assert!(!scheduler
+            .shard(shard)
+            .expect("scheduled shard")
+            .loaded_chunks()
+            .has_persist_dirty());
+    }
+
+    #[tokio::test]
+    async fn aliased_resident_chunk_is_rejected_before_tick_or_batch_drain() {
+        let aliased = ChunkPos::new(0, 0);
+        let mut scheduler = ShardScheduler::with_shadow_workers(
+            TickCoordinator::new(TickRate::VANILLA),
+            NonZeroUsize::new(2).expect("nonzero workers"),
+        )
+        .expect("worker pool");
+        let owner = scheduler
+            .register(persist_dirty_shard(ShardPos::new(0, 0), &[aliased]).await)
+            .expect("owner");
+        let mut clean_alias = persist_dirty_shard(ShardPos::new(1, 0), &[aliased]).await;
+        assert_eq!(
+            clean_alias.loaded_chunks_mut().take_persist_dirty(0).len(),
+            1
+        );
+        let foreign = scheduler.register(clean_alias).expect("foreign");
+        scheduler.activate(owner).expect("activate owner");
+        scheduler.activate(foreign).expect("activate foreign");
+        let player = PlayerId::offline("alias-preflight");
+        scheduler
+            .enqueue(
+                owner,
+                GameInput::PlayerJoin {
+                    player,
+                    position: Vec3::ZERO,
+                },
+            )
+            .expect("owner inbox");
+
+        assert_eq!(
+            scheduler.tick(),
+            Err(SimError::PersistChunkAliased {
+                key: ChunkKey::new(WorldId::new(0), DimensionId::new(0), aliased),
+                first: owner,
+                second: foreign,
+            })
+        );
+        assert_eq!(scheduler.current_tick(), Tick::ZERO);
+        assert!(scheduler
+            .shard(owner)
+            .expect("owner")
+            .loaded_chunks()
+            .has_persist_dirty());
+        assert!(!scheduler
+            .shard(foreign)
+            .expect("foreign")
+            .loaded_chunks()
+            .has_persist_dirty());
+        assert_eq!(scheduler.shard(owner).expect("owner").inbox_len(), 1);
+        assert!(!scheduler
+            .shard(owner)
+            .expect("owner")
+            .contains_player(player));
+        assert_eq!(
+            scheduler.tick(),
+            Err(SimError::PersistChunkAliased {
+                key: ChunkKey::new(WorldId::new(0), DimensionId::new(0), aliased),
+                first: owner,
+                second: foreign,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn equal_chunk_coordinates_in_distinct_worlds_are_not_aliases() {
+        let chunk = ChunkPos::new(0, 0);
+        let mut scheduler = ShardScheduler::with_shadow_workers(
+            TickCoordinator::new(TickRate::VANILLA),
+            NonZeroUsize::new(2).expect("nonzero workers"),
+        )
+        .expect("worker pool");
+        for world in [WorldId::new(1), WorldId::new(2)] {
+            let shard = persist_dirty_shard_in_dimension(
+                ShardPos::new(0, 0),
+                world,
+                DimensionId::new(0),
+                &[chunk],
+            )
+            .await;
+            let id = scheduler.register(shard).expect("world-scoped shard");
+            scheduler.activate(id).expect("activate");
+        }
+
+        let outcome = scheduler.tick().expect("world-scoped keys are distinct");
+        assert_eq!(outcome.persist_batches().len(), 2);
+        let keys: BTreeSet<_> = outcome
+            .persist_batches()
+            .iter()
+            .flat_map(|batch| batch.records().iter().map(|(key, _)| *key))
+            .collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from([
+                ChunkKey::new(WorldId::new(1), DimensionId::new(0), chunk),
+                ChunkKey::new(WorldId::new(2), DimensionId::new(0), chunk),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn post_worker_failure_keeps_persist_dirty_ownership_in_the_shard() {
+        let terminal = Tick::new(u64::MAX);
+        let mut scheduler = ShardScheduler::with_shadow_workers(
+            TickCoordinator::resuming_at(TickRate::VANILLA, Tick::new(u64::MAX - 1)),
+            NonZeroUsize::MIN,
+        )
+        .expect("worker pool");
+        let source = scheduler
+            .register(persist_dirty_shard(ShardPos::new(0, 0), &[ChunkPos::new(0, 0)]).await)
+            .expect("source");
+        let destination = scheduler
+            .register(SimShard::new(ShardPos::new(1, 0)))
+            .expect("destination");
+        scheduler.activate(source).expect("activate source");
+        scheduler
+            .activate(destination)
+            .expect("activate destination");
+        scheduler
+            .emit_cross_shard_during_next_tick(
+                source,
+                destination,
+                CrossShardPayload::ApplyInput(GameInput::PlayerLeave {
+                    player: PlayerId::offline("terminal-persist"),
+                }),
+            )
+            .expect("source outbox");
+
+        assert_eq!(
+            scheduler.tick(),
+            Err(SimError::CrossShardEnvelopeTickOverflow {
+                shard: source,
+                tick: terminal,
+            })
+        );
+        assert_eq!(scheduler.current_tick(), terminal);
+        assert!(scheduler
+            .shard(source)
+            .expect("source")
+            .loaded_chunks()
+            .has_persist_dirty());
+        assert_eq!(
+            scheduler.tick(),
+            Err(SimError::ShardSchedulerPoisoned { tick: terminal })
+        );
     }
 }
