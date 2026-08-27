@@ -13,4 +13,5 @@ pub use errors::NBTError;
 pub use nbt::NBT;
 pub use ser::{NBTSerializable, NBTSerializeOptions};
 
-pub use tokio;
+// pub use tokio;
+pub use tokio_with_wasm::alias as tokio;

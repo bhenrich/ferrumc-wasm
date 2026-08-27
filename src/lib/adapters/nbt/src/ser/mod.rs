@@ -1,6 +1,8 @@
 use std::io::Write;
 use tokio::io::AsyncWrite;
 
+use tokio_with_wasm::alias as tokio;
+
 mod r#impl;
 
 pub trait NBTSerializable {

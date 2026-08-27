@@ -8,6 +8,7 @@ use ferrumc_net_codec::net_types::var_int::VarInt;
 use std::fmt::Display;
 use std::io::{Read, Write};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_with_wasm::alias as tokio;
 
 #[derive(Debug, Clone, Hash, Default, PartialEq, Decode, Encode)]
 pub struct InventorySlot {

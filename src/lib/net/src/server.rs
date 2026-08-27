@@ -1,6 +1,7 @@
 use crate::errors::NetError;
 use ferrumc_config::server_config::get_global_config;
 use tokio::net::TcpListener;
+use tokio_with_wasm::alias as tokio;
 use tracing::{debug, error};
 
 pub async fn create_server_listener() -> Result<TcpListener, NetError> {

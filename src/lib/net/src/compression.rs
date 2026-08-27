@@ -151,7 +151,7 @@ mod tests {
             Ok(())
         }
 
-        async fn encode_async<W: tokio::io::AsyncWrite + Unpin>(
+        async fn encode_async<W: tokio_with_wasm::alias::io::AsyncWrite + Unpin>(
             &self,
             writer: &mut W,
             _opts: &NetEncodeOpts,

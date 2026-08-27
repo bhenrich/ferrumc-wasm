@@ -10,6 +10,7 @@ ferrumc-core = { workspace = true }
 ferrumc-inventories = { workspace = true }
 ferrumc-macros = { workspace = true }
 tokio = { workspace = true }
+tokio_with_wasm = { workspace = true }
 
 [lints]
 workspace = true

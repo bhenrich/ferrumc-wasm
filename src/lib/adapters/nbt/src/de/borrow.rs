@@ -6,6 +6,8 @@ use ferrumc_net_codec::encode::{NetEncode, NetEncodeOpts};
 use std::io::Write;
 use tokio::io::AsyncWrite;
 
+use tokio_with_wasm::alias as tokio;
+
 #[repr(u8)]
 #[derive(Debug, PartialEq, Clone)]
 pub enum NbtTag {

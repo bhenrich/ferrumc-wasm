@@ -25,6 +25,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
+use tokio_with_wasm::alias as tokio;
 use tracing::{debug, debug_span, error, trace, warn, Instrument};
 use typename::TypeName;
 

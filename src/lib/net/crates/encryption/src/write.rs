@@ -6,6 +6,7 @@ use std::io::Error;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
+use tokio_with_wasm::alias as tokio;
 
 /// A wrapper around a writer that encrypts outgoing bytes using AES/CFB8, if configured.
 pub struct EncryptedWriter<Writer> {

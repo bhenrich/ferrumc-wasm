@@ -14,6 +14,7 @@ use ferrumc_net_encryption::read::EncryptedReader;
 use ferrumc_state::GlobalState;
 use rand::prelude::SliceRandom;
 use tokio::net::tcp::OwnedReadHalf;
+use tokio_with_wasm::alias as tokio;
 use tracing::warn;
 
 /// Handles the Minecraft server "status" state of the handshake.

@@ -21,6 +21,7 @@ use int::IntArgumentFlags;
 use long::LongArgumentFlags;
 use string::StringArgumentType;
 use tokio::io::AsyncWrite;
+use tokio_with_wasm::alias as tokio;
 
 pub mod bool;
 pub mod char;

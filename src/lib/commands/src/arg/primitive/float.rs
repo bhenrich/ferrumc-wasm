@@ -3,6 +3,8 @@ use std::io::Write;
 use ferrumc_net_codec::encode::{NetEncode, NetEncodeOpts, errors::NetEncodeError};
 use tokio::io::AsyncWrite;
 
+use tokio_with_wasm::alias as tokio;
+
 use crate::{
     arg::{CommandArgument, ParserResult, utils::error},
     ctx::CommandContext,

@@ -55,7 +55,7 @@ impl NetEncode for ParticleType {
             _ => Ok(()),
         }
     }
-    async fn encode_async<W: tokio::io::AsyncWrite + Unpin>(
+    async fn encode_async<W: tokio_with_wasm::alias::io::AsyncWrite + Unpin>(
         &self,
         _: &mut W,
         _: &NetEncodeOpts,
@@ -82,7 +82,7 @@ impl NetEncode for &VibrationSource {
             }
         }
     }
-    async fn encode_async<W: tokio::io::AsyncWrite + Unpin>(
+    async fn encode_async<W: tokio_with_wasm::alias::io::AsyncWrite + Unpin>(
         &self,
         _: &mut W,
         _: &NetEncodeOpts,

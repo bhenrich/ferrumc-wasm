@@ -23,6 +23,7 @@ use azalea::swarm::prelude::*;
 use azalea::WalkDirection;
 use clap::Parser;
 use rand::Rng;
+use tokio_with_wasm::alias as tokio;
 
 /// Command-line configuration for a stress run.
 #[derive(Parser, Debug, Clone)]

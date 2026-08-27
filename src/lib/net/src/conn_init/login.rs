@@ -49,6 +49,7 @@ use crate::ConnState;
 use ferrumc_components::player::offline_player_data::OfflinePlayerData;
 use rand::RngCore;
 use tokio::net::tcp::OwnedReadHalf;
+use tokio_with_wasm::alias as tokio;
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 // =================================================================================================

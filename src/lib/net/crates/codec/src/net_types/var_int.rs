@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncReadExt, AsyncWrite};
+use tokio_with_wasm::alias as tokio;
 
 #[derive(Debug, Encode, Decode, Clone, DeepSizeOf, PartialEq, Eq, PartialOrd, Ord, Copy, Hash)]
 pub struct VarInt(pub i32);

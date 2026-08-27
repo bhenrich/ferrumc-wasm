@@ -4,6 +4,7 @@ use crate::net_types::var_int::VarInt;
 use std::io::Write;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
+use tokio_with_wasm::alias as tokio;
 
 /// A wrapper around a byte array that can be encoded with a length prefix.
 /// This is faster than a LengthPrefixedVec for raw byte data, as it avoids encoding each byte individually.

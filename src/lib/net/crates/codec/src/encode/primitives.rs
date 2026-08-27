@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::ops::Deref;
 use tokio::io::AsyncWriteExt;
+use tokio_with_wasm::alias as tokio;
 
 macro_rules! impl_for_primitives {
     ($($primitive_type:ty $(| $alt:ty)?),*) => {

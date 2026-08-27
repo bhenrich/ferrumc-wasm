@@ -8,6 +8,7 @@ use std::fmt::Display;
 use std::io::{Read, Write};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio_with_wasm::alias as tokio;
 
 /// The definition of a "Position" in the Minecraft protocol.
 #[derive(Clone, Debug, PartialEq)]

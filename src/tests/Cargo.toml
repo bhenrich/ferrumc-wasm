@@ -12,6 +12,7 @@ bevy_ecs = { workspace = true}
 ferrumc-core = { workspace = true }
 flate2 = { workspace = true }
 tokio = { workspace = true }
+tokio_with_wasm = { workspace = true }
 maplit = { workspace = true }
 
 [lints]

@@ -8,6 +8,7 @@ edition = "2021"
 tracing = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
+tokio_with_wasm = { workspace = true }
 sysinfo = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

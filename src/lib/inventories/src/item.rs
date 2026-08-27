@@ -8,6 +8,7 @@ use ferrumc_world::block_state_id::BlockStateId;
 use std::fmt::Display;
 use std::io::{Read, Write};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_with_wasm::alias as tokio;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Decode, Encode)]
 pub struct ItemID(pub VarInt);

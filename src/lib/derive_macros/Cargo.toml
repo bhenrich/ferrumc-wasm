@@ -22,6 +22,7 @@ craftflow-nbt = { workspace = true }
 indexmap = { workspace = true }
 bitcode = { workspace = true }
 simd-json = { workspace = true }
+tokio_with_wasm = { workspace = true }
 
 [dev-dependencies]
 ferrumc-world = { workspace = true }

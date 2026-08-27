@@ -2,6 +2,7 @@ use std::{io::Write, ops::Deref};
 
 use ferrumc_net_codec::encode::{NetEncode, NetEncodeOpts, errors::NetEncodeError};
 use tokio::io::AsyncWrite;
+use tokio_with_wasm::alias as tokio;
 
 use crate::{
     arg::{
