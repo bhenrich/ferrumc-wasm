@@ -38,6 +38,8 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, error, info, info_span, trace, warn, Instrument};
 
+use tokio_with_wasm::alias as tokio;
+
 /// Main entry point for the server game loop.
 ///
 /// This function:

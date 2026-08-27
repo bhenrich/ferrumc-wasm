@@ -4,6 +4,8 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use tokio::net::UdpSocket;
 use tracing::error;
 
+use tokio_with_wasm::alias as tokio;
+
 pub struct LanPinger {
     socket: UdpSocket,
     addr: SocketAddrV4,
