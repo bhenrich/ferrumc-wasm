@@ -159,7 +159,10 @@ tracy-client = "0.18.4"
 
 # Concurrency/Parallelism
 parking_lot = "0.12.5"
+
 rayon = "1.11.0"
+wasm-bindgen-rayon = "1.2"
+
 crossbeam-channel = "0.5.15"
 rusty_pool = "0.7.0"
 crossbeam-queue = "0.3.12"

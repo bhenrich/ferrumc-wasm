@@ -8,6 +8,8 @@
 //! - [errors](errors/index.html): Error types for the config module.
 //! - [server_config](server_config/index.html): Server configuration struct and functions.
 
+pub use wasm_bindgen_rayon::init_thread_pool;
+
 pub mod errors;
 pub mod favicon;
 pub mod server_config;

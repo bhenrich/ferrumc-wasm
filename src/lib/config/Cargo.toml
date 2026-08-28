@@ -21,6 +21,8 @@ once_cell = { workspace = true }
 figment = { workspace = true }
 rand = { workspace = true }
 
+wasm_bindgen_rayon = { workspace = true }
+
 [features]
 # Whether the dashboard options are enabled
 dashboard = []
