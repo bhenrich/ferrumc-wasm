@@ -1,15 +1,14 @@
 use ferrumc_config::server_config::get_global_config;
 use rand::prelude::SliceRandom;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use tokio::net::UdpSocket;
+//use tokio::net::UdpSocket;
 use tracing::error;
 
 pub struct LanPinger {
     socket: UdpSocket,
     addr: SocketAddrV4,
 }
-
-impl LanPinger {
+/*impl LanPinger {
     pub async fn new() -> std::io::Result<Self> {
         const ADDR: Ipv4Addr = Ipv4Addr::new(224, 0, 2, 60); // mojang's UDP multicast address
         const PORT: u16 = 4445;
@@ -40,3 +39,4 @@ impl LanPinger {
         }
     }
 }
+*/
