@@ -4,6 +4,7 @@ use crate::net_types::var_int::VarInt;
 use std::borrow::Cow;
 use std::io::Write;
 use tokio::io::AsyncWrite;
+use tokio_with_wasm::alias as tokio;
 
 pub struct NetworkArray<'data, T: NetEncode + ToOwned + Clone>(Cow<'data, [T]>);
 

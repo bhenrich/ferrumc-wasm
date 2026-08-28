@@ -45,6 +45,7 @@ use ferrumc_config::server_config::get_global_config;
 use ferrumc_state::GlobalState;
 use include_dir::{include_dir, Dir};
 use tokio::sync::broadcast;
+use tokio_with_wasm::alias as tokio;
 use tracing::{debug, info};
 
 mod handshake;

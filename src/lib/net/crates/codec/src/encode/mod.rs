@@ -1,6 +1,7 @@
 use crate::encode::errors::NetEncodeError;
 use std::io::Write;
 use tokio::io::AsyncWrite;
+use tokio_with_wasm::alias as tokio;
 
 pub mod errors;
 mod primitives;

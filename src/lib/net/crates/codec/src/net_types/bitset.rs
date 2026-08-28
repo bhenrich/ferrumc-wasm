@@ -5,6 +5,7 @@ use std::io::Write;
 use std::ops::Not;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
+use tokio_with_wasm::alias as tokio;
 
 #[derive(Debug, Clone)]
 pub struct BitSet(Vec<u64>);

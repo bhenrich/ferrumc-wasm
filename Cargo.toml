@@ -148,6 +148,8 @@ tokio = { version = "1.49.0", features = [
     "test-util",
     "rt-multi-thread"
 ], default-features = false }
+tokio_with_wasm = "0.10.1"
+
 
 # Logging
 tracing = "0.1.44"

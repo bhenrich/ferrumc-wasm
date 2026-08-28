@@ -18,6 +18,7 @@ use ferrumc_state::GlobalState;
 use ferrumc_text::{ComponentBuilder, NamedColor, TextComponent};
 use std::sync::atomic::Ordering;
 use tokio::net::tcp::OwnedReadHalf;
+use tokio_with_wasm::alias as tokio;
 use tracing::{error, trace};
 
 /// Represents the result of a login attempt after the handshake process.

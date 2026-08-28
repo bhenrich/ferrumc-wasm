@@ -7,6 +7,7 @@ use std::time::Duration;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::sync::broadcast::Sender;
 use tokio::time::interval;
+use tokio_with_wasm::alias as tokio;
 use tracing::{debug, error};
 
 #[derive(Clone, Debug, Serialize)]

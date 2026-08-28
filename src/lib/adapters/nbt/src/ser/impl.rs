@@ -5,6 +5,8 @@ use std::io::Write;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
+use tokio_with_wasm::alias as tokio;
+
 macro_rules! impl_ser_primitives {
     ($($($ty:ty) | * > $id:expr),*) => {
         $($(

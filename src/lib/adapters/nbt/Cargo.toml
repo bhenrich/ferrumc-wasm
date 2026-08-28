@@ -8,6 +8,7 @@ edition = "2021"
 thiserror = { workspace = true }
 ferrumc-net-codec = { workspace = true }
 tokio = { workspace = true }
+tokio_with_wasm = { workspace = true }
 ferrumc-general-purpose = { workspace = true }
 uuid = { workspace = true }
 

@@ -6,6 +6,7 @@ use std::hash::Hash;
 use std::io::Read;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio_with_wasm::alias as tokio;
 
 macro_rules! impl_for_primitives {
     ($($primitive_type:ty $(| $alt:ty)?),*) => {

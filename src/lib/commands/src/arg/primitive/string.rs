@@ -6,6 +6,7 @@ use ferrumc_net_codec::{
     net_types::var_int::VarInt,
 };
 use tokio::io::AsyncWrite;
+use tokio_with_wasm::alias as tokio;
 
 use crate::{
     arg::{CommandArgument, ParserResult, utils::parser_error},

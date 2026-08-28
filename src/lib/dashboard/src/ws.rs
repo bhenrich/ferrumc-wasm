@@ -4,6 +4,7 @@ use axum::extract::ws::{Message, Utf8Bytes, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use tokio::sync::broadcast;
+use tokio_with_wasm::alias as tokio;
 
 /// The state needed for the websocket
 #[derive(Clone)]

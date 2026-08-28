@@ -6,6 +6,7 @@ use ferrumc_net_codec::net_types::var_int::VarInt;
 use std::fmt::Display;
 use std::io::Read;
 use tokio::io::AsyncRead;
+use tokio_with_wasm::alias as tokio;
 use tracing::warn;
 use typename::TypeName;
 

@@ -5,6 +5,7 @@ use cfb8::Decryptor;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
+use tokio_with_wasm::alias as tokio;
 
 /// A wrapper around a reader that decrypts incoming bytes using AES/CFB8, if configured.
 pub struct EncryptedReader<Reader> {

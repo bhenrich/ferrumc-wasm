@@ -8,6 +8,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }
 tokio = { workspace = true }
+tokio_with_wasm = { workspace = true }
 ferrumc-text = { workspace = true }
 ferrumc-core = { workspace = true }
 enum-ordinalize = { workspace = true }

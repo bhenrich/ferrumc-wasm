@@ -5,6 +5,7 @@ use ferrumc_config::server_config::get_global_config;
 use ferrumc_net_codec::encode::errors::NetEncodeError;
 use ferrumc_net_codec::encode::{NetEncode, NetEncodeOpts};
 use std::io::Write;
+use tokio_with_wasm::alias as tokio;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Decode, Encode)]
 #[repr(u8)]

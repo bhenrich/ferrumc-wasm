@@ -10,6 +10,7 @@ use std::fmt::Debug;
 use std::io::Cursor;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio_with_wasm::alias as tokio;
 use tracing::{debug, error, trace};
 use yazi::{decompress, Format};
 

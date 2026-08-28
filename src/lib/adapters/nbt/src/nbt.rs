@@ -8,6 +8,8 @@ use std::io::{Read, Write};
 use std::ops::{Deref, DerefMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
+use tokio_with_wasm::alias as tokio;
+
 pub struct NBT<T> {
     inner: T,
 }

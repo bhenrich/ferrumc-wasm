@@ -5,6 +5,7 @@ use crate::encode::{NetEncode, NetEncodeOpts};
 use crate::net_types::var_int::VarInt;
 use std::io::{Read, Write};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_with_wasm::alias as tokio;
 
 #[derive(Debug, Clone)]
 pub struct LengthPrefixedVec<T> {

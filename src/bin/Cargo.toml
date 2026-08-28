@@ -68,6 +68,7 @@ clap = { workspace = true }
 rand = { workspace = true }
 ctrlc = { workspace = true }
 tokio = { workspace = true }
+tokio_with_wasm = { workspace = true }
 crossbeam-channel = { workspace = true }
 uuid = { workspace = true }
 dhat = { workspace = true, optional = true }

@@ -8,6 +8,7 @@ edition = "2024"
 ferrumc-net-codec = { workspace = true }
 bevy_ecs = { workspace = true }
 tokio = { workspace = true }
+tokio_with_wasm = { workspace = true }
 crossbeam-queue = { workspace = true }
 once_cell = { workspace = true }
 thiserror = { workspace = true }

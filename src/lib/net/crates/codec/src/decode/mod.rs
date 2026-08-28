@@ -1,6 +1,7 @@
 use crate::decode::errors::NetDecodeError;
 use std::io::Read;
 use tokio::io::AsyncRead;
+use tokio_with_wasm::alias as tokio;
 
 pub mod errors;
 mod primitives;
