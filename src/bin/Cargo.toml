@@ -4,10 +4,26 @@ description = "A high-performance Minecraft server implementation, crafted in Ru
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 
 [dependencies]
+
+# WASM-specific dependencies
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+#getrandom = { version = "0.2", features = ["js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = { version = "0.1", optional = true }
+
+# Other
 thiserror = { workspace = true }
 
 ferrumc-core = { workspace = true }
